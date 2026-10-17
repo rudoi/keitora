@@ -18,6 +18,7 @@ import {
   type DaemonInfo,
   daemonStatus,
   decodeBase64,
+  MAX_SCROLL_LINES,
   onPtyResume,
   openTerminalFile,
   ptyAttach,
@@ -25,20 +26,30 @@ import {
   ptyKill,
   ptyRepaint,
   ptyResize,
+  ptyScroll,
+  ptyScrollOffset,
   ptySpawn,
   ptyWrite,
   type RecoveryInfo,
   recoveryFocus,
   recoveryStartFresh,
+  type ScrollDirection,
+  type ScrollSource,
   saveClipboardImage,
   sessionLaunch,
   sessionTerminate,
 } from "../lib/ipc";
-import { isGlobalAppChord } from "../lib/keybindings";
+import { isGlobalAppChord, isScrollToLiveKey, paneScrollDirection } from "../lib/keybindings";
 import { markPending, onFrame, stamp } from "../lib/latencyProbe";
+import { createLiveTail, type LiveTail } from "../lib/liveTail";
 import { createPaneAttachments } from "../lib/paneAttach";
 import { createOutputGate, type OutputGate } from "../lib/paneOutput";
-import { afterRecoveringRefusal, nextPaneStatus, type Status } from "../lib/paneStatus";
+import {
+  afterRecoveringRefusal,
+  inputBlocked,
+  nextPaneStatus,
+  type Status,
+} from "../lib/paneStatus";
 import { isWindows } from "../lib/platform";
 import { paneRecoveryState, recoveryItem, recoveryPaneMessage } from "../lib/recovery";
 import {
@@ -49,12 +60,13 @@ import {
 } from "../lib/resumeNotice";
 import {
   accumulateWheelLines,
+  type Cell,
   clampPtySize,
+  cursorCell,
   type Dims,
   dimsAreSane,
   dimsEqual,
-  FALLBACK_ROW_PX,
-  isAtBottom,
+  wheelCell,
 } from "../lib/termFit";
 import { clipboardActionForKey, suppressNativePaste } from "../lib/terminalClipboard";
 import { suppressesCompositionDoubleCommit } from "../lib/terminalComposition";
@@ -144,9 +156,6 @@ function blobToBase64(blob: Blob): Promise<string> {
     reader.readAsDataURL(blob);
   });
 }
-
-// Bound synchronous redispatch work for malformed or extreme wheel events.
-const WHEEL_LINES_CAP = 100;
 
 /** The per-pane status union (declared with its reducer in `lib/paneStatus`). */
 export type { Status };
@@ -241,7 +250,6 @@ export function TerminalPane({
   const terminatedRef = useRef(terminated);
   terminatedRef.current = terminated;
   const wheelRemainderRef = useRef(0);
-  const wheelDiagLoggedRef = useRef(false);
 
   const [status, setStatus] = useState<Status>(terminated ? "terminated" : "attaching");
   // statusRef mirrors status so the onData closure doesn't capture a stale value.
@@ -257,6 +265,10 @@ export function TerminalPane({
   // Resolved app theme (light|dark). Chosen at construction and swapped live below.
   const resolvedTheme = useResolvedTheme();
   const [showReattachedPill, setShowReattachedPill] = useState(false);
+  // "↓ live" pill: the viewport is scrolled up into herdr's history.
+  const [showLivePill, setShowLivePill] = useState(false);
+  const liveTailRef = useRef<LiveTail | null>(null);
+  const scrollToLiveRef = useRef<() => void>(() => {});
   // The open confirm surface, by restart flavour or a terminate (`false` = closed).
   const [confirmKill, setConfirmKill] = useState<false | "resume" | "fresh" | "terminate">(false);
 
@@ -303,8 +315,7 @@ export function TerminalPane({
   // default 80×24 was shipped to the daemon — the "wrong size until I swap worktrees"
   // bug. Here we retry across frames until the proposal is sane AND stable across two
   // frames, then commit once; on exhaustion we fall back to a best-effort fit (never
-  // worse than before). After committing we refresh (resyncs a recreated WebGL viewport)
-  // and re-pin to the live tail iff we were already there (keeps scrollback reachable).
+  // worse than before). After committing we refresh (resyncs a recreated WebGL viewport).
   const refitAndResize = useCallback(() => {
     const term = termRef.current;
     const host = hostRef.current;
@@ -321,8 +332,6 @@ export function TerminalPane({
     let lastSane: Dims | null = null;
 
     const commit = () => {
-      const buf = term.buffer.active;
-      const stick = isAtBottom(buf.viewportY, buf.baseY);
       try {
         fit.fit();
       } catch {
@@ -336,13 +345,6 @@ export function TerminalPane({
         term.refresh(0, Math.max(0, term.rows - 1));
       } catch {
         /* ignore */
-      }
-      if (stick) {
-        try {
-          term.scrollToBottom();
-        } catch {
-          /* ignore */
-        }
       }
     };
 
@@ -387,10 +389,15 @@ export function TerminalPane({
       attachmentsRef.current.begin();
       // Output still queued from the previous attach is superseded by this one's scrollback.
       coalescerRef.current?.reset();
+      // A new attach paints the live viewport: whatever the pill said is stale.
+      liveTailRef.current?.reset();
       const gate = createOutputGate({
         write: (bytes, full) => {
           if (termRef.current !== term) return;
           coalescerRef.current?.push(bytes, onFrame(`${projectName}/${name}`), full);
+          // While the pill shows, output may mean history was erased or the
+          // viewport snapped back: re-check once it settles.
+          liveTailRef.current?.noteOutput();
         },
         // The output before the exit reaches the terminal first (hidden or not),
         // then the pane shows it ended. A newer attach or a restart resets the
@@ -637,8 +644,10 @@ export function TerminalPane({
         }
       }
       // The killed session's queued output and any "ended" still waiting on its
-      // write belong to the old session, not the one spawned next.
+      // write belong to the old session, not the one spawned next. So does its
+      // scroll position.
       coalescerRef.current?.reset();
+      liveTailRef.current?.reset();
       termRef.current?.clear();
       // Re-open the terminal if it was closed.
       const term = termRef.current;
@@ -666,8 +675,10 @@ export function TerminalPane({
       return;
     }
     genRef.current = null;
-    // The killed session's queued output and any "ended" still waiting on its write.
+    // The killed session's queued output and any "ended" still waiting on its write,
+    // and its scroll position.
     coalescerRef.current?.reset();
+    liveTailRef.current?.reset();
     updateStatus("terminated");
   }, [name, projectName, showToast, updateStatus]);
 
@@ -676,6 +687,7 @@ export function TerminalPane({
   const launch = useCallback(
     async (fresh = false) => {
       coalescerRef.current?.reset();
+      liveTailRef.current?.reset();
       termRef.current?.clear();
       const term = termRef.current;
       const host = hostRef.current;
@@ -806,9 +818,10 @@ export function TerminalPane({
       fontFamily: 'ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace',
       fontSize: fontSize,
       cursorBlink: true,
-      // Deeper history so heavy output doesn't trim the buffer out from under a
-      // scrolled-up viewport (one cause of the "can't scroll back to bottom" bug).
-      scrollback: 5000,
+      // herdr owns the pane's history (the wheel scrolls it there, see below); xterm
+      // only paints herdr's viewport, so it keeps none: rows it scrolled off would be
+      // stale, and a selection drag or scrollbar could move its viewport onto them.
+      scrollback: 0,
       theme: THEMES[resolvedTheme],
     });
     const links = installTerminalLinks(term, {
@@ -901,6 +914,20 @@ export function TerminalPane({
       // terminal: don't consume them, so they bubble to the window-level keymap
       // instead of being sent to the PTY.
       if (isGlobalAppChord(e)) return false;
+      // End returns to the live tail while the "↓ live" pill is up (and is not sent).
+      if (isScrollToLiveKey(e) && liveTailRef.current?.visible) {
+        e.preventDefault();
+        scrollToLiveRef.current();
+        return false;
+      }
+      // Shift+PageUp/PageDown page through herdr's history and never reach the app.
+      const pageDir = paneScrollDirection(e);
+      if (pageDir) {
+        e.preventDefault();
+        queueScroll(pageDir, "page_key", Math.max(1, term.rows - 1), cursorAt());
+        flushScroll();
+        return false;
+      }
       // Windows clipboard: WebView2 DOES deliver a native paste to xterm's textarea, but
       // that path is opaque to our attaching gate, so we own Ctrl+V explicitly
       // here and suppress the native duplicate at the host container (see the capture-
@@ -955,16 +982,9 @@ export function TerminalPane({
     // Input gating: suppress keystrokes while attaching, detached-alive, daemon-down,
     // while recovery holds the session (recovering / suspended), or once terminated.
     const dataDisp = term.onData((d) => {
-      if (statusRef.current === "attaching") return;
-      if (statusRef.current === "detached-alive") return;
-      if (
-        statusRef.current === "daemon-down" ||
-        statusRef.current === "recovering" ||
-        statusRef.current === "suspended" ||
-        statusRef.current === "terminated"
-      ) {
-        return;
-      }
+      if (inputBlocked(statusRef.current)) return;
+      // herdr snaps the viewport back to the live tail on any input.
+      liveTailRef.current?.noteInput();
       const t0 = stamp();
       markPending(`${projectName}/${name}`, t0);
       void ptyWrite(projectName, name, d, t0);
@@ -984,8 +1004,11 @@ export function TerminalPane({
     };
     host?.addEventListener("paste", onNativePaste, true);
 
-    // xterm's alternate-buffer pixel path can divide by an unmeasured row height. Capture on
-    // the host so pixel events are normalized before xterm's target listeners see them.
+    // Scrolling belongs to herdr: it routes each scroll to the app (mouse reporting),
+    // to arrow keys (alternate scroll) or to the pane's history. So every vertical wheel
+    // tick becomes a ptyScroll, and xterm neither scrolls its own viewport nor emulates
+    // arrows. Ticks are batched per animation frame; a direction change sends the
+    // pending batch first so the order of movement is kept.
     let wheelDebug = false;
     try {
       wheelDebug = !!localStorage.getItem("keitora:debug-wheel");
@@ -993,61 +1016,150 @@ export function TerminalPane({
       /* localStorage unavailable */
     }
 
-    const onWheelNormalize = (e: WheelEvent) => {
-      const t = termRef.current;
-      if (!t?.element) return;
-      if (t.buffer.active.type !== "alternate") return;
-      // This guard also lets the synthetic line events below pass without redispatching.
-      if (e.deltaMode !== WheelEvent.DOM_DELTA_PIXEL) return;
-      // xterm returns before its unsafe division for non-vertical wheel events.
-      if (e.shiftKey || e.deltaY === 0) return;
+    const liveTail = createLiveTail({
+      query: () => ptyScrollOffset(projectName, name),
+      onChange: setShowLivePill,
+    });
+    liveTailRef.current = liveTail;
+    setShowLivePill(false);
 
-      const rows = t.rows;
-      const rowHeightPx = rows > 0 && host ? host.clientHeight / rows : FALLBACK_ROW_PX;
+    let pendingScroll:
+      | ({ direction: ScrollDirection; source: ScrollSource; lines: number } & Cell)
+      | null = null;
+    let scrollRaf: number | null = null;
+
+    // The cursor's cell: where a key-driven scroll (page keys, back to live) points.
+    function cursorAt(): Cell {
+      const buf = term.buffer.active;
+      return cursorCell(buf.cursorX, buf.cursorY, term.cols, term.rows);
+    }
+
+    function flushScroll() {
+      if (scrollRaf !== null) {
+        cancelAnimationFrame(scrollRaf);
+        scrollRaf = null;
+      }
+      const batch = pendingScroll;
+      pendingScroll = null;
+      if (!batch || termRef.current !== term || inputBlocked(statusRef.current)) return;
+      if (wheelDebug) console.log("[keitora wheel] ptyScroll", batch);
+      const { direction, source, lines, column, row } = batch;
+      ptyScroll(projectName, name, direction, source, lines, column, row).catch((err) => {
+        // Expected while herdr recovers; the next tick tries again.
+        if (wheelDebug) console.debug("[keitora wheel] ptyScroll failed", err);
+      });
+      // Once the burst settles, ask whether the viewport ended up in history.
+      liveTail.noteScroll(direction);
+    }
+
+    // The pill's click / End: one wheel scroll down far enough to reach the live tail
+    // (herdr stops there). Queued like any other scroll, so a pending "up" batch goes
+    // out before it.
+    scrollToLiveRef.current = () => {
+      const lines = liveTail.jumpToLive();
+      if (lines === null) return;
+      queueScroll("down", "wheel", lines, cursorAt());
+      flushScroll();
+      term.focus();
+    };
+
+    function queueScroll(
+      direction: ScrollDirection,
+      source: ScrollSource,
+      lines: number,
+      cell: Cell,
+    ) {
+      // herdr routes a wheel and a page key differently, so they never share a batch.
+      if (
+        pendingScroll &&
+        (pendingScroll.direction !== direction || pendingScroll.source !== source)
+      ) {
+        flushScroll();
+      }
+      if (pendingScroll) {
+        pendingScroll.lines = Math.min(MAX_SCROLL_LINES, pendingScroll.lines + lines);
+        pendingScroll.column = cell.column;
+        pendingScroll.row = cell.row;
+      } else {
+        pendingScroll = { direction, source, lines: Math.min(MAX_SCROLL_LINES, lines), ...cell };
+      }
+      if (scrollRaf === null) {
+        scrollRaf = requestAnimationFrame(() => {
+          scrollRaf = null;
+          flushScroll();
+        });
+      }
+    }
+
+    // The painted screen, looked up on the first wheel event (it exists once the
+    // terminal is open, which any wheel event over it implies) and kept. Its rect is
+    // measured on the first wheel event of an animation frame and reused until the
+    // frame fires, so a fast wheel does not force a layout read per event.
+    let screen: Element | null = null;
+    let screenRect: DOMRect | null = null;
+    let screenRectRaf: number | null = null;
+    function measureScreen(): DOMRect | null {
+      if (screenRect) return screenRect;
+      screen ??= term.element?.querySelector(".xterm-screen") ?? null;
+      screenRect = screen?.getBoundingClientRect() ?? null;
+      screenRectRaf ??= requestAnimationFrame(() => {
+        screenRectRaf = null;
+        screenRect = null;
+      });
+      return screenRect;
+    }
+
+    term.attachCustomWheelEventHandler((e: WheelEvent) => {
+      // Ctrl+wheel is left to the webview (zoom); xterm still mustn't act on it.
+      if (e.ctrlKey) return false;
+      // Horizontal-only movement has nothing to scroll.
+      if (e.deltaY === 0) return false;
+      e.preventDefault();
+      if (inputBlocked(statusRef.current)) {
+        wheelRemainderRef.current = 0;
+        return false;
+      }
+
+      // Cell size comes from the painted screen, so it tracks font size and zoom.
+      // An unmeasured screen or empty grid gives a non-finite or zero cell size,
+      // which wheelCell maps to cell 0 and accumulateWheelLines to a fallback row.
+      const rect = measureScreen();
+      const cols = term.cols;
+      const rows = term.rows;
+      const cellW = (rect?.width ?? 0) / cols;
+      const cellH = (rect?.height ?? 0) / rows;
+      const cell = wheelCell(
+        e.clientX - (rect?.left ?? 0),
+        e.clientY - (rect?.top ?? 0),
+        cellW,
+        cellH,
+        cols,
+        rows,
+      );
+
       const { lines, remainder } = accumulateWheelLines(
         e.deltaY,
-        rowHeightPx,
+        cellH,
         wheelRemainderRef.current,
+        e.deltaMode,
+        rows,
       );
       wheelRemainderRef.current = remainder;
+      const direction = lines < 0 ? "up" : "down";
 
-      if (wheelDebug && !wheelDiagLoggedRef.current) {
-        wheelDiagLoggedRef.current = true;
+      if (wheelDebug) {
         console.log("[keitora wheel]", {
           deltaMode: e.deltaMode,
           deltaY: e.deltaY,
-          rows,
-          rowHeightPx,
           lines,
-          bufferType: t.buffer.active.type,
+          cell,
+          direction: lines === 0 ? null : direction,
         });
       }
 
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      if (lines === 0) return;
-
-      // Unit events preserve magnitude in both xterm paths: mouse reporting ignores deltaY's
-      // magnitude, while the alternate-buffer arrow path does not.
-      const step = lines > 0 ? 1 : -1;
-      const count = Math.min(Math.abs(lines), WHEEL_LINES_CAP);
-      for (let i = 0; i < count; i++) {
-        t.element.dispatchEvent(
-          new WheelEvent("wheel", {
-            deltaMode: WheelEvent.DOM_DELTA_LINE,
-            deltaY: step,
-            clientX: e.clientX,
-            clientY: e.clientY,
-            altKey: e.altKey,
-            ctrlKey: e.ctrlKey,
-            metaKey: e.metaKey,
-            bubbles: true,
-            cancelable: true,
-          }),
-        );
-      }
-    };
-    host?.addEventListener("wheel", onWheelNormalize, { capture: true, passive: false });
+      if (lines !== 0) queueScroll(direction, "wheel", Math.abs(lines), cell);
+      return false;
+    });
 
     let cancelled = false;
     let unResume: UnlistenFn | undefined;
@@ -1076,7 +1188,12 @@ export function TerminalPane({
       compositionHost?.removeEventListener("compositionend", onCompositionEnd);
       dataDisp.dispose();
       host?.removeEventListener("paste", onNativePaste, true);
-      host?.removeEventListener("wheel", onWheelNormalize, true);
+      if (scrollRaf !== null) cancelAnimationFrame(scrollRaf);
+      if (screenRectRaf !== null) cancelAnimationFrame(screenRectRaf);
+      pendingScroll = null;
+      liveTail.dispose();
+      liveTailRef.current = null;
+      scrollToLiveRef.current = () => {};
       unResume?.();
       webglRef.current?.dispose();
       webglRef.current = null;
@@ -1305,6 +1422,20 @@ export function TerminalPane({
 
       {/* "↩ reattached" pill */}
       {showReattachedPill && <div className="pane-reattached-pill">↩ reattached</div>}
+
+      {/* "↓ live" pill: shown while the viewport is scrolled into history */}
+      {showLivePill && (
+        <button
+          type="button"
+          className="pane-btn pane-live-pill"
+          title="Back to the live output (End)"
+          // Keep focus in the terminal: a click must not steal it.
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => scrollToLiveRef.current()}
+        >
+          ↓ live
+        </button>
+      )}
 
       {/* Per-state overlay — matches the full table in 04-frontend-ux.md §4.2 */}
       {status !== "running" && (

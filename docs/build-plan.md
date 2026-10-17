@@ -193,6 +193,14 @@ de-risks "beautiful" before any Rust/PTY work.
   **2026-10-06 note:** `keitora-ptyd` and `keitora-pty-proto` have since been removed. **herdr is now the only PTY
   backend** (a herdr server owns the PTYs and outlives the GUI; if it can't start the app shows an unavailable
   backend and the rail says why). The daemon text above is kept as history.
+  **2026-10-17 note (scrollback model):** herdr streams rendered viewport frames, not raw PTY bytes, so
+  xterm keeps almost no history of its own. **herdr owns each pane's history** (`[pty]
+  herdr_scrollback_limit_bytes`, default 16 MB of ghostty page memory, about 9k rows at 200 columns), and
+  the wheel / Shift+PgUp/PgDn send `terminal.scroll` to herdr, which routes it: a mouse report to an app
+  that enabled mouse reporting (e.g. Claude Code's fullscreen mode scrolls its own transcript), arrow keys
+  under alternate-scroll, otherwise herdr's own history. An app that emits `ESC[3J` (Claude Code's
+  fullscreen clear and its scroll-region renderer on resize/view switches; Codex's full clear) erases herdr's
+  history; that can't be recovered on the Keitora side. Cmd+F searches the visible viewport only.
   **2026-10-10 note:** the herdr backend is verified on macOS. herdr is located from `[pty] herdr_bin`,
   `KEITORA_HERDR_BIN`, the process `PATH`, the Homebrew / `/usr/local` / `~/.local` bin dirs, the newest
   standalone release, then the login-shell `PATH`, and a missing herdr shows a not-found message on the rail with a Restart
@@ -531,6 +539,7 @@ Status: **Phase 0 ✅ done** · **Phase 1 ✅ done (PR #1)** · **Phase 2 ✅ do
 - **Restart persistence** — **resolved (task #0040):** the `keitora-ptyd` daemon owns PTYs and outlives the
   GUI, so a relaunch/project-switch reattaches to the live `claude` with scrollback intact (no
   `claude --continue` restart, no scrollback loss). Daemon-crash is the remaining loss window.
+  (With herdr, history lives in the herdr server; see the scrollback-model note above.)
 - **Windows (fast-follow)** — `portable-pty` already targets ConPTY, so the session layer is shared. Main
   Windows work is path/shell handling and packaging, not a new session backend. Validate before Phase 5.
   See [docs/windows-backend.md](windows-backend.md) for the full Windows port design and open items.

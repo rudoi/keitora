@@ -26,6 +26,12 @@
 //! failed write restarts the bridge at the wanted size instead. Back-to-back
 //! queued resizes collapse to the last one.
 //!
+//! Scrolls (wheel ticks and page keys) are queued the same way, and back-to-back
+//! queued scrolls of one direction and source merge into one; the bridge then
+//! writes a wheel scroll as one-line commands (see [`bridge::scroll_payload`]).
+//! A scroll is best-effort: one that cannot be written is dropped (never retried,
+//! never a bridge restart), and its dead bridge is dropped as failed input drops it.
+//!
 //! A bridge stdin write can block for good on the full pipe of a control child
 //! that is alive but no longer reading. One watchdog thread per [`Writers`]
 //! registry scans every writer's in-flight write: one still blocked after
@@ -43,7 +49,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::backend::{PtyBackendError, SessionKey};
+use crate::backend::{PtyBackendError, ScrollDirection, ScrollSource, SessionKey};
 
 use super::bridge::{self, BridgeInput, BridgeStdin};
 
@@ -84,6 +90,15 @@ pub enum WriteJob {
     Resize { cols: u16, rows: u16 },
     /// Ask for a fresh full frame: a resize to the bridge's current size.
     Repaint,
+    /// Scroll `lines` toward `direction` from `source`, with the pointer at cell
+    /// `column`,`row`.
+    Scroll {
+        direction: ScrollDirection,
+        source: ScrollSource,
+        lines: u16,
+        column: u16,
+        row: u16,
+    },
     /// Answers once every earlier job is done.
     #[cfg(test)]
     Flush(SyncSender<()>),
@@ -438,6 +453,34 @@ impl<T: SessionIo> Writer<T> {
                     self.resize(Some((cols, rows)));
                 }
                 WriteJob::Repaint => self.resize(None),
+                WriteJob::Scroll {
+                    direction,
+                    source,
+                    mut lines,
+                    mut column,
+                    mut row,
+                } => {
+                    // A burst of ticks one way from one source is one scroll by
+                    // their sum, at the last pointer position. A turn of direction
+                    // or a change of source is kept: herdr routes each source its
+                    // own way (a wheel report vs a page key) to an app.
+                    while let Some(&WriteJob::Scroll {
+                        direction: d,
+                        source: s,
+                        lines: l,
+                        column: c,
+                        row: r,
+                    }) = self.queue.front()
+                    {
+                        if d != direction || s != source {
+                            break;
+                        }
+                        lines = lines.saturating_add(l);
+                        (column, row) = (c, r);
+                        self.queue.pop_front();
+                    }
+                    self.scroll(direction, source, lines, column, row);
+                }
                 #[cfg(test)]
                 WriteJob::Flush(done) => {
                     let _ = done.send(());
@@ -473,6 +516,33 @@ impl<T: SessionIo> Writer<T> {
             return;
         }
         self.io.resized(&stdin, cols, rows);
+    }
+
+    /// Send one scroll down the bridge. Not attached: nothing to do. A failed
+    /// write drops the scroll (a lost wheel tick is harmless, so no restart) and
+    /// drops the bridge as failed input does: its stdin is dead.
+    fn scroll(
+        &self,
+        direction: ScrollDirection,
+        source: ScrollSource,
+        lines: u16,
+        column: u16,
+        row: u16,
+    ) {
+        if let Err(e) = self.io.admit() {
+            log::debug!("herdr writer [{}]: scroll refused: {e}", self.name);
+            return;
+        }
+        let Some(stdin) = self.io.stdin() else {
+            return;
+        };
+        let sent = self.watch.watched(&stdin, || {
+            bridge::send_scroll_to(&stdin, direction, source, lines, column, row)
+        });
+        if let Err(e) = sent {
+            log::debug!("herdr writer [{}]: {e}; scroll dropped", self.name);
+            self.io.drop_bridge(&stdin);
+        }
     }
 
     /// Move everything already sent into the queue.
@@ -831,14 +901,20 @@ mod tests {
             .collect()
     }
 
-    /// The bridge stdin lines, parsed.
+    /// The bridge stdin lines, parsed (a write of several lines gives each).
     fn stdin_lines(seen: &[Seen]) -> Vec<serde_json::Value> {
         seen.iter()
             .filter_map(|s| match s {
-                Seen::Stdin(l) => Some(parse(l)),
+                Seen::Stdin(l) => Some(l.lines().map(parse).collect::<Vec<_>>()),
                 _ => None,
             })
+            .flatten()
             .collect()
+    }
+
+    /// How many bridge stdin writes were made.
+    fn stdin_writes(seen: &[Seen]) -> usize {
+        seen.iter().filter(|s| matches!(s, Seen::Stdin(_))).count()
     }
 
     fn resize_json(cols: u16, rows: u16) -> serde_json::Value {
@@ -1495,6 +1571,244 @@ mod tests {
         // Not a failure: the line may still land, and a retry would send it twice.
         assert!(reply.wait(Duration::from_millis(1)).is_ok());
         drop(answer);
+    }
+
+    /// A wheel scroll job.
+    fn scroll(direction: ScrollDirection, lines: u16, column: u16, row: u16) -> WriteJob {
+        WriteJob::Scroll {
+            direction,
+            source: ScrollSource::Wheel,
+            lines,
+            column,
+            row,
+        }
+    }
+
+    /// A page-key scroll job.
+    fn page(direction: ScrollDirection, lines: u16) -> WriteJob {
+        WriteJob::Scroll {
+            direction,
+            source: ScrollSource::PageKey,
+            lines,
+            column: 0,
+            row: 0,
+        }
+    }
+
+    fn scroll_json_from(
+        direction: &str,
+        source: &str,
+        lines: u16,
+        column: u16,
+        row: u16,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "type": "terminal.scroll",
+            "direction": direction,
+            "source": source,
+            "lines": lines,
+            "column": column,
+            "row": row,
+        })
+    }
+
+    /// The `lines` one-line wheel commands a wheel scroll of `lines` is written as.
+    fn wheel_json(direction: &str, lines: u16, column: u16, row: u16) -> Vec<serde_json::Value> {
+        vec![scroll_json_from(direction, "wheel", 1, column, row); usize::from(lines)]
+    }
+
+    /// Runs `jobs` queued up behind a held writer, so they coalesce where they
+    /// can, and returns once all have run.
+    fn run_queued(script: &Script, jobs: Vec<WriteJob>) {
+        let writers = Writers::default();
+        let gate_tx = hold_writer(&writers, script);
+        for job in jobs {
+            writers.send(&key(), 1, job, unused).unwrap();
+        }
+        gate_tx.send(()).unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        writers
+            .send(&key(), 1, WriteJob::Flush(tx), unused)
+            .unwrap();
+        rx.recv().unwrap();
+    }
+
+    #[test]
+    fn a_scroll_writes_a_scroll_line() {
+        let script = sized_script();
+        let writers = Writers::default();
+        writers
+            .send(&key(), 1, scroll(ScrollDirection::Up, 3, 10, 5), || {
+                script.clone()
+            })
+            .unwrap();
+        flush(&writers, &script);
+        let seen = script.seen();
+        assert_eq!(stdin_lines(&seen), wheel_json("up", 3, 10, 5));
+        assert_eq!(stdin_writes(&seen), 1, "one write for the whole scroll");
+    }
+
+    #[test]
+    fn queued_scrolls_one_way_merge_into_one_at_the_last_cell() {
+        let script = sized_script();
+        run_queued(
+            &script,
+            vec![
+                scroll(ScrollDirection::Down, 1, 1, 1),
+                scroll(ScrollDirection::Down, 2, 2, 2),
+                scroll(ScrollDirection::Down, 4, 3, 9),
+            ],
+        );
+        let seen = script.seen();
+        assert_eq!(stdin_lines(&seen), wheel_json("down", 7, 3, 9));
+        assert_eq!(stdin_writes(&seen), 1, "merged into one write");
+    }
+
+    #[test]
+    fn queued_scrolls_keep_each_turn_of_direction() {
+        let script = sized_script();
+        run_queued(
+            &script,
+            vec![
+                scroll(ScrollDirection::Up, 1, 0, 0),
+                scroll(ScrollDirection::Up, 2, 0, 0),
+                scroll(ScrollDirection::Down, 3, 0, 0),
+                scroll(ScrollDirection::Up, 4, 0, 0),
+            ],
+        );
+        let seen = script.seen();
+        assert_eq!(
+            stdin_lines(&seen),
+            [
+                wheel_json("up", 3, 0, 0),
+                wheel_json("down", 3, 0, 0),
+                wheel_json("up", 4, 0, 0),
+            ]
+            .concat()
+        );
+        assert_eq!(stdin_writes(&seen), 3);
+    }
+
+    #[test]
+    fn merged_scroll_lines_saturate_at_u16_max() {
+        let script = sized_script();
+        run_queued(
+            &script,
+            vec![
+                scroll(ScrollDirection::Up, 40_000, 0, 0),
+                scroll(ScrollDirection::Up, 40_000, 0, 0),
+                scroll(ScrollDirection::Up, 40_000, 0, 0),
+            ],
+        );
+        assert_eq!(
+            stdin_lines(&script.seen()),
+            vec![scroll_json_from("up", "wheel", u16::MAX, 0, 0)],
+            "past the split max: one command"
+        );
+    }
+
+    #[test]
+    fn queued_scrolls_do_not_merge_across_sources() {
+        let script = sized_script();
+        run_queued(
+            &script,
+            vec![
+                scroll(ScrollDirection::Up, 2, 0, 0),
+                page(ScrollDirection::Up, 30),
+                page(ScrollDirection::Up, 30),
+                scroll(ScrollDirection::Up, 1, 0, 0),
+            ],
+        );
+        let seen = script.seen();
+        assert_eq!(
+            stdin_lines(&seen),
+            [
+                wheel_json("up", 2, 0, 0),
+                vec![scroll_json_from("up", "page_key", 60, 0, 0)],
+                wheel_json("up", 1, 0, 0),
+            ]
+            .concat()
+        );
+        assert_eq!(stdin_writes(&seen), 3);
+    }
+
+    #[test]
+    fn a_page_key_scroll_is_one_command() {
+        let script = sized_script();
+        run_queued(&script, vec![page(ScrollDirection::Down, 40)]);
+        assert_eq!(
+            stdin_lines(&script.seen()),
+            vec![scroll_json_from("down", "page_key", 40, 0, 0)]
+        );
+    }
+
+    #[test]
+    fn a_scroll_is_ordered_between_the_input_around_it() {
+        let script = sized_script();
+        run_queued(
+            &script,
+            vec![
+                WriteJob::Text("a".into()),
+                scroll(ScrollDirection::Up, 2, 0, 0),
+                WriteJob::Text("b".into()),
+            ],
+        );
+        assert_eq!(
+            stdin_lines(&script.seen()),
+            vec![
+                serde_json::json!({"type": "terminal.input", "text": "a"}),
+                scroll_json_from("up", "wheel", 1, 0, 0),
+                scroll_json_from("up", "wheel", 1, 0, 0),
+                serde_json::json!({"type": "terminal.input", "text": "b"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_scroll_write_is_dropped_without_restarting_the_bridge() {
+        let script = sized_script();
+        let dead = script.stdin().unwrap();
+        *dead.lock().unwrap() = None; // the child's stdin is closed
+        let writers = Writers::with_wait(Duration::from_millis(10));
+        writers
+            .send(&key(), 1, scroll(ScrollDirection::Up, 1, 0, 0), || {
+                script.clone()
+            })
+            .unwrap();
+        flush(&writers, &script);
+        // The dead bridge is dropped as for input; never restarted, never retried.
+        assert_eq!(script.seen(), vec![Seen::DroppedBridge]);
+        assert!(script.stdin().is_none());
+        // The writer is still alive and scrolls down a new bridge.
+        script.attach();
+        writers
+            .send(&key(), 1, scroll(ScrollDirection::Down, 2, 0, 0), || {
+                script.clone()
+            })
+            .unwrap();
+        flush(&writers, &script);
+        assert_eq!(stdin_lines(&script.seen()), wheel_json("down", 2, 0, 0));
+    }
+
+    #[test]
+    fn scrolls_without_a_bridge_or_refused_do_nothing() {
+        let script = Script::default();
+        let writers = Writers::default();
+        writers
+            .send(&key(), 1, scroll(ScrollDirection::Up, 1, 0, 0), || {
+                script.clone()
+            })
+            .unwrap();
+        flush(&writers, &script);
+        script.attach();
+        *script.refuse.lock().unwrap() = true;
+        writers
+            .send(&key(), 1, scroll(ScrollDirection::Up, 1, 0, 0), || {
+                script.clone()
+            })
+            .unwrap();
+        flush(&writers, &script);
+        assert!(script.seen().is_empty(), "{:?}", script.seen());
     }
 
     #[test]

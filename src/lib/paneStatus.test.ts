@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DaemonState } from "./ipc";
-import { ALL_STATUSES, afterRecoveringRefusal, nextPaneStatus } from "./paneStatus";
+import { ALL_STATUSES, afterRecoveringRefusal, inputBlocked, nextPaneStatus } from "./paneStatus";
 import type { PaneRecovery } from "./recovery";
 
 const DAEMON_STATES: DaemonState[] = ["NeverStarted", "Connected", "Disconnected"];
@@ -109,5 +109,19 @@ describe("afterRecoveringRefusal", () => {
     for (const d of DAEMON_STATES.filter((d) => d !== "Connected")) {
       expect(afterRecoveringRefusal(d, null).attach).toBe(false);
     }
+  });
+});
+
+describe("inputBlocked", () => {
+  it("blocks input exactly while the session can't take it", () => {
+    const blocked = ALL_STATUSES.filter(inputBlocked);
+    expect(blocked).toEqual([
+      "attaching",
+      "detached-alive",
+      "daemon-down",
+      "recovering",
+      "suspended",
+      "terminated",
+    ]);
   });
 });

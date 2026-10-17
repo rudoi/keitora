@@ -314,6 +314,13 @@ impl HerdrOps for RealHerdr {
         Ok(panes.iter().filter_map(parse_pane_identity).collect())
     }
 
+    /// `herdr pane get <pane_id>` → that pane's identity (the same pane object as
+    /// a `pane list` entry, at `/result/pane`).
+    fn pane_get(&self, pane_id: &str) -> Result<Option<PaneInfo>, HerdrError> {
+        let value = self.run(CallClass::Quick, &["pane", "get", pane_id])?;
+        Ok(value.pointer("/result/pane").and_then(parse_pane_identity))
+    }
+
     /// `herdr agent start <name> --kind <kind> --pane <pane_id> --timeout <ms>
     /// [-- <args…>]`.
     ///

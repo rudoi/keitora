@@ -50,6 +50,17 @@ const RECOVERABLE: readonly Status[] = [...LIVE, "daemon-down", "recovering", "s
 const WAITING: readonly Status[] = ["daemon-down", "recovering", "suspended"];
 
 /**
+ * Statuses whose session can't take input right now: the pane is still attaching,
+ * waiting on the daemon or recovery, or terminated. Keystrokes and scrolls are dropped.
+ */
+const INPUT_BLOCKED: readonly Status[] = ["attaching", "detached-alive", ...WAITING, "terminated"];
+
+/** Whether a pane in `status` drops keystrokes and scrolls (see `INPUT_BLOCKED`). */
+export function inputBlocked(status: Status): boolean {
+  return INPUT_BLOCKED.includes(status);
+}
+
+/**
  * React to the daemon state and the pane's recovery state (`paneRecoveryState`).
  * A terminated pane stays terminated: nothing re-attaches it and recovery never
  * claims it (only a launch brings it back). A suspended session shows as suspended whatever the pane was doing; while

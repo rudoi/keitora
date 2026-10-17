@@ -21,7 +21,7 @@ use crate::backend::herdr::recovery::RecoveryHandle;
 use crate::backend::unavailable::UnavailableBackend;
 use crate::backend::{
     session_hint, AgentLaunch, AttachResult, DaemonStats, OutputSink, PtyBackend, PtyBackendError,
-    SessionHint, SessionKey, SharedBackend, StatusPayload,
+    ScrollDirection, ScrollSource, SessionHint, SessionKey, SharedBackend, StatusPayload,
 };
 use crate::{bg_notifier, codex_hooks, dispatch, hooks, tasks};
 
@@ -1579,6 +1579,46 @@ fn pty_resize(
     resize_pty(client.inner().as_ref(), &project, &id, rows, cols)
 }
 
+/// Scroll a session's viewport by `lines` from `source` with the pointer at the
+/// 0-based cell `column`,`row` (see [`PtyBackend::scroll`]): a wheel tick over the
+/// pane or a history page key.
+#[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
+fn pty_scroll(
+    client: State<SharedBackend>,
+    project: String,
+    id: String,
+    direction: ScrollDirection,
+    source: ScrollSource,
+    lines: u16,
+    column: u16,
+    row: u16,
+) -> Result<(), String> {
+    let key = SessionKey {
+        project,
+        worktree: id,
+    };
+    client
+        .scroll(&key, direction, source, lines, column, row)
+        .map_err(daemon_err)
+}
+
+/// How many lines above the live tail a session's viewport is scrolled (see
+/// [`PtyBackend::scroll_offset`]); `None` when the backend cannot tell. Async: it
+/// runs a herdr CLI call.
+#[tauri::command(async)]
+fn pty_scroll_offset(
+    client: State<SharedBackend>,
+    project: String,
+    id: String,
+) -> Result<Option<u32>, String> {
+    let key = SessionKey {
+        project,
+        worktree: id,
+    };
+    client.scroll_offset(&key).map_err(daemon_err)
+}
+
 /// Push one fresh full-viewport repaint frame for a session (see [`PtyBackend::repaint`]).
 /// The frontend calls this once its xterm/WebGL renderer is live, so an idle restored pane
 /// paints on boot instead of showing a blank terminal with a blinking block cursor.
@@ -2075,6 +2115,8 @@ pub fn run() {
             save_clipboard_image,
             crate::terminal_links::open_terminal_file,
             pty_resize,
+            pty_scroll,
+            pty_scroll_offset,
             pty_repaint,
             pty_kill,
             session_terminate,

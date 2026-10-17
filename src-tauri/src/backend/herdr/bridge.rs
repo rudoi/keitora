@@ -17,6 +17,11 @@
 //! frame is `full`: a same-size resize is how a pane asks for a fresh viewport.
 //! `terminal.resize` is not in herdr's docs; it is verified against the herdr
 //! 0.9.3 source (protocol 22), and a failed write falls back to a restart.
+//!
+//! A wheel tick or page key is a `terminal.scroll` line ([`scroll_line`]), also
+//! verified against the herdr 0.9.3 source; herdr routes it itself (a mouse report
+//! or a PageUp/PageDown key to an app that handles scrolling, arrow keys under
+//! alternate-scroll, else its own history).
 
 use std::borrow::Cow;
 use std::io::{BufRead, BufReader, Write};
@@ -28,7 +33,7 @@ use std::thread::JoinHandle;
 
 use serde::Deserialize;
 
-use crate::backend::{OutputSink, PtyBackendError};
+use crate::backend::{OutputSink, PtyBackendError, ScrollDirection, ScrollSource};
 
 use super::ops::{BridgeChild, HerdrOps};
 
@@ -142,6 +147,49 @@ pub fn resize_line(cols: u16, rows: u16) -> String {
     format!("{{\"type\":\"terminal.resize\",\"cols\":{cols},\"rows\":{rows}}}\n")
 }
 
+/// The NDJSON `terminal.scroll` line (newline included): `lines` (at least 1;
+/// herdr rejects 0) toward `direction` from `source`, with the pointer at the
+/// 0-based cell `column`,`row`.
+pub fn scroll_line(
+    direction: ScrollDirection,
+    source: ScrollSource,
+    lines: u16,
+    column: u16,
+    row: u16,
+) -> String {
+    let direction = direction.as_str();
+    let source = source.as_str();
+    let lines = lines.max(1);
+    format!(
+        "{{\"type\":\"terminal.scroll\",\"direction\":\"{direction}\",\"source\":\"{source}\",\"lines\":{lines},\"column\":{column},\"row\":{row}}}\n"
+    )
+}
+
+/// The most lines a wheel scroll is split into one-line commands for (see
+/// [`scroll_payload`]). Above it (only a jump to the live tail) one command goes.
+pub const WHEEL_SPLIT_MAX: u16 = 128;
+
+/// The bridge stdin bytes for one (possibly merged) scroll. herdr turns one wheel
+/// command into ONE app event (a mouse report or an arrow key) whatever its
+/// `lines`, so a wheel scroll of up to [`WHEEL_SPLIT_MAX`] lines goes as that many
+/// `lines:1` commands: an app reading the mouse gets one report per line, and
+/// herdr's own history scroll adds them up the same. A larger wheel scroll and
+/// every page-key scroll (one keypress per page) go as one command.
+pub fn scroll_payload(
+    direction: ScrollDirection,
+    source: ScrollSource,
+    lines: u16,
+    column: u16,
+    row: u16,
+) -> String {
+    let lines = lines.max(1);
+    if source == ScrollSource::Wheel && lines <= WHEEL_SPLIT_MAX {
+        scroll_line(direction, source, 1, column, row).repeat(usize::from(lines))
+    } else {
+        scroll_line(direction, source, lines, column, row)
+    }
+}
+
 /// Writes one `terminal.input` frame to a bridge stdin handle. Free function (not
 /// a `&self` method) so a caller can clone the `Arc` handle, release the
 /// bridges-map lock, and only THEN do the blocking write: a backed-up pipe on one
@@ -162,6 +210,21 @@ pub fn send_resize_to(
     rows: u16,
 ) -> Result<(), PtyBackendError> {
     write_line_to(stdin, &resize_line(cols, rows), "resize")
+}
+
+/// Writes one scroll to a bridge stdin handle: the `terminal.scroll` line(s) of
+/// [`scroll_payload`] in one write (see [`send_input_to`] for why this is a free
+/// function). herdr answers nothing, so `Ok` means only that it was written.
+pub fn send_scroll_to(
+    stdin: &Mutex<Option<Box<dyn Write + Send>>>,
+    direction: ScrollDirection,
+    source: ScrollSource,
+    lines: u16,
+    column: u16,
+    row: u16,
+) -> Result<(), PtyBackendError> {
+    let payload = scroll_payload(direction, source, lines, column, row);
+    write_line_to(stdin, &payload, "scroll")
 }
 
 fn write_line_to(
@@ -564,6 +627,107 @@ mod tests {
         bridge.stop();
         assert!(
             send_resize_to(&bridge.stdin_handle(), 80, 24).is_err(),
+            "stdin closed after stop"
+        );
+    }
+
+    #[test]
+    fn scroll_lines_carry_direction_source_lines_and_cell() {
+        for (direction, word) in [(ScrollDirection::Up, "up"), (ScrollDirection::Down, "down")] {
+            for (source, src) in [
+                (ScrollSource::Wheel, "wheel"),
+                (ScrollSource::PageKey, "page_key"),
+            ] {
+                let line = scroll_line(direction, source, 3, 12, 7);
+                let body = line.strip_suffix('\n').expect("newline-terminated");
+                assert!(!body.contains('\n'), "one line: {line:?}");
+                let v: Value = serde_json::from_str(body).unwrap();
+                assert_eq!(
+                    v,
+                    serde_json::json!({
+                        "type": "terminal.scroll",
+                        "direction": word,
+                        "source": src,
+                        "lines": 3,
+                        "column": 12,
+                        "row": 7,
+                    })
+                );
+            }
+        }
+        // herdr rejects zero lines.
+        let line = scroll_line(ScrollDirection::Up, ScrollSource::Wheel, 0, 0, 0);
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["lines"], 1);
+    }
+
+    /// Each line of a scroll payload, parsed.
+    fn payload_lines(payload: &str) -> Vec<Value> {
+        assert!(payload.ends_with('\n'), "newline-terminated: {payload:?}");
+        payload
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_wheel_scroll_goes_as_one_line_commands_up_to_the_split_max() {
+        let wheel_up = |n: u16| scroll_payload(ScrollDirection::Up, ScrollSource::Wheel, n, 4, 2);
+        let one_line = scroll_line(ScrollDirection::Up, ScrollSource::Wheel, 1, 4, 2);
+        assert_eq!(wheel_up(5), one_line.repeat(5));
+        let lines = payload_lines(&wheel_up(WHEEL_SPLIT_MAX));
+        assert_eq!(lines.len(), usize::from(WHEEL_SPLIT_MAX));
+        assert!(lines
+            .iter()
+            .all(|v| v["lines"] == 1 && v["source"] == "wheel"));
+        // Past the max (a jump to the live tail) it is one command.
+        assert_eq!(
+            wheel_up(WHEEL_SPLIT_MAX + 1),
+            scroll_line(
+                ScrollDirection::Up,
+                ScrollSource::Wheel,
+                WHEEL_SPLIT_MAX + 1,
+                4,
+                2
+            )
+        );
+        assert_eq!(payload_lines(&wheel_up(u16::MAX)).len(), 1);
+        // Zero lines is one one-line command.
+        assert_eq!(wheel_up(0), one_line);
+    }
+
+    #[test]
+    fn a_page_key_scroll_is_always_one_command() {
+        for n in [1, 3, WHEEL_SPLIT_MAX + 7] {
+            let payload = scroll_payload(ScrollDirection::Down, ScrollSource::PageKey, n, 1, 1);
+            assert_eq!(
+                payload,
+                scroll_line(ScrollDirection::Down, ScrollSource::PageKey, n, 1, 1)
+            );
+            let lines = payload_lines(&payload);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0]["source"], "page_key");
+            assert_eq!(lines[0]["lines"], n);
+        }
+    }
+
+    #[test]
+    fn scroll_lines_reach_the_bridge_stdin() {
+        let fake = FakeHerdr::new();
+        let sink = Arc::new(CaptureOutput::default());
+        let mut bridge = start(&fake, &sink);
+        let stdin = bridge.stdin_handle();
+        send_scroll_to(&stdin, ScrollDirection::Down, ScrollSource::Wheel, 3, 0, 0).unwrap();
+        send_scroll_to(&stdin, ScrollDirection::Up, ScrollSource::PageKey, 9, 0, 0).unwrap();
+        assert_eq!(
+            fake.bridge_input("term_1"),
+            scroll_payload(ScrollDirection::Down, ScrollSource::Wheel, 3, 0, 0)
+                + &scroll_line(ScrollDirection::Up, ScrollSource::PageKey, 9, 0, 0)
+        );
+        bridge.stop();
+        let stdin = bridge.stdin_handle();
+        assert!(
+            send_scroll_to(&stdin, ScrollDirection::Up, ScrollSource::Wheel, 1, 0, 0).is_err(),
             "stdin closed after stop"
         );
     }

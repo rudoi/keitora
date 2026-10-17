@@ -163,6 +163,8 @@ pub trait HerdrOps: Send + Sync {
     fn pane_close(&self, pane_id: &str) -> Result<(), HerdrError>;
     fn pane_read(&self, pane_id: &str, source: &str, format: &str) -> Result<String, HerdrError>;
     fn pane_list(&self) -> Result<Vec<PaneInfo>, HerdrError>;
+    /// One pane's identity (`pane get`); `None` when herdr's answer has no pane.
+    fn pane_get(&self, pane_id: &str) -> Result<Option<PaneInfo>, HerdrError>;
     /// `agent_not_ready` / "blocked during startup" are folded to `Ok` (the agent
     /// launched but is not ready yet).
     fn agent_start(
@@ -284,6 +286,7 @@ pub enum Op {
     PaneClose,
     PaneRead,
     PaneList,
+    PaneGet,
     AgentStart,
     AgentPrompt,
     AgentList,

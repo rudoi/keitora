@@ -3,8 +3,10 @@ import {
   cycleProject,
   DEFAULT_BINDINGS,
   isGlobalAppChord,
+  isScrollToLiveKey,
   type KeyCtx,
   matchesKey,
+  paneScrollDirection,
 } from "./keybindings";
 
 // Build a KeyboardEvent-shaped object with sane defaults (no modifiers held).
@@ -248,5 +250,51 @@ describe("view.* bindings removed", () => {
 
   it("view.grid no longer exists in DEFAULT_BINDINGS", () => {
     expect(DEFAULT_BINDINGS.find((b) => b.id === "view.grid")).toBeUndefined();
+  });
+});
+
+describe("pane scroll keys", () => {
+  it("Shift+PageUp / Shift+PageDown map to up / down", () => {
+    expect(paneScrollDirection(ev({ shiftKey: true, key: "PageUp" }))).toBe("up");
+    expect(paneScrollDirection(ev({ shiftKey: true, key: "PageDown" }))).toBe("down");
+  });
+
+  it("bare or otherwise-modified PageUp/PageDown are left for the app", () => {
+    expect(paneScrollDirection(ev({ key: "PageUp" }))).toBeNull();
+    expect(paneScrollDirection(ev({ key: "PageDown" }))).toBeNull();
+    expect(paneScrollDirection(ev({ shiftKey: true, ctrlKey: true, key: "PageUp" }))).toBeNull();
+    expect(paneScrollDirection(ev({ shiftKey: true, altKey: true, key: "PageDown" }))).toBeNull();
+    expect(paneScrollDirection(ev({ shiftKey: true, key: "ArrowUp" }))).toBeNull();
+  });
+
+  it("are listed bindings the window keymap never claims (the pane consumes them)", () => {
+    for (const id of ["terminal.scrollUp", "terminal.scrollDown"]) {
+      const binding = DEFAULT_BINDINGS.find((b) => b.id === id);
+      expect(binding).toBeDefined();
+      expect(binding?.global).toBeFalsy();
+      for (const view of ["focus", "grid", "board"] as const) {
+        expect(binding?.when(makeCtx({ view }))).toBe(false);
+      }
+    }
+    expect(isGlobalAppChord(ev({ shiftKey: true, key: "PageUp" }))).toBe(false);
+  });
+});
+
+describe("isScrollToLiveKey", () => {
+  it("matches bare End only", () => {
+    expect(isScrollToLiveKey(ev({ key: "End" }))).toBe(true);
+    expect(isScrollToLiveKey(ev({ shiftKey: true, key: "End" }))).toBe(false);
+    expect(isScrollToLiveKey(ev({ ctrlKey: true, key: "End" }))).toBe(false);
+    expect(isScrollToLiveKey(ev({ altKey: true, key: "End" }))).toBe(false);
+    expect(isScrollToLiveKey(ev({ metaKey: true, key: "End" }))).toBe(false);
+    expect(isScrollToLiveKey(ev({ key: "Home" }))).toBe(false);
+  });
+
+  it("is a listed binding the window keymap never claims", () => {
+    const binding = DEFAULT_BINDINGS.find((b) => b.id === "terminal.scrollToLive");
+    expect(binding?.keys).toBe("End");
+    expect(binding?.global).toBeFalsy();
+    expect(binding?.when(makeCtx({ view: "focus" }))).toBe(false);
+    expect(isGlobalAppChord(ev({ key: "End" }))).toBe(false);
   });
 });

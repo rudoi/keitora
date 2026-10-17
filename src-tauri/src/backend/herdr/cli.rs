@@ -33,6 +33,10 @@ pub struct PaneIdentity {
     /// The agent session herdr recorded for this pane (via its integration hook).
     /// Survives on a restored shell even after the agent itself is gone.
     pub agent_session: Option<AgentSession>,
+    /// How many lines above the live tail the pane's viewport is scrolled
+    /// (`scroll.offset_from_bottom`; `0` is the live tail). `None` when herdr
+    /// omits it.
+    pub scroll: Option<u32>,
 }
 
 /// The shared-interface name for a `pane list` entry.
@@ -132,6 +136,10 @@ pub fn parse_pane_identity(value: &Value) -> Option<PaneIdentity> {
         agent: opt_str("agent"),
         agent_status: opt_str("agent_status"),
         agent_session: value.get("agent_session").and_then(parse_agent_session),
+        scroll: value
+            .pointer("/scroll/offset_from_bottom")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok()),
     })
 }
 
@@ -236,6 +244,28 @@ pub fn parse_agent_list(value: &Value) -> Vec<AgentInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_identity_reads_the_scroll_position() {
+        let v = serde_json::json!({
+            "workspace_id": "w1", "pane_id": "w1:p1", "terminal_id": "t1",
+            "scroll": {"offset_from_bottom": 12, "max_offset_from_bottom": 400, "viewport_rows": 30},
+        });
+        assert_eq!(parse_pane_identity(&v).unwrap().scroll, Some(12));
+    }
+
+    #[test]
+    fn pane_identity_without_scroll_still_parses() {
+        let v = serde_json::json!({
+            "workspace_id": "w1", "pane_id": "w1:p1", "terminal_id": "t1",
+        });
+        assert_eq!(parse_pane_identity(&v).unwrap().scroll, None);
+        let bad = serde_json::json!({
+            "workspace_id": "w1", "pane_id": "w1:p1", "terminal_id": "t1",
+            "scroll": {"max_offset_from_bottom": 4},
+        });
+        assert_eq!(parse_pane_identity(&bad).unwrap().scroll, None);
+    }
 
     #[test]
     fn error_code_not_found_maps_to_no_such_session() {

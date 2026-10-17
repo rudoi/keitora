@@ -6,6 +6,7 @@
 
 import { useEffect, useRef } from "react";
 import type { View } from "../components/TopBar";
+import type { ScrollDirection } from "./ipc";
 
 // ── Context ──────────────────────────────────────────────────────────────────
 
@@ -72,6 +73,8 @@ export interface Keybinding {
  *   Cmd            → e.metaKey || e.ctrlKey  (Mac Cmd / non-Mac Ctrl)
  *   Up    / Down   → e.key === "ArrowUp" / "ArrowDown"
  *   Left  / Right  → e.key === "ArrowLeft" / "ArrowRight"
+ *   PageUp / PageDown → e.key === "PageUp" / "PageDown"
+ *   End            → e.key === "End"
  *   ?              → e.key === "?"
  *   Plus           → e.key === "+" || "="  (US layout; "+" is Shift+"=")
  *   Minus          → e.key === "-"  (unshifted; "_" / Cmd+Shift+- deliberately excluded)
@@ -121,6 +124,8 @@ export function matchesKey(e: KeyboardEvent, keys: string): boolean {
       if (e.key !== "ArrowLeft") return false;
     } else if (tok === "Right") {
       if (e.key !== "ArrowRight") return false;
+    } else if (tok === "PageUp" || tok === "PageDown" || tok === "End") {
+      if (e.key !== tok) return false;
     } else if (tok === "?") {
       if (e.key !== "?") return false;
     } else if (tok === "Plus") {
@@ -215,6 +220,43 @@ export const DEFAULT_BINDINGS: Keybinding[] = [
     // exactly what we want. `run` is intentionally a no-op: the per-pane overlay
     // owns the actual search (see 01-scrollback-search).
     when: (ctx) => ctx.view === "focus" || ctx.view === "grid",
+    run: () => {
+      /* handled by the focused TerminalPane's own key handler */
+    },
+  },
+  {
+    id: "terminal.scrollUp",
+    keys: "Shift+PageUp",
+    label: "Scroll terminal history up a page",
+    group: "Global",
+    // Listed for the help sheet only: the focused TerminalPane consumes the key (see
+    // paneScrollDirection) so it scrolls the pane instead of reaching the app. The
+    // window keymap never claims it, so Shift+PageUp keeps its default elsewhere.
+    when: () => false,
+    run: () => {
+      /* handled by the focused TerminalPane's own key handler */
+    },
+  },
+  {
+    id: "terminal.scrollDown",
+    keys: "Shift+PageDown",
+    label: "Scroll terminal history down a page",
+    group: "Global",
+    // Help sheet only, like terminal.scrollUp.
+    when: () => false,
+    run: () => {
+      /* handled by the focused TerminalPane's own key handler */
+    },
+  },
+  {
+    id: "terminal.scrollToLive",
+    keys: "End",
+    label: "Back to the live output (while scrolled into history)",
+    group: "Global",
+    // Listed for the help sheet only: the focused TerminalPane consumes End while its
+    // "↓ live" pill is up (see isScrollToLiveKey); otherwise End belongs to whatever
+    // has focus, so the window keymap never claims it.
+    when: () => false,
     run: () => {
       /* handled by the focused TerminalPane's own key handler */
     },
@@ -331,6 +373,41 @@ export const DEFAULT_BINDINGS: Keybinding[] = [
  */
 export function isGlobalAppChord(e: KeyboardEvent): boolean {
   return DEFAULT_BINDINGS.some((b) => b.global && matchesKey(e, b.keys));
+}
+
+/** The keys of the binding `id`, resolved once at module load. */
+function bindingKeys(id: string): string {
+  const binding = DEFAULT_BINDINGS.find((b) => b.id === id);
+  if (!binding) throw new Error(`keybindings: no binding ${id}`);
+  return binding.keys;
+}
+
+const PANE_SCROLL_KEYS: ReadonlyArray<readonly [string, ScrollDirection]> = [
+  [bindingKeys("terminal.scrollUp"), "up"],
+  [bindingKeys("terminal.scrollDown"), "down"],
+];
+
+const SCROLL_TO_LIVE_KEYS = bindingKeys("terminal.scrollToLive");
+
+/**
+ * The scroll direction for a pane history key (Shift+PageUp / Shift+PageDown), or null.
+ * TerminalPane calls this from its key handler and consumes matches, so the key scrolls
+ * the pane and is never sent to the app.
+ */
+export function paneScrollDirection(e: KeyboardEvent): ScrollDirection | null {
+  if (e.key !== "PageUp" && e.key !== "PageDown") return null;
+  for (const [keys, direction] of PANE_SCROLL_KEYS) {
+    if (matchesKey(e, keys)) return direction;
+  }
+  return null;
+}
+
+/**
+ * Whether the event is the back-to-live key (bare End). TerminalPane consumes it only
+ * while its "↓ live" pill is showing; otherwise End goes to the app as usual.
+ */
+export function isScrollToLiveKey(e: KeyboardEvent): boolean {
+  return matchesKey(e, SCROLL_TO_LIVE_KEYS);
 }
 
 // ── Hook ─────────────────────────────────────────────────────────────────────

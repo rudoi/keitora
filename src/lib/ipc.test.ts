@@ -11,6 +11,8 @@ import {
   onPtyResume,
   ptyAttach,
   ptyDetach,
+  ptyScroll,
+  ptyScrollOffset,
   ptySpawn,
   ptyWrite,
   sessionLaunch,
@@ -120,6 +122,50 @@ describe("sessionLaunch", () => {
       "session_launch",
       expect.objectContaining({ fresh: true }),
     );
+  });
+});
+
+describe("ptyScroll", () => {
+  beforeEach(() => {
+    transport.invoke.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("invokes pty_scroll with the direction, source, lines and cell", async () => {
+    await ptyScroll("keitora", "epsilon", "up", "wheel", 3, 12, 7);
+    expect(transport.invoke).toHaveBeenCalledWith("pty_scroll", {
+      project: "keitora",
+      id: "epsilon",
+      direction: "up",
+      source: "wheel",
+      lines: 3,
+      column: 12,
+      row: 7,
+    });
+    await ptyScroll("keitora", "epsilon", "down", "page_key", 23, 0, 0);
+    expect(transport.invoke).toHaveBeenLastCalledWith(
+      "pty_scroll",
+      expect.objectContaining({ direction: "down", source: "page_key", lines: 23 }),
+    );
+  });
+});
+
+describe("ptyScrollOffset", () => {
+  beforeEach(() => {
+    transport.invoke.mockReset();
+  });
+
+  it("invokes pty_scroll_offset and returns the offset", async () => {
+    transport.invoke.mockResolvedValue(42);
+    await expect(ptyScrollOffset("keitora", "epsilon")).resolves.toBe(42);
+    expect(transport.invoke).toHaveBeenCalledWith("pty_scroll_offset", {
+      project: "keitora",
+      id: "epsilon",
+    });
+  });
+
+  it("passes through null when the backend cannot tell", async () => {
+    transport.invoke.mockResolvedValue(null);
+    await expect(ptyScrollOffset("keitora", "epsilon")).resolves.toBeNull();
   });
 });
 

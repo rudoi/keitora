@@ -378,6 +378,13 @@ impl FakeHerdr {
         }
     }
 
+    /// Set (or clear) the lines above the live tail herdr reports for `pane_id`.
+    pub fn set_pane_scroll(&self, pane_id: &str, offset_from_bottom: Option<u32>) {
+        if let Ok(p) = self.state().pane_mut(pane_id) {
+            p.scroll = offset_from_bottom;
+        }
+    }
+
     /// Simulate the agent exiting in (or returning to) its shell.
     pub fn set_agent_present(&self, pane_id: &str, present: bool) {
         if let Ok(p) = self.state().pane_mut(pane_id) {
@@ -800,6 +807,12 @@ impl HerdrOps for FakeHerdr {
         }
         st.lingering.retain(|(_, left)| *left > 0);
         Ok(out)
+    }
+
+    fn pane_get(&self, pane_id: &str) -> Result<Option<PaneInfo>, HerdrError> {
+        let mut st = self.state();
+        st.control(Op::PaneGet, pane_id.to_string())?;
+        st.pane_mut(pane_id).map(|p| Some(p.clone()))
     }
 
     fn agent_start(

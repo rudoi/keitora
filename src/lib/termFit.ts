@@ -31,15 +31,6 @@ export function dimsEqual(a: Dims, b: Dims): boolean {
   return a.rows === b.rows && a.cols === b.cols;
 }
 
-/**
- * Sticky-bottom: the xterm viewport was pinned to the live tail before a refit.
- * viewportY >= baseY means the bottom page is showing (xterm buffer semantics); we
- * use >= rather than === so a transient over-scroll still re-pins to the tail.
- */
-export function isAtBottom(viewportY: number, baseY: number): boolean {
-  return viewportY >= baseY;
-}
-
 /** Defensive row height when the terminal has not produced a usable measurement. */
 export const FALLBACK_ROW_PX = 17;
 
@@ -48,17 +39,29 @@ export interface WheelLineResult {
   remainder: number;
 }
 
+// WheelEvent.deltaMode values, spelled out so this module needs no DOM.
+export const WHEEL_DELTA_PIXEL = 0;
+export const WHEEL_DELTA_LINE = 1;
+export const WHEEL_DELTA_PAGE = 2;
+
+/** Upper bound on lines one wheel event can produce (malformed or extreme deltas). */
+export const WHEEL_LINES_CAP = 100;
+
 /**
- * Convert pixel wheel movement to whole lines while carrying the sub-line remainder.
- * Invalid measurements and inputs are normalized so xterm never receives NaN or Infinity.
+ * Convert wheel movement to whole lines while carrying the sub-line remainder.
+ * Pixel deltas are divided by the row height, line deltas pass through, and page
+ * deltas are multiplied by the visible row count. Invalid measurements and inputs are
+ * normalized so the result is never NaN or Infinity, and one event yields at most
+ * WHEEL_LINES_CAP lines either way.
  */
 export function accumulateWheelLines(
-  deltaPixels: number,
+  delta: number,
   rowHeightPx: number,
   prevRemainder: number,
+  deltaMode: number = WHEEL_DELTA_PIXEL,
+  rows = 0,
 ): WheelLineResult {
-  const safeRow = Number.isFinite(rowHeightPx) && rowHeightPx > 0 ? rowHeightPx : FALLBACK_ROW_PX;
-  const safeDelta = Number.isFinite(deltaPixels) ? deltaPixels : 0;
+  const safeDelta = Number.isFinite(delta) ? delta : 0;
   const safePrevRaw = Number.isFinite(prevRemainder) ? prevRemainder : 0;
   // Do not let carry from the prior direction delay a reversal.
   const safePrev =
@@ -66,8 +69,56 @@ export function accumulateWheelLines(
       ? 0
       : safePrevRaw;
 
-  const acc = safePrev + safeDelta / safeRow;
+  let deltaLines: number;
+  if (deltaMode === WHEEL_DELTA_LINE) {
+    deltaLines = safeDelta;
+  } else if (deltaMode === WHEEL_DELTA_PAGE) {
+    deltaLines = safeDelta * (Number.isFinite(rows) && rows > 0 ? rows : 1);
+  } else {
+    const safeRow = Number.isFinite(rowHeightPx) && rowHeightPx > 0 ? rowHeightPx : FALLBACK_ROW_PX;
+    deltaLines = safeDelta / safeRow;
+  }
+
+  const acc = safePrev + deltaLines;
   // Math.trunc keeps the sign symmetric; `|| 0` normalizes -0 → 0 for a canonical result.
-  const lines = Math.trunc(acc) || 0;
-  return { lines, remainder: acc - lines };
+  const whole = Math.trunc(acc) || 0;
+  if (Math.abs(whole) > WHEEL_LINES_CAP) {
+    // Clamp and drop the carry: an extreme event shouldn't bank movement for later.
+    return { lines: Math.sign(whole) * WHEEL_LINES_CAP, remainder: 0 };
+  }
+  return { lines: whole, remainder: acc - whole };
+}
+
+export interface Cell {
+  column: number;
+  row: number;
+}
+
+/** Clamp a 0-based cell index to `0..count-1`; a non-finite index or empty axis is 0. */
+function clampAxis(index: number, count: number): number {
+  const max = Number.isFinite(count) && count > 0 ? Math.floor(count) - 1 : 0;
+  if (!Number.isFinite(index)) return 0;
+  return Math.min(max, Math.max(0, Math.floor(index)));
+}
+
+/**
+ * Map a pointer offset (relative to the terminal screen's top-left, in CSS px) to the
+ * 0-based cell under it, clamped to the grid. A missing cell measurement maps to 0.
+ */
+export function wheelCell(
+  offsetX: number,
+  offsetY: number,
+  cellW: number,
+  cellH: number,
+  cols: number,
+  rows: number,
+): Cell {
+  const axis = (offset: number, size: number, count: number) =>
+    Number.isFinite(size) && size > 0 ? clampAxis(offset / size, count) : 0;
+  return { column: axis(offsetX, cellW, cols), row: axis(offsetY, cellH, rows) };
+}
+
+/** The cursor's 0-based cell (`cursorX`,`cursorY` in xterm's buffer), clamped to the grid. */
+export function cursorCell(cursorX: number, cursorY: number, cols: number, rows: number): Cell {
+  return { column: clampAxis(cursorX, cols), row: clampAxis(cursorY, rows) };
 }

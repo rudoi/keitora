@@ -138,8 +138,11 @@ impl OriginalXdg {
 }
 
 /// herdr's per-pane scrollback unless `[pty] herdr_scrollback_limit_bytes` says
-/// otherwise (herdr's own default is 10 MB; it is the only history a pane keeps).
-pub const DEFAULT_HERDR_SCROLLBACK_LIMIT_BYTES: u64 = 4_000_000;
+/// otherwise; it is the only history a pane keeps. The limit is ghostty page memory
+/// (about `8 * cols` bytes a row, visible screen included), not text: 16 MB holds
+/// roughly 15k rows at 120 columns and 9k at 200. It is allocated only as history
+/// grows, and applies to panes created after the herdr server next starts.
+pub const DEFAULT_HERDR_SCROLLBACK_LIMIT_BYTES: u64 = 16_000_000;
 
 /// Accepted range for a configured scrollback limit.
 const SCROLLBACK_RANGE: std::ops::RangeInclusive<u64> = 100_000..=100_000_000;
@@ -1977,7 +1980,7 @@ mod tests {
     #[test]
     fn clamp_scrollback_accepts_only_the_range() {
         let d = DEFAULT_HERDR_SCROLLBACK_LIMIT_BYTES;
-        assert_eq!(d, 4_000_000);
+        assert_eq!(d, 16_000_000);
         assert_eq!(clamp_scrollback(None), d);
         assert_eq!(clamp_scrollback(Some(2_000_000)), 2_000_000);
         assert_eq!(clamp_scrollback(Some(100_000)), 100_000);

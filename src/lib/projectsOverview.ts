@@ -4,6 +4,7 @@
 // `ipc.ts` (the same reason `listSessions` lives in `sessions.ts`).
 
 import { useEffect, useMemo, useRef } from "react";
+import { trailingDebounce } from "./debounce";
 import { onProjectChanged, onWorktreesChanged, type WorktreeInfo } from "./ipc";
 import type { WorktreeSession } from "./sessions";
 import { getTransport, liveListen } from "./transport";
@@ -28,30 +29,6 @@ export interface ProjectOverview {
 /** Every registered project's worktrees and session states, in display order. */
 export function projectsOverview(): Promise<ProjectOverview[]> {
   return getTransport().invoke<ProjectOverview[]>("projects_overview");
-}
-
-/**
- * Wrap `fn` so a burst of calls runs it once, `ms` after the last call. `cancel` drops a
- * pending run (for teardown).
- */
-export function trailingDebounce(
-  fn: () => void,
-  ms: number,
-): { call: () => void; cancel: () => void } {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  return {
-    call: () => {
-      if (timer !== undefined) clearTimeout(timer);
-      timer = setTimeout(() => {
-        timer = undefined;
-        fn();
-      }, ms);
-    },
-    cancel: () => {
-      if (timer !== undefined) clearTimeout(timer);
-      timer = undefined;
-    },
-  };
 }
 
 /** A value with its JSON signature, for `keepStable`. */

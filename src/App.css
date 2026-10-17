@@ -739,6 +739,17 @@ body {
 .pane-btn:hover {
   filter: brightness(1.08);
 }
+/* "↓ live": bottom-right of the pane, above xterm's layers; click returns to the tail.
+   Colours, font and hover come from .pane-btn (declared after it so its shape wins). */
+.pane-live-pill {
+  position: absolute;
+  right: 16px;
+  bottom: 12px;
+  z-index: 12;
+  border-radius: 999px;
+  padding: 3px 12px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
 /* Confirm modal: a centered card on the overlay backdrop. Without these,
    .pane-confirm / .pane-btn-row have no layout — text left-aligns and the buttons touch. */
 .pane-confirm {

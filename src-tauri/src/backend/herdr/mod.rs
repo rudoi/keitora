@@ -47,7 +47,7 @@ use crate::lifecycle::{self, LifecycleEvent, ResumeResult, ServerStartHow};
 
 use super::{
     AgentLaunch, AttachResult, DaemonStats, OutputSink, OutputSinks, PtyBackend, PtyBackendError,
-    SessionKey, SessionSummary, StatusPayload,
+    ScrollDirection, ScrollSource, SessionKey, SessionSummary, StatusPayload,
 };
 
 pub mod agent;
@@ -2367,6 +2367,51 @@ impl PtyBackend for HerdrBackend {
         )
     }
 
+    fn scroll(
+        &self,
+        key: &SessionKey,
+        direction: ScrollDirection,
+        source: ScrollSource,
+        lines: u16,
+        column: u16,
+        row: u16,
+    ) -> Result<(), PtyBackendError> {
+        self.gate.admit_session(key)?;
+        // A `terminal.scroll` on the bridge, queued between the keys around it; the
+        // writer merges a burst of same-way, same-source ticks and drops one it
+        // cannot write. herdr routes it (app mouse report or page key, alternate
+        // scroll, or its own history).
+        // A wheel over a pane with no bridge is not an error.
+        if !self.bridges.lock().unwrap().contains_key(key) {
+            return Ok(());
+        }
+        self.enqueue(
+            key,
+            WriteJob::Scroll {
+                direction,
+                source,
+                lines,
+                column,
+                row,
+            },
+        )
+    }
+
+    fn scroll_offset(&self, key: &SessionKey) -> Result<Option<u32>, PtyBackendError> {
+        self.gate.admit_session(key)?;
+        // One `pane get` read (herdr reports the pane's viewport position there);
+        // the caller asks once after a scroll burst, so it is off the typing path.
+        // A pane that is unmapped or gone from herdr has nothing to report.
+        let Some(pane) = self.keymap.get(key) else {
+            return Ok(None);
+        };
+        match self.ops.pane_get(&pane.pane_id) {
+            Ok(info) => Ok(info.and_then(|p| p.scroll)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn kill(&self, key: &SessionKey, gen: u64) -> Result<(), PtyBackendError> {
         // A session that is live during recovery (resumed already, or the
         // driver's own resume in flight) may be killed. Asked before the cancel
@@ -3408,6 +3453,131 @@ mod tests {
         assert!(fake.bridge_input(&terminal).is_empty());
         assert_eq!(count(&fake, ops::Op::SpawnBridge), 1);
         assert_eq!(bridge_size(&backend, &skey("a")), None);
+    }
+
+    // ---- wheel scroll ----
+
+    #[test]
+    fn scroll_writes_a_scroll_line_on_the_running_bridge() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _, terminal) = typing_backend(&fake, Duration::from_secs(30));
+        backend
+            .scroll(
+                &skey("a"),
+                ScrollDirection::Up,
+                ScrollSource::Wheel,
+                3,
+                4,
+                10,
+            )
+            .unwrap();
+        backend
+            .scroll(
+                &skey("a"),
+                ScrollDirection::Down,
+                ScrollSource::PageKey,
+                20,
+                0,
+                0,
+            )
+            .unwrap();
+        flush_writer(&backend, &skey("a"));
+        let wheel_tick = serde_json::json!({
+            "type": "terminal.scroll",
+            "direction": "up",
+            "source": "wheel",
+            "lines": 1,
+            "column": 4,
+            "row": 10,
+        });
+        assert_eq!(
+            stdin_lines(&fake, &terminal),
+            vec![
+                wheel_tick.clone(),
+                wheel_tick.clone(),
+                wheel_tick,
+                serde_json::json!({
+                    "type": "terminal.scroll",
+                    "direction": "down",
+                    "source": "page_key",
+                    "lines": 20,
+                    "column": 0,
+                    "row": 0,
+                }),
+            ]
+        );
+        assert_eq!(count(&fake, ops::Op::SpawnBridge), 1, "only the spawn's");
+    }
+
+    #[test]
+    fn scroll_on_an_unknown_or_detached_pane_is_ok_and_writes_nothing() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _, terminal) = typing_backend(&fake, Duration::from_secs(30));
+        backend
+            .scroll(
+                &skey("nope"),
+                ScrollDirection::Down,
+                ScrollSource::Wheel,
+                1,
+                0,
+                0,
+            )
+            .unwrap();
+        backend.stop_bridge(&skey("a"));
+        backend
+            .scroll(
+                &skey("a"),
+                ScrollDirection::Down,
+                ScrollSource::Wheel,
+                1,
+                0,
+                0,
+            )
+            .unwrap();
+        flush_writer(&backend, &skey("a"));
+        assert!(fake.bridge_input(&terminal).is_empty());
+        assert_eq!(count(&fake, ops::Op::SpawnBridge), 1);
+    }
+
+    #[test]
+    fn scroll_offset_reads_the_panes_offset_from_pane_get() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _, _) = typing_backend(&fake, Duration::from_secs(30));
+        let pane_id = backend.keymap.get(&skey("a")).unwrap().pane_id;
+        assert_eq!(
+            backend.scroll_offset(&skey("a")).unwrap(),
+            None,
+            "no scroll"
+        );
+        fake.set_pane_scroll(&pane_id, Some(42));
+        assert_eq!(backend.scroll_offset(&skey("a")).unwrap(), Some(42));
+        fake.set_pane_scroll(&pane_id, Some(0));
+        assert_eq!(backend.scroll_offset(&skey("a")).unwrap(), Some(0));
+        assert_eq!(count(&fake, ops::Op::PaneList), 0, "one pane, not the list");
+        assert_eq!(backend.scroll_offset(&skey("nope")).unwrap(), None);
+        // A pane herdr no longer has reads as nothing to report.
+        fake.pane_close(&pane_id).unwrap();
+        assert_eq!(backend.scroll_offset(&skey("a")).unwrap(), None);
+    }
+
+    #[test]
+    fn a_failed_scroll_write_does_not_restart_the_bridge() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _, terminal) = typing_backend(&fake, Duration::from_secs(30));
+        fake.fail_bridge_input(&terminal, true);
+        backend
+            .scroll(
+                &skey("a"),
+                ScrollDirection::Up,
+                ScrollSource::Wheel,
+                1,
+                0,
+                0,
+            )
+            .unwrap();
+        flush_writer(&backend, &skey("a"));
+        assert_eq!(count(&fake, ops::Op::SpawnBridge), 1, "no restart");
+        assert!(!backend.bridges.lock().unwrap().contains_key(&skey("a")));
     }
 
     #[test]

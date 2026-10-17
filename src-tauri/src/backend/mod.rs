@@ -11,7 +11,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use keitora_tasks::WorktreeSession;
 
@@ -27,6 +27,46 @@ pub use emit::EmitSink;
 pub mod fake;
 
 // ── Neutral session identity + summaries ─────────────────────────────────────
+
+/// Which way a [`PtyBackend::scroll`] moves: `up` is back into history. Its wire
+/// spelling (IPC and herdr's `terminal.scroll`) is lowercase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScrollDirection {
+    Up,
+    Down,
+}
+
+impl ScrollDirection {
+    /// The wire spelling: `"up"` / `"down"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScrollDirection::Up => "up",
+            ScrollDirection::Down => "down",
+        }
+    }
+}
+
+/// What a [`PtyBackend::scroll`] came from, which decides how herdr routes it to an
+/// app that handles scrolling itself: a `wheel` tick becomes one mouse report (or
+/// arrow key), a `page_key` becomes one PageUp/PageDown keypress. Over a plain
+/// shell both scroll herdr's own history. Its wire spelling is snake case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollSource {
+    Wheel,
+    PageKey,
+}
+
+impl ScrollSource {
+    /// The wire spelling: `"wheel"` / `"page_key"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScrollSource::Wheel => "wheel",
+            ScrollSource::PageKey => "page_key",
+        }
+    }
+}
 
 /// Canonical identity of a PTY session, `"project/worktree"`. Owned by `backend`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -495,6 +535,32 @@ pub trait PtyBackend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Scroll a session's viewport by `lines` from `source` (a wheel tick or a page
+    /// key), with the pointer at the 0-based cell `column`,`row`. The backend decides
+    /// where it goes: the app (mouse reporting, alternate scroll, page keys) or the
+    /// backend's own history. Best-effort: no session or bridge is not an error.
+    /// Default is a no-op.
+    fn scroll(
+        &self,
+        key: &SessionKey,
+        direction: ScrollDirection,
+        source: ScrollSource,
+        lines: u16,
+        column: u16,
+        row: u16,
+    ) -> Result<(), PtyBackendError> {
+        let _ = (key, direction, source, lines, column, row);
+        Ok(())
+    }
+
+    /// How many lines above the live tail a session's viewport is scrolled, when
+    /// the backend can tell (`0` is the live tail). `None` when it cannot, or the
+    /// session is unknown. One-shot query for the UI, never polled. Default is `None`.
+    fn scroll_offset(&self, key: &SessionKey) -> Result<Option<u32>, PtyBackendError> {
+        let _ = key;
+        Ok(None)
+    }
+
     /// Generation-gated kill: a kill for an older generation than the live one is a
     /// no-op `Ok`.
     fn kill(&self, key: &SessionKey, gen: u64) -> Result<(), PtyBackendError>;
@@ -658,6 +724,37 @@ pub fn cached_background_set(backend: &dyn PtyBackend) -> HashSet<SessionKey> {
 mod tests {
     use super::*;
     use crate::backend::fake::FakeBackend;
+
+    #[test]
+    fn scroll_directions_use_their_lowercase_wire_spelling() {
+        for (d, word) in [(ScrollDirection::Up, "up"), (ScrollDirection::Down, "down")] {
+            assert_eq!(d.as_str(), word);
+            assert_eq!(serde_json::to_value(d).unwrap(), word);
+            assert_eq!(
+                serde_json::from_value::<ScrollDirection>(word.into()).unwrap(),
+                d
+            );
+        }
+        assert!(serde_json::from_value::<ScrollDirection>("Up".into()).is_err());
+        assert!(serde_json::from_value::<ScrollDirection>("left".into()).is_err());
+    }
+
+    #[test]
+    fn scroll_sources_use_their_snake_case_wire_spelling() {
+        for (s, word) in [
+            (ScrollSource::Wheel, "wheel"),
+            (ScrollSource::PageKey, "page_key"),
+        ] {
+            assert_eq!(s.as_str(), word);
+            assert_eq!(serde_json::to_value(s).unwrap(), word);
+            assert_eq!(
+                serde_json::from_value::<ScrollSource>(word.into()).unwrap(),
+                s
+            );
+        }
+        assert!(serde_json::from_value::<ScrollSource>("pageKey".into()).is_err());
+        assert!(serde_json::from_value::<ScrollSource>("Wheel".into()).is_err());
+    }
 
     fn key(project: &str, worktree: &str) -> SessionKey {
         SessionKey {

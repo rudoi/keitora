@@ -727,6 +727,46 @@ export function ptyResize(project: string, id: string, rows: number, cols: numbe
   return invoke("pty_resize", { project, id, rows, cols });
 }
 
+/** Which way a pane scroll moves: `up` is back into history. */
+export type ScrollDirection = "up" | "down";
+
+/**
+ * What a pane scroll came from. herdr routes it to an app that handles scrolling
+ * itself as one wheel report (or arrow key) for `wheel`, one PageUp/PageDown key for
+ * `page_key`; over a plain shell both scroll its own history.
+ */
+export type ScrollSource = "wheel" | "page_key";
+
+/** The most lines one `ptyScroll` can carry (the wire field is a u16). */
+export const MAX_SCROLL_LINES = 0xffff;
+
+/**
+ * Scroll a pane's viewport by `lines` (a whole number, 1..MAX_SCROLL_LINES) from `source`,
+ * with the pointer at the 0-based cell `column`,`row`. herdr routes it: to the app when it
+ * reports the mouse, uses alternate scroll or takes page keys, otherwise through its own
+ * history.
+ */
+export function ptyScroll(
+  project: string,
+  id: string,
+  direction: ScrollDirection,
+  source: ScrollSource,
+  lines: number,
+  column: number,
+  row: number,
+): Promise<void> {
+  return invoke("pty_scroll", { project, id, direction, source, lines, column, row });
+}
+
+/**
+ * How many lines above the live tail a pane's viewport is scrolled (0 = live), or
+ * null when the backend cannot tell. One call per ask: it runs a CLI command, so
+ * never poll it.
+ */
+export function ptyScrollOffset(project: string, id: string): Promise<number | null> {
+  return invoke("pty_scroll_offset", { project, id });
+}
+
 /**
  * Ask the backend to push one fresh repaint frame for a session. Called once the
  * terminal's renderer is live so an idle restored pane paints on boot instead of showing
