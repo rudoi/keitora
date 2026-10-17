@@ -2,6 +2,7 @@
 // subscriptions. Output arrives base64-encoded (see src-tauri pty batching).
 
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import type { Dims } from "./termFit";
 import { getTransport } from "./transport";
 
 // Route every backend call through the active transport (localTransport —
@@ -449,12 +450,20 @@ export interface AttachPayload {
  */
 export type OutputMsg = { type: "frame"; data: string; full: boolean } | { type: "exit" };
 
+/** A takeover size as the host's `rows`/`cols` params: both `null` when unmeasured. */
+function sizeArgs(size: Dims | null): { rows: number | null; cols: number | null } {
+  return { rows: size?.rows ?? null, cols: size?.cols ?? null };
+}
+
 /**
  * Attach to an existing daemon session for `id` (bare worktree name).
  * Returns scrollback bytes (already base64-encoded by the backend), the
  * daemon-side gen, a truncation flag and the attach id. From then on the
  * session's output and exit arrive, in order, on `onOutput` (a channel of this
  * attach only; a later attach replaces it).
+ *
+ * `size` is the pane's measured size, or `null` when unmeasured (the backend
+ * then picks one).
  *
  * Rust param names: project, id, rows, cols, on_output  (rows before cols in
  * host.rs pty_attach). `project` qualifies the session so same-named worktrees
@@ -463,12 +472,11 @@ export type OutputMsg = { type: "frame"; data: string; full: boolean } | { type:
 export function ptyAttach(
   project: string,
   id: string,
-  rows: number,
-  cols: number,
+  size: Dims | null,
   onOutput: (msg: OutputMsg) => void,
 ): Promise<AttachPayload> {
   const channel = getTransport().channel<OutputMsg>(onOutput);
-  return invoke<AttachPayload>("pty_attach", { project, id, rows, cols, onOutput: channel });
+  return invoke<AttachPayload>("pty_attach", { project, id, ...sizeArgs(size), onOutput: channel });
 }
 
 /**
@@ -503,13 +511,13 @@ export function listWorktrees(): Promise<WorktreeInfo[]> {
  * Spawn the session for `id` in `cwd` under `project`. `command` overrides the
  * default Claude launcher. `project` is the daemon namespace. The default launch
  * resumes the worktree's conversation; `fresh` starts a new, empty one instead.
+ * `size` is `null` when the pane is unmeasured (the backend picks one).
  */
 export function ptySpawn(
   project: string,
   id: string,
   cwd: string,
-  rows: number,
-  cols: number,
+  size: Dims | null,
   command?: string,
   fresh?: boolean,
 ): Promise<number> {
@@ -517,8 +525,7 @@ export function ptySpawn(
     project,
     id,
     cwd,
-    rows,
-    cols,
+    ...sizeArgs(size),
     command: command ?? null,
     fresh: fresh ?? false,
   });
@@ -552,11 +559,16 @@ export function sessionLaunch(
   project: string,
   id: string,
   cwd: string,
-  rows: number,
-  cols: number,
+  size: Dims | null,
   fresh?: boolean,
 ): Promise<number> {
-  return invoke<number>("session_launch", { project, id, cwd, rows, cols, fresh: fresh ?? false });
+  return invoke<number>("session_launch", {
+    project,
+    id,
+    cwd,
+    ...sizeArgs(size),
+    fresh: fresh ?? false,
+  });
 }
 
 /** `t0` is the latency probe's keystroke stamp (epoch ms); omitted when the probe is off. */

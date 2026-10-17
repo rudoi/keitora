@@ -1229,6 +1229,7 @@ mod tests {
             agent_status: status.map(str::to_string),
             agent_session: None,
             scroll: None,
+            viewport_rows: None,
         };
         let entry = |id: &str| HerdrPane {
             workspace_id: "w".into(),

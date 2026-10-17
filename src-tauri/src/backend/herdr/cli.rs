@@ -37,6 +37,9 @@ pub struct PaneIdentity {
     /// (`scroll.offset_from_bottom`; `0` is the live tail). `None` when herdr
     /// omits it.
     pub scroll: Option<u32>,
+    /// The pane's current row count (`scroll.viewport_rows`). `None` when herdr has
+    /// no metrics for the pane yet, or reports zero.
+    pub viewport_rows: Option<u16>,
 }
 
 /// The shared-interface name for a `pane list` entry.
@@ -140,6 +143,11 @@ pub fn parse_pane_identity(value: &Value) -> Option<PaneIdentity> {
             .pointer("/scroll/offset_from_bottom")
             .and_then(Value::as_u64)
             .and_then(|n| u32::try_from(n).ok()),
+        viewport_rows: value
+            .pointer("/scroll/viewport_rows")
+            .and_then(Value::as_u64)
+            .map(|n| u16::try_from(n).unwrap_or(u16::MAX))
+            .filter(|&n| n > 0),
     })
 }
 
@@ -265,6 +273,36 @@ mod tests {
             "scroll": {"max_offset_from_bottom": 4},
         });
         assert_eq!(parse_pane_identity(&bad).unwrap().scroll, None);
+    }
+
+    #[test]
+    fn pane_identity_reads_the_viewport_rows() {
+        let v = serde_json::json!({
+            "workspace_id": "w1", "pane_id": "w1:p1", "terminal_id": "t1",
+            "scroll": {"offset_from_bottom": 0, "viewport_rows": 30},
+        });
+        assert_eq!(parse_pane_identity(&v).unwrap().viewport_rows, Some(30));
+        let huge = serde_json::json!({
+            "workspace_id": "w1", "pane_id": "w1:p1", "terminal_id": "t1",
+            "scroll": {"viewport_rows": 100000},
+        });
+        assert_eq!(
+            parse_pane_identity(&huge).unwrap().viewport_rows,
+            Some(u16::MAX)
+        );
+    }
+
+    #[test]
+    fn pane_identity_viewport_rows_absent_or_zero_is_none() {
+        let none = serde_json::json!({
+            "workspace_id": "w1", "pane_id": "w1:p1", "terminal_id": "t1",
+        });
+        assert_eq!(parse_pane_identity(&none).unwrap().viewport_rows, None);
+        let zero = serde_json::json!({
+            "workspace_id": "w1", "pane_id": "w1:p1", "terminal_id": "t1",
+            "scroll": {"viewport_rows": 0},
+        });
+        assert_eq!(parse_pane_identity(&zero).unwrap().viewport_rows, None);
     }
 
     #[test]

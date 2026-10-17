@@ -66,6 +66,7 @@ import {
   type Dims,
   dimsAreSane,
   dimsEqual,
+  sizeToSend,
   wheelCell,
 } from "../lib/termFit";
 import { clipboardActionForKey, suppressNativePaste } from "../lib/terminalClipboard";
@@ -157,6 +158,20 @@ function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
+// The fit addon's proposal for its terminal's host; undefined when it cannot measure.
+function proposeFit(fit: FitAddon): Dims | undefined {
+  try {
+    return fit.proposeDimensions();
+  } catch {
+    return undefined;
+  }
+}
+
+// Size `term` to an already-measured proposal (a no-op when it already is).
+function sizeTerminal(term: Terminal, d: Dims) {
+  if (!dimsEqual(d, { rows: term.rows, cols: term.cols })) term.resize(d.cols, d.rows);
+}
+
 /** The per-pane status union (declared with its reducer in `lib/paneStatus`). */
 export type { Status };
 
@@ -214,9 +229,16 @@ export function TerminalPane({
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const webglRef = useRef<WebglAddon | null>(null);
+  // `active` for callbacks that must not hold a GPU context for an off-screen pane.
+  const activeRef = useRef(active);
+  activeRef.current = active;
   const searchRef = useRef<SearchAddon | null>(null);
   const searchOpenRef = useRef(false); // mirrors searchVisible state for use inside the key handler
   const openedRef = useRef(false);
+  // A real fit has been committed to this Terminal (by refitAndResize or the fit before
+  // an attach/spawn). Until then it holds xterm's default 80×24, which must never reach
+  // herdr as a takeover size: attaches and spawns send no size instead.
+  const measuredRef = useRef(false);
   // True while an IME composition is in flight in this pane's textarea. Read by the custom
   // key handler to suppress xterm's double-commit on the 中/英 (Caps Lock) toggle.
   const isComposingRef = useRef(false);
@@ -314,8 +336,9 @@ export function TerminalPane({
   // FitAddon.proposeDimensions() returned undefined, fit.fit() no-op'd, and xterm's
   // default 80×24 was shipped to the daemon — the "wrong size until I swap worktrees"
   // bug. Here we retry across frames until the proposal is sane AND stable across two
-  // frames, then commit once; on exhaustion we fall back to a best-effort fit (never
-  // worse than before). After committing we refresh (resyncs a recreated WebGL viewport).
+  // frames, then commit once. On exhaustion we commit the last sane proposal seen, or
+  // nothing at all: the terminal's own size may still be the unmeasured default. After
+  // committing we refresh (resyncs a recreated WebGL viewport).
   const refitAndResize = useCallback(() => {
     const term = termRef.current;
     const host = hostRef.current;
@@ -331,14 +354,20 @@ export function TerminalPane({
     let frames = 0;
     let lastSane: Dims | null = null;
 
-    const commit = () => {
+    // Sizes xterm to the proposal already measured (no second layout read) and
+    // sends it.
+    // With no proposal (the loop gave up) only the refresh runs: xterm's own size
+    // may be the unmeasured default.
+    const commit = (d: Dims | null) => {
       try {
-        fit.fit();
+        if (d) sizeTerminal(term, d);
       } catch {
         /* host not measurable */
       }
-      if (term.cols >= 1 && term.rows >= 1) {
-        const sized = clampPtySize({ rows: term.rows, cols: term.cols });
+      // Only a size xterm actually took counts as measured.
+      if (d && dimsEqual(d, { rows: term.rows, cols: term.cols })) {
+        measuredRef.current = true;
+        const sized = clampPtySize(d);
         void ptyResize(projectName, name, sized.rows, sized.cols);
       }
       try {
@@ -357,21 +386,16 @@ export function TerminalPane({
       if (host.clientWidth === 0 || host.clientHeight === 0) return;
 
       frames += 1;
-      let proposed: Dims | undefined;
-      try {
-        proposed = fit.proposeDimensions();
-      } catch {
-        proposed = undefined;
-      }
+      const proposed = proposeFit(fit);
       if (dimsAreSane(proposed)) {
         if (lastSane && dimsEqual(lastSane, proposed)) {
-          commit();
+          commit(proposed);
           return;
         }
         lastSane = proposed;
       }
       if (frames >= MAX_FIT_FRAMES) {
-        commit();
+        commit(lastSane);
         return;
       }
       refitRafRef.current = requestAnimationFrame(tick);
@@ -379,6 +403,49 @@ export function TerminalPane({
 
     refitRafRef.current = requestAnimationFrame(tick);
   }, [name, projectName, cancelRefit]);
+
+  // Hold a WebGL context for an opened, on-screen terminal (once).
+  const loadWebgl = useCallback((term: Terminal) => {
+    if (webglRef.current) return;
+    try {
+      const w = new WebglAddon();
+      term.loadAddon(w);
+      webglRef.current = w;
+    } catch {
+      /* WebGL unavailable — xterm falls back to its canvas/DOM renderer */
+    }
+  }, []);
+
+  // Fit the terminal before an attach or spawn, so herdr takes the pane over at its
+  // real size rather than xterm's default. Only a laid-out host is touched: it is
+  // opened (proposeDimensions needs the terminal's element) and fitted when the
+  // renderer can measure a cell. A hidden (0×0) host is left alone, so the pane stays
+  // unmeasured and sends no size; its first fit on show sends the real one. No
+  // ptyResize here: the attach or spawn that follows carries the size.
+  const fitBeforeTakeover = useCallback(() => {
+    const term = termRef.current;
+    const host = hostRef.current;
+    const fit = fitRef.current;
+    if (!term || !host || !fit) return;
+    if (host.clientWidth === 0 || host.clientHeight === 0) return;
+    if (!openedRef.current) {
+      term.open(host);
+      openedRef.current = true;
+    }
+    // Measure with the renderer the pane will paint with: a cell measured by the
+    // DOM renderer can differ from WebGL's, and the refit that follows would then
+    // shrink the pane it just took over.
+    if (activeRef.current) loadWebgl(term);
+    const proposed = proposeFit(fit);
+    // Renderer cell metrics not ready yet: the post-attach refit sends the size.
+    if (!dimsAreSane(proposed)) return;
+    try {
+      sizeTerminal(term, proposed);
+      measuredRef.current = true;
+    } catch {
+      /* host not measurable */
+    }
+  }, [loadWebgl]);
 
   // The gate for a new attach's output channel, writing into `term`. Closes the
   // previous attach's gate (its late messages are dropped); the previous attach
@@ -440,7 +507,13 @@ export function TerminalPane({
     async (term: Terminal) => {
       const gate = newOutputGate(term);
       try {
-        const result = await ptyAttach(projectName, name, term.rows, term.cols, gate.onMessage);
+        // The spawn just sent the same size (or none); this takeover keeps it.
+        const result = await ptyAttach(
+          projectName,
+          name,
+          sizeToSend(measuredRef.current, term),
+          gate.onMessage,
+        );
         if (termRef.current !== term) {
           // Torn down meanwhile: release just this attach.
           gate.close();
@@ -467,15 +540,20 @@ export function TerminalPane({
       if (!term) return;
       if (via === "spawn" && terminatedRef.current) return;
       try {
+        // An unmeasured pane spawns with no size; the backend picks one, and its
+        // first fit sends the real size.
+        const size = sizeToSend(measuredRef.current, term);
         const gen =
           via === "launch"
-            ? await sessionLaunch(projectName, name, path, term.rows, term.cols, fresh)
-            : await ptySpawn(projectName, name, path, term.rows, term.cols, undefined, fresh);
+            ? await sessionLaunch(projectName, name, path, size, fresh)
+            : await ptySpawn(projectName, name, path, size, undefined, fresh);
         genRef.current = gen;
         updateStatus("running");
-        if (term.cols >= 1 && term.rows >= 1) {
-          const sized = clampPtySize({ rows: term.rows, cols: term.cols });
-          void ptyResize(projectName, name, sized.rows, sized.cols);
+        // A fit may have changed the size while the spawn was in flight: send the
+        // new one. Still unmeasured, or unchanged: nothing to send.
+        const sizeNow = sizeToSend(measuredRef.current, term);
+        if (sizeNow && !(size && dimsEqual(size, sizeNow))) {
+          void ptyResize(projectName, name, sizeNow.rows, sizeNow.cols);
         }
         if (attachmentsRef.current.live == null) await attachAfterSpawn(term);
       } catch (e) {
@@ -530,7 +608,17 @@ export function TerminalPane({
         // until the scrollback below is written.
         const gate = newOutputGate(term);
         try {
-          const result = await ptyAttach(projectName, name, term.rows, term.cols, gate.onMessage);
+          // Fit first (a visible pane opens here, under the "attaching" overlay), so
+          // the takeover happens at the pane's real size. Unmeasured: send no size and
+          // let the backend keep the pane's own. Re-run per try: the host may have been
+          // shown or resized while a retry waited.
+          fitBeforeTakeover();
+          const result = await ptyAttach(
+            projectName,
+            name,
+            sizeToSend(measuredRef.current, term),
+            gate.onMessage,
+          );
           window.clearTimeout(spinnerId);
           setShowSpinner(false);
           if (termRef.current !== term) {
@@ -542,7 +630,8 @@ export function TerminalPane({
           }
           attachSucceeded(result);
 
-          // Open the terminal and write scrollback before making it visible.
+          // Open the terminal (unless the fit above already did) and write scrollback
+          // before making it visible.
           if (!openedRef.current) {
             term.open(host);
             openedRef.current = true;
@@ -627,6 +716,7 @@ export function TerminalPane({
     newOutputGate,
     attachSucceeded,
     attachFailed,
+    fitBeforeTakeover,
   ]);
   doAttachRef.current = doAttach;
 
@@ -656,9 +746,11 @@ export function TerminalPane({
         term.open(host);
         openedRef.current = true;
       }
+      // A visible pane spawns at its real size; a hidden one sends none.
+      fitBeforeTakeover();
       await spawn(fresh);
     },
-    [name, projectName, spawn],
+    [name, projectName, spawn, fitBeforeTakeover],
   );
 
   // Terminate: like restart's kill, but nothing is spawned after it. The mark is
@@ -695,10 +787,11 @@ export function TerminalPane({
         term.open(host);
         openedRef.current = true;
       }
+      fitBeforeTakeover();
       updateStatus("attaching");
       await spawn(fresh, "launch");
     },
-    [spawn, updateStatus],
+    [spawn, updateStatus, fitBeforeTakeover],
   );
 
   // This pane's place in recovery (from `daemon://recovery`, never the error token).
@@ -968,6 +1061,8 @@ export function TerminalPane({
 
     termRef.current = term;
     fitRef.current = fit;
+    // A new Terminal starts at xterm's default size, not a measured one.
+    measuredRef.current = false;
     coalescerRef.current = createFrameCoalescer({
       visible: linkContextRef.current.active,
       write: (bytes, done) => term.write(bytes, done),
@@ -1242,20 +1337,13 @@ export function TerminalPane({
 
     if (active) {
       // Open the terminal only when not in "attaching" state (the attach flow
-      // calls term.open itself after scrollback is ready).
+      // opens it itself: before the attach when the host is laid out, else after
+      // the scrollback is ready).
       if (!openedRef.current && status !== "attaching") {
         term.open(host);
         openedRef.current = true;
       }
-      if (openedRef.current && !webglRef.current) {
-        try {
-          const w = new WebglAddon();
-          term.loadAddon(w);
-          webglRef.current = w;
-        } catch {
-          /* WebGL unavailable — xterm falls back to its canvas/DOM renderer */
-        }
-      }
+      if (openedRef.current) loadWebgl(term);
       if (openedRef.current) {
         // Reliable multi-frame fit replaces the old single rAF that could
         // measure before the renderer was warm and ship xterm's default 80×24.

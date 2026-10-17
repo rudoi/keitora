@@ -25,22 +25,19 @@ pub enum Call {
         key: SessionKey,
         cwd: String,
         db_path: String,
-        cols: u16,
-        rows: u16,
+        size: Option<(u16, u16)>,
         command: Option<String>,
     },
     SpawnAgent {
         key: SessionKey,
         cwd: String,
         db_path: String,
-        cols: u16,
-        rows: u16,
+        size: Option<(u16, u16)>,
         launch: AgentLaunch,
     },
     Attach {
         key: SessionKey,
-        cols: u16,
-        rows: u16,
+        size: Option<(u16, u16)>,
     },
     Detach {
         key: SessionKey,
@@ -167,8 +164,7 @@ impl PtyBackend for FakeBackend {
         key: SessionKey,
         cwd: String,
         db_path: String,
-        cols: u16,
-        rows: u16,
+        size: Option<(u16, u16)>,
         command: Option<String>,
     ) -> Result<u64, PtyBackendError> {
         let mut st = self.state.lock().unwrap();
@@ -177,8 +173,7 @@ impl PtyBackend for FakeBackend {
             key,
             cwd,
             db_path,
-            cols,
-            rows,
+            size,
             command,
         });
         if terminated {
@@ -192,8 +187,7 @@ impl PtyBackend for FakeBackend {
         key: SessionKey,
         cwd: String,
         db_path: String,
-        cols: u16,
-        rows: u16,
+        size: Option<(u16, u16)>,
         launch: AgentLaunch,
     ) -> Result<u64, PtyBackendError> {
         let mut st = self.state.lock().unwrap();
@@ -202,8 +196,7 @@ impl PtyBackend for FakeBackend {
             key,
             cwd,
             db_path,
-            cols,
-            rows,
+            size,
             launch,
         });
         if terminated {
@@ -215,15 +208,14 @@ impl PtyBackend for FakeBackend {
     fn attach(
         &self,
         key: SessionKey,
-        cols: u16,
-        rows: u16,
+        size: Option<(u16, u16)>,
         _out: std::sync::Arc<dyn OutputSink>,
     ) -> Result<AttachResult, PtyBackendError> {
         self.state
             .lock()
             .unwrap()
             .calls
-            .push(Call::Attach { key, cols, rows });
+            .push(Call::Attach { key, size });
         Ok(AttachResult {
             gen: 1,
             scrollback: Vec::new(),
@@ -386,8 +378,7 @@ mod tests {
                 key.clone(),
                 "/w".into(),
                 "/db".into(),
-                80,
-                24,
+                Some((80, 24)),
                 launch.clone(),
             )
             .unwrap();
@@ -398,8 +389,7 @@ mod tests {
                 key,
                 cwd: "/w".into(),
                 db_path: "/db".into(),
-                cols: 80,
-                rows: 24,
+                size: Some((80, 24)),
                 launch,
             }]
         );

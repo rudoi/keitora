@@ -121,10 +121,65 @@ pub type WorktreeFilter = Arc<dyn Fn(&SessionKey) -> bool + Send + Sync>;
 /// its own (no pane asked for it). `None` when it cannot be resolved.
 pub type LaunchResolver = Arc<dyn Fn(&SessionKey) -> Option<(String, AgentLaunch)> + Send + Sync>;
 
-/// Bridge size for a session resumed with no pane attached; the real pane's
-/// attach restarts the bridge at its own size, so the value is cosmetic.
+/// Bridge size for a resumed session whose size was never measured this run; the
+/// real pane's attach restarts the bridge at its own size, so the value is cosmetic.
 const RESUME_COLS: u16 = 120;
 const RESUME_ROWS: u16 = 32;
+
+/// Takeover size (cols, rows) when nothing better is known (see [`takeover_size`]).
+const DEFAULT_TAKEOVER_SIZE: (u16, u16) = (80, 24);
+
+/// The size (cols, rows) a takeover uses: the frontend's measured size, else the
+/// session's last measured size, else the pane's own rows from herdr (default
+/// cols), else the default. A takeover at a guessed size can shrink the pane, and
+/// a shrink pushes its live screen into history.
+fn takeover_size(
+    requested: Option<(u16, u16)>,
+    remembered: Option<(u16, u16)>,
+    pane_rows: Option<u16>,
+) -> (u16, u16) {
+    requested
+        .or(remembered)
+        .or_else(|| pane_rows.map(|rows| (DEFAULT_TAKEOVER_SIZE.0, rows)))
+        .unwrap_or(DEFAULT_TAKEOVER_SIZE)
+}
+
+/// The last size (cols, rows) the frontend measured for each session this run.
+/// Each call takes and releases the lock, so it never nests under another one.
+#[derive(Clone, Default)]
+struct SizeMemory(Arc<Mutex<HashMap<SessionKey, (u16, u16)>>>);
+
+impl SizeMemory {
+    /// Remember `size` for `key`, clamped like every takeover.
+    /// Resizes repeat the same size often, so an existing entry is updated in place.
+    fn record(&self, key: &SessionKey, (cols, rows): (u16, u16)) {
+        let size = (cols.max(1), rows.max(1));
+        let mut sizes = self.0.lock().unwrap();
+        match sizes.get_mut(key) {
+            Some(known) => *known = size,
+            None => {
+                sizes.insert(key.clone(), size);
+            }
+        }
+    }
+
+    fn get(&self, key: &SessionKey) -> Option<(u16, u16)> {
+        self.0.lock().unwrap().get(key).copied()
+    }
+
+    /// Remember a measured `requested` size, then pick the takeover size.
+    fn takeover(
+        &self,
+        key: &SessionKey,
+        requested: Option<(u16, u16)>,
+        pane_rows: Option<u16>,
+    ) -> (u16, u16) {
+        if let Some(size) = requested {
+            self.record(key, size);
+        }
+        takeover_size(requested, self.get(key), pane_rows)
+    }
+}
 
 /// Apply the platform spawn flags for a short-lived herdr child (CLI call or
 /// bridge): on Windows, `CREATE_NO_WINDOW` so no console flashes; a no-op
@@ -241,6 +296,8 @@ pub struct HerdrBackend {
     /// Whether the herdr executable is known to be missing, and the message
     /// shown while it is.
     exe_missing: Arc<ExeMissing>,
+    /// Each session's last measured size, for takeovers sent without one.
+    sizes: SizeMemory,
 }
 
 /// When a bridge stream's end last proved the server gone: in which
@@ -679,6 +736,8 @@ struct Spawner {
     projects_dir: Option<PathBuf>,
     /// Whether a bridge stream that just ended is a real pane exit.
     exit_authority: ExitAuthority,
+    /// Each session's last measured size (a resume takes over at it).
+    sizes: SizeMemory,
 }
 
 impl Spawner {
@@ -884,7 +943,8 @@ impl Spawner {
             .and_then(|l| l(key))
             .ok_or(PtyBackendError::NoSuchSession)?;
         let decision = decision.unwrap_or_else(|| self.resolve(key, &cwd, &launch));
-        self.spawn_agent_locked(key, cwd, RESUME_COLS, RESUME_ROWS, &launch, decision)
+        let (cols, rows) = self.sizes.get(key).unwrap_or((RESUME_COLS, RESUME_ROWS));
+        self.spawn_agent_locked(key, cwd, cols, rows, &launch, decision)
             .map(|(_, result, fell_back)| Some((result, fell_back)))
     }
 }
@@ -1569,6 +1629,14 @@ fn pane_is_live(panes: &[PaneInfo], pane_id: &str) -> bool {
     panes.iter().any(|p| p.pane_id == pane_id)
 }
 
+/// The row count herdr lists for `pane_id`, when it reports one.
+fn pane_viewport_rows(panes: &[PaneInfo], pane_id: &str) -> Option<u16> {
+    panes
+        .iter()
+        .find(|p| p.pane_id == pane_id)
+        .and_then(|p| p.viewport_rows)
+}
+
 /// Sample CPU/memory/uptime for `pid` via the shared `sysinfo::System`.
 /// Returns `running: false` / `version: None`; the caller overlays those. A `None` pid or
 /// an exited process yields null stats (the card then shows `—`). The pure math lives in
@@ -1693,6 +1761,7 @@ impl HerdrBackend {
             base_margin_bytes: default_recovery_params().base_margin,
             exit_verdict: Arc::default(),
             writers: Writers::default(),
+            sizes: SizeMemory::default(),
         }
     }
 
@@ -1807,6 +1876,7 @@ impl HerdrBackend {
             launcher: self.launcher.clone(),
             projects_dir: self.projects_dir.clone(),
             exit_authority: self.exit_authority(),
+            sizes: self.sizes.clone(),
         }
     }
 
@@ -2102,10 +2172,11 @@ impl PtyBackend for HerdrBackend {
         key: SessionKey,
         cwd: String,
         _db_path: String,
-        cols: u16,
-        rows: u16,
+        size: Option<(u16, u16)>,
         command: Option<String>,
     ) -> Result<u64, PtyBackendError> {
+        // A new pane has no rows of its own in herdr to fall back on.
+        let (cols, rows) = self.sizes.takeover(&key, size, None);
         // A spawn never starts the server: only recovery does.
         if !self.is_ready() {
             return Err(PtyBackendError::NotConnected);
@@ -2160,10 +2231,11 @@ impl PtyBackend for HerdrBackend {
         key: SessionKey,
         cwd: String,
         _db_path: String,
-        cols: u16,
-        rows: u16,
+        size: Option<(u16, u16)>,
         launch: AgentLaunch,
     ) -> Result<u64, PtyBackendError> {
+        // A new pane has no rows of its own in herdr to fall back on.
+        let (cols, rows) = self.sizes.takeover(&key, size, None);
         // A spawn never starts the server: only recovery does.
         if !self.is_ready() {
             return Err(PtyBackendError::NotConnected);
@@ -2193,10 +2265,13 @@ impl PtyBackend for HerdrBackend {
     fn attach(
         &self,
         key: SessionKey,
-        cols: u16,
-        rows: u16,
+        size: Option<(u16, u16)>,
         out: Arc<dyn OutputSink>,
     ) -> Result<AttachResult, PtyBackendError> {
+        // A measured size is remembered even when the attach is refused below.
+        if let Some(measured) = size {
+            self.sizes.record(&key, measured);
+        }
         // First: during recovery the pane must hear "recovering", not
         // `NotConnected` (which the frontend eventually answers with a spawn),
         // unless its session already resumed this episode.
@@ -2224,7 +2299,8 @@ impl PtyBackend for HerdrBackend {
         // frontend respawns on. A `pane_list` transport error is NOT treated as "dead"
         // (that would wrongly respawn a live pane on a transient blip): fall through and
         // attach best-effort.
-        match self.ops.pane_list() {
+        // The same listing gives the pane's rows, for a takeover sent without a size.
+        let pane_rows = match self.ops.pane_list() {
             Ok(panes) => {
                 // Records session ids only: whether an agent was quit is the
                 // status loop's to decide, which knows the server it lists.
@@ -2237,12 +2313,16 @@ impl PtyBackend for HerdrBackend {
                     self.live.lock().unwrap().remove(&key);
                     return Err(PtyBackendError::NoSuchSession);
                 }
+                pane_viewport_rows(&panes, &pane.pane_id)
             }
-            Err(e) => log::warn!(
-                "herdr: attach pane_list check failed ({}); attaching best-effort",
-                PtyBackendError::from(e)
-            ),
-        }
+            Err(e) => {
+                log::warn!(
+                    "herdr: attach pane_list check failed ({}); attaching best-effort",
+                    PtyBackendError::from(e)
+                );
+                None
+            }
+        };
         // Paint the current screen synchronously as `scrollback`:
         // `pane read --source visible --format ansi` gives the live
         // viewport as renderable ANSI, and bridge frames update it in place. The
@@ -2265,6 +2345,8 @@ impl PtyBackend for HerdrBackend {
         // The new sink replaces the old attach's before the bridge restarts, so every
         // frame of the new bridge reaches this attach.
         let attach_id = self.outputs.replace(&key, out);
+        // `size` was recorded on entry; recording it again is harmless.
+        let (cols, rows) = self.sizes.takeover(&key, size, pane_rows);
         // Clamp to a minimum of 1 (as spawn/spawn_agent do): a boot attach that races the
         // first fit could pass 0, and `--cols 0 --rows 0` is not a valid takeover size.
         if let Err(e) =
@@ -2348,6 +2430,9 @@ impl PtyBackend for HerdrBackend {
     }
 
     fn resize(&self, key: &SessionKey, cols: u16, rows: u16) -> Result<(), PtyBackendError> {
+        // Remembered first, even when refused or with no bridge yet: a resize that
+        // races an attach still sizes the next takeover sent without a size.
+        self.sizes.record(key, (cols, rows));
         self.gate.admit_session(key)?;
         // A `terminal.resize` on the existing bridge, queued so it lands between the keys
         // typed before and after it. No-op when nothing is attached. The writer skips an
@@ -3132,7 +3217,13 @@ mod tests {
         let (backend, _) = fake_backend(&fake);
         let (backend, rx) = backend.with_recording_recovery();
         let gen = backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         // A stale kill changes nothing, recovery included.
         backend.kill(&skey("a"), gen + 1).unwrap();
@@ -3182,8 +3273,7 @@ mod tests {
                 skey("a"),
                 "/repos/a".into(),
                 String::new(),
-                80,
-                24,
+                Some((80, 24)),
                 claude_launch(),
             )
             .unwrap();
@@ -3212,7 +3302,13 @@ mod tests {
         let fake = fake::FakeHerdr::new();
         let (backend, _) = fake_backend(&fake);
         let gen = backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         backend.keymap.begin_recovery(&[skey("a"), skey("b")]);
         backend.kill(&skey("a"), gen).unwrap();
@@ -3237,7 +3333,13 @@ mod tests {
         backend.writers = writers;
         backend.outputs.register(&skey("a"), output());
         let gen = backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         let terminal = backend.keymap.get(&skey("a")).unwrap().terminal_id;
         (backend, gen, terminal)
@@ -3301,7 +3403,7 @@ mod tests {
         };
         // Each attach stops the bridge and starts a new one mid-stream.
         for _ in 0..20 {
-            backend.attach(skey("a"), 80, 24, output()).unwrap();
+            backend.attach(skey("a"), Some((80, 24)), output()).unwrap();
         }
         let sent = typist.join().unwrap();
         flush_writer(&backend, &skey("a"));
@@ -3397,7 +3499,7 @@ mod tests {
         // The writer survives: a new bridge gets the next keys.
         fake.fail_bridge_input(&terminal, false);
         backend.repaint(&skey("a")).unwrap(); // no bridge: a no-op
-        backend.attach(skey("a"), 80, 24, output()).unwrap();
+        backend.attach(skey("a"), Some((80, 24)), output()).unwrap();
         backend.write(&skey("a"), b"y").unwrap();
         flush_writer(&backend, &skey("a"));
         assert_eq!(typed_text(&fake, &terminal), "y");
@@ -3660,7 +3762,9 @@ mod tests {
         let fake = fake::FakeHerdr::new();
         let (backend, _, terminal) = typing_backend(&fake, Duration::from_secs(30));
         let out = Arc::new(fake::CaptureOutput::default());
-        backend.attach(skey("a"), 80, 24, out.clone()).unwrap();
+        backend
+            .attach(skey("a"), Some((80, 24)), out.clone())
+            .unwrap();
         push_text(&fake, &terminal, "hello");
         fake.push_frame(&terminal, r#"{"type":"terminal.closed","reason":"exited"}"#);
         assert!(out.wait_for(|e| e.contains(&fake::OutputEvent::Exit)));
@@ -3674,8 +3778,12 @@ mod tests {
         let (backend, _, terminal) = typing_backend(&fake, Duration::from_secs(30));
         let first = Arc::new(fake::CaptureOutput::default());
         let second = Arc::new(fake::CaptureOutput::default());
-        let a = backend.attach(skey("a"), 80, 24, first.clone()).unwrap();
-        let b = backend.attach(skey("a"), 80, 24, second.clone()).unwrap();
+        let a = backend
+            .attach(skey("a"), Some((80, 24)), first.clone())
+            .unwrap();
+        let b = backend
+            .attach(skey("a"), Some((80, 24)), second.clone())
+            .unwrap();
         assert!(b.attach_id > a.attach_id, "attach ids are monotonic");
         push_text(&fake, &terminal, "after");
         assert!(second.wait_for(has_frame));
@@ -3688,9 +3796,11 @@ mod tests {
     fn a_stale_attach_id_detach_is_a_no_op() {
         let fake = fake::FakeHerdr::new();
         let (backend, _, terminal) = typing_backend(&fake, Duration::from_secs(30));
-        let old = backend.attach(skey("a"), 80, 24, output()).unwrap();
+        let old = backend.attach(skey("a"), Some((80, 24)), output()).unwrap();
         let out = Arc::new(fake::CaptureOutput::default());
-        let new = backend.attach(skey("a"), 80, 24, out.clone()).unwrap();
+        let new = backend
+            .attach(skey("a"), Some((80, 24)), out.clone())
+            .unwrap();
         // The old pane's late detach leaves the newer attach running.
         backend.detach(skey("a"), Some(old.attach_id)).unwrap();
         assert!(backend.bridges.lock().unwrap().contains_key(&skey("a")));
@@ -3712,7 +3822,7 @@ mod tests {
     fn an_unscoped_detach_stops_the_bridge() {
         let fake = fake::FakeHerdr::new();
         let (backend, _, _) = typing_backend(&fake, Duration::from_secs(30));
-        backend.attach(skey("a"), 80, 24, output()).unwrap();
+        backend.attach(skey("a"), Some((80, 24)), output()).unwrap();
         backend.detach(skey("a"), None).unwrap();
         assert!(!backend.bridges.lock().unwrap().contains_key(&skey("a")));
         assert!(backend.outputs.get(&skey("a")).is_none());
@@ -3723,7 +3833,9 @@ mod tests {
         let fake = fake::FakeHerdr::new();
         let (backend, _, terminal) = typing_backend(&fake, Duration::from_secs(30));
         let out = Arc::new(fake::CaptureOutput::default());
-        backend.attach(skey("a"), 80, 24, out.clone()).unwrap();
+        backend
+            .attach(skey("a"), Some((80, 24)), out.clone())
+            .unwrap();
         // A failed resize write restarts the bridge from the writer thread.
         fake.fail_bridge_input(&terminal, true);
         backend.resize(&skey("a"), 100, 30).unwrap();
@@ -3743,10 +3855,18 @@ mod tests {
         let fake = fake::FakeHerdr::new();
         let (backend, _, _) = typing_backend(&fake, Duration::from_secs(30));
         let out = Arc::new(fake::CaptureOutput::default());
-        backend.attach(skey("a"), 80, 24, out.clone()).unwrap();
+        backend
+            .attach(skey("a"), Some((80, 24)), out.clone())
+            .unwrap();
         // A restart: the session is replaced while its pane stays attached.
         backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         let terminal = backend.keymap.get(&skey("a")).unwrap().terminal_id;
         push_text(&fake, &terminal, "fresh");
@@ -3759,12 +3879,20 @@ mod tests {
         let fake = fake::FakeHerdr::new();
         let (backend, _) = fake_backend(&fake);
         backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         assert_eq!(count(&fake, ops::Op::SpawnBridge), 0, "nobody to stream to");
         assert!(!backend.bridges.lock().unwrap().contains_key(&skey("a")));
         let out = Arc::new(fake::CaptureOutput::default());
-        backend.attach(skey("a"), 100, 30, out.clone()).unwrap();
+        backend
+            .attach(skey("a"), Some((100, 30)), out.clone())
+            .unwrap();
         let terminal = backend.keymap.get(&skey("a")).unwrap().terminal_id;
         let spawns: Vec<String> = fake
             .calls()
@@ -3782,6 +3910,167 @@ mod tests {
         assert_eq!(out.frames(), vec!["seen".to_string()]);
     }
 
+    /// The `terminal_id COLSxROWS` of every bridge started so far.
+    fn bridge_takeovers(fake: &fake::FakeHerdr) -> Vec<String> {
+        fake.calls()
+            .into_iter()
+            .filter(|c| c.op == ops::Op::SpawnBridge)
+            .map(|c| c.args)
+            .collect()
+    }
+
+    /// A backend with session "a" spawned without a size, and its terminal id.
+    fn unsized_spawn(fake: &Arc<fake::FakeHerdr>) -> (HerdrBackend, String) {
+        let (backend, _) = fake_backend(fake);
+        backend
+            .spawn(skey("a"), "/repos/a".into(), String::new(), None, None)
+            .unwrap();
+        let terminal = backend.keymap.get(&skey("a")).unwrap().terminal_id;
+        (backend, terminal)
+    }
+
+    #[test]
+    fn takeover_size_prefers_measured_then_remembered_then_pane_rows() {
+        let cases = [
+            (Some((100, 30)), Some((90, 40)), Some(50), (100, 30)),
+            (None, Some((90, 40)), Some(50), (90, 40)),
+            (None, None, Some(50), (80, 50)),
+            (None, None, None, (80, 24)),
+        ];
+        for (requested, remembered, pane_rows, want) in cases {
+            assert_eq!(
+                takeover_size(requested, remembered, pane_rows),
+                want,
+                "{requested:?} {remembered:?} {pane_rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_attach_with_no_size_and_nothing_known_takes_over_at_the_default() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, terminal) = unsized_spawn(&fake);
+        backend.attach(skey("a"), None, output()).unwrap();
+        assert_eq!(bridge_takeovers(&fake), vec![format!("{terminal} 80x24")]);
+    }
+
+    #[test]
+    fn an_attach_with_no_size_takes_over_at_the_panes_own_rows() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, terminal) = unsized_spawn(&fake);
+        let pane = backend.keymap.get(&skey("a")).unwrap().pane_id;
+        fake.set_viewport_rows(&pane, Some(50));
+        backend.attach(skey("a"), None, output()).unwrap();
+        assert_eq!(bridge_takeovers(&fake), vec![format!("{terminal} 80x50")]);
+    }
+
+    #[test]
+    fn an_attach_with_no_size_takes_over_at_a_resize_sent_before_any_bridge() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, terminal) = unsized_spawn(&fake);
+        let pane = backend.keymap.get(&skey("a")).unwrap().pane_id;
+        fake.set_viewport_rows(&pane, Some(50));
+        // No bridge yet: the resize is a no-op for herdr, but remembered.
+        backend.resize(&skey("a"), 120, 40).unwrap();
+        assert!(bridge_takeovers(&fake).is_empty());
+        backend.attach(skey("a"), None, output()).unwrap();
+        assert_eq!(bridge_takeovers(&fake), vec![format!("{terminal} 120x40")]);
+    }
+
+    #[test]
+    fn a_measured_attach_sizes_the_next_unsized_one() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, terminal) = unsized_spawn(&fake);
+        backend
+            .attach(skey("a"), Some((132, 44)), output())
+            .unwrap();
+        backend.attach(skey("a"), None, output()).unwrap();
+        assert_eq!(
+            bridge_takeovers(&fake),
+            vec![format!("{terminal} 132x44"), format!("{terminal} 132x44")]
+        );
+    }
+
+    #[test]
+    fn a_measured_spawn_sizes_the_next_unsized_attach() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        backend
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((100, 30)),
+                None,
+            )
+            .unwrap();
+        backend.attach(skey("a"), None, output()).unwrap();
+        let terminal = backend.keymap.get(&skey("a")).unwrap().terminal_id;
+        assert_eq!(bridge_takeovers(&fake), vec![format!("{terminal} 100x30")]);
+    }
+
+    #[test]
+    fn an_unsized_respawn_of_an_attached_pane_keeps_its_size() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        backend
+            .spawn_agent(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((110, 35)),
+                claude_launch(),
+            )
+            .unwrap();
+        // A restart of the attached pane, sent before it was measured again.
+        backend.outputs.register(&skey("a"), output());
+        backend
+            .spawn_agent(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                None,
+                claude_launch(),
+            )
+            .unwrap();
+        let terminal = backend.keymap.get(&skey("a")).unwrap().terminal_id;
+        assert_eq!(
+            bridge_takeovers(&fake).last(),
+            Some(&format!("{terminal} 110x35"))
+        );
+    }
+
+    #[test]
+    fn a_resume_takes_over_at_the_remembered_size() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend_with(&fake, Some(launch_everything()));
+        backend.keymap.begin_recovery(&[skey("a")]);
+        // The pane is attached (its output registered) and was measured.
+        backend.outputs.register(&skey("a"), output());
+        backend.resize(&skey("a"), 140, 45).unwrap();
+        backend
+            .resume_session(&skey("a"), Some(ResumeDecision::Continue))
+            .unwrap();
+        let terminal = backend.keymap.get(&skey("a")).unwrap().terminal_id;
+        assert_eq!(bridge_takeovers(&fake), vec![format!("{terminal} 140x45")]);
+    }
+
+    #[test]
+    fn a_resume_with_no_remembered_size_uses_the_resume_default() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend_with(&fake, Some(launch_everything()));
+        backend.keymap.begin_recovery(&[skey("a")]);
+        backend.outputs.register(&skey("a"), output());
+        backend
+            .resume_session(&skey("a"), Some(ResumeDecision::Continue))
+            .unwrap();
+        let terminal = backend.keymap.get(&skey("a")).unwrap().terminal_id;
+        assert_eq!(
+            bridge_takeovers(&fake),
+            vec![format!("{terminal} {RESUME_COLS}x{RESUME_ROWS}")]
+        );
+    }
+
     #[test]
     fn an_agent_spawn_with_no_attached_pane_starts_no_bridge() {
         let fake = fake::FakeHerdr::new();
@@ -3791,8 +4080,7 @@ mod tests {
                 skey("a"),
                 "/repos/a".into(),
                 String::new(),
-                80,
-                24,
+                Some((80, 24)),
                 claude_launch(),
             )
             .unwrap();
@@ -3804,8 +4092,7 @@ mod tests {
                 skey("a"),
                 "/repos/a".into(),
                 String::new(),
-                80,
-                24,
+                Some((80, 24)),
                 claude_launch(),
             )
             .unwrap();
@@ -3872,7 +4159,13 @@ mod tests {
         assert!(old.stdin().is_some(), "its own bridge is reachable");
         backend.kill(&skey("a"), gen1).unwrap();
         let gen2 = backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         assert_ne!(gen1, gen2);
         assert!(backend.bridges.lock().unwrap().contains_key(&skey("a")));
@@ -3905,7 +4198,13 @@ mod tests {
         backend.enqueue(&skey("a"), job).unwrap();
         backend.kill(&skey("a"), gen1).unwrap();
         backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         let term2 = backend.keymap.get(&skey("a")).unwrap().terminal_id;
         assert_ne!(term1, term2);
@@ -3933,7 +4232,13 @@ mod tests {
         backend.write(&skey("a"), b"old").unwrap();
         // A same-key spawn replaces the session (and stops its bridge).
         backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         let term2 = backend.keymap.get(&skey("a")).unwrap().terminal_id;
         backend.write(&skey("a"), b"new").unwrap();
@@ -3989,7 +4294,9 @@ mod tests {
         use writer::SessionIo as _;
         let (stdin, _) = io.bridge().unwrap();
         // The failed bridge was already replaced by an attach at a newer size.
-        backend.attach(skey("a"), 132, 50, output()).unwrap();
+        backend
+            .attach(skey("a"), Some((132, 50)), output())
+            .unwrap();
         io.restart_bridge(&stdin, 80, 24).unwrap();
         assert_eq!(
             count(&fake, ops::Op::SpawnBridge),
@@ -4003,9 +4310,9 @@ mod tests {
     fn a_failed_attach_keeps_the_attach_it_would_have_replaced() {
         let fake = fake::FakeHerdr::new();
         let (backend, _, _) = typing_backend(&fake, Duration::from_secs(30));
-        let live = backend.attach(skey("a"), 80, 24, output()).unwrap();
+        let live = backend.attach(skey("a"), Some((80, 24)), output()).unwrap();
         fake.fail_next(ops::Op::SpawnBridge, ops::HerdrError::Timeout);
-        assert!(backend.attach(skey("a"), 80, 24, output()).is_err());
+        assert!(backend.attach(skey("a"), Some((80, 24)), output()).is_err());
         assert_eq!(backend.outputs.current_id(&skey("a")), Some(live.attach_id));
         // Its own detach still releases it.
         backend.detach(skey("a"), Some(live.attach_id)).unwrap();
@@ -4017,10 +4324,12 @@ mod tests {
         let fake = fake::FakeHerdr::new();
         let (backend, _, _) = typing_backend(&fake, Duration::from_secs(30));
         let live_out = Arc::new(fake::CaptureOutput::default());
-        backend.attach(skey("a"), 80, 24, live_out.clone()).unwrap();
+        backend
+            .attach(skey("a"), Some((80, 24)), live_out.clone())
+            .unwrap();
         let stdin = backend.bridges.lock().unwrap()[&skey("a")].stdin_handle();
         fake.fail_next(ops::Op::SpawnBridge, ops::HerdrError::Timeout);
-        assert!(backend.attach(skey("a"), 80, 24, output()).is_err());
+        assert!(backend.attach(skey("a"), Some((80, 24)), output()).is_err());
         // The same bridge is still running, and its frames reach the live attach.
         let bridges = backend.bridges.lock().unwrap();
         assert!(Arc::ptr_eq(&bridges[&skey("a")].stdin_handle(), &stdin));
@@ -4041,7 +4350,7 @@ mod tests {
     fn a_failed_attach_stops_the_bridge_of_an_attach_detached_meanwhile() {
         let fake = fake::FakeHerdr::new();
         let (backend, _, _) = typing_backend(&fake, Duration::from_secs(30));
-        let live = backend.attach(skey("a"), 80, 24, output()).unwrap();
+        let live = backend.attach(skey("a"), Some((80, 24)), output()).unwrap();
         // While the next attach's bridge is starting (and failing), the live
         // attach's owner detaches: skipped, as the new attach is current.
         {
@@ -4054,7 +4363,7 @@ mod tests {
             );
         }
         fake.fail_next(ops::Op::SpawnBridge, ops::HerdrError::Timeout);
-        assert!(backend.attach(skey("a"), 80, 24, output()).is_err());
+        assert!(backend.attach(skey("a"), Some((80, 24)), output()).is_err());
         assert!(
             backend.outputs.current(&skey("a")).is_none(),
             "the detached attach is not brought back"
@@ -4093,7 +4402,13 @@ mod tests {
             // Each pane is attached, so each session runs a bridge.
             backend.outputs.register(&skey(w), output());
             backend
-                .spawn(skey(w), format!("/repos/{w}"), String::new(), 80, 24, None)
+                .spawn(
+                    skey(w),
+                    format!("/repos/{w}"),
+                    String::new(),
+                    Some((80, 24)),
+                    None,
+                )
                 .unwrap();
         }
         record_quit(&fake, &skey("quit"));
@@ -4154,7 +4469,13 @@ mod tests {
         let fake = fake::FakeHerdr::new();
         let (backend, _) = fake_backend(&fake);
         backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         let handler = backend.death_handler();
         let g0 = backend.keymap.generation();
@@ -4268,7 +4589,13 @@ mod tests {
             "boot spawned the server"
         );
         backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         let g = backend.keymap.generation();
 
@@ -4331,7 +4658,13 @@ mod tests {
         let fake = fake::FakeHerdr::new();
         let (backend, _) = fake_backend(&fake);
         let gen = backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         backend.gate.set_view(
             recovery::RecoveryPhase::Down,
@@ -4343,7 +4676,13 @@ mod tests {
             |r: Result<(), PtyBackendError>| matches!(r, Err(PtyBackendError::RecoveryPending));
         assert!(pending(
             backend
-                .spawn(skey("b"), "/repos/b".into(), String::new(), 80, 24, None)
+                .spawn(
+                    skey("b"),
+                    "/repos/b".into(),
+                    String::new(),
+                    Some((80, 24)),
+                    None
+                )
                 .map(|_| ())
         ));
         assert!(pending(
@@ -4352,14 +4691,15 @@ mod tests {
                     skey("b"),
                     "/repos/b".into(),
                     String::new(),
-                    80,
-                    24,
+                    Some((80, 24)),
                     claude_launch()
                 )
                 .map(|_| ())
         ));
         assert!(pending(
-            backend.attach(skey("a"), 80, 24, output()).map(|_| ())
+            backend
+                .attach(skey("a"), Some((80, 24)), output())
+                .map(|_| ())
         ));
         let line = backend.write_line(&skey("a"), "hi", 0);
         assert!(matches!(line, Err(PtyBackendError::RecoveryPending)));
@@ -4384,7 +4724,13 @@ mod tests {
         let (backend, _) = fake_backend(&fake);
         for w in ["a", "b"] {
             backend
-                .spawn(skey(w), format!("/repos/{w}"), String::new(), 80, 24, None)
+                .spawn(
+                    skey(w),
+                    format!("/repos/{w}"),
+                    String::new(),
+                    Some((80, 24)),
+                    None,
+                )
                 .unwrap();
         }
         backend.gate.set_view(
@@ -4400,7 +4746,9 @@ mod tests {
         };
         // The settled session.
         assert!(!refused(
-            backend.attach(skey("a"), 80, 24, output()).map(|_| ())
+            backend
+                .attach(skey("a"), Some((80, 24)), output())
+                .map(|_| ())
         ));
         assert!(!refused(backend.write(&skey("a"), b"x")));
         assert!(!refused(backend.resize(&skey("a"), 100, 30)));
@@ -4408,14 +4756,22 @@ mod tests {
         assert!(!refused(backend.write_line(&skey("a"), "hi", 0)));
         // A session still queued.
         assert!(refused(
-            backend.attach(skey("b"), 80, 24, output()).map(|_| ())
+            backend
+                .attach(skey("b"), Some((80, 24)), output())
+                .map(|_| ())
         ));
         assert!(refused(backend.write(&skey("b"), b"x")));
         assert!(refused(backend.write_line(&skey("b"), "hi", 0)));
         // Keyless callers wait for Healthy, the settled key's own included.
         assert!(refused(
             backend
-                .spawn(skey("c"), "/repos/c".into(), String::new(), 80, 24, None)
+                .spawn(
+                    skey("c"),
+                    "/repos/c".into(),
+                    String::new(),
+                    Some((80, 24)),
+                    None
+                )
                 .map(|_| ())
         ));
         // A kill of the queued session waits too.
@@ -4433,7 +4789,9 @@ mod tests {
             Err(PtyBackendError::RecoveryPaused)
         ));
         assert!(matches!(
-            backend.attach(skey("a"), 80, 24, output()).map(|_| ()),
+            backend
+                .attach(skey("a"), Some((80, 24)), output())
+                .map(|_| ()),
             Err(PtyBackendError::RecoveryPaused)
         ));
         let gen_a = backend.keymap.get(&skey("a")).unwrap().gen;
@@ -4453,7 +4811,13 @@ mod tests {
         let mut gens = HashMap::new();
         for w in ["settled", "inflight", "queued", "waiting"] {
             let gen = backend
-                .spawn(skey(w), format!("/repos/{w}"), String::new(), 80, 24, None)
+                .spawn(
+                    skey(w),
+                    format!("/repos/{w}"),
+                    String::new(),
+                    Some((80, 24)),
+                    None,
+                )
                 .unwrap();
             gens.insert(w, gen);
         }
@@ -4580,16 +4944,21 @@ mod tests {
         let (backend, _) = fake_backend(&fake);
         fake.kill_server(Some(1));
         let try_all = |backend: &HerdrBackend| {
-            let _ = backend.spawn(skey("x"), "/repos/x".into(), String::new(), 80, 24, None);
+            let _ = backend.spawn(
+                skey("x"),
+                "/repos/x".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            );
             let _ = backend.spawn_agent(
                 skey("x"),
                 "/repos/x".into(),
                 String::new(),
-                80,
-                24,
+                Some((80, 24)),
                 claude_launch(),
             );
-            let _ = backend.attach(skey("x"), 80, 24, output());
+            let _ = backend.attach(skey("x"), Some((80, 24)), output());
             let _ = backend.resume_session(&skey("x"), None);
         };
         try_all(&backend);
@@ -4617,7 +4986,13 @@ mod tests {
         let fake = fake::FakeHerdr::new();
         let (backend, _) = unready_backend(&fake, None);
         assert!(matches!(
-            backend.spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None),
+            backend.spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None
+            ),
             Err(PtyBackendError::NotConnected)
         ));
         assert!(matches!(
@@ -4625,8 +5000,7 @@ mod tests {
                 skey("a"),
                 "/repos/a".into(),
                 String::new(),
-                80,
-                24,
+                Some((80, 24)),
                 claude_launch()
             ),
             Err(PtyBackendError::NotConnected)
@@ -4642,15 +5016,20 @@ mod tests {
         let fake = fake::FakeHerdr::new();
         let (backend, _) = fake_backend(&fake);
         backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         backend
             .spawn_agent(
                 skey("b"),
                 "/repos/b".into(),
                 String::new(),
-                80,
-                24,
+                Some((80, 24)),
                 claude_launch(),
             )
             .unwrap();
@@ -4696,8 +5075,7 @@ mod tests {
                 skey("b"),
                 "/repos/b".into(),
                 String::new(),
-                80,
-                24,
+                Some((80, 24)),
                 claude_launch()
             ),
             Err(PtyBackendError::RecoveryPending)
@@ -4749,7 +5127,13 @@ mod tests {
         let (backend, _) = fake_backend_with(&fake, Some(launch_everything()));
         for w in ["a", "b"] {
             backend
-                .spawn(skey(w), format!("/repos/{w}"), String::new(), 80, 24, None)
+                .spawn(
+                    skey(w),
+                    format!("/repos/{w}"),
+                    String::new(),
+                    Some((80, 24)),
+                    None,
+                )
                 .unwrap();
         }
         assert_eq!(backend.keymap.instance(), None);
@@ -4775,7 +5159,13 @@ mod tests {
         let out = Arc::new(fake::CaptureOutput::default());
         backend.outputs.register(&skey("a"), out.clone());
         backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         (backend, out)
     }
@@ -4880,7 +5270,13 @@ mod tests {
         let fake = fake::FakeHerdr::new();
         let (backend, _) = fake_backend(&fake);
         backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         backend.keymap.set_instance(fake.server_instance());
         fake.kill_server(Some(1));
@@ -4955,7 +5351,13 @@ mod tests {
     fn two_sessions(backend: &HerdrBackend, fake: &fake::FakeHerdr) {
         for w in ["a", "b"] {
             backend
-                .spawn(skey(w), format!("/repos/{w}"), String::new(), 80, 24, None)
+                .spawn(
+                    skey(w),
+                    format!("/repos/{w}"),
+                    String::new(),
+                    Some((80, 24)),
+                    None,
+                )
                 .unwrap();
         }
         backend.keymap.set_instance(fake.server_instance());
@@ -5176,7 +5578,13 @@ mod tests {
         };
         let (backend, _) = fake_backend_with(&fake, Some(launcher));
         backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         backend.keymap.set_instance(fake.server_instance());
         // Toggled after the session started, before the restart resumes it.
@@ -5462,7 +5870,13 @@ mod tests {
 
         // The backend is usable: a session can be spawned on the new server.
         backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .expect("spawn on the restarted server");
     }
 
@@ -5870,7 +6284,13 @@ mod tests {
         let fake = fake::FakeHerdr::new();
         let (backend, _) = fake_backend(&fake);
         backend
-            .spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         backend.keymap.set_instance(fake.server_instance());
         backend.live.lock().unwrap().clear();
@@ -5890,7 +6310,13 @@ mod tests {
         let backend = backend.with_worktree_filter(Arc::new(|k: &SessionKey| k.worktree != "gone"));
         for w in ["a", "b", "gone"] {
             backend
-                .spawn(skey(w), format!("/repos/{w}"), String::new(), 80, 24, None)
+                .spawn(
+                    skey(w),
+                    format!("/repos/{w}"),
+                    String::new(),
+                    Some((80, 24)),
+                    None,
+                )
                 .unwrap();
         }
         backend.keymap.set_instance(fake.server_instance());
@@ -5933,7 +6359,13 @@ mod tests {
         );
         for w in ["a", "b"] {
             backend
-                .spawn(skey(w), format!("/repos/{w}"), String::new(), 80, 24, None)
+                .spawn(
+                    skey(w),
+                    format!("/repos/{w}"),
+                    String::new(),
+                    Some((80, 24)),
+                    None,
+                )
                 .unwrap();
         }
         // The controller learns who is live from the status loop's observation.
@@ -6094,7 +6526,7 @@ mod tests {
         };
         let (gen, got) = lifecycle::with_capture(|| {
             backend
-                .spawn_agent(skey("wt"), cwd, String::new(), 80, 24, launch)
+                .spawn_agent(skey("wt"), cwd, String::new(), Some((80, 24)), launch)
                 .unwrap()
         });
         assert_eq!(gen, 1);
@@ -6129,8 +6561,7 @@ mod tests {
                     skey("wt"),
                     "/repos/wt".into(),
                     String::new(),
-                    80,
-                    24,
+                    Some((80, 24)),
                     claude_launch(),
                 )
                 .unwrap()
@@ -6163,7 +6594,13 @@ mod tests {
             fake::AgentStartScript::Ok,
         ]);
         let (res, got) = lifecycle::with_capture(|| {
-            backend.spawn_agent(skey("wt"), cwd, String::new(), 80, 24, claude_launch())
+            backend.spawn_agent(
+                skey("wt"),
+                cwd,
+                String::new(),
+                Some((80, 24)),
+                claude_launch(),
+            )
         });
         res.unwrap();
         assert_eq!(
@@ -6209,7 +6646,13 @@ mod tests {
             fake::AgentStartScript::Ok,
         ]);
         backend
-            .spawn_agent(skey("wt"), cwd, String::new(), 80, 24, claude_launch())
+            .spawn_agent(
+                skey("wt"),
+                cwd,
+                String::new(),
+                Some((80, 24)),
+                claude_launch(),
+            )
             .unwrap();
         assert_eq!(
             agent_start_args(&fake),
@@ -6235,7 +6678,13 @@ mod tests {
             message: "agent did not become ready".into(),
         })]);
         let (res, got) = lifecycle::with_capture(|| {
-            backend.spawn_agent(skey("wt"), cwd, String::new(), 80, 24, claude_launch())
+            backend.spawn_agent(
+                skey("wt"),
+                cwd,
+                String::new(),
+                Some((80, 24)),
+                claude_launch(),
+            )
         });
         assert!(res.is_err());
         assert_eq!(count(&fake, ops::Op::AgentStart), 1, "no retry");
@@ -6258,7 +6707,7 @@ mod tests {
             ..claude_launch()
         };
         backend
-            .spawn_agent(skey("wt"), cwd, String::new(), 80, 24, launch)
+            .spawn_agent(skey("wt"), cwd, String::new(), Some((80, 24)), launch)
             .unwrap();
         assert_eq!(agent_start_args(&fake), vec![""]);
         let row = keitora_tasks::LocalStore::open(&fake.env().resume_db_path().to_string_lossy())
@@ -6283,7 +6732,13 @@ mod tests {
         let (backend, _) = fake_backend_with(&fake, launcher);
         for w in ["a", "b"] {
             backend
-                .spawn(skey(w), format!("/repos/{w}"), String::new(), 80, 24, None)
+                .spawn(
+                    skey(w),
+                    format!("/repos/{w}"),
+                    String::new(),
+                    Some((80, 24)),
+                    None,
+                )
                 .unwrap();
         }
         backend.keymap.set_instance(fake.server_instance());
@@ -6636,7 +7091,13 @@ mod tests {
             HashSet::from(["a".to_string()])
         );
         assert!(matches!(
-            backend.spawn(skey("a"), "/repos/a".into(), String::new(), 80, 24, None),
+            backend.spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None
+            ),
             Err(PtyBackendError::Terminated)
         ));
         assert!(matches!(
@@ -6644,8 +7105,7 @@ mod tests {
                 skey("a"),
                 "/repos/a".into(),
                 String::new(),
-                80,
-                24,
+                Some((80, 24)),
                 claude_launch()
             ),
             Err(PtyBackendError::Terminated)
@@ -6654,7 +7114,13 @@ mod tests {
         assert_eq!(count(&fake, ops::Op::AgentStart), 0);
         // Another session spawns as usual, and so does `a` once launched.
         backend
-            .spawn(skey("b"), "/repos/b".into(), String::new(), 80, 24, None)
+            .spawn(
+                skey("b"),
+                "/repos/b".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
             .unwrap();
         backend.set_terminated(&skey("a"), false).unwrap();
         assert!(backend.terminated_keys("p").is_empty());
@@ -6663,8 +7129,7 @@ mod tests {
                 skey("a"),
                 "/repos/a".into(),
                 String::new(),
-                80,
-                24,
+                Some((80, 24)),
                 claude_launch(),
             )
             .unwrap();
@@ -6677,7 +7142,13 @@ mod tests {
         let (backend, _) = fake_backend(&fake);
         for w in ["a", "term"] {
             backend
-                .spawn(skey(w), format!("/repos/{w}"), String::new(), 80, 24, None)
+                .spawn(
+                    skey(w),
+                    format!("/repos/{w}"),
+                    String::new(),
+                    Some((80, 24)),
+                    None,
+                )
                 .unwrap();
         }
         backend.set_terminated(&skey("term"), true).unwrap();
@@ -6910,8 +7381,7 @@ mod tests {
                 key.clone(),
                 cwd,
                 String::new(),
-                80,
-                24,
+                Some((80, 24)),
                 Some("echo HELLO_HERDR_SLICE".to_string()),
             )
             .expect("spawn");
@@ -6920,7 +7390,7 @@ mod tests {
         // Let the echo land, then attach (the first full frame mirrors the viewport).
         std::thread::sleep(Duration::from_millis(1500));
         backend
-            .attach(key.clone(), 80, 24, output.clone())
+            .attach(key.clone(), Some((80, 24)), output.clone())
             .expect("attach");
         assert!(
             frame_arrives(&output, "HELLO_HERDR_SLICE", Duration::from_secs(6)),
@@ -6961,8 +7431,7 @@ mod tests {
                 key.clone(),
                 env!("CARGO_MANIFEST_DIR").to_string(),
                 String::new(),
-                80,
-                24,
+                Some((80, 24)),
                 Some("echo SPAWN_ONLY_MARKER".to_string()),
             )
             .expect("spawn");
@@ -7027,8 +7496,7 @@ mod tests {
             key.clone(),
             env!("CARGO_MANIFEST_DIR").to_string(),
             String::new(),
-            80,
-            24,
+            Some((80, 24)),
             launch,
         );
 
@@ -7130,8 +7598,7 @@ mod tests {
 
         let res = backend.attach(
             key.clone(),
-            80,
-            24,
+            Some((80, 24)),
             Arc::new(fake::CaptureOutput::default()),
         );
 
@@ -7166,8 +7633,7 @@ mod tests {
                 key.clone(),
                 env!("CARGO_MANIFEST_DIR").to_string(),
                 String::new(),
-                80,
-                24,
+                Some((80, 24)),
                 Some("echo REPAINT_MARKER".to_string()),
             )
             .expect("spawn");
@@ -7205,8 +7671,7 @@ mod tests {
                 key.clone(),
                 cwd.to_string(),
                 String::new(),
-                80,
-                24,
+                Some((80, 24)),
                 Some("echo RECONCILE_SPAWN".to_string()),
             )
             .expect("spawn");
@@ -7332,8 +7797,7 @@ mod tests {
                 key.clone(),
                 env!("CARGO_MANIFEST_DIR").to_string(),
                 String::new(),
-                80,
-                24,
+                Some((80, 24)),
                 None,
             )
             .expect("spawn");

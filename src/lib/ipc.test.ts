@@ -54,7 +54,7 @@ describe("ptySpawn", () => {
   });
 
   it("defaults fresh to false", async () => {
-    await ptySpawn("keitora", "epsilon", "/wt", 24, 80);
+    await ptySpawn("keitora", "epsilon", "/wt", { rows: 24, cols: 80 });
     expect(transport.invoke).toHaveBeenCalledWith("pty_spawn", {
       project: "keitora",
       id: "epsilon",
@@ -66,8 +66,16 @@ describe("ptySpawn", () => {
     });
   });
 
+  it("sends null sizes through when the pane is unmeasured", async () => {
+    await ptySpawn("keitora", "epsilon", "/wt", null);
+    expect(transport.invoke).toHaveBeenCalledWith(
+      "pty_spawn",
+      expect.objectContaining({ rows: null, cols: null }),
+    );
+  });
+
   it("forwards fresh", async () => {
-    await ptySpawn("keitora", "epsilon", "/wt", 24, 80, undefined, true);
+    await ptySpawn("keitora", "epsilon", "/wt", { rows: 24, cols: 80 }, undefined, true);
     expect(transport.invoke).toHaveBeenCalledWith(
       "pty_spawn",
       expect.objectContaining({ command: null, fresh: true }),
@@ -105,7 +113,9 @@ describe("sessionLaunch", () => {
   });
 
   it("defaults fresh to false and returns the generation", async () => {
-    await expect(sessionLaunch("keitora", "epsilon", "/wt", 24, 80)).resolves.toBe(2);
+    await expect(sessionLaunch("keitora", "epsilon", "/wt", { rows: 24, cols: 80 })).resolves.toBe(
+      2,
+    );
     expect(transport.invoke).toHaveBeenCalledWith("session_launch", {
       project: "keitora",
       id: "epsilon",
@@ -116,8 +126,16 @@ describe("sessionLaunch", () => {
     });
   });
 
+  it("sends null sizes through when the pane is unmeasured", async () => {
+    await sessionLaunch("keitora", "epsilon", "/wt", null);
+    expect(transport.invoke).toHaveBeenCalledWith(
+      "session_launch",
+      expect.objectContaining({ rows: null, cols: null }),
+    );
+  });
+
   it("forwards fresh", async () => {
-    await sessionLaunch("keitora", "epsilon", "/wt", 24, 80, true);
+    await sessionLaunch("keitora", "epsilon", "/wt", { rows: 24, cols: 80 }, true);
     expect(transport.invoke).toHaveBeenCalledWith(
       "session_launch",
       expect.objectContaining({ fresh: true }),
@@ -210,7 +228,9 @@ describe("ptyAttach", () => {
       repaints: true,
     });
     const got: OutputMsg[] = [];
-    const result = await ptyAttach("keitora", "epsilon", 24, 80, (m) => got.push(m));
+    const result = await ptyAttach("keitora", "epsilon", { rows: 24, cols: 80 }, (m) =>
+      got.push(m),
+    );
     expect(result.attach_id).toBe(9);
     expect(result.repaints).toBe(true);
 
@@ -220,6 +240,13 @@ describe("ptyAttach", () => {
     args.onOutput.onMessage({ type: "frame", data: "aGk=", full: true });
     args.onOutput.onMessage({ type: "exit" });
     expect(got).toEqual([{ type: "frame", data: "aGk=", full: true }, { type: "exit" }]);
+  });
+
+  it("sends null sizes through when the pane is unmeasured", async () => {
+    transport.channel.mockImplementation((onMessage: (m: OutputMsg) => void) => ({ onMessage }));
+    transport.invoke.mockResolvedValue({ gen: 3, scrollback: "", attach_id: 9, repaints: true });
+    await ptyAttach("keitora", "epsilon", null, () => {});
+    expect(transport.invoke.mock.calls[0][1]).toMatchObject({ rows: null, cols: null });
   });
 });
 

@@ -474,8 +474,7 @@ pub trait PtyBackend: Send + Sync + 'static {
         key: SessionKey,
         cwd: String,
         db_path: String,
-        cols: u16,
-        rows: u16,
+        size: Option<(u16, u16)>,
         command: Option<String>,
     ) -> Result<u64, PtyBackendError>;
 
@@ -488,8 +487,7 @@ pub trait PtyBackend: Send + Sync + 'static {
         key: SessionKey,
         cwd: String,
         db_path: String,
-        cols: u16,
-        rows: u16,
+        size: Option<(u16, u16)>,
         launch: AgentLaunch,
     ) -> Result<u64, PtyBackendError>;
 
@@ -499,8 +497,7 @@ pub trait PtyBackend: Send + Sync + 'static {
     fn attach(
         &self,
         key: SessionKey,
-        cols: u16,
-        rows: u16,
+        size: Option<(u16, u16)>,
         out: Arc<dyn OutputSink>,
     ) -> Result<AttachResult, PtyBackendError>;
 

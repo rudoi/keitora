@@ -7,6 +7,7 @@ import {
   dimsEqual,
   FALLBACK_ROW_PX,
   MIN_PTY,
+  sizeToSend,
   WHEEL_DELTA_LINE,
   WHEEL_DELTA_PAGE,
   WHEEL_DELTA_PIXEL,
@@ -73,6 +74,30 @@ describe("dimsEqual", () => {
 
   it("is false when cols differ", () => {
     expect(dimsEqual({ rows: 24, cols: 80 }, { rows: 24, cols: 81 })).toBe(false);
+  });
+});
+
+describe("sizeToSend", () => {
+  it("is null while the terminal is unmeasured, even at a plausible size", () => {
+    // xterm's default 80×24 is exactly what an unmeasured terminal holds.
+    expect(sizeToSend(false, { rows: 24, cols: 80 })).toBeNull();
+    expect(sizeToSend(false, { rows: 50, cols: 200 })).toBeNull();
+  });
+
+  it("sends the measured size", () => {
+    expect(sizeToSend(true, { rows: 50, cols: 200 })).toEqual({ rows: 50, cols: 200 });
+  });
+
+  it("clamps a measured size up to the PTY minimum", () => {
+    expect(sizeToSend(true, { rows: 2, cols: 5 })).toEqual({
+      rows: MIN_PTY.rows,
+      cols: MIN_PTY.cols,
+    });
+  });
+
+  it("is null for a degenerate size even when flagged measured", () => {
+    expect(sizeToSend(true, { rows: 0, cols: 80 })).toBeNull();
+    expect(sizeToSend(true, { rows: 24, cols: Number.NaN })).toBeNull();
   });
 });
 

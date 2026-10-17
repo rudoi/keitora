@@ -63,8 +63,7 @@ impl PtyBackend for UnavailableBackend {
         _key: SessionKey,
         _cwd: String,
         _db_path: String,
-        _cols: u16,
-        _rows: u16,
+        _size: Option<(u16, u16)>,
         _command: Option<String>,
     ) -> Result<u64, PtyBackendError> {
         Err(self.refused())
@@ -75,8 +74,7 @@ impl PtyBackend for UnavailableBackend {
         _key: SessionKey,
         _cwd: String,
         _db_path: String,
-        _cols: u16,
-        _rows: u16,
+        _size: Option<(u16, u16)>,
         _launch: AgentLaunch,
     ) -> Result<u64, PtyBackendError> {
         Err(self.refused())
@@ -85,8 +83,7 @@ impl PtyBackend for UnavailableBackend {
     fn attach(
         &self,
         _key: SessionKey,
-        _cols: u16,
-        _rows: u16,
+        _size: Option<(u16, u16)>,
         _out: Arc<dyn OutputSink>,
     ) -> Result<AttachResult, PtyBackendError> {
         Err(self.refused())
@@ -224,13 +221,12 @@ mod tests {
     #[test]
     fn spawn_spawn_agent_and_attach_are_refused_with_the_reason() {
         let (b, _) = backend();
-        assert_refused(b.spawn(key(), "/w".into(), "/db".into(), 80, 24, None));
+        assert_refused(b.spawn(key(), "/w".into(), "/db".into(), Some((80, 24)), None));
         assert_refused(b.spawn(
             key(),
             "/w".into(),
             "/db".into(),
-            80,
-            24,
+            Some((80, 24)),
             Some("echo hi".into()),
         ));
         let launch = AgentLaunch {
@@ -240,8 +236,8 @@ mod tests {
             resume_target: None,
             fresh: false,
         };
-        assert_refused(b.spawn_agent(key(), "/w".into(), "/db".into(), 80, 24, launch));
-        assert_refused(b.attach(key(), 80, 24, Arc::new(NoOutput)));
+        assert_refused(b.spawn_agent(key(), "/w".into(), "/db".into(), Some((80, 24)), launch));
+        assert_refused(b.attach(key(), Some((80, 24)), Arc::new(NoOutput)));
     }
 
     #[test]

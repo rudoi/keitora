@@ -1204,6 +1204,15 @@ const RECOVERING_TOKEN: &str = "Recovering";
 /// user terminated the session.
 const TERMINATED_TOKEN: &str = "Terminated";
 
+/// The takeover size the frontend measured: `Some((cols, rows))` only when it sent both
+/// and both are at least 1. Anything else means "unknown" and the backend picks one.
+fn requested_size(cols: Option<u16>, rows: Option<u16>) -> Option<(u16, u16)> {
+    match (cols, rows) {
+        (Some(c), Some(r)) if c >= 1 && r >= 1 => Some((c, r)),
+        _ => None,
+    }
+}
+
 /// Map a `pty_spawn` error: a server under recovery is the `Recovering` token, a
 /// terminated session the `Terminated` token; everything else keeps its
 /// [`daemon_err`] text.
@@ -1233,11 +1242,12 @@ pub(crate) fn spawn_pty(
     project: String,
     id: String,
     cwd: String,
-    rows: u16,
-    cols: u16,
+    rows: Option<u16>,
+    cols: Option<u16>,
     command: Option<String>,
     fresh: bool,
 ) -> Result<u64, String> {
+    let size = requested_size(cols, rows);
     // The PTY identity is the explicit `project` param; `active_project()` is kept
     // only for the `db_path` the daemon needs to mark the worktree offline on exit.
     let (_, db_path) = active_project()?;
@@ -1251,7 +1261,7 @@ pub(crate) fn spawn_pty(
     // derives the pane PATH from `launch.path` (see `backend::herdr::env::pane_env`).
     if let Some(command) = command {
         return client
-            .spawn(key, cwd, db_path, cols, rows, Some(command))
+            .spawn(key, cwd, db_path, size, Some(command))
             .map_err(spawn_err_kind);
     }
     // Re-derive the default launch from persisted state on EVERY spawn.
@@ -1272,7 +1282,7 @@ pub(crate) fn spawn_pty(
     let launch = AgentLaunch { fresh, ..launch };
 
     client
-        .spawn_agent(key, cwd, db_path, cols, rows, launch)
+        .spawn_agent(key, cwd, db_path, size, launch)
         .map_err(spawn_err_kind)
 }
 
@@ -1395,8 +1405,8 @@ fn pty_spawn(
     project: String,
     id: String,
     cwd: String,
-    rows: u16,
-    cols: u16,
+    rows: Option<u16>,
+    cols: Option<u16>,
     command: Option<String>,
     fresh: Option<bool>,
 ) -> Result<u64, String> {
@@ -1468,8 +1478,8 @@ fn pty_attach(
     client: State<SharedBackend>,
     project: String,
     id: String,
-    rows: u16,
-    cols: u16,
+    rows: Option<u16>,
+    cols: Option<u16>,
     on_output: Channel<OutputMsg>,
 ) -> Result<AttachPayload, String> {
     let key = SessionKey {
@@ -1477,7 +1487,11 @@ fn pty_attach(
         worktree: id,
     };
     client
-        .attach(key, cols, rows, Arc::new(ChannelSink(on_output)))
+        .attach(
+            key,
+            requested_size(cols, rows),
+            Arc::new(ChannelSink(on_output)),
+        )
         .map(Into::into)
         .map_err(|e| attach_err_kind(&e))
 }
@@ -1718,8 +1732,8 @@ fn session_launch(
     project: String,
     id: String,
     cwd: String,
-    rows: u16,
-    cols: u16,
+    rows: Option<u16>,
+    cols: Option<u16>,
     fresh: Option<bool>,
 ) -> Result<u64, String> {
     let backend = client.inner().as_ref();
@@ -2187,7 +2201,17 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutputMsg, PtyBackendError};
+    use super::{requested_size, OutputMsg, PtyBackendError};
+
+    #[test]
+    fn requested_size_needs_both_dimensions_at_least_one() {
+        assert_eq!(requested_size(Some(100), Some(30)), Some((100, 30)));
+        assert_eq!(requested_size(Some(100), None), None);
+        assert_eq!(requested_size(None, Some(30)), None);
+        assert_eq!(requested_size(None, None), None);
+        assert_eq!(requested_size(Some(0), Some(30)), None);
+        assert_eq!(requested_size(Some(100), Some(0)), None);
+    }
 
     /// The output channel's wire shape, which the TS `OutputMsg` mirrors.
     #[test]
@@ -2357,7 +2381,7 @@ mod tests {
                 || {
                     assert!(notified.get(), "the rail hears of it before the spawn");
                     // The spawn the command makes: refused while still terminated.
-                    fake.spawn(key(), "/w".into(), "/db".into(), 80, 24, None)
+                    fake.spawn(key(), "/w".into(), "/db".into(), Some((80, 24)), None)
                         .map_err(|e| e.to_string())
                 },
             );
@@ -2669,7 +2693,7 @@ mod tests {
             assert!(status.reason.as_deref().unwrap().contains(err));
             assert!(!status.restartable, "only a relaunch helps");
             assert!(matches!(
-                chosen.spawn(SessionKey { project: "p".into(), worktree: "w".into() }, "/w".into(), "/db".into(), 80, 24, None),
+                chosen.spawn(SessionKey { project: "p".into(), worktree: "w".into() }, "/w".into(), "/db".into(), Some((80, 24)), None),
                 Err(PtyBackendError::Other(m)) if m == format!("herdr unavailable: {err}")
             ));
             // It is not started yet: the caller starts it, which emits the status.

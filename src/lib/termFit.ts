@@ -31,6 +31,17 @@ export function dimsEqual(a: Dims, b: Dims): boolean {
   return a.rows === b.rows && a.cols === b.cols;
 }
 
+/**
+ * The size an attach or spawn tells herdr to take the pane over at: the terminal's
+ * clamped size once a real fit has been committed (`measured`), else `null` ("size
+ * unknown", so the backend keeps the pane's own size). An unmeasured terminal still
+ * holds xterm's default 80×24, and taking a pane over at that guess shrinks it.
+ */
+export function sizeToSend(measured: boolean, d: Dims): Dims | null {
+  if (!measured || !dimsAreSane(d)) return null;
+  return clampPtySize(d);
+}
+
 /** Defensive row height when the terminal has not produced a usable measurement. */
 export const FALLBACK_ROW_PX = 17;
 

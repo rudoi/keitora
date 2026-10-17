@@ -385,6 +385,13 @@ impl FakeHerdr {
         }
     }
 
+    /// Set (or clear) the row count herdr reports for `pane_id`'s viewport.
+    pub fn set_viewport_rows(&self, pane_id: &str, rows: Option<u16>) {
+        if let Ok(p) = self.state().pane_mut(pane_id) {
+            p.viewport_rows = rows;
+        }
+    }
+
     /// Simulate the agent exiting in (or returning to) its shell.
     pub fn set_agent_present(&self, pane_id: &str, present: bool) {
         if let Ok(p) = self.state().pane_mut(pane_id) {
