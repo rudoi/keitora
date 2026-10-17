@@ -677,16 +677,18 @@ export function Rail({
           onReorder={onReorder}
         />
       </div>
-      <DaemonStatusBadge daemonInfo={daemonInfo} />
-      <div className="rail-footer">
-        <button className="rail-settings" onClick={onOpenSettings} title="Settings">
-          <Settings size={14} />
-          <span>Settings</span>
-        </button>
-        <button className="rail-shortcuts" onClick={onOpenHelp} title="Keyboard shortcuts (?)">
-          <HelpCircle size={14} />
-          <span>shortcuts</span>
-        </button>
+      <div className="rail-dock">
+        <DaemonStatusBadge daemonInfo={daemonInfo} />
+        <div className="rail-footer">
+          <button className="rail-settings" onClick={onOpenSettings} title="Settings">
+            <Settings size={14} />
+            <span>Settings</span>
+          </button>
+          <button className="rail-shortcuts" onClick={onOpenHelp} title="Keyboard shortcuts (?)">
+            <HelpCircle size={14} />
+            <span>shortcuts</span>
+          </button>
+        </div>
       </div>
       <WorktreeMenu
         state={menu}

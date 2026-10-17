@@ -197,10 +197,17 @@ body {
   overflow-y: auto;
   min-height: 0;
 }
-.rail-footer {
+/* Pinned bottom dock: daemon status + footer as one anchored strip. Full-bleed to the
+   rail edges (cancel the rail's 10px padding on the sides and bottom) with a single top
+   edge, so the scrolling list has a clean break where it ends. */
+.rail-dock {
   flex: 0 0 auto;
-  margin-top: 8px;
+  margin: 8px -10px -10px;
+  padding: 8px 10px 10px;
   border-top: 1px solid var(--line);
+  background: var(--bg-0);
+}
+.rail-footer {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1092,6 +1099,23 @@ body {
   flex-direction: column;
   padding: 0 6px;
   margin-bottom: 2px;
+}
+/* Inside the dock the daemon panel sits on the dock surface, not in its own card:
+   flatten it and align its left inset with the Settings/shortcuts row below. */
+.rail-dock .rail-daemon-badge-wrap {
+  padding: 0 4px;
+  margin-bottom: 0;
+}
+.rail-dock .rail-daemon-card {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 6px 2px;
+}
+/* Offline state renders .rail-daemon-offline directly (no card wrapper); give it the
+   same left inset so its reason + Restart line up with the Connected card and footer. */
+.rail-dock .rail-daemon-offline {
+  padding: 0 4px;
 }
 .rail-daemon-badge {
   display: flex;
