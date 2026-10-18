@@ -27,6 +27,14 @@
   --high: #f5a623;
   --normal: #56b6e0;
   --low: #6b7585;
+  /* Stacking layers for app-wide overlays. In-pane/in-rail elements (pane overlays ≤ 15,
+     the rail drop line) and app chrome (DiffView, perf overlay, font-size HUD: 40–100) sit
+     below these; Radix menus/popovers use z-50. Anything portaled from inside a dialog must
+     use a layer above --z-modal or it renders under the dialog. */
+  --z-modal: 1500; /* every dialog, drawer and the shortcut cheatsheet */
+  --z-switch: 2000; /* project-switch blocker */
+  --z-toast: 2500; /* above dialogs, so errors raised by dialog actions stay visible */
+  --z-quit: 3000; /* the quit confirmation is always topmost */
 }
 
 /* Light theme (short-name mirror of the block in index.css). Keep the two in lockstep.
@@ -935,7 +943,7 @@ body {
 .kbd-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 100;
+  z-index: var(--z-modal);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1032,12 +1040,12 @@ body {
 
 /* ---- project switch overlay ---- */
 /* Full-screen blocking overlay shown while a project switch is in flight, so the
-   user knows not to act mid-transition. Above everything, including the portaled
-   rail context menus (z-index 1000). */
+   user knows not to act mid-transition. Above dialogs and the portaled rail context
+   menus; only toasts and the quit confirmation stack higher. */
 .switch-overlay {
   position: fixed;
   inset: 0;
-  z-index: 2000;
+  z-index: var(--z-switch);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1295,7 +1303,7 @@ body {
 
 /* Transient terminal-font-size HUD: a centered "zoom indicator" that flashes the
    current px on Cmd +/-/0. Non-interactive (pointer-events: none) so it never blocks
-   the terminal; sits above panes but below modal overlays (.kbd-backdrop = 100). */
+   the terminal; sits above panes but below dialogs (--z-modal). */
 .fontsize-hud {
   position: fixed;
   inset: 0;

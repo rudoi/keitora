@@ -27,8 +27,6 @@ export interface KeyCtx {
   openDiff: (name: string) => void;
   setView: (v: View) => void;
   setSelected: (name: string) => void;
-  /** Dispatch-suggest (board view). */
-  onSuggest: () => void;
   /** Toggle the per-card DispatchMenu for the selected card (Board → App wired). */
   openCardMenu: () => void;
   /** Step the terminal font size by `delta` px (clamped), and flash the size HUD. */
@@ -216,11 +214,10 @@ export const DEFAULT_BINDINGS: Keybinding[] = [
     keys: "Cmd+F",
     label: "Terminal search",
     group: "Global",
-    // Listed for discoverability. The focused TerminalPane intercepts Cmd+F at
-    // the xterm DOM level (attachCustomKeyEventHandler → returns false), so this
-    // window-level binding never fires while a terminal is focused — which is
-    // exactly what we want. `run` is intentionally a no-op: the per-pane overlay
-    // owns the actual search (see 01-scrollback-search).
+    // Listed for discoverability. The focused TerminalPane opens its search box from
+    // its own key handler; this window-level binding never fires while the terminal is
+    // focused (its input is a <textarea>), and `run` is a no-op. useKeybindings still
+    // preventDefaults every Cmd+F so the webview's native find bar never opens.
     when: (ctx) => ctx.view === "focus" || ctx.view === "grid",
     run: () => {
       /* handled by the focused TerminalPane's own key handler */
@@ -262,17 +259,6 @@ export const DEFAULT_BINDINGS: Keybinding[] = [
     run: () => {
       /* handled by the focused TerminalPane's own key handler */
     },
-  },
-  {
-    id: "dispatch.suggest",
-    keys: "Cmd+K",
-    label: "Dispatch suggest",
-    group: "Board",
-    // Global so it still fires while a form field is focused on the board
-    // (matches the pre-keymap handler, which had no input guard).
-    global: true,
-    when: (ctx) => ctx.view === "board",
-    run: (ctx) => ctx.onSuggest(),
   },
   {
     id: "font.increase",
@@ -402,6 +388,17 @@ const PANE_SCROLL_KEYS: ReadonlyArray<readonly [string, ScrollDirection]> = [
 
 const SCROLL_TO_LIVE_KEYS = bindingKeys("terminal.scrollToLive");
 
+const FIND_KEYS = bindingKeys("search.open");
+
+/**
+ * Whether the event is the find chord (plain Cmd/Ctrl+F, no Shift or Alt). The window
+ * keymap preventDefaults it everywhere, since the webview's native find bar cannot see
+ * terminal text; a focused TerminalPane opens its own search box on it.
+ */
+export function isFindChord(e: KeyboardEvent): boolean {
+  return matchesKey(e, FIND_KEYS);
+}
+
 /**
  * The scroll direction for a pane history key (Shift+PageUp / Shift+PageDown), or null.
  * TerminalPane calls this from its key handler and consumes matches, so the key scrolls
@@ -431,8 +428,7 @@ export function isScrollToLiveKey(e: KeyboardEvent): boolean {
  * whose `when(ctx)` is true wins (preventDefault + run, stop).
  *
  * `ctx` is read through a ref so the listener is attached exactly once for the
- * component's lifetime: `ctx` changes on every session tick (via onSuggest →
- * idleCount), and re-subscribing on each change would needlessly churn the
+ * component's lifetime: `ctx` changes on every session tick, and re-subscribing on each change would needlessly churn the
  * window listener.
  */
 export function useKeybindings(ctx: KeyCtx): void {
@@ -445,6 +441,9 @@ export function useKeybindings(ctx: KeyCtx): void {
       const target = e.target as HTMLElement | null;
       const tag = target?.tagName;
       const inEditable = tag === "INPUT" || tag === "TEXTAREA" || !!target?.isContentEditable;
+      // Never let the webview open its native find bar, whatever has focus. Propagation
+      // is left alone: a focused pane's own handler opens the terminal search.
+      if (isFindChord(e)) e.preventDefault();
 
       for (const binding of DEFAULT_BINDINGS) {
         if (!matchesKey(e, binding.keys)) continue;

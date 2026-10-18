@@ -72,6 +72,8 @@ struct FakeState {
     /// What `pane_process_info` answers, by pane id; a pane without an entry is
     /// not found.
     process_info: HashMap<String, PaneProcessInfo>,
+    /// What `pane_read` answers, by pane id; a pane without an entry reads empty.
+    pane_text: HashMap<String, String>,
     next_workspace: u32,
     next_terminal: u32,
     next_session: u32,
@@ -321,6 +323,7 @@ impl FakeHerdr {
                     panes: Vec::new(),
                     closed: Vec::new(),
                     process_info: HashMap::new(),
+                    pane_text: HashMap::new(),
                     next_workspace: 0,
                     next_terminal: 0,
                     next_session: 0,
@@ -387,6 +390,13 @@ impl FakeHerdr {
         if let Ok(p) = self.state().pane_mut(pane_id) {
             p.scroll = offset_from_bottom;
         }
+    }
+
+    /// Set the text `pane_read` answers for `pane_id`.
+    pub fn set_pane_text(&self, pane_id: &str, text: &str) {
+        self.state()
+            .pane_text
+            .insert(pane_id.to_string(), text.to_string());
     }
 
     /// Set (or clear) the row count herdr reports for `pane_id`'s viewport.
@@ -796,10 +806,21 @@ impl HerdrOps for FakeHerdr {
         Ok(())
     }
 
-    fn pane_read(&self, pane_id: &str, source: &str, format: &str) -> Result<String, HerdrError> {
+    fn pane_read(
+        &self,
+        pane_id: &str,
+        source: &str,
+        format: &str,
+        lines: Option<u32>,
+    ) -> Result<String, HerdrError> {
         let mut st = self.state();
-        st.control(Op::PaneRead, format!("{pane_id} {source} {format}"))?;
-        st.pane_mut(pane_id).map(|_| String::new())
+        let detail = match lines {
+            Some(n) => format!("{pane_id} {source} {format} --lines {n}"),
+            None => format!("{pane_id} {source} {format}"),
+        };
+        st.control(Op::PaneRead, detail)?;
+        st.pane_mut(pane_id)?;
+        Ok(st.pane_text.get(pane_id).cloned().unwrap_or_default())
     }
 
     fn pane_list(&self) -> Result<Vec<PaneInfo>, HerdrError> {

@@ -10,6 +10,7 @@
 import * as RadixToast from "@radix-ui/react-toast";
 import { X } from "lucide-react";
 import { createContext, useCallback, useContext, useRef, useState } from "react";
+import { LAYER_TOAST } from "../lib/layers";
 
 // ---- Context ----------------------------------------------------------------
 
@@ -82,7 +83,9 @@ export function AttentionBannersProvider({ children }: { children: React.ReactNo
           </RadixToast.Root>
         )}
 
-        <RadixToast.Viewport className="fixed top-4 right-4 z-50 w-[320px] max-w-[90vw]" />
+        <RadixToast.Viewport
+          className={`fixed top-4 right-4 ${LAYER_TOAST} w-[320px] max-w-[90vw]`}
+        />
       </RadixToast.Provider>
     </Ctx.Provider>
   );

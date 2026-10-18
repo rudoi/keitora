@@ -6,13 +6,13 @@
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { FitAddon } from "@xterm/addon-fit";
-import { SearchAddon } from "@xterm/addon-search";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { type ITheme, Terminal } from "@xterm/xterm";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { classifyAttachError } from "../lib/attachErrors";
 import { useTerminalFontSize } from "../lib/fontSize";
 import { createFrameCoalescer, type FrameCoalescer } from "../lib/frameCoalescer";
+import { appOwnsScroll } from "../lib/historySearch";
 import {
   type CliKind,
   type DaemonInfo,
@@ -39,7 +39,12 @@ import {
   sessionLaunch,
   sessionTerminate,
 } from "../lib/ipc";
-import { isGlobalAppChord, isScrollToLiveKey, paneScrollDirection } from "../lib/keybindings";
+import {
+  isFindChord,
+  isGlobalAppChord,
+  isScrollToLiveKey,
+  paneScrollDirection,
+} from "../lib/keybindings";
 import { markPending, onFrame, stamp } from "../lib/latencyProbe";
 import { createLiveTail, type LiveTail } from "../lib/liveTail";
 import { createPaneAttachments } from "../lib/paneAttach";
@@ -79,7 +84,7 @@ import {
 } from "../lib/terminalFileDrop";
 import { installTerminalLinks } from "../lib/terminalLinks";
 import { type ResolvedTheme, useResolvedTheme } from "../lib/theme";
-import { TerminalSearch } from "./TerminalSearch";
+import { type HistoryView, TerminalSearch } from "./TerminalSearch";
 import { useToast } from "./Toast";
 import "@xterm/xterm/css/xterm.css";
 
@@ -158,6 +163,12 @@ function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
+/** The history view while no terminal is wired up: does nothing. */
+const IDLE_HISTORY_VIEW: HistoryView = {
+  scrollBy: async () => false,
+  returnToLive: () => {},
+};
+
 // The fit addon's proposal for its terminal's host; undefined when it cannot measure.
 function proposeFit(fit: FitAddon): Dims | undefined {
   try {
@@ -232,7 +243,6 @@ export function TerminalPane({
   // `active` for callbacks that must not hold a GPU context for an off-screen pane.
   const activeRef = useRef(active);
   activeRef.current = active;
-  const searchRef = useRef<SearchAddon | null>(null);
   const searchOpenRef = useRef(false); // mirrors searchVisible state for use inside the key handler
   const openedRef = useRef(false);
   // A real fit has been committed to this Terminal (by refitAndResize or the fit before
@@ -282,6 +292,10 @@ export function TerminalPane({
   }, []);
 
   const [searchVisible, setSearchVisible] = useState(false);
+  const setSearchOpen = useCallback((open: boolean) => {
+    searchOpenRef.current = open;
+    setSearchVisible(open);
+  }, []);
   const [showSpinner, setShowSpinner] = useState(false);
   const [fontSize] = useTerminalFontSize();
   // Resolved app theme (light|dark). Chosen at construction and swapped live below.
@@ -291,6 +305,9 @@ export function TerminalPane({
   const [showLivePill, setShowLivePill] = useState(false);
   const liveTailRef = useRef<LiveTail | null>(null);
   const scrollToLiveRef = useRef<() => void>(() => {});
+  // What the terminal search drives: herdr's history, scrolled by a line delta and brought
+  // back to the live tail. Wired up with the terminal below.
+  const historyViewRef = useRef<HistoryView>(IDLE_HISTORY_VIEW);
   // The open confirm surface, by restart flavour or a terminate (`false` = closed).
   const [confirmKill, setConfirmKill] = useState<false | "resume" | "fresh" | "terminate">(false);
 
@@ -926,9 +943,6 @@ export function TerminalPane({
     linksRef.current = links;
     const fit = new FitAddon();
     term.loadAddon(fit);
-    const search = new SearchAddon();
-    term.loadAddon(search);
-    searchRef.current = search;
 
     // Track IME composition state off the host: composition events bubble from xterm's
     // internal textarea, which term.open() creates inside the host later (and re-creates
@@ -993,14 +1007,15 @@ export function TerminalPane({
     term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
       // We only ever act on keydown; let xterm handle keypress/keyup unchanged.
       if (e.type !== "keydown") return true;
-      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
-        setSearchVisible(true);
-        searchOpenRef.current = true;
-        return false; // prevents xterm default AND browser native find
+      if (isFindChord(e)) {
+        // Returning false only stops xterm; preventDefault keeps the webview's native
+        // find bar from opening too.
+        e.preventDefault();
+        setSearchOpen(true);
+        return false;
       }
       if (e.key === "Escape" && searchOpenRef.current) {
-        setSearchVisible(false);
-        searchOpenRef.current = false;
+        setSearchOpen(false);
         return false;
       }
       // Let app-navigation chords (view switch, worktree cycle) win over the
@@ -1158,6 +1173,50 @@ export function TerminalPane({
       term.focus();
     };
 
+    // The search's scrolls move herdr's history only. A wheel scroll goes to the app
+    // instead when it owns the scroll (alternate screen, mouse tracking), where a jump's
+    // many lines would become as many key presses or mouse reports, so none is sent then.
+    const historyScrollable = () =>
+      !appOwnsScroll(term.buffer.active.type, term.modes.mouseTrackingMode);
+
+    // The search's jumps: one wheel scroll of the given size, after any pending batch.
+    // Resolves true once herdr has taken it, false when nothing was sent; rejects when
+    // the scroll failed.
+    const scrollBy = async (lines: number): Promise<boolean> => {
+      flushScroll();
+      if (
+        lines === 0 ||
+        termRef.current !== term ||
+        inputBlocked(statusRef.current) ||
+        !historyScrollable()
+      ) {
+        return false;
+      }
+      const direction: ScrollDirection = lines > 0 ? "up" : "down";
+      const { column, row } = cursorAt();
+      const n = Math.min(MAX_SCROLL_LINES, Math.abs(lines));
+      try {
+        await ptyScroll(projectName, name, direction, "wheel", n, column, row);
+      } finally {
+        liveTail.noteScroll(direction);
+      }
+      return true;
+    };
+    historyViewRef.current = {
+      scrollBy,
+      // Scrolls down by the offset herdr reports, never blindly by the maximum.
+      returnToLive: () => {
+        if (!historyScrollable()) return;
+        if (liveTail.visible) {
+          scrollToLiveRef.current();
+          return;
+        }
+        void ptyScrollOffset(projectName, name)
+          .then((offset) => (offset ? scrollBy(-offset) : false))
+          .catch(() => {});
+      },
+    };
+
     function queueScroll(
       direction: ScrollDirection,
       source: ScrollSource,
@@ -1289,11 +1348,10 @@ export function TerminalPane({
       liveTail.dispose();
       liveTailRef.current = null;
       scrollToLiveRef.current = () => {};
+      historyViewRef.current = IDLE_HISTORY_VIEW;
       unResume?.();
       webglRef.current?.dispose();
       webglRef.current = null;
-      searchRef.current?.dispose();
-      searchRef.current = null;
       links.dispose();
       linksRef.current = null;
       term.dispose();
@@ -1497,12 +1555,14 @@ export function TerminalPane({
       data-name={name}
     >
       <div className="term-host" ref={hostRef} />
-      {searchVisible && searchRef.current && (
+      {searchVisible && termRef.current && (
         <TerminalSearch
-          addon={searchRef.current}
+          term={termRef.current}
+          project={projectName}
+          id={name}
+          history={historyViewRef}
           onClose={() => {
-            setSearchVisible(false);
-            searchOpenRef.current = false;
+            setSearchOpen(false);
             termRef.current?.focus();
           }}
         />

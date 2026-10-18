@@ -3,6 +3,7 @@
 // they all ask the same question in the same words before interrupting sessions.
 
 import * as Dialog from "@radix-ui/react-dialog";
+import { LAYER_MODAL, MODAL_OVERLAY_CLS } from "../lib/layers";
 
 const btnPrimary =
   "rounded-chip border border-accent bg-accent px-3.5 py-1.5 text-[11.5px] font-semibold text-[var(--color-on-accent)] disabled:opacity-60";
@@ -30,8 +31,10 @@ export function RestartDaemonDialog({
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 bg-black/55" />
-        <Dialog.Content className="fixed left-1/2 top-1/2 w-[420px] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 rounded-card border border-line bg-bg-1 p-5 shadow-[0_8px_30px_rgba(0,0,0,.4)]">
+        <Dialog.Overlay className={MODAL_OVERLAY_CLS} />
+        <Dialog.Content
+          className={`fixed left-1/2 top-1/2 ${LAYER_MODAL} w-[420px] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 rounded-card border border-line bg-bg-1 p-5 shadow-[0_8px_30px_rgba(0,0,0,.4)]`}
+        >
           <Dialog.Title className="text-[15px] font-semibold text-tx-1">
             Restart daemon?
           </Dialog.Title>

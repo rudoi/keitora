@@ -9,23 +9,9 @@ function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   return getTransport().invoke<T>(cmd, args);
 }
 
-export interface Proposal {
-  task_id: number;
-  worktree: string;
-  rationale: string;
-  confidence: number;
-}
-
 export interface DispatchOutcome {
   dispatched: boolean;
   reason: string | null;
-}
-
-/** Ask the backend to score open tasks against idle worktrees and return
- *  a ranked list of proposals. The frontend pre-checks for idle sessions and
- *  should NOT call this if there are none. */
-export function dispatchSuggest(): Promise<Proposal[]> {
-  return invoke<Proposal[]>("dispatch_suggest");
 }
 
 /** Reserve and (if the worktree is idle + live) inject the task into its PTY.

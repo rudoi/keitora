@@ -7,6 +7,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { useEffect, useState } from "react";
 
 import { appQuitKeep, appQuitStop, onAppCloseRequested } from "../lib/ipc";
+import { LAYER_QUIT, QUIT_OVERLAY_CLS } from "../lib/layers";
 
 export function QuitConfirmModal() {
   const [open, setOpen] = useState(false);
@@ -65,8 +66,10 @@ export function QuitConfirmModal() {
       }}
     >
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 bg-black/55" />
-        <Dialog.Content className="fixed left-1/2 top-1/2 w-[420px] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 rounded-card border border-line bg-bg-1 p-5 shadow-[0_8px_30px_rgba(0,0,0,.4)]">
+        <Dialog.Overlay className={QUIT_OVERLAY_CLS} />
+        <Dialog.Content
+          className={`fixed left-1/2 top-1/2 ${LAYER_QUIT} w-[420px] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 rounded-card border border-line bg-bg-1 p-5 shadow-[0_8px_30px_rgba(0,0,0,.4)]`}
+        >
           <Dialog.Title className="text-[15px] font-semibold text-tx-1">Quit Keitora?</Dialog.Title>
           <Dialog.Description className="mt-1 text-[12px] text-tx-3">
             The daemon is holding {sessionLabel}. Choose what happens when you quit.

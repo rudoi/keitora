@@ -111,19 +111,6 @@ Windows probe order for `claude`:
 3. `claude` on the inherited system PATH (unlikely from a GUI launch)
 4. User-configured path (future settings panel)
 
-### 2c. `claude` binary resolution in `dispatch_suggest`
-
-`src-tauri/src/dispatch.rs` `run_claude_bounded()` (line 301) spawns:
-
-```rust
-Command::new("claude")
-    .arg("-p")
-    ...
-```
-
-This also inherits the GUI PATH and will fail on Windows for the same reason as
-§2b. The same probe-and-fall-back fix applies here.
-
 ### 2d. Path separators in `pty_spawn`
 
 `pty_spawn()` receives `cwd: String` from the frontend (line 53) and passes it

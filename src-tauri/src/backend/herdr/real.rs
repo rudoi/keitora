@@ -301,13 +301,16 @@ impl HerdrOps for RealHerdr {
     /// stdout as RAW bytes (NOT a JSON envelope), so this uses [`RealHerdr::run_raw`].
     /// Used by `attach` to paint the current screen synchronously (`--format ansi`
     /// `--source visible`), which avoids the async-first-frame race.
-    fn pane_read(&self, pane_id: &str, source: &str, format: &str) -> Result<String, HerdrError> {
-        self.run_raw(
-            CallClass::Quick,
-            &[
-                "pane", "read", pane_id, "--source", source, "--format", format,
-            ],
-        )
+    fn pane_read(
+        &self,
+        pane_id: &str,
+        source: &str,
+        format: &str,
+        lines: Option<u32>,
+    ) -> Result<String, HerdrError> {
+        let args = pane_read_args(pane_id, source, format, lines);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run_raw(CallClass::Quick, &args)
     }
 
     /// `herdr pane list` → the herdr identities of all live panes.
@@ -641,9 +644,35 @@ pub(crate) fn cmd_of(p: &sysinfo::Process) -> Vec<String> {
         .collect()
 }
 
+/// The `pane read` argv; `--lines` is added only when a cap is asked for.
+fn pane_read_args(pane_id: &str, source: &str, format: &str, lines: Option<u32>) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "pane", "read", pane_id, "--source", source, "--format", format,
+    ]
+    .map(String::from)
+    .into();
+    if let Some(n) = lines {
+        args.push("--lines".into());
+        args.push(n.to_string());
+    }
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_read_adds_lines_only_when_capped() {
+        assert_eq!(
+            pane_read_args("w1:p2", "visible", "ansi", None),
+            ["pane", "read", "w1:p2", "--source", "visible", "--format", "ansi"]
+        );
+        assert_eq!(
+            pane_read_args("w1:p2", "recent", "text", Some(500)),
+            ["pane", "read", "w1:p2", "--source", "recent", "--format", "text", "--lines", "500"]
+        );
+    }
 
     #[test]
     fn timing_subcommand_names_at_most_two_arguments() {

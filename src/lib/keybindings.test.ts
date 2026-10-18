@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   cycleProject,
   DEFAULT_BINDINGS,
+  isFindChord,
   isGlobalAppChord,
   isScrollToLiveKey,
   type KeyCtx,
@@ -162,7 +163,6 @@ function makeCtx(overrides: Partial<KeyCtx> = {}): KeyCtx {
     openDiff: vi.fn(),
     setView: vi.fn(),
     setSelected: vi.fn(),
-    onSuggest: vi.fn(),
     openCardMenu: vi.fn(),
     adjustFontSize: vi.fn(),
     resetFontSize: vi.fn(),
@@ -315,5 +315,24 @@ describe("isScrollToLiveKey", () => {
     expect(binding?.global).toBeFalsy();
     expect(binding?.when(makeCtx({ view: "focus" }))).toBe(false);
     expect(isGlobalAppChord(ev({ key: "End" }))).toBe(false);
+  });
+});
+
+describe("isFindChord", () => {
+  it("matches plain Ctrl/Cmd+F, either case", () => {
+    expect(isFindChord(ev({ ctrlKey: true, key: "f" }))).toBe(true);
+    expect(isFindChord(ev({ metaKey: true, key: "f" }))).toBe(true);
+    expect(isFindChord(ev({ ctrlKey: true, key: "F" }))).toBe(true);
+  });
+
+  it("leaves Shift, Alt and unmodified F alone", () => {
+    expect(isFindChord(ev({ ctrlKey: true, shiftKey: true, key: "F" }))).toBe(false);
+    expect(isFindChord(ev({ ctrlKey: true, altKey: true, key: "f" }))).toBe(false);
+    expect(isFindChord(ev({ key: "f" }))).toBe(false);
+    expect(isFindChord(ev({ ctrlKey: true, key: "g" }))).toBe(false);
+  });
+
+  it("is the search.open binding's chord", () => {
+    expect(DEFAULT_BINDINGS.find((b) => b.id === "search.open")?.keys).toBe("Cmd+F");
   });
 });

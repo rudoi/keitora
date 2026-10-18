@@ -845,6 +845,14 @@ export function ptyScrollOffset(project: string, id: string): Promise<number | n
 }
 
 /**
+ * The last `lines` lines of a pane's history as plain text (what scrolled off plus the
+ * live screen). One call per ask: it runs a CLI command, so never poll it.
+ */
+export function ptyReadHistory(project: string, id: string, lines: number): Promise<string> {
+  return invoke("pty_read_history", { project, id, lines });
+}
+
+/**
  * Ask the backend to push one fresh repaint frame for a session. Called once the
  * terminal's renderer is live so an idle restored pane paints on boot instead of showing
  * a blank terminal with a blinking block cursor.

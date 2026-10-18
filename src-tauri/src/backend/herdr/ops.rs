@@ -163,7 +163,15 @@ pub trait HerdrOps: Send + Sync {
     fn pane_send_text(&self, pane_id: &str, text: &str) -> Result<(), HerdrError>;
     fn pane_send_keys(&self, pane_id: &str, keys: &[String]) -> Result<(), HerdrError>;
     fn pane_close(&self, pane_id: &str) -> Result<(), HerdrError>;
-    fn pane_read(&self, pane_id: &str, source: &str, format: &str) -> Result<String, HerdrError>;
+    /// `pane read`; `lines` caps the read to the last N lines (`None` reads everything
+    /// the source holds).
+    fn pane_read(
+        &self,
+        pane_id: &str,
+        source: &str,
+        format: &str,
+        lines: Option<u32>,
+    ) -> Result<String, HerdrError>;
     fn pane_list(&self) -> Result<Vec<PaneInfo>, HerdrError>;
     /// One pane's identity (`pane get`); `None` when herdr's answer has no pane.
     fn pane_get(&self, pane_id: &str) -> Result<Option<PaneInfo>, HerdrError>;

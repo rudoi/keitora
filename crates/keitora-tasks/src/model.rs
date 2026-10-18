@@ -124,7 +124,8 @@ pub struct DispatchLogEntry {
     pub id: i64,
     pub task_id: i64,
     pub worktree: String,
-    /// The dispatcher's decision: `'dispatched'`, `'queued'`, `'released'`, or `'suggested'`.
+    /// The dispatcher's decision: `'dispatched'`, `'queued'`, or `'released'`. Legacy
+    /// rows may also carry `'suggested'`, written by a since-removed feature.
     pub decision: String,
     pub rationale: String,
     pub created_at: String,

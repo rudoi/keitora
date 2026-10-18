@@ -558,6 +558,15 @@ pub trait PtyBackend: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// The last `lines` lines of a session's history as plain text (what scrolled off
+    /// plus the live screen). One-shot query for the UI. Default: unsupported.
+    fn read_history(&self, key: &SessionKey, lines: u32) -> Result<String, PtyBackendError> {
+        let _ = (key, lines);
+        Err(PtyBackendError::Other(
+            "history is not available on this backend".to_string(),
+        ))
+    }
+
     /// Generation-gated kill: a kill for an older generation than the live one is a
     /// no-op `Ok`.
     fn kill(&self, key: &SessionKey, gen: u64) -> Result<(), PtyBackendError>;

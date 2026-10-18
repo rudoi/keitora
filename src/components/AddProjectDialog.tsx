@@ -5,6 +5,7 @@
 
 import * as Dialog from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
+import { LAYER_MODAL, MODAL_OVERLAY_CLS } from "../lib/layers";
 import { AddProjectFlow } from "./AddProjectFlow";
 
 interface AddProjectDialogProps {
@@ -18,9 +19,9 @@ export function AddProjectDialog({ open, onOpenChange }: AddProjectDialogProps) 
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 bg-black/55" />
+        <Dialog.Overlay className={MODAL_OVERLAY_CLS} />
         <Dialog.Content
-          className="fixed left-1/2 top-1/2 w-[480px] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 rounded-card border border-line bg-bg-1 p-5 shadow-[0_8px_30px_rgba(0,0,0,.4)]"
+          className={`fixed left-1/2 top-1/2 ${LAYER_MODAL} w-[480px] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 rounded-card border border-line bg-bg-1 p-5 shadow-[0_8px_30px_rgba(0,0,0,.4)]`}
           aria-describedby={undefined}
         >
           <div className="mb-4 flex items-center justify-between">

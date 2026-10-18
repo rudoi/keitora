@@ -292,9 +292,10 @@ function WorktreeMenu({
   codexAvailable: boolean;
 }) {
   const targetCli: CliKind = state?.cli === "codex" ? "claude" : "codex";
-  // Claude is never surfaced as unavailable here — it's a hard requirement of the
-  // app today (claude_runtime() in host.rs assumes it resolves), so only a
-  // Codex *target* can be disabled.
+  // Claude is never surfaced as unavailable here — it's the default agent and a
+  // hard requirement of the app today (pane launches fall back to a bare `claude`
+  // when no path is configured or discovered), so only a Codex *target* can be
+  // disabled.
   const codexMissing = targetCli === "codex" && !codexAvailable;
   const items = worktreeMenuItems(state?.terminated ?? false, { inactive: state?.inactive });
   const item = (kind: WorktreeMenuItem) => {
@@ -687,7 +688,7 @@ export function Rail({
         <div className="rail-footer">
           <button className="rail-settings" onClick={onOpenSettings} title="Settings">
             <Settings size={14} />
-            <span>Settings</span>
+            <span>settings</span>
           </button>
           <button
             className="rail-perf"

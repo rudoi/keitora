@@ -13,7 +13,6 @@ import { ConfirmDialogProvider, useConfirmDialog } from "./components/ConfirmDia
 import { CreateWorktreeDialog } from "./components/CreateWorktreeDialog";
 import { DiffView } from "./components/DiffView";
 import { DispatchStepsEditor } from "./components/DispatchStepsEditor";
-import { DispatchStrip } from "./components/DispatchStrip";
 import { FontSizeHud, type FontSizeHudHandle } from "./components/FontSizeHud";
 import { Inspector } from "./components/Inspector";
 import { KeybindingHelp } from "./components/KeybindingHelp";
@@ -28,7 +27,6 @@ import { ToastProvider, useToast } from "./components/Toast";
 import { TopBar, type View } from "./components/TopBar";
 import { WorktreePicker } from "./components/WorktreePicker";
 import { useAttention } from "./lib/attention";
-import { dispatchSuggest, type Proposal } from "./lib/dispatch";
 import {
   clampFontSize,
   getTerminalFontSize,
@@ -422,10 +420,6 @@ function AppInner() {
     };
   }, [loadProject]);
 
-  // ── Dispatcher state ────────────────────────────────────────────────────────
-  const [proposals, setProposals] = useState<Map<number, Proposal>>(new Map());
-  const [suggestLoading, setSuggestLoading] = useState(false);
-  const [suggestError, setSuggestError] = useState<string | null>(null);
   const { showToast } = useToast();
   const { confirmDialog } = useConfirmDialog();
 
@@ -654,42 +648,6 @@ function AppInner() {
     selected,
   ]);
 
-  // Count of idle worktrees — pre-check before calling dispatch_suggest.
-  const idleCount = Array.from(sessions.values()).filter((s) => s.state === "idle").length;
-
-  const onSuggest = useCallback(async () => {
-    if (suggestLoading) return;
-    // Frontend pre-check: skip the subprocess if nothing is idle.
-    if (idleCount === 0) {
-      // DispatchStrip will show the "No idle worktrees" note via idleCount.
-      return;
-    }
-    setSuggestLoading(true);
-    setSuggestError(null);
-    try {
-      const list = await dispatchSuggest();
-      const map = new Map<number, Proposal>();
-      for (const p of list) {
-        map.set(p.task_id, p);
-      }
-      setProposals(map);
-    } catch (e) {
-      const msg = String(e);
-      setSuggestError(msg);
-      showToast(msg);
-    } finally {
-      setSuggestLoading(false);
-    }
-  }, [suggestLoading, idleCount, showToast]);
-
-  const onProposalSpent = useCallback((taskId: number) => {
-    setProposals((prev) => {
-      const next = new Map(prev);
-      next.delete(taskId);
-      return next;
-    });
-  }, []);
-
   // Run a lane action in the active project, through the same handlers as the rail's
   // worktree menu. Lane actions need a worktree; "new-worktree" is project-level.
   const runPendingAction = useCallback(
@@ -895,7 +853,6 @@ function AppInner() {
       openDiff: (name: string) => setDiffTarget(name),
       setView,
       setSelected,
-      onSuggest: () => void onSuggest(),
       openCardMenu: () => openCardMenuRef.current(),
       adjustFontSize,
       resetFontSize,
@@ -908,7 +865,6 @@ function AppInner() {
       selected,
       availableWorktrees,
       selectedTaskId,
-      onSuggest,
       adjustFontSize,
       resetFontSize,
       projectNames,
@@ -1165,19 +1121,7 @@ function AppInner() {
         {/* Board surface — center stage + inspector. Only mounted in board view. */}
         {view === "board" && (
           <>
-            {/* DispatchStrip lives above the Board, sibling to it in App. */}
             <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-bg-0">
-              <DispatchStrip
-                proposals={proposals}
-                loading={suggestLoading}
-                error={suggestError}
-                idleCount={idleCount}
-                onSuggest={() => void onSuggest()}
-                selectedId={selectedTaskId}
-                onSelect={setSelectedTaskId}
-                tasks={tasks ?? []}
-                sessions={sessions}
-              />
               <Board
                 tasks={tasks ?? []}
                 worktreeNames={worktreeNames}
@@ -1196,9 +1140,6 @@ function AppInner() {
               actor={actor}
               reload={reloadTasks}
               onClose={() => setSelectedTaskId(null)}
-              sessions={sessions}
-              proposals={proposals}
-              onProposalSpent={onProposalSpent}
               collapsed={inspectorCollapsed}
               onToggleCollapsed={() => {
                 // Derive both from the same next value so a manual toggle stays

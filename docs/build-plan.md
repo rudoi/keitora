@@ -247,6 +247,10 @@ Keitora polls/watches this table (with PTY ownership as a fallback signal) and e
 
 ## 7. Dispatcher (advisory v1)
 
+> **Update:** the suggestion pass (`dispatch_suggest`, the proposal strip/cards, and ⌘K) was
+> later removed. Manual board dispatch (`dispatch_apply`) remains. The text below is the
+> original design and is kept for history.
+
 The LLM is **purely advisory**; Keitora performs the mechanical injection, gated on idle state.
 
 1. **Propose** — `dispatch_suggest()` invokes a **headless** `claude -p` with `--output-format stream-json`,
@@ -327,7 +331,7 @@ Status: **Phase 0 ✅ done** · **Phase 1 ✅ done (PR #1)** · **Phase 2 ✅ do
   idle/busy/waiting/offline dots on the Rail (with task chip) and board column headers; live via
   `sessions://changed`. *Exit met:* states are accurate in real time. (Pane-badge overlay deferred;
   offline = SessionEnd + PTY-exit/ownership, not heartbeat staleness.)
-- **Phase 4 — Dispatcher (advisory). ✅ done (PR #5).** `dispatch_suggest` (headless `claude -p`,
+- **Phase 4 — Dispatcher (advisory). ✅ done (PR #5); the suggestion pass was later removed.** `dispatch_suggest` (headless `claude -p`,
   `--json-schema` → `structured_output`, neutral cwd, 90s hard-kill) → suggestion cards →
   `dispatch_apply` (reserve always; inject only into an idle worktree with a live PTY) → `dispatch_log`;
   drag-to-dispatch board (dnd-kit) with reserve/queue states; Inspector approve + busy→reserve.

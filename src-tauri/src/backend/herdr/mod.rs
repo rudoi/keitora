@@ -2332,7 +2332,7 @@ impl PtyBackend for HerdrBackend {
         // verified against a real server, so this read stays as the guaranteed first
         // paint for an idle pane. The pane is validated-live above, so a read error
         // here is logged (not fatal): the bridge's first full frame still repaints.
-        let scrollback = match self.ops.pane_read(&pane.pane_id, "visible", "ansi") {
+        let scrollback = match self.ops.pane_read(&pane.pane_id, "visible", "ansi", None) {
             Ok(s) => s.into_bytes(),
             Err(e) => {
                 log::warn!(
@@ -2496,6 +2496,16 @@ impl PtyBackend for HerdrBackend {
             Err(e) if e.is_not_found() => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    fn read_history(&self, key: &SessionKey, lines: u32) -> Result<String, PtyBackendError> {
+        self.gate.admit_session(key)?;
+        // One `pane read` of herdr's own history; unlike `scroll_offset`, an unmapped
+        // session is an error, since the caller asked for text it cannot get.
+        let pane = self.keymap.get(key).ok_or(PtyBackendError::NoSuchSession)?;
+        Ok(self
+            .ops
+            .pane_read(&pane.pane_id, "recent", "text", Some(lines))?)
     }
 
     fn kill(&self, key: &SessionKey, gen: u64) -> Result<(), PtyBackendError> {
@@ -3672,6 +3682,36 @@ mod tests {
     }
 
     #[test]
+    fn read_history_returns_the_panes_recent_text() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _, _) = typing_backend(&fake, Duration::from_secs(30));
+        let pane_id = backend.keymap.get(&skey("a")).unwrap().pane_id;
+        fake.set_pane_text(&pane_id, "one\ntwo\nthree");
+        assert_eq!(
+            backend.read_history(&skey("a"), 200).unwrap(),
+            "one\ntwo\nthree"
+        );
+        let reads: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter(|c| c.op == ops::Op::PaneRead)
+            .map(|c| c.args)
+            .collect();
+        assert_eq!(reads, [format!("{pane_id} recent text --lines 200")]);
+    }
+
+    #[test]
+    fn read_history_of_an_unknown_session_errors() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _, _) = typing_backend(&fake, Duration::from_secs(30));
+        assert!(matches!(
+            backend.read_history(&skey("nope"), 10),
+            Err(PtyBackendError::NoSuchSession)
+        ));
+        assert_eq!(count(&fake, ops::Op::PaneRead), 0);
+    }
+
+    #[test]
     fn a_failed_scroll_write_does_not_restart_the_bridge() {
         let fake = fake::FakeHerdr::new();
         let (backend, _, terminal) = typing_backend(&fake, Duration::from_secs(30));
@@ -3779,6 +3819,21 @@ mod tests {
         assert!(out.wait_for(|e| e.contains(&fake::OutputEvent::Exit)));
         assert_eq!(out.frames(), vec!["hello".to_string()]);
         assert_eq!(out.exits(), 1);
+    }
+
+    #[test]
+    fn attach_paints_the_visible_screen_without_a_lines_cap() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _, _) = typing_backend(&fake, Duration::from_secs(30));
+        let pane_id = backend.keymap.get(&skey("a")).unwrap().pane_id;
+        backend.attach(skey("a"), Some((80, 24)), output()).unwrap();
+        let reads: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter(|c| c.op == ops::Op::PaneRead)
+            .map(|c| c.args)
+            .collect();
+        assert_eq!(reads, [format!("{pane_id} visible ansi")]);
     }
 
     #[test]

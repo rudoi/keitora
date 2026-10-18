@@ -1,5 +1,5 @@
 // Small hook to check the user's reduced-motion preference. Gates all
-// motion/animation use in the dispatcher UI (DispatchStrip, ProposalCard, etc.).
+// motion/animation use in the UI.
 
 import { useEffect, useState } from "react";
 

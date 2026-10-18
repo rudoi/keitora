@@ -522,7 +522,8 @@ pub trait TaskBackend: Send + Sync {
     // ======================================================================
 
     /// Append a dispatcher decision to the audit trail.
-    /// `decision` is one of `'dispatched'`, `'queued'`, `'released'`, `'suggested'`.
+    /// `decision` is one of `'dispatched'`, `'queued'`, `'released'`. (`'suggested'`
+    /// is a legacy value written by a since-removed feature; old rows may carry it.)
     async fn dispatch_log_add(
         &self,
         task_id: i64,

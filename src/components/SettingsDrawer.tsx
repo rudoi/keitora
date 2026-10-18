@@ -9,6 +9,7 @@ import { AlertTriangle, Loader2, X } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import type { CliKind, DiffBase, ProjectSummary } from "../lib/ipc";
 import { daemonRestart, daemonShutdown } from "../lib/ipc";
+import { LAYER_MODAL, MODAL_OVERLAY_CLS } from "../lib/layers";
 import { RESTART_FALLBACK_MS, restartOutcome } from "../lib/recovery";
 import { useDaemonStatus, useRecovery } from "../lib/sessions";
 import {
@@ -485,9 +486,9 @@ export function SettingsDrawer({
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 bg-black/55" />
+        <Dialog.Overlay className={MODAL_OVERLAY_CLS} />
         <Dialog.Content
-          className="fixed left-0 top-0 bottom-0 z-50 flex w-[420px] max-w-[92vw] flex-col border-r border-line bg-bg-1 shadow-[8px_0_30px_rgba(0,0,0,.4)]"
+          className={`fixed left-0 top-0 bottom-0 ${LAYER_MODAL} flex w-[420px] max-w-[92vw] flex-col border-r border-line bg-bg-1 shadow-[8px_0_30px_rgba(0,0,0,.4)]`}
           aria-describedby={undefined}
         >
           {/* Header */}

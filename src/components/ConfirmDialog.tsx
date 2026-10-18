@@ -13,6 +13,7 @@
 
 import * as Dialog from "@radix-ui/react-dialog";
 import { createContext, useCallback, useContext, useRef, useState } from "react";
+import { LAYER_MODAL, MODAL_OVERLAY_CLS } from "../lib/layers";
 
 export interface ConfirmOptions {
   title: string;
@@ -80,8 +81,10 @@ export function ConfirmDialogProvider({ children }: { children: React.ReactNode 
       {children}
       <Dialog.Root open={current !== null} onOpenChange={(open) => !open && settle(false)}>
         <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 bg-black/55" />
-          <Dialog.Content className="fixed left-1/2 top-1/2 w-[460px] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 rounded-card border border-line bg-bg-1 p-5 shadow-[0_8px_30px_rgba(0,0,0,.4)]">
+          <Dialog.Overlay className={MODAL_OVERLAY_CLS} />
+          <Dialog.Content
+            className={`fixed left-1/2 top-1/2 ${LAYER_MODAL} w-[460px] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 rounded-card border border-line bg-bg-1 p-5 shadow-[0_8px_30px_rgba(0,0,0,.4)]`}
+          >
             <Dialog.Title className="text-[15px] font-semibold text-tx-1">
               {current?.title}
             </Dialog.Title>

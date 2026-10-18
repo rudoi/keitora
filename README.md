@@ -20,9 +20,6 @@ waiting on you, and which are free for the next task.
 - **A task board shared by every worktree.** Create tasks, claim them, and mark them done from the
   app or from the `keitora` command line. Both read and write the same task list, so a claim made
   in one worktree shows up everywhere straight away.
-- **Suggestions for what to hand out next.** When a worktree is idle, Keitora can suggest an open
-  task for it. Nothing is typed into a session until you approve it, and only an idle session can
-  receive one.
 - **A diff view per worktree.** See what a worktree has changed relative to `main` (or any base you
   choose), with syntax highlighting.
 - **Sessions that outlive the window.** Terminals run in a [herdr](https://herdr.dev) server, so

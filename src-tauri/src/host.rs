@@ -1016,28 +1016,6 @@ fn install_keitora_cli() -> Result<crate::cli_install::CliStatus, String> {
     })
 }
 
-/// Resolve the `claude` command + the `PATH` to spawn children with.
-/// `claude`: project `keitora.toml` override → user registry → bare `"claude"`
-/// (relying on inherited PATH as a last resort). `PATH`: the cached login PATH.
-pub(crate) fn claude_runtime() -> (String, Option<String>) {
-    let user = keitora_tasks::UserConfig::load().unwrap_or_default();
-    let project = keitora_tasks::resolve_active().ok();
-    // Config override → well-known-location discovery (npm shim / native installer
-    // under ~/.local/bin etc.; GUI-launched PATH is unreliable, esp. on Windows) →
-    // bare "claude" relying on the inherited PATH as a last resort.
-    let claude = keitora_tasks::resolve_claude_path(project.as_ref(), &user)
-        .or_else(keitora_tasks::discover_claude)
-        .unwrap_or_else(|| "claude".to_string());
-    // Unix: spawn children with the cached login PATH (a GUI launch inherits a
-    // minimal PATH). Windows: inherit the process PATH — a bash-format login PATH
-    // would be unusable by native CreateProcessW, and `claude` is an absolute path.
-    #[cfg(unix)]
-    let path_env = cached_login_path();
-    #[cfg(windows)]
-    let path_env: Option<String> = None;
-    (claude, path_env)
-}
-
 /// One-time startup: if no `claude` path is configured (neither the active
 /// project nor the user registry), discover it and persist to the user registry
 /// so subsequent launches skip discovery. Best-effort — failures are non-fatal
@@ -1633,6 +1611,22 @@ fn pty_scroll_offset(
     client.scroll_offset(&key).map_err(daemon_err)
 }
 
+/// The last `lines` lines of a session's history as plain text (see
+/// [`PtyBackend::read_history`]). Async: it runs a herdr CLI call.
+#[tauri::command(async)]
+fn pty_read_history(
+    client: State<SharedBackend>,
+    project: String,
+    id: String,
+    lines: u32,
+) -> Result<String, String> {
+    let key = SessionKey {
+        project,
+        worktree: id,
+    };
+    client.read_history(&key, lines).map_err(daemon_err)
+}
+
 /// Push one fresh full-viewport repaint frame for a session (see [`PtyBackend::repaint`]).
 /// The frontend calls this once its xterm/WebGL renderer is live, so an idle restored pane
 /// paints on boot instead of showing a blank terminal with a blinking block cursor.
@@ -2095,9 +2089,10 @@ pub fn run() {
             // Idempotent + Claude Code hot-reloads, so timing doesn't matter.
             thread::spawn(hooks::install_session_hooks);
             // Resolve + persist the `claude` path once (runs a login shell), so a
-            // LaunchServices-spawned app can find it. Off-thread: don't block the
-            // window on a shell round-trip. Still needed: `claude_runtime` builds
-            // the daemon's launch command from the resolved `claude` path.
+            // LaunchServices-spawned app can find it. Still needed: the agent launch
+            // for herdr panes (`agent_launch_with`) takes the persisted path, else
+            // falls back to a bare `claude`, and Settings shows it. Off-thread: don't
+            // block the window on a shell round-trip.
             thread::spawn(ensure_claude_path);
             Ok(())
         })
@@ -2133,6 +2128,7 @@ pub fn run() {
             pty_resize,
             pty_scroll,
             pty_scroll_offset,
+            pty_read_history,
             pty_repaint,
             pty_kill,
             session_terminate,
@@ -2187,7 +2183,6 @@ pub fn run() {
             tasks::task_new,
             tasks::task_release,
             tasks::task_delete,
-            dispatch::dispatch_suggest,
             dispatch::dispatch_apply,
             crate::transfer::preview_claude_transfer,
             crate::transfer::transfer_worktree,

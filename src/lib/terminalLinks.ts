@@ -1,5 +1,6 @@
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import type { ILink, ILinkProvider, Terminal } from "@xterm/xterm";
+import { bufferRowCells } from "./bufferText";
 
 export type TerminalDestination =
   | { kind: "web"; url: string }
@@ -135,43 +136,34 @@ export function createFileLinkProvider(
       const maxRows = Math.max(1, Math.ceil(65536 / terminal.cols));
       while (start > 0 && end - start < maxRows && buffer.getLine(start)?.isWrapped) start--;
       while (end - start < maxRows && buffer.getLine(end + 1)?.isWrapped) end++;
+      // The joined text, and the 1-based cell each of its UTF-16 units sits in.
       let text = "";
-      const cells: { x: number; y: number; width: number }[] = [];
+      const xs: number[] = [];
+      const ys: number[] = [];
       for (let row = start; row <= end; row++) {
-        const line = buffer.getLine(row);
-        if (!line) continue;
-        for (let col = 0; col < terminal.cols; col++) {
-          const cell = line.getCell(col);
-          if (!cell || cell.getWidth() === 0) continue;
-          const chars = cell.getChars();
-          // An empty last cell before a wrapped wide character is padding.
-          if (
-            !chars &&
-            col === terminal.cols - 1 &&
-            row < end &&
-            buffer
-              .getLine(row + 1)
-              ?.getCell(0)
-              ?.getWidth() === 2
-          )
-            continue;
-          const value = chars || " ";
-          text += value;
-          for (let i = 0; i < value.length; i++)
-            cells.push({ x: col + 1, y: row + 1, width: cell.getWidth() });
+        const { text: rowText, cellAt } = bufferRowCells(buffer, row, terminal.cols, row < end);
+        text += rowText;
+        for (let i = 0; i < rowText.length; i++) {
+          xs.push(cellAt[i] + 1);
+          ys.push(row + 1);
         }
       }
       callback(
         findFileReferences(text).flatMap((match): ILink[] => {
-          const first = cells[match.index];
-          const last = cells[match.index + match.text.length - 1];
-          if (!first || !last || y < first.y || y > last.y) return [];
+          const first = match.index;
+          const last = match.index + match.text.length - 1;
+          if (last >= xs.length || y < ys[first] || y > ys[last]) return [];
+          const lastWidth =
+            buffer
+              .getLine(ys[last] - 1)
+              ?.getCell(xs[last] - 1)
+              ?.getWidth() ?? 1;
           return [
             {
               text: match.text,
               range: {
-                start: { x: first.x, y: first.y },
-                end: { x: last.x + last.width - 1, y: last.y },
+                start: { x: xs[first], y: ys[first] },
+                end: { x: xs[last] + lastWidth - 1, y: ys[last] },
               },
               ...callbacks,
               activate: (event, text) => callbacks.activate(event, text, match.delimited),
