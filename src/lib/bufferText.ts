@@ -8,6 +8,19 @@ export interface RowCells {
 }
 
 /**
+ * Whether the row after `row` starts with a wide glyph, so an empty last cell of `row` is
+ * the padding xterm leaves when a wide glyph wraps to the next row.
+ */
+export function wrapsWideGlyphAfter(buffer: IBuffer, row: number): boolean {
+  return (
+    buffer
+      .getLine(row + 1)
+      ?.getCell(0)
+      ?.getWidth() === 2
+  );
+}
+
+/**
  * Walk the painted cells of `row`. A wide glyph's zero-width tail is skipped and an empty
  * cell reads as " ". With `joinsNext` (the next row continues this one), an empty last
  * cell before a wrapped wide glyph is padding and is skipped too. Fills `cellAt` when given.
@@ -27,16 +40,7 @@ function readRow(
       const cell: IBufferCell | undefined = line.getCell(col, reuse);
       if (!cell || cell.getWidth() === 0) continue;
       const chars = cell.getChars();
-      if (
-        !chars &&
-        joinsNext &&
-        col === cols - 1 &&
-        buffer
-          .getLine(row + 1)
-          ?.getCell(0)
-          ?.getWidth() === 2
-      )
-        continue;
+      if (!chars && joinsNext && col === cols - 1 && wrapsWideGlyphAfter(buffer, row)) continue;
       const value = chars || " ";
       text += value;
       if (cellAt) for (let i = 0; i < value.length; i++) cellAt.push(col);

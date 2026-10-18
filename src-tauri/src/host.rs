@@ -1506,6 +1506,33 @@ pub(crate) fn inject(
     client.write(&key, data.as_bytes()).map_err(daemon_err)
 }
 
+/// Paste `text` into the session keyed by `id` as one unit. The backend
+/// brackets it; a refusal comes back as the error's `Display`
+/// (`PasteTooLarge: {bytes} > {limit}` when over the size cap).
+pub(crate) fn paste_text(
+    client: &dyn PtyBackend,
+    project: &str,
+    id: &str,
+    text: &str,
+) -> Result<(), String> {
+    let key = SessionKey {
+        project: project.to_string(),
+        worktree: id.to_string(),
+    };
+    client.paste(&key, text).map_err(daemon_err)
+}
+
+/// Paste text into the PTY as one bracketed unit (via the backend).
+#[tauri::command]
+fn pty_paste(
+    client: State<SharedBackend>,
+    project: String,
+    id: String,
+    text: String,
+) -> Result<(), String> {
+    paste_text(client.inner().as_ref(), &project, &id, &text)
+}
+
 /// Write user keystrokes to the PTY (via the daemon).
 #[tauri::command]
 fn pty_write(
@@ -2122,6 +2149,7 @@ pub fn run() {
             pty_attach,
             pty_detach,
             pty_write,
+            pty_paste,
             crate::latency_probe::latency_probe_enabled,
             save_clipboard_image,
             crate::terminal_links::open_terminal_file,
@@ -2253,6 +2281,32 @@ mod tests {
         assert_eq!(kind(PtyBackendError::NotConnected), "herdr unreachable");
         assert_eq!(kind(PtyBackendError::NoSuchSession), "no live session");
         assert_eq!(kind(PtyBackendError::Other("boom".into())), "boom");
+    }
+
+    #[test]
+    fn paste_text_forwards_the_paste_and_maps_a_refusal() {
+        use crate::backend::fake::{Call, FakeBackend};
+        use crate::backend::SessionKey;
+        let fake = FakeBackend::new();
+        assert_eq!(super::paste_text(&fake, "proj", "alpha", "a\rb"), Ok(()));
+        assert_eq!(
+            fake.calls(),
+            vec![Call::Paste {
+                key: SessionKey {
+                    project: "proj".into(),
+                    worktree: "alpha".into(),
+                },
+                text: "a\rb".into(),
+            }]
+        );
+        fake.push_paste(Err(PtyBackendError::PasteTooLarge {
+            bytes: 1_048_577,
+            limit: 1_048_576,
+        }));
+        assert_eq!(
+            super::paste_text(&fake, "proj", "alpha", "big"),
+            Err("PasteTooLarge: 1048577 > 1048576".to_string())
+        );
     }
 
     mod terminate_and_launch {

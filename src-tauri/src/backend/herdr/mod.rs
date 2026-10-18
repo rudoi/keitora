@@ -20,6 +20,7 @@
 //! - [`keymap`] — durable `SessionKey -> HerdrPane` map (+ gen);
 //! - [`resume`] — which agent conversation each session resumes;
 //! - [`input`] — pure keystroke → herdr input translation;
+//! - [`paste`] — pure paste bracketing, marker stripping and size caps;
 //! - [`bridge`] — per-pane output/input I/O bridge;
 //! - [`writer`] — the ordered per-session input queue in front of the bridge.
 //!
@@ -63,6 +64,7 @@ pub mod gate;
 pub mod input;
 pub mod keymap;
 pub mod ops;
+pub mod paste;
 pub mod perf_source;
 pub mod real;
 pub mod reconcile;
@@ -565,6 +567,12 @@ fn stop_bridge_if_in(
     }
 }
 
+/// The per-session event `pty://{kind}/{project}/{worktree}` (e.g. `resume`,
+/// `paste-refused`) a pane listens on.
+fn session_event(kind: &str, key: &SessionKey) -> String {
+    format!("pty://{kind}/{}/{}", key.project, key.worktree)
+}
+
 /// The backend parts one session's writer thread drives, for one session
 /// generation: the bridge and pane of any other generation are out of reach.
 struct WriterIo {
@@ -577,6 +585,8 @@ struct WriterIo {
     gate: Arc<RecoveryGate>,
     outputs: OutputSinks,
     authority: ExitAuthority,
+    /// Where the writer reports a paste it refused.
+    sink: Arc<dyn EmitSink>,
 }
 
 impl WriterIo {
@@ -690,6 +700,28 @@ impl writer::SessionIo for WriterIo {
             }
         }
         Ok(())
+    }
+
+    fn fallback_paste(&self, block: &str) -> Result<(), PtyBackendError> {
+        // A session that is gone is not told its paste was too large.
+        let pane = self.pane().ok_or(PtyBackendError::NoSuchSession)?;
+        // Too long for one CLI call: refused whole (never a part) and reported
+        // to the pane. Never logs the pasted text.
+        if let Some(cost) = paste::fallback_overage(block) {
+            let limit = paste::FALLBACK_PASTE_LIMIT;
+            log::warn!(
+                "herdr writer [{}]: paste refused on the fallback: {cost} > {limit}",
+                self.key
+            );
+            self.sink.emit(
+                &session_event("paste-refused", &self.key),
+                serde_json::json!({ "bytes": cost, "limit": limit }),
+            );
+            return Ok(());
+        }
+        // One `send-text` with the markers as real ESC bytes: `translate_input`
+        // would turn each marker's ESC into an `esc` key and each `\r` into Enter.
+        Ok(self.ops.pane_send_text(&pane.pane_id, block)?)
     }
 
     fn stdin_written(&self) {
@@ -894,7 +926,7 @@ impl Spawner {
         let fell_back = decision != first;
         if fell_back || decision != ResumeDecision::Fresh {
             self.sink.emit(
-                &format!("pty://resume/{}/{}", key.project, key.worktree),
+                &session_event("resume", key),
                 serde_json::json!({ "outcome": word, "fell_back": fell_back }),
             );
         }
@@ -2078,6 +2110,7 @@ impl HerdrBackend {
             gate: Arc::clone(&self.gate),
             outputs: self.outputs.clone(),
             authority: self.exit_authority(),
+            sink: Arc::clone(&self.sink),
         }
     }
 
@@ -2085,11 +2118,20 @@ impl HerdrBackend {
     /// (started on first use, replacing the writer of an older generation).
     /// Never blocks on I/O. No session mapped: `NoSuchSession`.
     fn enqueue(&self, key: &SessionKey, job: WriteJob) -> Result<(), PtyBackendError> {
-        let gen = self
-            .keymap
+        let gen = self.session_gen(key)?;
+        self.enqueue_at(key, gen, job)
+    }
+
+    /// The generation of `key`'s current session. No session mapped: `NoSuchSession`.
+    fn session_gen(&self, key: &SessionKey) -> Result<u64, PtyBackendError> {
+        self.keymap
             .get(key)
             .map(|p| p.gen)
-            .ok_or(PtyBackendError::NoSuchSession)?;
+            .ok_or(PtyBackendError::NoSuchSession)
+    }
+
+    /// [`Self::enqueue`] for a generation already looked up.
+    fn enqueue_at(&self, key: &SessionKey, gen: u64, job: WriteJob) -> Result<(), PtyBackendError> {
         self.writers
             .send(key, gen, job, || self.writer_io(key, gen))
     }
@@ -2405,6 +2447,29 @@ impl PtyBackend for HerdrBackend {
         // Runs on the main thread (`pty_write`): only enqueue. The session's writer
         // does the bridge write (or the CLI fallback) in order; its errors are logged.
         self.enqueue(key, WriteJob::input(data))
+    }
+
+    fn paste(&self, key: &SessionKey, text: &str) -> Result<(), PtyBackendError> {
+        // A gated or missing session is refused before the text is scanned.
+        self.gate.admit_session(key)?;
+        let gen = self.session_gen(key)?;
+        let payload = paste::sanitize(text);
+        if payload.is_empty() {
+            return Ok(());
+        }
+        // Checked here, on the command thread, so the caller sees the refusal.
+        let bytes = paste::bracketed_len(&payload);
+        if bytes > paste::BRIDGE_PASTE_LIMIT {
+            log::warn!(
+                "herdr paste [{key}]: refused {bytes} bytes (limit {})",
+                paste::BRIDGE_PASTE_LIMIT
+            );
+            return Err(PtyBackendError::PasteTooLarge {
+                bytes,
+                limit: paste::BRIDGE_PASTE_LIMIT,
+            });
+        }
+        self.enqueue_at(key, gen, WriteJob::Paste(paste::bracketed(&payload)))
     }
 
     fn write_line(
@@ -3484,6 +3549,206 @@ mod tests {
         flush_writer(&backend, &skey("a"));
         assert_eq!(send_text_args(&fake), vec![format!("{pane} abcd")]);
         assert!(fake.bridge_input(&terminal).is_empty());
+    }
+
+    // ---- paste ----
+
+    #[test]
+    fn paste_goes_down_the_bridge_as_one_bracketed_block() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _, terminal) = typing_backend(&fake, Duration::from_secs(30));
+        backend.paste(&skey("a"), "line1\rline2").unwrap();
+        flush_writer(&backend, &skey("a"));
+        let lines = input_lines(&fake, &terminal);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["text"], "\x1b[200~line1\rline2\x1b[201~");
+    }
+
+    #[test]
+    fn paste_strips_embedded_markers_and_stays_one_block() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _, terminal) = typing_backend(&fake, Duration::from_secs(30));
+        backend
+            .paste(&skey("a"), "a\x1b[201~b\x1b[200~c\x1b[20\x1b[201~1~d")
+            .unwrap();
+        flush_writer(&backend, &skey("a"));
+        let lines = input_lines(&fake, &terminal);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["text"], "\x1b[200~abcd\x1b[201~");
+    }
+
+    #[test]
+    fn paste_queued_behind_a_busy_writer_is_never_coalesced() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _, terminal) = typing_backend(&fake, Duration::from_secs(30));
+        {
+            // The writer cannot look up the bridge while this is held, so all
+            // three queue up behind it.
+            let _held = backend.bridges.lock().unwrap();
+            backend.write(&skey("a"), b"x").unwrap();
+            backend.paste(&skey("a"), "p").unwrap();
+            backend.write(&skey("a"), b"y").unwrap();
+        }
+        flush_writer(&backend, &skey("a"));
+        let texts: Vec<Value> = input_lines(&fake, &terminal)
+            .into_iter()
+            .map(|v| v["text"].clone())
+            .collect();
+        assert_eq!(texts, vec!["x", "\x1b[200~p\x1b[201~", "y"]);
+    }
+
+    #[test]
+    fn paste_over_the_bridge_cap_is_refused_and_nothing_is_queued() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _, terminal) = typing_backend(&fake, Duration::from_secs(30));
+        let err = backend
+            .paste(&skey("a"), &"a".repeat(paste::BRIDGE_PASTE_LIMIT - 11))
+            .unwrap_err();
+        // The cap counts the whole block, markers included.
+        assert!(
+            matches!(
+                err,
+                PtyBackendError::PasteTooLarge {
+                    bytes: 1_048_577,
+                    limit: 1_048_576
+                }
+            ),
+            "{err:?}"
+        );
+        // A block of exactly the cap is still accepted.
+        backend
+            .paste(&skey("a"), &"a".repeat(paste::BRIDGE_PASTE_LIMIT - 12))
+            .unwrap();
+        flush_writer(&backend, &skey("a"));
+        let lines = input_lines(&fake, &terminal);
+        assert_eq!(lines.len(), 1, "only the paste at the cap");
+    }
+
+    #[test]
+    fn paste_that_is_empty_or_only_markers_sends_nothing() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _, terminal) = typing_backend(&fake, Duration::from_secs(30));
+        backend.paste(&skey("a"), "").unwrap();
+        backend.paste(&skey("a"), "\x1b[200~\x1b[201~\0").unwrap();
+        flush_writer(&backend, &skey("a"));
+        assert!(input_lines(&fake, &terminal).is_empty());
+        assert!(send_text_args(&fake).is_empty());
+    }
+
+    #[test]
+    fn paste_without_a_session_is_refused() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        assert!(matches!(
+            backend.paste(&skey("nope"), "p"),
+            Err(PtyBackendError::NoSuchSession)
+        ));
+    }
+
+    #[test]
+    fn paste_fallback_is_one_send_text_with_both_markers() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, gen, _) = typing_backend(&fake, Duration::from_secs(30));
+        let pane = backend.keymap.get(&skey("a")).unwrap().pane_id;
+        let io = backend.writer_io(&skey("a"), gen);
+        use writer::SessionIo as _;
+        let block = paste::bracketed("l1\rl2");
+        io.fallback_paste(&block).unwrap();
+        assert_eq!(send_text_args(&fake), vec![format!("{pane} {block}")]);
+        assert_eq!(
+            count(&fake, ops::Op::PaneSendKeys),
+            0,
+            "no enter or esc keys"
+        );
+    }
+
+    #[test]
+    fn paste_without_a_bridge_falls_back_through_the_writer_as_one_block() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _, terminal) = typing_backend(&fake, Duration::from_millis(10));
+        backend.stop_bridge(&skey("a"));
+        let pane = backend.keymap.get(&skey("a")).unwrap().pane_id;
+        backend.paste(&skey("a"), "l1\rl2").unwrap();
+        flush_writer(&backend, &skey("a"));
+        assert_eq!(
+            send_text_args(&fake),
+            vec![format!("{pane} \x1b[200~l1\rl2\x1b[201~")]
+        );
+        assert_eq!(count(&fake, ops::Op::PaneSendKeys), 0);
+        assert!(fake.bridge_input(&terminal).is_empty());
+    }
+
+    /// A backend with session `a` spawned, that session's writer io, and the
+    /// events the backend emitted.
+    fn spawned_writer_io(fake: &Arc<fake::FakeHerdr>) -> (HerdrBackend, WriterIo, Events) {
+        let (backend, events) = fake_backend(fake);
+        let gen = backend
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
+            .unwrap();
+        let io = backend.writer_io(&skey("a"), gen);
+        (backend, io, events)
+    }
+
+    fn paste_refusals(events: &Events) -> Vec<(String, Value)> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(e, _)| e.starts_with("pty://paste-refused/"))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn paste_over_the_fallback_cap_is_refused_whole_with_a_per_session_event() {
+        let fake = fake::FakeHerdr::new();
+        let (_backend, io, events) = spawned_writer_io(&fake);
+        use writer::SessionIo as _;
+        // Under the cap raw, over it once each quote counts twice.
+        let quotes = "\"".repeat(paste::FALLBACK_PASTE_LIMIT / 2 + 1);
+        let cost = paste::fallback_cost(&quotes);
+        io.fallback_paste(&paste::bracketed(&quotes)).unwrap();
+        assert!(send_text_args(&fake).is_empty(), "nothing is sent");
+        assert_eq!(
+            paste_refusals(&events),
+            vec![(
+                "pty://paste-refused/p/a".to_string(),
+                serde_json::json!({"bytes": cost, "limit": 24_576})
+            )]
+        );
+    }
+
+    #[test]
+    fn paste_over_the_fallback_cap_for_a_gone_session_is_not_reported_as_too_large() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, events) = fake_backend(&fake);
+        // No session `a` of this generation: its pane is gone.
+        let io = backend.writer_io(&skey("a"), 1);
+        use writer::SessionIo as _;
+        let over = "a".repeat(paste::FALLBACK_PASTE_LIMIT + 1);
+        assert!(matches!(
+            io.fallback_paste(&paste::bracketed(&over)),
+            Err(PtyBackendError::NoSuchSession)
+        ));
+        assert!(paste_refusals(&events).is_empty());
+        assert!(send_text_args(&fake).is_empty());
+    }
+
+    #[test]
+    fn paste_at_the_fallback_cap_is_still_sent() {
+        let fake = fake::FakeHerdr::new();
+        let (_backend, io, events) = spawned_writer_io(&fake);
+        use writer::SessionIo as _;
+        let block = paste::bracketed(&"a".repeat(paste::FALLBACK_PASTE_LIMIT));
+        io.fallback_paste(&block).unwrap();
+        assert_eq!(send_text_args(&fake).len(), 1);
+        assert!(paste_refusals(&events).is_empty());
     }
 
     #[test]

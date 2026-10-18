@@ -19,11 +19,13 @@ import {
   daemonStatus,
   decodeBase64,
   MAX_SCROLL_LINES,
+  onPtyPasteRefused,
   onPtyResume,
   openTerminalFile,
   ptyAttach,
   ptyDetach,
   ptyKill,
+  ptyPaste,
   ptyRepaint,
   ptyResize,
   ptyScroll,
@@ -63,6 +65,7 @@ import {
   resumeNoticeLine,
   terminateConfirmCopy,
 } from "../lib/resumeNotice";
+import { copyEol, rectSelectionAfterPress, selectionToText } from "../lib/selectionText";
 import {
   accumulateWheelLines,
   type Cell,
@@ -74,7 +77,7 @@ import {
   sizeToSend,
   wheelCell,
 } from "../lib/termFit";
-import { clipboardActionForKey, suppressNativePaste } from "../lib/terminalClipboard";
+import { clipboardActionForKey } from "../lib/terminalClipboard";
 import { suppressesCompositionDoubleCommit } from "../lib/terminalComposition";
 import {
   FILE_DROP_EVENT,
@@ -83,6 +86,7 @@ import {
   quotePathForInjection,
 } from "../lib/terminalFileDrop";
 import { installTerminalLinks } from "../lib/terminalLinks";
+import { deliverPaste, fallbackPasteRefusedMessage, preparePasteText } from "../lib/terminalPaste";
 import { type ResolvedTheme, useResolvedTheme } from "../lib/theme";
 import { type HistoryView, TerminalSearch } from "./TerminalSearch";
 import { useToast } from "./Toast";
@@ -238,6 +242,10 @@ export function TerminalPane({
   const linksRef = useRef<ReturnType<typeof installTerminalLinks> | null>(null);
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  // The live terminal's sendPaste, for the file-drop effect (null while unmounted).
+  const sendPasteRef = useRef<((text: string) => void) | null>(null);
+  // The current selection was started with Alt held, so xterm made it a rectangle.
+  const altRectRef = useRef(false);
   const fitRef = useRef<FitAddon | null>(null);
   const webglRef = useRef<WebglAddon | null>(null);
   // `active` for callbacks that must not hold a GPU context for an off-screen pane.
@@ -922,7 +930,7 @@ export function TerminalPane({
   }, [launchNonce, launch]);
 
   // Lifetime: create the Terminal, wire I/O, attach or spawn the session. Disposed on unmount.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only terminal setup; all deps are stable refs, intentionally excluded
+  // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only terminal setup; all deps are stable refs or callbacks (showToast), intentionally excluded
   useEffect(() => {
     const term = new Terminal({
       fontFamily: 'ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace',
@@ -958,13 +966,30 @@ export function TerminalPane({
     compositionHost?.addEventListener("compositionstart", onCompositionStart);
     compositionHost?.addEventListener("compositionend", onCompositionEnd);
 
+    // Every paste (clipboard text, image path, file drop, native paste event) lands
+    // here, never in xterm's paste: xterm brackets only when its own bracketed-paste
+    // mode is on, and herdr's frames never turn it on, so the text would arrive as
+    // typed keys. ptyPaste has the backend bracket it as one paste instead; the input
+    // gate is the same as typing (attaching, daemon-down).
+    const sendPaste = (raw: string) => {
+      const text = preparePasteText(raw);
+      if (!text) return;
+      if (inputBlocked(statusRef.current)) return;
+      void deliverPaste(text, (t) => ptyPaste(projectName, name, t), {
+        // herdr snaps the viewport back to the live tail on input it took.
+        accepted: () => liveTailRef.current?.noteInput(),
+        refused: showToast,
+      });
+    };
+    sendPasteRef.current = sendPaste;
+
     // Paste: Claude takes an image by *path*, so when the clipboard holds
     // image data we write it to a temp file and inject the quoted path — the same
     // shape a real terminal produces when you drag an image in. Anything else (or
     // any failure reading an image) falls back to the plain text paste.
     //
-    // Both branches go through term.paste() rather than ptyWrite() so they respect
-    // bracketed-paste mode and the onData input gate below (attaching).
+    // Both branches go through sendPaste, so the backend brackets the text as one
+    // paste and the input gate applies.
     const pasteClipboard = async () => {
       try {
         // clipboard.read() is absent in some webviews; readText() is the baseline.
@@ -988,7 +1013,7 @@ export function TerminalPane({
               );
               // The pane may have unmounted (term disposed) while the read was in
               // flight — termRef is nulled on cleanup, so this skips a dead terminal.
-              if (termRef.current === term) term.paste(`${quotePathForInjection(path)} `);
+              if (termRef.current === term) sendPaste(`${quotePathForInjection(path)} `);
               return;
             }
           }
@@ -998,11 +1023,23 @@ export function TerminalPane({
       }
       try {
         const text = await navigator.clipboard.readText();
-        if (text && termRef.current === term) term.paste(text);
+        if (text && termRef.current === term) sendPaste(text);
       } catch {
         /* clipboard unavailable / denied — silent */
       }
     };
+
+    // The selection as text to copy. Soft-wrapped rows are rejoined from the buffer (herdr's
+    // frames carry no wrap marks); a rectangle has no wrap meaning, so it keeps xterm's own.
+    const copyText = (): string =>
+      altRectRef.current
+        ? term.getSelection()
+        : selectionToText(
+            term.buffer.active,
+            term.cols,
+            term.getSelectionPosition(),
+            copyEol(isWindows),
+          );
 
     term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
       // We only ever act on keydown; let xterm handle keypress/keyup unchanged.
@@ -1039,17 +1076,18 @@ export function TerminalPane({
       // Windows clipboard: WebView2 DOES deliver a native paste to xterm's textarea, but
       // that path is opaque to our attaching gate, so we own Ctrl+V explicitly
       // here and suppress the native duplicate at the host container (see the capture-
-      // phase paste listener below). term.paste() respects bracketed-paste mode
-      // and flows through the onData gate below. No-op off Windows (clipboardActionForKey
-      // returns null).
+      // phase paste listener below). sendPaste applies the input gate and the backend
+      // brackets the text. No-op off Windows (clipboardActionForKey returns null).
       const action = clipboardActionForKey(e, isWindows);
       if (action === "paste") {
         void pasteClipboard();
         return false;
       }
       if (action === "copy") {
-        const sel = term.getSelection();
+        const sel = copyText();
         if (sel) {
+          // Stop the native copy event: WebView2 would fire it for this Ctrl+C too.
+          e.preventDefault();
           // Clear the selection only after the copy succeeds, so a denied write
           // doesn't drop the selection with nothing on the clipboard. With the
           // selection gone, the next Ctrl+C sends SIGINT (Windows Terminal behavior).
@@ -1100,19 +1138,50 @@ export function TerminalPane({
       void ptyWrite(projectName, name, d, t0);
     });
 
-    // Windows double-paste: WebView2 fires a native `paste` on xterm's helper
-    // textarea IN ADDITION to our explicit Ctrl+V handler above, so xterm would paste a
-    // second time. Suppress the native paste at the host container — an ANCESTOR of the
-    // textarea, so this capture-phase listener runs before xterm's target-phase handlers
-    // (a same-node listener would lose on registration order). We own paste via the
-    // explicit path. No-op off Windows, where the native textarea paste IS the paste path.
+    // Native paste, every platform: xterm's own handler would type the text unbracketed,
+    // so it never runs. This listener sits on the host container — an ANCESTOR of the
+    // helper textarea, so in the capture phase it runs before xterm's target-phase
+    // handlers (a same-node listener would lose on registration order). On Windows the
+    // event is a duplicate of the explicit Ctrl+V handler above (WebView2 fires both) and
+    // is just dropped. Elsewhere it IS the paste path (Cmd/Ctrl+V, middle-click, context
+    // menu), so its text goes to sendPaste; an image-only clipboard there is swallowed.
     const host = hostRef.current;
     const onNativePaste = (e: ClipboardEvent) => {
-      if (!suppressNativePaste(isWindows)) return;
       e.preventDefault(); // stop native insertion into the helper textarea
       e.stopImmediatePropagation(); // stop xterm's textarea + element paste handlers
+      if (!isWindows) {
+        // Read synchronously: clipboardData is unusable once the handler returns.
+        const text = e.clipboardData?.getData("text/plain");
+        if (text) sendPaste(text);
+      }
     };
     host?.addEventListener("paste", onNativePaste, true);
+
+    // Native copy, every platform (Cmd/Ctrl+C off Windows, context-menu copy): put the
+    // rebuilt text on the clipboard. Capture phase on the host runs before xterm's own copy
+    // listener on its element, which then never sees the event.
+    const onNativeCopy = (e: ClipboardEvent) => {
+      if (!term.hasSelection()) return; // nothing selected: leave native behaviour alone
+      const text = copyText();
+      if (!text) return;
+      e.clipboardData?.setData("text/plain", text);
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    host?.addEventListener("copy", onNativeCopy, true);
+    // xterm makes an Alt+drag selection a rectangle (on macOS too, since
+    // macOptionClickForcesSelection is unset) but does not expose the mode, so track it.
+    // Only a plain left press starts a selection; a right click (context menu) or a
+    // Shift+click extending the selection keeps the mode.
+    const onSelectMouseDown = (e: MouseEvent) => {
+      altRectRef.current = rectSelectionAfterPress(altRectRef.current, e);
+    };
+    host?.addEventListener("mousedown", onSelectMouseDown, true);
+    // A cleared selection ends the rectangle, so a later one made without a fresh left
+    // press (select-all, a word double-click) is copied as rejoined text.
+    const selectionDisp = term.onSelectionChange(() => {
+      if (!term.hasSelection()) altRectRef.current = false;
+    });
 
     // Scrolling belongs to herdr: it routes each scroll to the app (mouse reporting),
     // to arrow keys (alternate scroll) or to the pane's history. So every vertical wheel
@@ -1317,6 +1386,7 @@ export function TerminalPane({
 
     let cancelled = false;
     let unResume: UnlistenFn | undefined;
+    let unPasteRefused: UnlistenFn | undefined;
     (async () => {
       // Output and exit arrive on each attach's own channel (see doAttach).
       // The backend says how it brought the agent back (resumed / continued / fell back).
@@ -1326,6 +1396,12 @@ export function TerminalPane({
       });
       if (cancelled) return void resume();
       unResume = resume;
+      // The writer refused a paste over the CLI-fallback cap (the bridge was down).
+      const refused = await onPtyPasteRefused(projectName, name, (r) => {
+        if (!cancelled) showToast(fallbackPasteRefusedMessage(r));
+      });
+      if (cancelled) return void refused();
+      unPasteRefused = refused;
 
       // Always attach-first: the daemon is the source of truth for whether a live
       // session exists. doAttach() waits out the brief post-mount connecting
@@ -1342,6 +1418,10 @@ export function TerminalPane({
       compositionHost?.removeEventListener("compositionend", onCompositionEnd);
       dataDisp.dispose();
       host?.removeEventListener("paste", onNativePaste, true);
+      host?.removeEventListener("copy", onNativeCopy, true);
+      host?.removeEventListener("mousedown", onSelectMouseDown, true);
+      selectionDisp.dispose();
+      if (sendPasteRef.current === sendPaste) sendPasteRef.current = null;
       if (scrollRaf !== null) cancelAnimationFrame(scrollRaf);
       if (screenRectRaf !== null) cancelAnimationFrame(screenRectRaf);
       pendingScroll = null;
@@ -1350,6 +1430,7 @@ export function TerminalPane({
       scrollToLiveRef.current = () => {};
       historyViewRef.current = IDLE_HISTORY_VIEW;
       unResume?.();
+      unPasteRefused?.();
       webglRef.current?.dispose();
       webglRef.current = null;
       links.dispose();
@@ -1445,13 +1526,13 @@ export function TerminalPane({
 
   // File drops: App.tsx watches the webview drag-drop event (only it sees OS
   // file paths) and dispatches the paths at the pane under the cursor. We inject here
-  // via term.paste() rather than letting App call ptyWrite, so a drop obeys the same
-  // bracketed-paste + onData gate as typing (attaching / daemon-down).
+  // via sendPaste rather than letting App call the backend, so a drop obeys the same
+  // input gate as typing (attaching / daemon-down) and arrives as one bracketed paste.
   useEffect(() => {
     const el = paneRef.current;
     if (!el) return;
     const onFileDrop = (ev: Event) => {
-      // Only a live session can receive a drop. The onData gate below covers
+      // Only a live session can receive a drop. sendPaste's input gate covers
       // attaching/detached-alive/daemon-down but not ended/lost/spawn-failed — and on a
       // dead pane the focus() call would pull focus off the "Kill & Restart" button
       // (which the status effect deliberately focuses) onto a terminal going nowhere.
@@ -1459,7 +1540,7 @@ export function TerminalPane({
       const { paths } = (ev as CustomEvent<FileDropDetail>).detail ?? { paths: [] };
       const text = injectionTextForPaths(paths);
       if (!text) return;
-      termRef.current?.paste(text);
+      sendPasteRef.current?.(text);
       // Match a real terminal: the path lands at the prompt with focus, ready to submit.
       termRef.current?.focus();
     };

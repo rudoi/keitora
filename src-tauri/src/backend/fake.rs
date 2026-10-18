@@ -46,6 +46,10 @@ pub enum Call {
         key: SessionKey,
         data: Vec<u8>,
     },
+    Paste {
+        key: SessionKey,
+        text: String,
+    },
     WriteLine {
         key: SessionKey,
         text: String,
@@ -80,6 +84,7 @@ struct FakeState {
     sessions: Vec<SessionSummary>,
     calls: Vec<Call>,
     write_line_results: VecDeque<Result<(), PtyBackendError>>,
+    paste_results: VecDeque<Result<(), PtyBackendError>>,
     kill_results: VecDeque<Result<(), PtyBackendError>>,
     list_sessions_results: VecDeque<Result<Vec<SessionSummary>, PtyBackendError>>,
     is_live_count: u32,
@@ -117,6 +122,11 @@ impl FakeBackend {
     /// Script the next `write_line` result.
     pub fn push_write_line(&self, r: Result<(), PtyBackendError>) {
         self.state.lock().unwrap().write_line_results.push_back(r);
+    }
+
+    /// Script the next `paste` result.
+    pub fn push_paste(&self, r: Result<(), PtyBackendError>) {
+        self.state.lock().unwrap().paste_results.push_back(r);
     }
 
     /// Script the next `kill` result.
@@ -235,6 +245,15 @@ impl PtyBackend for FakeBackend {
             data: data.to_vec(),
         });
         Ok(())
+    }
+
+    fn paste(&self, key: &SessionKey, text: &str) -> Result<(), PtyBackendError> {
+        let mut st = self.state.lock().unwrap();
+        st.calls.push(Call::Paste {
+            key: key.clone(),
+            text: text.to_string(),
+        });
+        st.paste_results.pop_front().unwrap_or(Ok(()))
     }
 
     fn write_line(
@@ -392,6 +411,34 @@ mod tests {
                 size: Some((80, 24)),
                 launch,
             }]
+        );
+    }
+
+    #[test]
+    fn paste_records_the_call_and_returns_the_scripted_result() {
+        let fake = FakeBackend::new();
+        let key = SessionKey {
+            project: "proj".into(),
+            worktree: "wt".into(),
+        };
+        assert!(fake.paste(&key, "a\rb").is_ok());
+        fake.push_paste(Err(PtyBackendError::PasteTooLarge { bytes: 2, limit: 1 }));
+        assert!(matches!(
+            fake.paste(&key, "xy"),
+            Err(PtyBackendError::PasteTooLarge { bytes: 2, limit: 1 })
+        ));
+        assert_eq!(
+            fake.calls(),
+            vec![
+                Call::Paste {
+                    key: key.clone(),
+                    text: "a\rb".into(),
+                },
+                Call::Paste {
+                    key,
+                    text: "xy".into(),
+                },
+            ]
         );
     }
 }

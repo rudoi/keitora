@@ -429,6 +429,8 @@ pub enum PtyBackendError {
     RecoveryPaused,
     /// The user terminated the session; it stays down until launched.
     Terminated,
+    /// A paste of `bytes` was refused: it is over the backend's `limit`.
+    PasteTooLarge { bytes: usize, limit: usize },
     /// Any other error (protocol / IO / implementation-specific), message verbatim.
     Other(String),
 }
@@ -450,6 +452,9 @@ impl fmt::Display for PtyBackendError {
             PtyBackendError::RecoveryPending => write!(f, "herdr is recovering"),
             PtyBackendError::RecoveryPaused => write!(f, "herdr recovery is paused"),
             PtyBackendError::Terminated => write!(f, "Terminated: the session was terminated"),
+            PtyBackendError::PasteTooLarge { bytes, limit } => {
+                write!(f, "PasteTooLarge: {bytes} > {limit}")
+            }
             PtyBackendError::Other(m) => write!(f, "{m}"),
         }
     }
@@ -508,6 +513,10 @@ pub trait PtyBackend: Send + Sync + 'static {
 
     /// Write raw bytes (user keystrokes) into a session.
     fn write(&self, key: &SessionKey, data: &[u8]) -> Result<(), PtyBackendError>;
+
+    /// Paste `text` as one unit: the backend brackets it and never merges it with
+    /// other input. Refuses (never truncates) a paste over the size cap.
+    fn paste(&self, key: &SessionKey, text: &str) -> Result<(), PtyBackendError>;
 
     /// Atomic server-side submit: write `text`, pause `submit_delay_ms`, write `\r`.
     fn write_line(
@@ -819,6 +828,14 @@ mod tests {
         assert_eq!(
             PtyBackendError::Terminated.to_string(),
             "Terminated: the session was terminated"
+        );
+        assert_eq!(
+            PtyBackendError::PasteTooLarge {
+                bytes: 1_048_577,
+                limit: 1_048_576
+            }
+            .to_string(),
+            "PasteTooLarge: 1048577 > 1048576"
         );
     }
 

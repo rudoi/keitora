@@ -2,15 +2,15 @@
  * Helpers for injecting filesystem paths into a terminal's PTY — shared by drag &
  * drop and clipboard image paste.
  *
- * Both flows converge on `ptyWrite(project, name, text)`; only how the path is
- * obtained differs. Quoting lives here (TS) rather than in Rust because dragged
+ * Both flows converge on a bracketed paste (`ptyPaste(project, name, text)`); only
+ * how the path is obtained differs. Quoting lives here (TS) rather than in Rust because dragged
  * paths arrive as JS strings on the Tauri drag-drop event and never reach the
  * backend — only pasted image *bytes* do, via `save_clipboard_image`.
  */
 
 /**
  * A terminal pane's write identity: the `(projectName, name)` pair TerminalPane
- * already passes to `ptyWrite` (TerminalPane.tsx). `name` is the worktree name.
+ * already passes to `ptyPaste`/`ptyWrite` (TerminalPane.tsx). `name` is the worktree name.
  */
 export interface PaneHit {
   project: string;
@@ -27,7 +27,7 @@ export interface PaneHit {
  */
 export function quotePathForInjection(path: string): string {
   // Strip control characters first. A filename may legally contain a newline on
-  // macOS/Linux, and xterm's paste() rewrites \n to \r — so an embedded newline would
+  // macOS/Linux, and the paste path normalises \n to \r — so an embedded newline would
   // *submit* the prompt half-way through the path instead of injecting it. Quoting
   // alone doesn't help: \n also matches \s, so the path would just be quoted and sent.
   // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping them is the point
@@ -107,9 +107,9 @@ export function paneElementAtPoint(
  * DOM event carrying dropped paths to the pane that owns the PTY.
  *
  * The OS drop is observed once at the app level (only the webview sees file paths),
- * but the *write* has to happen inside TerminalPane: that's where `term.paste()`
- * lives, which applies bracketed-paste mode and the onData input gate (attaching,
- * daemon-down). Dispatching at the hit-tested element keeps that gating
+ * but the *write* has to happen inside TerminalPane: that's where `sendPaste`
+ * lives, which applies the input gate (attaching, daemon-down) and sends the text
+ * as one paste that the backend brackets. Dispatching at the hit-tested element keeps that gating
  * intact without App.tsx holding a registry of panes or their PTY state.
  */
 export const FILE_DROP_EVENT = "keitora:filedrop";

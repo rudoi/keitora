@@ -1,9 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  type ClipboardKeyAction,
-  clipboardActionForKey,
-  suppressNativePaste,
-} from "./terminalClipboard";
+import { type ClipboardKeyAction, clipboardActionForKey } from "./terminalClipboard";
 
 // KeyboardEvent-shaped object with no modifiers held. clipboardActionForKey only
 // reads ctrlKey/shiftKey/altKey/metaKey/key, so a plain object suffices (no DOM) —
@@ -79,15 +75,5 @@ describe("clipboardActionForKey — modifier discipline", () => {
 
   it("unrelated chord Ctrl+A → null", () => {
     expect(act({ ctrlKey: true, key: "a" })).toBeNull();
-  });
-});
-
-describe("suppressNativePaste", () => {
-  it("suppresses xterm's native paste on Windows", () => {
-    expect(suppressNativePaste(true)).toBe(true);
-  });
-
-  it("does not suppress off Windows (native textarea paste is the paste path)", () => {
-    expect(suppressNativePaste(false)).toBe(false);
   });
 });

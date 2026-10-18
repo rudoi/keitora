@@ -8,9 +8,11 @@ vi.mock("./transport", () => ({
 import {
   daemonStatus,
   type OutputMsg,
+  onPtyPasteRefused,
   onPtyResume,
   ptyAttach,
   ptyDetach,
+  ptyPaste,
   ptyScroll,
   ptyScrollOffset,
   ptySpawn,
@@ -212,6 +214,25 @@ describe("ptyWrite", () => {
   });
 });
 
+describe("ptyPaste", () => {
+  it("invokes pty_paste with the project, id and text", async () => {
+    transport.invoke.mockReset().mockResolvedValue(undefined);
+    await ptyPaste("keitora", "epsilon", "a\rb");
+    expect(transport.invoke).toHaveBeenCalledWith("pty_paste", {
+      project: "keitora",
+      id: "epsilon",
+      text: "a\rb",
+    });
+  });
+
+  it("passes a size refusal through as the rejection", async () => {
+    transport.invoke.mockReset().mockRejectedValue("PasteTooLarge: 1048577 > 1048576");
+    await expect(ptyPaste("keitora", "epsilon", "x")).rejects.toBe(
+      "PasteTooLarge: 1048577 > 1048576",
+    );
+  });
+});
+
 describe("ptyAttach", () => {
   beforeEach(() => {
     transport.invoke.mockReset();
@@ -295,6 +316,31 @@ describe("onPtyResume", () => {
       throw new Error("unsupported");
     });
     const un2 = await onPtyResume("keitora", "epsilon", () => {});
+    expect(() => un2()).not.toThrow();
+  });
+});
+
+describe("onPtyPasteRefused", () => {
+  beforeEach(() => {
+    transport.listen.mockReset();
+  });
+
+  it("listens on the session's paste-refused channel", async () => {
+    const un = vi.fn();
+    transport.listen.mockResolvedValue(un);
+    const cb = vi.fn();
+    await expect(onPtyPasteRefused("keitora", "epsilon", cb)).resolves.toBe(un);
+    expect(transport.listen).toHaveBeenCalledWith("pty://paste-refused/keitora/epsilon", cb);
+  });
+
+  it("resolves to a no-op when the transport cannot listen", async () => {
+    transport.listen.mockRejectedValue(new Error("unsupported"));
+    const un = await onPtyPasteRefused("keitora", "epsilon", () => {});
+    expect(() => un()).not.toThrow();
+    transport.listen.mockImplementation(() => {
+      throw new Error("unsupported");
+    });
+    const un2 = await onPtyPasteRefused("keitora", "epsilon", () => {});
     expect(() => un2()).not.toThrow();
   });
 });

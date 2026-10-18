@@ -98,6 +98,10 @@ impl PtyBackend for UnavailableBackend {
         Err(PtyBackendError::NotConnected)
     }
 
+    fn paste(&self, _key: &SessionKey, _text: &str) -> Result<(), PtyBackendError> {
+        Err(PtyBackendError::NotConnected)
+    }
+
     /// `NotConnected` maps to `Queued`, so dispatch keeps the task reserved
     /// rather than dropping it.
     fn write_line(
@@ -253,6 +257,10 @@ mod tests {
         let k = key();
         assert!(matches!(
             b.write(&k, b"ls\r"),
+            Err(PtyBackendError::NotConnected)
+        ));
+        assert!(matches!(
+            b.paste(&k, "pasted"),
             Err(PtyBackendError::NotConnected)
         ));
         assert!(matches!(

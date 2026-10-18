@@ -28,16 +28,3 @@ export function clipboardActionForKey(
   if (k === "c" && !e.shiftKey) return "copy"; // Ctrl+C only
   return null;
 }
-
-/**
- * Whether to suppress xterm's native `paste` DOM event.
- *
- * Windows only: WebView2 delivers a native paste to xterm's helper textarea *in
- * addition to* our explicit Ctrl+V handler (see TerminalPane), so xterm would paste a
- * second time. We suppress the native event on Windows and own paste via the explicit
- * path. Off Windows (macOS/Unix) the native textarea paste IS the paste path — never
- * suppress it there.
- */
-export function suppressNativePaste(isWindows: boolean): boolean {
-  return isWindows;
-}

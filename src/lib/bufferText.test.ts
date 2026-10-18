@@ -1,6 +1,6 @@
 import type { IBuffer } from "@xterm/xterm";
 import { describe, expect, it } from "vitest";
-import { bufferRowCells, bufferRowText, cellSpan } from "./bufferText";
+import { bufferRowCells, bufferRowText, cellSpan, wrapsWideGlyphAfter } from "./bufferText";
 
 type Cell = { chars: string; width: number };
 const cell = (chars: string, width = 1): Cell => ({ chars, width });
@@ -58,5 +58,19 @@ describe("bufferRowCells / cellSpan", () => {
 
   it("reads a missing row as empty", () => {
     expect(bufferRowCells(fakeBuffer([]), 0, 4)).toEqual({ text: "", cellAt: [4] });
+  });
+});
+
+describe("wrapsWideGlyphAfter", () => {
+  it("is true only when the next row starts with a wide glyph", () => {
+    const buf = fakeBuffer([
+      [cell("a"), cell("")],
+      [cell("你", 2), cell("", 0)],
+      [cell("b"), cell("")],
+    ]);
+    expect(wrapsWideGlyphAfter(buf, 0)).toBe(true);
+    expect(wrapsWideGlyphAfter(buf, 1)).toBe(false);
+    // No next row.
+    expect(wrapsWideGlyphAfter(buf, 2)).toBe(false);
   });
 });

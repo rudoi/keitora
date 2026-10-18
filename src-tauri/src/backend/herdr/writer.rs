@@ -20,6 +20,11 @@
 //! up to [`BRIDGE_WAIT`], collecting what arrives meanwhile, and only then sends the
 //! whole run through the CLI fallback as one call.
 //!
+//! A paste is never coalesced: it is sent as its own bracketed block (herdr only
+//! treats a message that is exactly one block as a paste), in order with the
+//! input around it. Without a bridge it goes through the fallback as one
+//! `send-text`, or is refused when too long for one (see [`super::paste`]).
+//!
 //! Resizes and repaints go through the same queue, so a resize lands after the
 //! keys typed before it and before those typed after it. Each is one
 //! `terminal.resize` on the bridge stdin (a repaint is a same-size resize); a
@@ -78,6 +83,9 @@ pub enum WriteJob {
     Text(String),
     /// Input that is not UTF-8 (sent as base64 `bytes`).
     Bytes(Vec<u8>),
+    /// A paste, already sanitized and bracketed; sent as one block and never
+    /// merged with neighbouring input.
+    Paste(String),
     /// An injected line (dispatch / handoff); the result goes back on `reply`.
     Line {
         text: String,
@@ -181,11 +189,13 @@ impl LineReply {
     }
 }
 
-/// A coalesced run of input jobs of one kind.
+/// A coalesced run of input jobs of one kind, or one paste.
 #[derive(Debug, PartialEq, Eq)]
 enum Run {
     Text(String),
     Bytes(Vec<u8>),
+    /// One bracketed paste block.
+    Paste(String),
 }
 
 impl Run {
@@ -208,13 +218,7 @@ impl Run {
         match self {
             Run::Text(t) => BridgeInput::Text(t),
             Run::Bytes(b) => BridgeInput::Bytes(b),
-        }
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        match self {
-            Run::Text(t) => t.as_bytes(),
-            Run::Bytes(b) => b,
+            Run::Paste(block) => BridgeInput::Text(block),
         }
     }
 }
@@ -232,6 +236,9 @@ pub trait SessionIo: Send + Sync + 'static {
     fn drop_bridge(&self, stdin: &BridgeStdin);
     /// Send input without a bridge (the herdr CLI).
     fn fallback(&self, data: &[u8]) -> Result<(), PtyBackendError>;
+    /// Send one bracketed paste block without a bridge, as one CLI call, or
+    /// refuse it whole (and report that) when it is too long for one.
+    fn fallback_paste(&self, block: &str) -> Result<(), PtyBackendError>;
     /// Input just reached the bridge stdin.
     fn stdin_written(&self);
     /// Inject one submitted line.
@@ -409,6 +416,11 @@ struct Writer<T> {
     /// Jobs received but not yet run, in order.
     queue: VecDeque<WriteJob>,
     wait: Duration,
+    /// When the current wait for a bridge ends. Shared by the runs of one batch
+    /// (the jobs queued before the writer next goes idle), so input behind a run
+    /// that already waited out a down bridge falls back at once instead of
+    /// waiting again. Cleared once the queue is empty or input reaches a bridge.
+    bridge_deadline: Option<Instant>,
     watch: Arc<Watch<T>>,
     name: String,
 }
@@ -417,6 +429,8 @@ impl<T: SessionIo> Writer<T> {
     fn run(mut self) {
         loop {
             if self.queue.is_empty() {
+                // The batch is done: later input gets its own wait for a bridge.
+                self.bridge_deadline = None;
                 match self.rx.recv() {
                     Ok(job) => self.queue.push_back(job),
                     // The sender is gone and the queue is done.
@@ -435,6 +449,11 @@ impl<T: SessionIo> Writer<T> {
                 }
                 WriteJob::Bytes(b) => {
                     if !self.write_input(Run::Bytes(b)) {
+                        return;
+                    }
+                }
+                WriteJob::Paste(p) => {
+                    if !self.write_input(Run::Paste(p)) {
                         return;
                     }
                 }
@@ -566,7 +585,7 @@ impl<T: SessionIo> Writer<T> {
     }
 
     /// Send one run of input: down the bridge, or, when none is up within the
-    /// wait, through the fallback as one call. `false` when the sender went away
+    /// batch's wait, through the fallback as one call. `false` when the sender went away
     /// while waiting (the session is gone; the run is dropped).
     fn write_input(&mut self, mut run: Run) -> bool {
         self.absorb_into(&mut run);
@@ -574,7 +593,6 @@ impl<T: SessionIo> Writer<T> {
             log::debug!("herdr writer [{}]: input refused: {e}", self.name);
             return true;
         }
-        let mut deadline: Option<Instant> = None;
         loop {
             if let Some(stdin) = self.io.stdin() {
                 let sent = self
@@ -582,6 +600,7 @@ impl<T: SessionIo> Writer<T> {
                     .watched(&stdin, || bridge::send_input_to(&stdin, run.as_input()));
                 match sent {
                     Ok(()) => {
+                        self.bridge_deadline = None;
                         self.io.stdin_written();
                         return true;
                     }
@@ -595,9 +614,15 @@ impl<T: SessionIo> Writer<T> {
                 }
             }
             let now = Instant::now();
-            let deadline = *deadline.get_or_insert(now + self.wait);
+            let deadline = *self.bridge_deadline.get_or_insert(now + self.wait);
             if now >= deadline {
-                if let Err(e) = self.io.fallback(run.as_bytes()) {
+                // A paste is never translated as keystrokes: it goes whole or not at all.
+                let sent = match &run {
+                    Run::Text(t) => self.io.fallback(t.as_bytes()),
+                    Run::Bytes(b) => self.io.fallback(b),
+                    Run::Paste(block) => self.io.fallback_paste(block),
+                };
+                if let Err(e) = sent {
                     log::warn!("herdr writer [{}]: fallback input failed: {e}", self.name);
                 }
                 return true;
@@ -722,6 +747,7 @@ impl Writers {
             rx,
             queue: VecDeque::new(),
             wait: self.wait,
+            bridge_deadline: None,
             watch,
             name: name.clone(),
         };
@@ -779,6 +805,7 @@ mod tests {
     enum Seen {
         Stdin(String),
         Fallback(String),
+        FallbackPaste(String),
         Line(String),
         DroppedBridge,
         Resized(u16, u16),
@@ -841,6 +868,11 @@ mod tests {
         fn fallback(&self, data: &[u8]) -> Result<(), PtyBackendError> {
             let text = String::from_utf8_lossy(data).into_owned();
             self.seen.lock().unwrap().push(Seen::Fallback(text));
+            Ok(())
+        }
+        fn fallback_paste(&self, block: &str) -> Result<(), PtyBackendError> {
+            let seen = Seen::FallbackPaste(block.to_string());
+            self.seen.lock().unwrap().push(seen);
             Ok(())
         }
         fn stdin_written(&self) {}
@@ -974,6 +1006,9 @@ mod tests {
         }
         fn fallback(&self, d: &[u8]) -> Result<(), PtyBackendError> {
             self.0.fallback(d)
+        }
+        fn fallback_paste(&self, block: &str) -> Result<(), PtyBackendError> {
+            self.0.fallback_paste(block)
         }
         fn stdin_written(&self) {}
         fn write_line(&self, text: &str) -> Result<(), PtyBackendError> {
@@ -1411,6 +1446,9 @@ mod tests {
         fn fallback(&self, d: &[u8]) -> Result<(), PtyBackendError> {
             self.0.fallback(d)
         }
+        fn fallback_paste(&self, block: &str) -> Result<(), PtyBackendError> {
+            self.0.fallback_paste(block)
+        }
         fn stdin_written(&self) {}
         fn write_line(&self, text: &str) -> Result<(), PtyBackendError> {
             self.0.write_line(text)
@@ -1829,5 +1867,154 @@ mod tests {
         rx.recv().unwrap();
         assert_eq!(stdin_lines(&script.seen()), vec![resize_json(83, 26)]);
         assert_eq!(*script.size.lock().unwrap(), (83, 26));
+    }
+
+    fn paste_block(p: &str) -> String {
+        super::super::paste::bracketed(p)
+    }
+
+    fn paste_job(p: &str) -> WriteJob {
+        WriteJob::Paste(paste_block(p))
+    }
+
+    #[test]
+    fn paste_run_absorbs_nothing_and_is_never_absorbed() {
+        let mut run = Run::Paste(paste_block("p"));
+        assert!(matches!(
+            run.absorb(WriteJob::Text("x".into())),
+            Err(WriteJob::Text(_))
+        ));
+        assert!(matches!(
+            run.absorb(paste_job("q")),
+            Err(WriteJob::Paste(_))
+        ));
+        assert_eq!(run, Run::Paste(paste_block("p")));
+        let mut text = Run::Text("a".into());
+        assert!(matches!(
+            text.absorb(paste_job("p")),
+            Err(WriteJob::Paste(_))
+        ));
+        let mut bytes = Run::Bytes(vec![1]);
+        assert!(bytes.absorb(paste_job("p")).is_err());
+    }
+
+    #[test]
+    fn paste_queued_between_texts_is_its_own_block() {
+        let script = sized_script();
+        run_queued(
+            &script,
+            vec![
+                WriteJob::Text("x".into()),
+                WriteJob::Text("x2".into()),
+                paste_job("p"),
+                WriteJob::Text("y".into()),
+            ],
+        );
+        let seen = script.seen();
+        assert_eq!(
+            stdin_lines(&seen),
+            vec![
+                serde_json::json!({"type": "terminal.input", "text": "xx2"}),
+                serde_json::json!({"type": "terminal.input", "text": paste_block("p")}),
+                serde_json::json!({"type": "terminal.input", "text": "y"}),
+            ]
+        );
+        assert_eq!(stdin_writes(&seen), 3);
+    }
+
+    #[test]
+    fn paste_adjacent_pastes_are_never_merged() {
+        let script = sized_script();
+        run_queued(&script, vec![paste_job("a"), paste_job("b")]);
+        let lines = stdin_lines(&script.seen());
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0]["text"], paste_block("a"));
+        assert_eq!(lines[1]["text"], paste_block("b"));
+    }
+
+    #[test]
+    fn paste_without_a_bridge_falls_back_as_one_block() {
+        let script = Script::default();
+        let writers = Writers::with_wait(Duration::from_millis(10));
+        writers
+            .send(&key(), 1, paste_job("l1\rl2"), || script.clone())
+            .unwrap();
+        writers
+            .send(&key(), 1, WriteJob::Text("t".into()), || script.clone())
+            .unwrap();
+        flush(&writers, &script);
+        // Only the paste path sees the block; the text after it is its own call.
+        assert_eq!(
+            script.seen(),
+            vec![
+                Seen::FallbackPaste(paste_block("l1\rl2")),
+                Seen::Fallback("t".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn input_queued_behind_a_paste_shares_its_wait_for_a_bridge() {
+        let script = Script::default();
+        let wait = Duration::from_millis(400);
+        let writers = Writers::with_wait(wait);
+        let gate_tx = hold_writer(&writers, &script);
+        writers.send(&key(), 1, paste_job("p"), unused).unwrap();
+        writers
+            .send(&key(), 1, WriteJob::Text("t".into()), unused)
+            .unwrap();
+        let started = Instant::now();
+        gate_tx.send(()).unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        writers
+            .send(&key(), 1, WriteJob::Flush(tx), unused)
+            .unwrap();
+        rx.recv().unwrap();
+        let took = started.elapsed();
+        assert_eq!(
+            script.seen(),
+            vec![
+                Seen::Line("held".into()),
+                Seen::FallbackPaste(paste_block("p")),
+                Seen::Fallback("t".into())
+            ]
+        );
+        // One wait for the batch, not one per run.
+        assert!(took >= wait, "{took:?}");
+        assert!(took < wait * 2, "{took:?}");
+    }
+
+    #[test]
+    fn a_new_batch_waits_for_a_bridge_again() {
+        let script = Script::default();
+        let wait = Duration::from_millis(200);
+        let writers = Writers::with_wait(wait);
+        writers
+            .send(&key(), 1, WriteJob::Text("a".into()), || script.clone())
+            .unwrap();
+        flush(&writers, &script);
+        // The writer went idle: the next input waits its own full wait.
+        let started = Instant::now();
+        writers
+            .send(&key(), 1, WriteJob::Text("b".into()), || script.clone())
+            .unwrap();
+        flush(&writers, &script);
+        assert!(started.elapsed() >= wait, "{:?}", started.elapsed());
+        assert_eq!(
+            script.seen(),
+            vec![Seen::Fallback("a".into()), Seen::Fallback("b".into())]
+        );
+    }
+
+    #[test]
+    fn paste_refused_by_the_session_is_dropped() {
+        let script = sized_script();
+        *script.refuse.lock().unwrap() = true;
+        let writers = Writers::default();
+        writers
+            .send(&key(), 1, paste_job("p"), || script.clone())
+            .unwrap();
+        flush(&writers, &script);
+        assert!(script.seen().is_empty(), "{:?}", script.seen());
     }
 }

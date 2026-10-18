@@ -3,6 +3,7 @@
 
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import type { Dims } from "./termFit";
+import type { PasteRefusal } from "./terminalPaste";
 import { getTransport } from "./transport";
 
 // Route every backend call through the active transport (localTransport —
@@ -641,6 +642,16 @@ export function ptyWrite(project: string, id: string, data: string, t0?: number)
   return invoke("pty_write", t0 === undefined ? { project, id, data } : { project, id, data, t0 });
 }
 
+/**
+ * Paste `text` into the session as one unit. The backend strips any embedded
+ * bracketed-paste markers and wraps the text in one block, so pass plain text
+ * (newlines already normalised to `\r`). Rejects with `PasteTooLarge: <bytes> > <limit>`
+ * when over the size cap.
+ */
+export function ptyPaste(project: string, id: string, text: string): Promise<void> {
+  return invoke("pty_paste", { project, id, text });
+}
+
 /** Whether the backend latency probe is on (read once at startup). */
 export function latencyProbeEnabled(): Promise<boolean> {
   return invoke("latency_probe_enabled");
@@ -872,21 +883,46 @@ export interface PtyResumeEvent {
 }
 
 /**
+ * Subscribe to the per-session event `pty://{kind}/{project}/{id}`. Best-effort: a
+ * transport that does not carry the event resolves to a no-op unlisten instead of failing.
+ */
+function listenSession<T>(
+  kind: string,
+  project: string,
+  id: string,
+  cb: (e: T) => void,
+): Promise<UnlistenFn> {
+  const noop: UnlistenFn = () => {};
+  try {
+    return listen<T>(`pty://${kind}/${project}/${id}`, cb).catch(() => noop);
+  } catch {
+    return Promise.resolve(noop);
+  }
+}
+
+/**
  * Subscribe to the notice the backend sends when it resumed a session's
- * conversation (or had to fall back). Best-effort: a transport that does not
- * carry the event resolves to a no-op unlisten instead of failing.
+ * conversation (or had to fall back). Best-effort (see `listenSession`).
  */
 export function onPtyResume(
   project: string,
   id: string,
   cb: (e: PtyResumeEvent) => void,
 ): Promise<UnlistenFn> {
-  const noop: UnlistenFn = () => {};
-  try {
-    return listen<PtyResumeEvent>(`pty://resume/${project}/${id}`, cb).catch(() => noop);
-  } catch {
-    return Promise.resolve(noop);
-  }
+  return listenSession("resume", project, id, cb);
+}
+
+/**
+ * Subscribe to the writer's notice that it refused a paste for size (the CLI-fallback
+ * cap, only known once the bridge turned out to be down). Best-effort like
+ * `onPtyResume`: a transport that does not carry the event resolves to a no-op.
+ */
+export function onPtyPasteRefused(
+  project: string,
+  id: string,
+  cb: (e: PasteRefusal) => void,
+): Promise<UnlistenFn> {
+  return listenSession("paste-refused", project, id, cb);
 }
 
 /** Fires when task-config.json changes (worktrees added/removed/renamed). */
