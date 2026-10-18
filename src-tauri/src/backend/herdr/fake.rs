@@ -16,7 +16,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use super::cli::{
     AgentInfo, AgentSession, AgentSessionKind, IntegrationStatus, PaneIdentity, PaneInfo,
-    ServerStatus,
+    PaneProcessInfo, ServerStatus,
 };
 use super::env::{ExeDiscovery, HerdrEnv};
 use super::ops::{
@@ -69,6 +69,9 @@ struct FakeState {
     basis: ServerInstance,
     panes: Vec<PaneIdentity>,
     closed: Vec<String>,
+    /// What `pane_process_info` answers, by pane id; a pane without an entry is
+    /// not found.
+    process_info: HashMap<String, PaneProcessInfo>,
     next_workspace: u32,
     next_terminal: u32,
     next_session: u32,
@@ -317,6 +320,7 @@ impl FakeHerdr {
                     basis: INITIAL_INSTANCE,
                     panes: Vec::new(),
                     closed: Vec::new(),
+                    process_info: HashMap::new(),
                     next_workspace: 0,
                     next_terminal: 0,
                     next_session: 0,
@@ -390,6 +394,11 @@ impl FakeHerdr {
         if let Ok(p) = self.state().pane_mut(pane_id) {
             p.viewport_rows = rows;
         }
+    }
+
+    /// What `pane_process_info` answers for `pane_id` from now on.
+    pub fn set_process_info(&self, pane_id: &str, info: PaneProcessInfo) {
+        self.state().process_info.insert(pane_id.to_string(), info);
     }
 
     /// Simulate the agent exiting in (or returning to) its shell.
@@ -820,6 +829,17 @@ impl HerdrOps for FakeHerdr {
         let mut st = self.state();
         st.control(Op::PaneGet, pane_id.to_string())?;
         st.pane_mut(pane_id).map(|p| Some(p.clone()))
+    }
+
+    /// The info scripted with [`FakeHerdr::set_process_info`]; a pane without
+    /// any is not found.
+    fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
+        let mut st = self.state();
+        st.control(Op::PaneProcessInfo, pane_id.to_string())?;
+        st.process_info
+            .get(pane_id)
+            .cloned()
+            .ok_or_else(|| pane_not_found(pane_id))
     }
 
     fn agent_start(
@@ -1365,6 +1385,60 @@ mod tests {
         assert_eq!(fake.status_server(), Err(HerdrError::Timeout));
         fake.hang(Op::StatusServer, false);
         assert!(fake.status_server().is_ok());
+    }
+
+    #[test]
+    fn pane_process_info_answers_what_was_scripted() {
+        let fake = FakeHerdr::new();
+        let info = PaneProcessInfo {
+            shell_pid: 4100,
+            foreground_pids: vec![4200],
+        };
+        fake.set_process_info("w1:p1", info.clone());
+        assert_eq!(fake.pane_process_info("w1:p1"), Ok(info));
+        assert!(
+            fake.pane_process_info("w9:p9").unwrap_err().is_not_found(),
+            "an unscripted pane is not found"
+        );
+        assert_eq!(
+            fake.calls(),
+            vec![
+                Call {
+                    op: Op::PaneProcessInfo,
+                    args: "w1:p1".into(),
+                },
+                Call {
+                    op: Op::PaneProcessInfo,
+                    args: "w9:p9".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pane_process_info_honours_fail_next_and_a_dead_server() {
+        let fake = FakeHerdr::new();
+        let info = PaneProcessInfo {
+            shell_pid: 7,
+            foreground_pids: Vec::new(),
+        };
+        fake.set_process_info("w1:p1", info.clone());
+        fake.fail_next(Op::PaneProcessInfo, HerdrError::Timeout);
+        assert_eq!(fake.pane_process_info("w1:p1"), Err(HerdrError::Timeout));
+        assert_eq!(fake.pane_process_info("w1:p1"), Ok(info), "queue drained");
+        assert!(fake.pane_list().is_ok(), "other ops unaffected");
+
+        fake.kill_server(None);
+        assert_eq!(fake.pane_process_info("w1:p1"), Err(not_running()));
+        assert_eq!(
+            ops_of(&fake),
+            vec![
+                Op::PaneProcessInfo,
+                Op::PaneProcessInfo,
+                Op::PaneList,
+                Op::PaneProcessInfo,
+            ]
+        );
     }
 
     #[test]

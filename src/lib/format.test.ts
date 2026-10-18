@@ -4,6 +4,7 @@ import {
   formatAgo,
   formatBytes,
   formatCpu,
+  formatRate,
   formatUptime,
   parseUtc,
   shortPath,
@@ -48,6 +49,19 @@ describe("formatCpu", () => {
   it("returns an em dash for invalid input", () => {
     expect(formatCpu(-1)).toBe("—");
     expect(formatCpu(Number.NaN)).toBe("—");
+  });
+});
+
+describe("formatRate", () => {
+  it("appends /s to the byte format", () => {
+    expect(formatRate(0)).toBe("0 B/s");
+    expect(formatRate(1536)).toBe("1.5 KB/s");
+    expect(formatRate(5 * 1024 * 1024)).toBe("5.0 MB/s");
+  });
+
+  it("returns an em dash for invalid input", () => {
+    expect(formatRate(-1)).toBe("—");
+    expect(formatRate(Number.NaN)).toBe("—");
   });
 });
 

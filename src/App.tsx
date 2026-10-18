@@ -18,6 +18,7 @@ import { FontSizeHud, type FontSizeHudHandle } from "./components/FontSizeHud";
 import { Inspector } from "./components/Inspector";
 import { KeybindingHelp } from "./components/KeybindingHelp";
 import { Onboarding } from "./components/Onboarding";
+import { PerfOverlay } from "./components/PerfOverlay";
 import { QuitConfirmModal } from "./components/QuitConfirmModal";
 import { Rail } from "./components/Rail";
 import { RecoveryBanner } from "./components/RecoveryBanner";
@@ -160,6 +161,7 @@ function AppInner() {
     setInspectorCollapsed(selectedTaskId !== null ? false : collapsedPrefRef.current);
   }, [selectedTaskId]);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [perfOpen, setPerfOpen] = useState(false);
   const [wtOpen, setWtOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   // Add-project dialog — single instance lifted here so both the rail and
@@ -831,6 +833,16 @@ function AppInner() {
       void handleSwitchProjectRef.current(g.key, g.summary, { select: w, silent: true });
     }
   }, []);
+  // Focus a worktree picked in the performance overlay, switching project when needed.
+  const focusPerfSession = useCallback(
+    (project: string, worktree: string) => {
+      const g = railGroups.find((x) => x.resolvedName === project);
+      if (g) selectLane(g, worktree);
+    },
+    [railGroups, selectLane],
+  );
+  const closePerf = useCallback(() => setPerfOpen(false), []);
+  const togglePerf = useCallback(() => setPerfOpen((v) => !v), []);
   const openLaneDiff = useCallback((g: GroupModel, w: string) => {
     if (g.isActive && activeReadyRef.current) setDiffTarget(w);
     else
@@ -879,6 +891,7 @@ function AppInner() {
       availableWorktrees,
       hasSelectedCard: selectedTaskId !== null,
       toggleHelp: () => setHelpOpen((o) => !o),
+      togglePerf,
       openDiff: (name: string) => setDiffTarget(name),
       setView,
       setSelected,
@@ -901,6 +914,7 @@ function AppInner() {
       projectNames,
       activeProjectKey,
       switchToProject,
+      togglePerf,
     ],
   );
   useKeybindings(keyCtx);
@@ -1118,6 +1132,8 @@ function AppInner() {
           onAddProject={() => setAddProjectOpen(true)}
           onOpenSettings={() => setSettingsOpen(true)}
           onOpenHelp={() => setHelpOpen(true)}
+          perfOpen={perfOpen}
+          onTogglePerf={togglePerf}
           daemonInfo={daemonInfo}
           hintVisible={hintVisible}
           codexAvailable={codexAvailable}
@@ -1241,6 +1257,9 @@ function AppInner() {
             <DiffView key={diffTarget} worktree={diffTarget} onClose={() => setDiffTarget(null)} />
           </div>
         )}
+        {/* Performance overlay: floats over the stage (never the rail); mounted only while
+            open so its sort and expansion state reset on close. */}
+        {perfOpen && <PerfOverlay onClose={closePerf} onFocusSession={focusPerfSession} />}
       </div>
       {helpOpen && <KeybindingHelp onClose={() => setHelpOpen(false)} />}
       <FontSizeHud ref={fontHudRef} />

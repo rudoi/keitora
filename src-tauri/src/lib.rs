@@ -21,6 +21,7 @@ mod latency_probe;
 mod lifecycle;
 mod logging;
 mod paths;
+mod perf;
 mod tasks;
 mod terminal_links;
 mod transfer;

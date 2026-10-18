@@ -111,6 +111,18 @@ impl ActivityState {
         *lock(&self.worktrees) = Some((fresh.clone(), Instant::now()));
         fresh
     }
+
+    /// The registered worktrees as perf's path-inference roots.
+    pub(crate) fn worktree_roots(&self) -> Vec<crate::perf::attribute::WorktreeRoot> {
+        self.worktrees()
+            .into_iter()
+            .map(|w| crate::perf::attribute::WorktreeRoot {
+                project: w.project,
+                worktree: w.worktree,
+                path: w.path.to_string_lossy().into_owned(),
+            })
+            .collect()
+    }
 }
 
 /// Enumerate every registered project's available worktrees. Best-effort: a project whose

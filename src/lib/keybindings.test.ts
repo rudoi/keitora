@@ -158,6 +158,7 @@ function makeCtx(overrides: Partial<KeyCtx> = {}): KeyCtx {
     availableWorktrees: [],
     hasSelectedCard: false,
     toggleHelp: vi.fn(),
+    togglePerf: vi.fn(),
     openDiff: vi.fn(),
     setView: vi.fn(),
     setSelected: vi.fn(),
@@ -171,6 +172,24 @@ function makeCtx(overrides: Partial<KeyCtx> = {}): KeyCtx {
     ...overrides,
   };
 }
+
+describe("perf.toggle binding", () => {
+  const binding = DEFAULT_BINDINGS.find((b) => b.id === "perf.toggle");
+
+  it("is a global Cmd+Shift+P chord", () => {
+    expect(binding).toBeDefined();
+    expect(binding?.global).toBe(true);
+    expect(matchesKey(ev({ ctrlKey: true, shiftKey: true, key: "P" }), binding?.keys ?? "")).toBe(
+      true,
+    );
+  });
+
+  it("run toggles the overlay", () => {
+    const ctx = makeCtx();
+    binding?.run(ctx);
+    expect(ctx.togglePerf).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("diff.open binding", () => {
   it("opens the diff for the selected worktree", () => {

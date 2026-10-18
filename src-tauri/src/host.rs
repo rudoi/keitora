@@ -2074,6 +2074,8 @@ pub fn run() {
             // Shared sysinfo System for the rail daemon card's 2s stats poll.
             // Per-worktree activity caches (workflow slots, branch cache, UBT engine).
             app.manage(crate::activity::ActivityState::default());
+            // Performance overlay: the sampler's lease, latest snapshot and wake channel.
+            app.manage(crate::perf::PerfState::default());
             // Diff view: per-file LRU cache, the per-worktree cancellation registry for
             // in-flight per-file `git diff` jobs, the single-scan summary snapshotter, and
             // the refcounted filesystem watchers that drive change detection.
@@ -2146,6 +2148,9 @@ pub fn run() {
             daemon_restart,
             daemon_list_sessions,
             crate::activity::worktree_activity,
+            crate::perf::perf_subscribe,
+            crate::perf::perf_unsubscribe,
+            crate::perf::perf_snapshot,
             app_quit_keep,
             app_quit_stop,
             worktrees,

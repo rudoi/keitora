@@ -98,6 +98,17 @@ pub enum IntegrationStatus {
     Unknown,
 }
 
+/// The OS processes rooted in one pane (`herdr pane process-info`): the pane's
+/// shell, plus the foreground processes herdr reports for it. A foreground pid
+/// may sit outside the shell's process tree (e.g. an agent launched through Git
+/// Bash on Windows), which is why both are kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaneProcessInfo {
+    pub shell_pid: u32,
+    /// Distinct foreground pids, in herdr's order, never including `shell_pid`.
+    pub foreground_pids: Vec<u32>,
+}
+
 /// Read a herdr `error` JSON object (`{"code","message"}`) as an
 /// [`HerdrError::Api`]. A missing code reads as `""`, a missing message as
 /// `"unknown herdr error"`.
@@ -165,6 +176,41 @@ fn parse_agent_session(value: &Value) -> Option<AgentSession> {
         agent: field("agent")?,
         kind,
         value: field("value")?,
+    })
+}
+
+/// Parse a `pane process-info` response. The payload sits at
+/// `/result/process_info`; a bare `/process_info` is read when there is no
+/// `result` envelope. `shell_pid` is required (and must fit a `u32`), so a
+/// payload without one is `None`. `foreground_processes` is optional: each
+/// entry's `pid` is collected (entries without a valid one are skipped), with
+/// duplicates and the shell pid dropped. Every other field is ignored.
+pub fn parse_pane_process_info(value: &Value) -> Option<PaneProcessInfo> {
+    let info = match value.get("result") {
+        Some(result) => result.get("process_info")?,
+        None => value.get("process_info")?,
+    };
+    fn pid_of(v: &Value) -> Option<u32> {
+        v.as_u64().and_then(|n| u32::try_from(n).ok())
+    }
+    let shell_pid = info.get("shell_pid").and_then(pid_of)?;
+    let entries = info
+        .get("foreground_processes")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut foreground_pids: Vec<u32> = Vec::new();
+    for pid in entries
+        .iter()
+        .filter_map(|entry| entry.get("pid").and_then(pid_of))
+    {
+        if pid != shell_pid && !foreground_pids.contains(&pid) {
+            foreground_pids.push(pid);
+        }
+    }
+    Some(PaneProcessInfo {
+        shell_pid,
+        foreground_pids,
     })
 }
 
@@ -544,6 +590,96 @@ mod tests {
             agent_prompt_error_from(coded("pane_not_found", "gone")),
             PtyBackendError::NoSuchSession
         ));
+    }
+
+    #[test]
+    fn pane_process_info_reads_the_enveloped_shape() {
+        // A hand-written sample in the shape herdr documents, inside the
+        // `result` envelope `RealHerdr::run` hands back.
+        let v: Value = serde_json::from_str(
+            r#"{"id":"cli:pane:process-info","result":{"type":"pane_process_info","process_info":{
+                "pane_id":"w1:p1","shell_pid":4100,"foreground_process_group_id":4200,"tty":null,
+                "foreground_processes":[
+                  {"pid":4200,"name":"claude","argv0":"claude","argv":["claude"],"cmdline":"claude","cwd":"C:/Users/x/proj"},
+                  {"pid":4300,"name":"node","argv0":"node","argv":["node"],"cmdline":"node","cwd":"C:/Users/x/proj"}
+                ]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_pane_process_info(&v),
+            Some(PaneProcessInfo {
+                shell_pid: 4100,
+                foreground_pids: vec![4200, 4300],
+            })
+        );
+    }
+
+    #[test]
+    fn pane_process_info_reads_the_bare_shape() {
+        let v = serde_json::json!({
+            "type": "pane_process_info",
+            "process_info": {"pane_id": "w1:p1", "shell_pid": 77},
+        });
+        assert_eq!(
+            parse_pane_process_info(&v),
+            Some(PaneProcessInfo {
+                shell_pid: 77,
+                foreground_pids: Vec::new(),
+            }),
+            "no foreground list is an empty one"
+        );
+    }
+
+    #[test]
+    fn pane_process_info_without_a_shell_pid_is_none() {
+        for v in [
+            serde_json::json!({"result": {"process_info": {"pane_id": "w1:p1"}}}),
+            serde_json::json!({"process_info": {"shell_pid": "12"}}),
+            serde_json::json!({"process_info": {"shell_pid": -1}}),
+            serde_json::json!({"process_info": {"shell_pid": 5_000_000_000u64}}),
+            // An envelope without a payload is not read as the bare shape.
+            serde_json::json!({"result": {"pane": {}}, "process_info": {"shell_pid": 3}}),
+            serde_json::json!({}),
+            Value::Null,
+        ] {
+            assert_eq!(parse_pane_process_info(&v), None, "{v}");
+        }
+    }
+
+    #[test]
+    fn pane_process_info_skips_entries_without_a_pid() {
+        let v = serde_json::json!({"result": {"process_info": {
+            "shell_pid": 10,
+            "foreground_processes": [
+                {"name": "no-pid"},
+                {"pid": "11"},
+                {"pid": -4},
+                {"pid": 5_000_000_000u64},
+                {"pid": 12},
+                "not-an-object",
+            ],
+        }}});
+        assert_eq!(
+            parse_pane_process_info(&v).unwrap().foreground_pids,
+            vec![12]
+        );
+    }
+
+    #[test]
+    fn pane_process_info_drops_duplicates_and_the_shell_pid() {
+        let v = serde_json::json!({"result": {"process_info": {
+            "shell_pid": 10,
+            "foreground_processes": [
+                {"pid": 10}, {"pid": 30}, {"pid": 20}, {"pid": 30}, {"pid": 10}, {"pid": 20},
+            ],
+        }}});
+        assert_eq!(
+            parse_pane_process_info(&v),
+            Some(PaneProcessInfo {
+                shell_pid: 10,
+                foreground_pids: vec![30, 20],
+            })
+        );
     }
 
     const STATUS_SAMPLE: &str = "pi: not installed (C:\\u\\.pi\\x.ts)\n\

@@ -63,6 +63,7 @@ pub mod gate;
 pub mod input;
 pub mod keymap;
 pub mod ops;
+pub mod perf_source;
 pub mod real;
 pub mod reconcile;
 pub mod recovery;
@@ -2634,6 +2635,14 @@ impl PtyBackend for HerdrBackend {
             return DaemonStats::default();
         }
         self.status_cache.lock().unwrap().stats.clone()
+    }
+
+    fn perf_source(&self) -> Option<Arc<dyn crate::perf::PerfSource>> {
+        Some(Arc::new(perf_source::HerdrPerfSource::new(
+            Arc::clone(&self.ops),
+            Arc::clone(&self.keymap),
+            Arc::clone(&self.status_cache),
+        )))
     }
 
     fn shutdown(&self) -> Result<(), PtyBackendError> {

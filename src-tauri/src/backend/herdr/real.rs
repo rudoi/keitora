@@ -19,7 +19,8 @@ use serde_json::Value;
 
 use super::cli::{
     agent_start_result_from, api_error_from_value, parse_agent_list, parse_integration_status,
-    parse_pane_identity, AgentInfo, IntegrationStatus, PaneIdentity, PaneInfo, ServerStatus,
+    parse_pane_identity, parse_pane_process_info, AgentInfo, IntegrationStatus, PaneIdentity,
+    PaneInfo, PaneProcessInfo, ServerStatus,
 };
 use super::env::{discover_exe, ExeDiscovery, HerdrEnv, LoginSearch};
 use super::exec::{run_with_deadline, CallClass};
@@ -158,6 +159,12 @@ impl RealHerdr {
 /// arguments (`agent start`, `pane list`), never a value passed after them.
 fn subcommand(args: &[&str]) -> String {
     args.iter().take(2).copied().collect::<Vec<_>>().join(" ")
+}
+
+/// The argv of `herdr pane process-info` for `pane_id`. herdr does not default
+/// the leaf to the calling pane, so `--pane` is always passed.
+fn pane_process_info_args(pane_id: &str) -> [&str; 4] {
+    ["pane", "process-info", "--pane", pane_id]
 }
 
 fn exit_error(status: ExitStatus, stderr: &[u8]) -> HerdrError {
@@ -319,6 +326,15 @@ impl HerdrOps for RealHerdr {
     fn pane_get(&self, pane_id: &str) -> Result<Option<PaneInfo>, HerdrError> {
         let value = self.run(CallClass::Quick, &["pane", "get", pane_id])?;
         Ok(value.pointer("/result/pane").and_then(parse_pane_identity))
+    }
+
+    /// `herdr pane process-info --pane <pane_id>` → the pane's shell pid and
+    /// foreground pids (at `/result/process_info`).
+    fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
+        let value = self.run(CallClass::Quick, &pane_process_info_args(pane_id))?;
+        parse_pane_process_info(&value).ok_or_else(|| HerdrError::Parse {
+            message: "pane process-info: unexpected shape".into(),
+        })
     }
 
     /// `herdr agent start <name> --kind <kind> --pane <pane_id> --timeout <ms>
@@ -638,6 +654,19 @@ mod tests {
         assert_eq!(subcommand(&["pane", "list"]), "pane list");
         assert_eq!(subcommand(&["server"]), "server");
         assert_eq!(subcommand(&[]), "");
+    }
+
+    #[test]
+    fn pane_process_info_passes_the_pane_flag() {
+        assert_eq!(
+            pane_process_info_args("w1:p2"),
+            ["pane", "process-info", "--pane", "w1:p2"]
+        );
+        // The timing log names the subcommand, never the pane.
+        assert_eq!(
+            subcommand(&pane_process_info_args("w1:p2")),
+            "pane process-info"
+        );
     }
 
     /// The server-pid scan command matcher: our detached `herdr server` matches, but the

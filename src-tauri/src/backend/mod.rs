@@ -618,6 +618,13 @@ pub trait PtyBackend: Send + Sync + 'static {
         DaemonStats::default()
     }
 
+    /// What the performance overlay's sampler reads from the backend: its panes'
+    /// process roots and server pid. The default has none (the sampler then
+    /// attributes nothing to sessions) — only the herdr backend overrides it.
+    fn perf_source(&self) -> Option<Arc<dyn crate::perf::PerfSource>> {
+        None
+    }
+
     /// Stop the backend and engage the explicit-Stop gate (no auto-respawn until
     /// `restart()` or `spawn()`).
     fn shutdown(&self) -> Result<(), PtyBackendError>;
@@ -860,6 +867,11 @@ mod tests {
     #[test]
     fn daemon_stats_defaults_to_not_running() {
         assert_eq!(FakeBackend::new().daemon_stats(), DaemonStats::default());
+    }
+
+    #[test]
+    fn perf_source_defaults_to_none() {
+        assert!(FakeBackend::new().perf_source().is_none());
     }
 
     #[test]

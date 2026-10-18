@@ -250,6 +250,71 @@ export function daemonStats(): Promise<DaemonStats> {
   return invoke<RawDaemonStats>("daemon_stats").then(normalizeDaemonStats);
 }
 
+// ── Performance overlay ──────────────────────────────────────────────────────────
+// Mirrors `perf::PerfSnapshot` (src-tauri/src/perf/mod.rs). `Option` fields arrive as `null`.
+
+export type PerfRowKind = "project" | "worktree" | "keitora" | "herdr" | "other";
+
+export interface PerfMachine {
+  cpu_percent: number;
+  mem_used: number;
+  mem_total: number;
+  disk_read_bps: number;
+  disk_write_bps: number;
+}
+
+export interface PerfHistory {
+  cpu: number[];
+  mem: number[];
+}
+
+export interface PerfProc {
+  pid: number;
+  name: string;
+  cpu_percent: number;
+  mem_bytes: number;
+  disk_read_bps: number;
+  disk_write_bps: number;
+  inferred: boolean;
+}
+
+export interface PerfRow {
+  key: string;
+  kind: PerfRowKind;
+  project: string | null;
+  worktree: string | null;
+  resolving: boolean;
+  cpu_percent: number;
+  mem_bytes: number;
+  disk_read_bps: number;
+  disk_write_bps: number;
+  proc_count: number;
+  inferred_count: number;
+  history: PerfHistory;
+  top_procs: PerfProc[];
+}
+
+export interface PerfSnapshot {
+  at_ms: number;
+  machine: PerfMachine;
+  rows: PerfRow[];
+}
+
+/** Start (or renew) the sampling lease; the backend stops sampling when it lapses. */
+export function perfSubscribe(): Promise<void> {
+  return invoke("perf_subscribe");
+}
+
+/** Release the sampling lease. */
+export function perfUnsubscribe(): Promise<void> {
+  return invoke("perf_unsubscribe");
+}
+
+/** The most recent snapshot, or `null` before the first sample. */
+export function perfSnapshot(): Promise<PerfSnapshot | null> {
+  return invoke<PerfSnapshot | null>("perf_snapshot");
+}
+
 // ── Worktree activity (rail lanes) ──────────────────────────────────────────────
 // Mirrors `activity::WorktreeActivity` (src-tauri/src/activity/mod.rs): each project's
 // worktrees, with workflow stage, git branch, UBT build progress, and a working flag.

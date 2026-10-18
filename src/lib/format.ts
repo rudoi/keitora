@@ -40,6 +40,12 @@ export function formatBytes(bytes: number): string {
     : `${rounded1.toFixed(1)} ${units[unit]}`;
 }
 
+/** Format a bytes-per-second rate (`1.2 MB/s`); `—` for the inputs `formatBytes` rejects. */
+export function formatRate(bytesPerSec: number): string {
+  const b = formatBytes(bytesPerSec);
+  return b === "—" ? b : `${b}/s`;
+}
+
 /**
  * Format a CPU percentage with one decimal place always (`1.0%`, `12.3%`), so the field
  * width doesn't jump as the value ticks in the rail card.

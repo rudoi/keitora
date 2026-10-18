@@ -8,7 +8,7 @@
 // header looks selected, and the focused lane carries the rail's single accent focus bar.
 
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { HelpCircle, Settings } from "lucide-react";
+import { Activity, HelpCircle, Settings } from "lucide-react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatBytes, formatCpu, formatUptime } from "../lib/format";
 import type { CliKind, DaemonInfo } from "../lib/ipc";
@@ -480,6 +480,8 @@ export function Rail({
   onAddProject,
   onOpenSettings,
   onOpenHelp,
+  perfOpen,
+  onTogglePerf,
   daemonInfo,
   hintVisible,
   codexAvailable,
@@ -498,6 +500,9 @@ export function Rail({
   onAddProject: () => void;
   onOpenSettings: () => void;
   onOpenHelp: () => void;
+  /** Whether the performance overlay is showing (drives the toggle's pressed state). */
+  perfOpen: boolean;
+  onTogglePerf: () => void;
   daemonInfo: DaemonInfo;
   hintVisible: boolean;
   codexAvailable: boolean;
@@ -683,6 +688,15 @@ export function Rail({
           <button className="rail-settings" onClick={onOpenSettings} title="Settings">
             <Settings size={14} />
             <span>Settings</span>
+          </button>
+          <button
+            className="rail-perf"
+            aria-pressed={perfOpen}
+            title={`Performance (${modKeyLabel}+Shift+P)`}
+            onClick={onTogglePerf}
+          >
+            <Activity size={14} />
+            <span>perf</span>
           </button>
           <button className="rail-shortcuts" onClick={onOpenHelp} title="Keyboard shortcuts (?)">
             <HelpCircle size={14} />
