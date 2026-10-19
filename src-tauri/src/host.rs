@@ -263,6 +263,16 @@ fn reorder_projects(app: AppHandle, order: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// Persist a new worktree order for the project registered as `project` and tell the
+/// frontend to reload its worktree lists. `order` may be partial (see
+/// `keitora_tasks::reorder_entries`).
+#[tauri::command(async)]
+fn reorder_worktrees(app: AppHandle, project: String, order: Vec<String>) -> Result<(), String> {
+    keitora_tasks::reorder_project_worktrees(&project, &order).map_err(|e| e.to_string())?;
+    let _ = app.emit("worktrees://changed", ());
+    Ok(())
+}
+
 /// Switch the active project by registry name. Emits the project/worktrees/tasks/
 /// sessions change events directly so the frontend reseeds immediately, instead of
 /// waiting on the config-file watcher's ~200 ms debounce (the source of the visible
@@ -2183,6 +2193,7 @@ pub fn run() {
             projects_overview,
             set_active_project,
             reorder_projects,
+            reorder_worktrees,
             onboard_project,
             detect_legacy,
             migrate_legacy,

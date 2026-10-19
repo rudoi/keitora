@@ -1,9 +1,10 @@
 // One lane row of the rail: a worktree's status block, name, task, stage, branch and build
 // bar. Available lanes are selectable; others render muted with their status.
 
+import { useDraggable } from "@dnd-kit/core";
 import { FileDiff } from "lucide-react";
-import type { CSSProperties } from "react";
-import { memo, useEffect, useRef, useState } from "react";
+import type { CSSProperties, PointerEventHandler, Ref } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   formatActions,
   formatEta,
@@ -14,6 +15,7 @@ import {
 import type { WorkflowState, WorktreeActivity, WorktreeStatus } from "../../lib/ipc";
 import { blockAnimates } from "../../lib/laneState";
 import type { LaneModel } from "../../lib/railGroups";
+import { laneDragId } from "../../lib/railOrder";
 import { usePrefersReducedMotion } from "../../lib/usePrefersReducedMotion";
 import { ProviderGlyph } from "../ProviderGlyph";
 
@@ -142,9 +144,33 @@ function LaneBuild({ build }: { build: NonNullable<WorktreeActivity["build"]> })
 
 // ── Lane ───────────────────────────────────────────────────────────────────────
 
+/** What a lane's drag reports to RailProjects: the group it belongs to and its worktree. */
+export interface LaneDragData {
+  kind: "lane";
+  group: string;
+  worktree: string;
+}
+
+/**
+ * The lifted copy of a lane that follows the pointer while it is dragged: a one-row chip
+ * with the worktree name, centred in the overlay box (sized to the grabbed lane).
+ */
+export function LaneOverlay({ ref, name }: { ref?: Ref<HTMLDivElement>; name: string }) {
+  return (
+    <div ref={ref} className="rail-lane-overlay" aria-hidden="true">
+      <span className="lane-name">{name}</span>
+    </div>
+  );
+}
+
 // Memoized: the handlers take the worktree name, so the parent passes the same ones to
 // every lane and an unchanged lane skips re-rendering.
+//
+// The whole row is a mouse drag handle (past the rail's 4 px threshold, so a click still
+// selects). Only the pointer listener is attached: no keyboard activation, role or tab
+// stop, so Enter on the diff button never starts a drag.
 export const Lane = memo(function Lane({
+  groupKey,
   lane,
   isSelected,
   hintBadge,
@@ -153,6 +179,8 @@ export const Lane = memo(function Lane({
   onOpenDiff,
   onContextMenu,
 }: {
+  /** Registry key of the lane's project group. */
+  groupKey: string;
   lane: LaneModel;
   isSelected: boolean;
   hintBadge?: number;
@@ -162,6 +190,14 @@ export const Lane = memo(function Lane({
   onContextMenu: (worktree: string, x: number, y: number) => void;
 }) {
   const reduceMotion = usePrefersReducedMotion();
+  const data = useMemo<LaneDragData>(
+    () => ({ kind: "lane", group: groupKey, worktree: lane.name }),
+    [groupKey, lane.name],
+  );
+  const { listeners, setNodeRef, isDragging } = useDraggable({
+    id: laneDragId(groupKey, lane.name),
+    data,
+  });
   const { activity: act, task, building, attn, terminated } = lane;
   const ok = lane.status === "available";
   const badge = hintBadge;
@@ -179,6 +215,7 @@ export const Lane = memo(function Lane({
     ok ? "" : "disabled",
     terminated ? "terminated" : "",
     isSelected ? "sel" : "",
+    isDragging ? "is-dragging" : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -201,7 +238,9 @@ export const Lane = memo(function Lane({
     .join(" ");
   return (
     <div
+      ref={setNodeRef}
       className={rowCls}
+      onPointerDown={listeners?.onPointerDown as PointerEventHandler<HTMLDivElement> | undefined}
       onClick={ok ? () => onSelect(lane.name) : undefined}
       onContextMenu={
         ok

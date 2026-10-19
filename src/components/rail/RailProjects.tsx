@@ -5,6 +5,10 @@
 // copy's position against each group's header, see lib/railDrop). A drop shows its new
 // order at once and persists it through `onReorder`; the shown order holds until the
 // registry reports it (or reverts, with a toast, when the save fails).
+//
+// Worktree lanes reorder the same way within their own group, by mouse only: the line
+// marks a gap between that group's lanes, and the dropped order shows at once as a
+// per-group override until the group's reported lanes catch up.
 
 import {
   type Announcements,
@@ -28,20 +32,36 @@ import {
   type VSpan,
 } from "../../lib/railDrop";
 import type { GroupModel } from "../../lib/railGroups";
-import { applyOrder, moveToSlot, settleOverride } from "../../lib/railOrder";
+import {
+  applyLaneOrders,
+  applyOrder,
+  type LaneOverrides,
+  laneNamesByGroup,
+  moveToSlot,
+  settleLaneOverrides,
+  settleOverride,
+} from "../../lib/railOrder";
 import { useHomeDir, useMinuteNow } from "../../lib/useRailClock";
 import { useToast } from "../Toast";
+import { type LaneDragData, LaneOverlay } from "./Lane";
 import { ProjectGroup, ProjectGroupOverlay } from "./ProjectGroup";
 
 /**
- * The group being dragged: its key, its index in the current order, the slot it would drop
- * into, and whether the keyboard is driving it.
+ * The item being dragged: a project group (`group` null) or a worktree lane of the group
+ * `group`. `key` is the group's registry key or the lane's worktree name; `from` its index
+ * in the current order (of groups, or of that group's lanes); `slot` the slot it would
+ * drop into; and whether the keyboard is driving it (groups only).
  */
 interface DragState {
   key: string;
+  group: string | null;
   from: number;
   slot: number;
   keyboard: boolean;
+}
+
+function laneData(data: unknown): LaneDragData | null {
+  return (data as { kind?: string } | undefined)?.kind === "lane" ? (data as LaneDragData) : null;
 }
 
 const span = (r: DOMRect): VSpan => ({ top: r.top, bottom: r.bottom });
@@ -63,6 +83,7 @@ export function RailProjects({
   onNewWorktree,
   onOpenMenu,
   onReorder,
+  onReorderWorktrees,
 }: {
   groups: GroupModel[];
   /** Registry keys of the open groups. */
@@ -79,15 +100,20 @@ export function RailProjects({
   onNewWorktree: (g: GroupModel) => void;
   onOpenMenu: (g: GroupModel, x: number, y: number, from: HTMLElement | null) => void;
   onReorder: (keys: string[]) => Promise<void>;
+  onReorderWorktrees: (project: string, order: string[]) => Promise<void>;
 }) {
   const { showToast } = useToast();
   const home = useHomeDir();
   const now = useMinuteNow();
   // A dropped order not yet reported back by the registry.
   const [override, setOverride] = useState<readonly string[] | null>(null);
+  // Dropped worktree orders not yet reported back, by group key.
+  const [laneOverrides, setLaneOverrides] = useState<LaneOverrides>(() => new Map());
   // The key of the group being dragged, and whether the keyboard is driving it (the copy
   // is then hidden: the arrows move the line, and the dimmed group shows what moves).
   const [dragKey, setDragKey] = useState<string | null>(null);
+  // The worktree lane being dragged, for its lifted copy.
+  const [dragLane, setDragLane] = useState<LaneDragData | null>(null);
   const [byKeyboard, setByKeyboard] = useState(false);
   // The drop line's offset from the top of the list; null hides it.
   const [lineTop, setLineTop] = useState<number | null>(null);
@@ -103,11 +129,39 @@ export function RailProjects({
     setOverride((cur) => settleOverride(cur, incoming));
   }, [incomingSig]);
 
-  const shown = useMemo(() => applyOrder(groups, override, (g) => g.key), [groups, override]);
+  // Settle the worktree overrides against each group's reported lanes; with none pending
+  // there is nothing to compare.
+  useEffect(() => {
+    setLaneOverrides((cur) =>
+      cur.size === 0 ? cur : settleLaneOverrides(cur, laneNamesByGroup(groups)),
+    );
+  }, [groups]);
+
+  const shown = useMemo(
+    () =>
+      applyLaneOrders(
+        applyOrder(groups, override, (g) => g.key),
+        laneOverrides,
+      ),
+    [groups, override, laneOverrides],
+  );
   const keys = useMemo(() => shown.map((g) => g.key), [shown]);
   // The current order, for the drag callbacks: the list can change under a running drag.
   const keysRef = useRef(keys);
   keysRef.current = keys;
+  // The shown groups, for the same reason; their lane order is read only during a drag.
+  const shownRef = useRef(shown);
+  shownRef.current = shown;
+  const laneNames = useCallback(
+    (group: string): string[] =>
+      shownRef.current.find((g) => g.key === group)?.lanes.map((l) => l.name) ?? [],
+    [],
+  );
+  // The order a drag reorders: the groups, or the lanes of the dragged lane's group.
+  const orderOf = useCallback(
+    (d: DragState): readonly string[] => (d.group === null ? keysRef.current : laneNames(d.group)),
+    [laneNames],
+  );
   const dragGroup = dragKey === null ? null : (shown.find((g) => g.key === dragKey) ?? null);
 
   // Viewport rects of every group card and header in list order, the list's top, and the
@@ -132,6 +186,16 @@ export function RailProjects({
     };
   }, []);
 
+  // Viewport rects of the lanes of the group `group`, in order.
+  const measureLanes = useCallback((group: string): VSpan[] => {
+    const list = listRef.current;
+    if (!list) return [];
+    const rows = list.querySelectorAll<HTMLElement>(
+      `:scope > .rail-group[data-group="${CSS.escape(group)}"] .rail-group-lanes > .lane-row`,
+    );
+    return [...rows].map((r) => span(r.getBoundingClientRect()));
+  }, []);
+
   // The lifted copy's vertical centre on screen. Read from the DOM rather than derived
   // from the drag delta, so it stays right while the rail auto-scrolls under it.
   const overlayCentre = useCallback(() => {
@@ -146,27 +210,32 @@ export function RailProjects({
     const d = drag.current;
     const m = measure();
     if (!d || !m) return;
-    const from = keysRef.current.indexOf(d.key);
+    const from = orderOf(d).indexOf(d.key);
     if (from !== -1) d.from = from;
+    // A lane's slot and line are among its own group's lanes.
+    const rows = d.group === null ? null : measureLanes(d.group);
+    // With the group's lanes not in the DOM, keep the last slot and line.
+    if (rows !== null && rows.length === 0) return;
     if (!d.keyboard) {
       const y = overlayCentre();
       if (y === null) return;
-      d.slot = insertionIndex(m.heads, y);
+      d.slot = insertionIndex(rows ?? m.heads, y);
     }
-    const top = isNoopSlot(d.slot, d.from) ? null : lineOffset(m.cards, d.slot, m.listTop);
+    const top = isNoopSlot(d.slot, d.from) ? null : lineOffset(rows ?? m.cards, d.slot, m.listTop);
     setLineTop(
       top === null
         ? null
         : Math.min(Math.max(top, m.view.top - m.listTop + 2), m.view.bottom - m.listTop - 2),
     );
-  }, [measure, overlayCentre]);
+  }, [measure, measureLanes, orderOf, overlayCentre]);
 
   // The list also moves under a still pointer when the rail auto-scrolls.
+  const dragging = dragKey !== null || dragLane !== null;
   useEffect(() => {
-    if (dragKey === null) return;
+    if (!dragging) return;
     document.addEventListener("scroll", track, { capture: true, passive: true });
     return () => document.removeEventListener("scroll", track, { capture: true });
-  }, [dragKey, track]);
+  }, [dragging, track]);
 
   // Arrow keys step the slot to the next one that changes the order. The (hidden) copy is
   // moved there too, which is what makes dnd-kit report the move and speak it.
@@ -198,39 +267,56 @@ export function RailProjects({
   // Spoken updates by project name and position; a move is spoken once per new slot. The
   // drag is tracked in onDragMove before dnd-kit speaks, so the slot is current.
   const spoken = useRef<number | null>(null);
+  // A lane is spoken by its worktree name and its position among its group's lanes.
   const announcements = useMemo<Announcements>(() => {
-    const n = () => keysRef.current.length;
+    const nameOf = (active: { id: unknown; data: { current?: unknown } }) =>
+      laneData(active.data.current)?.worktree ?? String(active.id);
+    const n = () => {
+      const d = drag.current;
+      return d ? orderOf(d).length : keysRef.current.length;
+    };
     return {
       onDragStart: ({ active }) => {
         spoken.current = null;
-        return `Picked up ${active.id}, position ${keysRef.current.indexOf(String(active.id)) + 1} of ${n()}.`;
+        const d = drag.current;
+        const position = d ? d.from + 1 : keysRef.current.indexOf(String(active.id)) + 1;
+        return `Picked up ${nameOf(active)}, position ${position} of ${n()}.`;
       },
       onDragMove: ({ active }) => {
         const d = drag.current;
         if (!d || spoken.current === landing(d)) return undefined;
         spoken.current = landing(d);
-        return `${active.id} will move to position ${landing(d)} of ${n()}.`;
+        return `${nameOf(active)} will move to position ${landing(d)} of ${n()}.`;
       },
       // No droppables, so there is never an `over` to speak; onDragMove says where it lands.
       onDragOver: () => undefined,
       onDragEnd: ({ active }) => {
         const d = drag.current;
-        return d ? `${active.id} dropped at position ${landing(d)} of ${n()}.` : undefined;
+        return d ? `${nameOf(active)} dropped at position ${landing(d)} of ${n()}.` : undefined;
       },
-      onDragCancel: ({ active }) => `Reorder cancelled. ${active.id} is back where it was.`,
+      onDragCancel: ({ active }) => `Reorder cancelled. ${nameOf(active)} is back where it was.`,
     };
-  }, []);
+  }, [orderOf]);
 
   const onDragStart = (e: DragStartEvent) => {
+    const lane = laneData(e.active.data.current);
+    if (lane) {
+      const from = laneNames(lane.group).indexOf(lane.worktree);
+      drag.current = { key: lane.worktree, group: lane.group, from, slot: from, keyboard: false };
+      setByKeyboard(false);
+      setDragLane(lane);
+      return;
+    }
     const key = String(e.active.id);
     const from = keys.indexOf(key);
     const keyboard = e.activatorEvent instanceof KeyboardEvent;
-    drag.current = { key, from, slot: from, keyboard };
+    drag.current = { key, group: null, from, slot: from, keyboard };
     setByKeyboard(keyboard);
     setDragKey(key);
   };
   const stop = () => {
     setDragKey(null);
+    setDragLane(null);
     setLineTop(null);
   };
   const onDragCancel = () => {
@@ -243,6 +329,23 @@ export function RailProjects({
     const d = drag.current;
     stop();
     if (!d) return;
+    if (d.group !== null) {
+      const group = d.group;
+      const next = moveToSlot(orderOf(d), d.key, d.slot);
+      if (next === null) return;
+      setLaneOverrides((cur) => new Map(cur).set(group, next));
+      onReorderWorktrees(group, next).catch((err: unknown) => {
+        // Revert only if no later drop in this group has replaced this one.
+        setLaneOverrides((cur) => {
+          if (cur.get(group) !== next) return cur;
+          const out = new Map(cur);
+          out.delete(group);
+          return out;
+        });
+        showToast(String(err));
+      });
+      return;
+    }
     const next = moveToSlot(keys, d.key, d.slot);
     if (next === null) return;
     setOverride(next);
@@ -262,7 +365,7 @@ export function RailProjects({
       onDragEnd={onDragEnd}
       onDragCancel={onDragCancel}
     >
-      <div ref={listRef} className={dragKey === null ? "rail-projects" : "rail-projects dragging"}>
+      <div ref={listRef} className={dragging ? "rail-projects dragging" : "rail-projects"}>
         {shown.map((g) => (
           <ProjectGroup
             key={g.key}
@@ -296,6 +399,7 @@ export function RailProjects({
             reduceMotion={reduceMotion}
           />
         )}
+        {dragLane && <LaneOverlay ref={overlayRef} name={dragLane.worktree} />}
       </DragOverlay>
     </DndContext>
   );

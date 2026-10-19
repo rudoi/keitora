@@ -1963,6 +1963,27 @@ html[data-theme="light"] .rail-group-head[data-stuck="true"] {
   right: -3px;
 }
 
+/* A dragged worktree lane stays in place, dimmed; its lifted copy is a card with the
+   worktree name, raised like the project copy below. */
+.rail-projects .lane-row.is-dragging {
+  opacity: 0.4;
+}
+.rail-lane-overlay {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-chip);
+  background: var(--bg-3);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  color: var(--tx-1);
+  cursor: grabbing;
+}
+html[data-theme="light"] .rail-lane-overlay {
+  box-shadow: 0 8px 24px rgba(15, 30, 25, 0.16);
+}
+
 /* The lifted copy: raised a surface (bg-3) on a soft drop shadow — a lift, no rotation.
    The active project's copy keeps its selected tint and pill. */
 .rail-group-overlay .rail-group-head {
