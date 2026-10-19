@@ -37,11 +37,12 @@ pub use config::{
     cached_login_path, classify_worktree, config_path, current_worktree, discover_claude,
     discover_cli, effective_config, git_toplevel, herdr_bin_candidates, herdr_on_path,
     herdr_release_paths, herdr_well_known_paths, is_executable_file, is_safe_claude_session_id,
-    keitora_on_path, login_path, resolve, resolve_active, resolve_autonomy, resolve_claude_path,
-    resolve_cli, resolve_keitora_path, resolve_provider_path, resolve_skip_permissions, short_path,
-    stamp_from_registry, strip_extended_prefix_str, CliConfig, CliKind, Config, DiffBase,
-    DispatchConfig, HerdrPtyConfig, ProjectConfig, ProjectMeta, ProjectRef, ProjectSettingsPatch,
-    ProviderConfig, PtyConfig, RecoveryConfig, ResolveError, TaskConfig, UserConfig, WorktreeEntry,
+    keitora_on_path, login_path, reorder_entries, resolve, resolve_active, resolve_autonomy,
+    resolve_claude_path, resolve_cli, resolve_keitora_path, resolve_provider_path,
+    resolve_skip_permissions, short_path, stamp_from_registry, strip_extended_prefix_str,
+    CliConfig, CliKind, Config, DiffBase, DispatchConfig, HerdrPtyConfig, ProjectConfig,
+    ProjectMeta, ProjectRef, ProjectSettingsPatch, ProviderConfig, PtyConfig, RecoveryConfig,
+    ResolveError, TaskConfig, UserConfig, WorktreeEntry,
 };
 // Windows-only: expose the bundled `keitora` CLI on spawned terminals' PATH.
 #[cfg(unix)]
@@ -56,7 +57,8 @@ pub use config_edit::{
     set_user_codex_path_at, set_worktrees_dir, write_project_settings,
 };
 pub use discovery::{
-    create_worktree, discover_worktrees, repair_project_worktree_paths, set_project_worktrees,
+    create_worktree, discover_worktrees, reorder_project_worktrees, repair_project_worktree_paths,
+    set_project_worktrees,
 };
 pub use factory::open_backend;
 pub use local_store::{LocalStore, ResumeRow};

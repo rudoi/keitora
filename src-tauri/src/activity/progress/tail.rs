@@ -206,6 +206,9 @@ fn split_into_lines(chunk: &[u8], cursor: &mut TailCursor, lines: &mut Vec<Strin
     let text = String::from_utf8_lossy(chunk);
     cursor.partial.push_str(&text);
 
+    // Clippy 1.98 reports `while_let_loop` on this loop; the loop stays as written because
+    // `while let Some(nl) = cursor.partial.find('\n')` runs the same iterations.
+    #[allow(clippy::while_let_loop)]
     loop {
         let Some(nl) = cursor.partial.find('\n') else {
             break;

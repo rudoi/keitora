@@ -43,6 +43,7 @@ import {
   type ProjectSummary,
   previewClaudeTransfer,
   reorderProjects,
+  reorderWorktrees,
   takeXdgLeakNotice,
   transferWorktree,
 } from "./lib/ipc";
@@ -59,7 +60,7 @@ import {
 } from "./lib/pendingIntent";
 import { useProjectsOverview } from "./lib/projectsOverview";
 import { buildGroups, type GroupModel, shareGroups } from "./lib/railGroups";
-import { latestWins } from "./lib/railOrder";
+import { latestWins, latestWinsBy } from "./lib/railOrder";
 import { nextRestartSignal, type RestartSignal } from "./lib/resumeNotice";
 import { countsByProject } from "./lib/sessionCounts";
 import {
@@ -102,6 +103,8 @@ import "./App.css";
 // Inner component so useToast() can access the ToastProvider above it.
 // Drops persist one at a time and in order, so a slow save can't land after a later one.
 const persistProjectOrder = latestWins(reorderProjects);
+// The same per project, so a drop in one project never replaces a save for another.
+const persistWorktreeOrder = latestWinsBy(reorderWorktrees);
 
 function AppInner() {
   // First-run nudge to put the `keitora` CLI on PATH (so session hooks work anywhere).
@@ -1085,6 +1088,7 @@ function AppInner() {
           onLaneAction={laneAction}
           onNewWorktree={newWorktreeIn}
           onReorder={persistProjectOrder}
+          onReorderWorktrees={persistWorktreeOrder}
           onAddProject={() => setAddProjectOpen(true)}
           onOpenSettings={() => setSettingsOpen(true)}
           onOpenHelp={() => setHelpOpen(true)}

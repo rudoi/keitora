@@ -960,6 +960,11 @@ export function reorderProjects(order: string[]): Promise<void> {
   return invoke("reorder_projects", { order });
 }
 
+/** Persist a project's worktree order (worktree names; may be partial). */
+export function reorderWorktrees(project: string, order: string[]): Promise<void> {
+  return invoke("reorder_worktrees", { project, order });
+}
+
 /**
  * Register and activate a project at the given folder path.
  * If the folder has no keitora.toml the backend scaffolds one.

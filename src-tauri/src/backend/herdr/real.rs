@@ -106,27 +106,12 @@ impl RealHerdr {
     }
 
     /// Run `herdr <args>` with the isolated env under `class`'s deadline; return
-    /// the parsed JSON value. A `{"error":{…}}` body (even with a zero exit) is an
-    /// [`HerdrError::Api`]; a non-zero exit with no error body is an
-    /// [`HerdrError::Exit`]; an overrun is [`HerdrError::Timeout`].
+    /// the parsed JSON value. A `{"error":{…}}` body on stdout (even with a zero
+    /// exit), or on stderr with a non-zero exit, is an [`HerdrError::Api`]; a
+    /// non-zero exit with no error body is an [`HerdrError::Exit`]; an overrun is
+    /// [`HerdrError::Timeout`].
     fn run(&self, class: CallClass, args: &[&str]) -> Result<Value, HerdrError> {
-        let output = self.run_timed(class, args)?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let trimmed = stdout.trim();
-        if !trimmed.is_empty() {
-            if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-                if let Some(err) = value.get("error") {
-                    return Err(api_error_from_value(err));
-                }
-                return Ok(value);
-            }
-        }
-        if output.status.success() {
-            // Some commands (e.g. `server stop`) succeed with no stdout.
-            return Ok(Value::Null);
-        }
-        Err(exit_error(output.status, &output.stderr))
+        json_result(&self.run_timed(class, args)?)
     }
 
     /// Run a herdr command and return raw stdout. Used for commands like
@@ -165,6 +150,44 @@ fn subcommand(args: &[&str]) -> String {
 /// the leaf to the calling pane, so `--pane` is always passed.
 fn pane_process_info_args(pane_id: &str) -> [&str; 4] {
     ["pane", "process-info", "--pane", pane_id]
+}
+
+/// The argv of `herdr agent prompt` submitting `text` to `pane_id`. herdr reads
+/// the text as the second positional argument and parses only options after
+/// it; `agent prompt` has no `--` separator, so a `--` would be taken as the
+/// text and the text rejected as an unknown option.
+fn agent_prompt_args<'a>(pane_id: &'a str, text: &'a str) -> [&'a str; 4] {
+    ["agent", "prompt", pane_id, text]
+}
+
+/// The result of a finished herdr call, as [`RealHerdr::run`] documents it.
+fn json_result(output: &Output) -> Result<Value, HerdrError> {
+    if let Some(value) = json_body(&output.stdout) {
+        if let Some(err) = value.get("error") {
+            return Err(api_error_from_value(err));
+        }
+        return Ok(value);
+    }
+    if output.status.success() {
+        // Some commands (e.g. `server stop`) succeed with no stdout.
+        return Ok(Value::Null);
+    }
+    // `agent prompt` reports its errors on stderr with exit code 1.
+    if let Some(err) = json_body(&output.stderr).and_then(|v| v.get("error").cloned()) {
+        return Err(api_error_from_value(&err));
+    }
+    Err(exit_error(output.status, &output.stderr))
+}
+
+/// `bytes` parsed as one JSON value, ignoring surrounding whitespace; `None` when
+/// empty or not JSON.
+fn json_body(bytes: &[u8]) -> Option<Value> {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    serde_json::from_str(trimmed).ok()
 }
 
 fn exit_error(status: ExitStatus, stderr: &[u8]) -> HerdrError {
@@ -378,11 +401,11 @@ impl HerdrOps for RealHerdr {
         }
     }
 
-    /// `herdr agent prompt <pane_id> -- <text>` — fire-and-forget (no `--wait`).
+    /// `herdr agent prompt <pane_id> <text>` — fire-and-forget (no `--wait`).
     /// `agent_blocked` / `agent_not_ready` come back as [`HerdrError::Api`]; the
     /// backend maps them to "queue the line" via [`super::cli::agent_prompt_error_from`].
     fn agent_prompt(&self, pane_id: &str, text: &str) -> Result<(), HerdrError> {
-        self.run(CallClass::Quick, &["agent", "prompt", pane_id, "--", text])
+        self.run(CallClass::Quick, &agent_prompt_args(pane_id, text))
             .map(|_| ())
     }
 
@@ -695,6 +718,102 @@ mod tests {
         assert_eq!(
             subcommand(&pane_process_info_args("w1:p2")),
             "pane process-info"
+        );
+    }
+
+    #[test]
+    fn agent_prompt_passes_the_text_as_the_second_argument() {
+        assert_eq!(
+            agent_prompt_args("w1:p2", "go"),
+            ["agent", "prompt", "w1:p2", "go"]
+        );
+        // A dash-leading text is passed unchanged, with no separator before it.
+        assert_eq!(
+            agent_prompt_args("w1:p2", "-x"),
+            ["agent", "prompt", "w1:p2", "-x"]
+        );
+    }
+
+    /// A finished call that exited with `code` and printed `stdout` / `stderr`.
+    fn output(code: i32, stdout: &str, stderr: &str) -> Output {
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(code as u32)
+        };
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(code << 8)
+        };
+        Output {
+            status,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    fn api(code: &str, message: &str) -> HerdrError {
+        HerdrError::Api {
+            code: code.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn json_result_returns_the_stdout_value() {
+        let value = json_result(&output(0, " {\"result\":{\"ok\":true}}\n", "")).unwrap();
+        assert_eq!(value, serde_json::json!({"result": {"ok": true}}));
+    }
+
+    #[test]
+    fn json_result_is_null_for_a_success_with_no_stdout() {
+        assert_eq!(json_result(&output(0, "", "")).unwrap(), Value::Null);
+        // stderr on a success is not an error.
+        assert_eq!(
+            json_result(&output(0, "  \n", "{\"error\":{\"code\":\"x\"}}")).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn json_result_reads_an_error_body_on_stdout() {
+        let body = "{\"error\":{\"code\":\"pane_not_found\",\"message\":\"gone\"}}";
+        assert_eq!(
+            json_result(&output(0, body, "")).unwrap_err(),
+            api("pane_not_found", "gone")
+        );
+        assert_eq!(
+            json_result(&output(1, body, "")).unwrap_err(),
+            api("pane_not_found", "gone")
+        );
+    }
+
+    #[test]
+    fn json_result_reads_an_error_body_on_stderr_of_a_failed_call() {
+        let body = "{\"error\":{\"code\":\"agent_not_ready\",\"message\":\"busy\"},\"id\":\"cli:agent:prompt\"}\n";
+        assert_eq!(
+            json_result(&output(1, "", body)).unwrap_err(),
+            api("agent_not_ready", "busy")
+        );
+    }
+
+    #[test]
+    fn json_result_is_an_exit_error_without_an_error_body() {
+        assert_eq!(
+            json_result(&output(2, "", "unknown option '--x'\n")).unwrap_err(),
+            HerdrError::Exit {
+                code: Some(2),
+                stderr: "unknown option '--x'\n".to_string(),
+            }
+        );
+        // JSON on stderr with no `error` member is not an error body.
+        assert_eq!(
+            json_result(&output(1, "", "{\"id\":\"x\"}")).unwrap_err(),
+            HerdrError::Exit {
+                code: Some(1),
+                stderr: "{\"id\":\"x\"}".to_string(),
+            }
         );
     }
 
