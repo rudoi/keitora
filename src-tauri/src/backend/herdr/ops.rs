@@ -31,7 +31,8 @@ pub enum HerdrError {
         os_error: Option<i32>,
         message: String,
     },
-    /// The process ran, exited non-zero, and printed no `{"error":..}` body.
+    /// The process ran, exited non-zero, and printed no `{"error":..}` body on
+    /// stdout or stderr.
     Exit { code: Option<i32>, stderr: String },
     /// stdout was not the expected shape. The lenient parsers treat a missing
     /// array as empty, so this is only produced for a missing required object.

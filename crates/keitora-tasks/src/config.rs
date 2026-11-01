@@ -653,6 +653,31 @@ fn merge_worktree_registry_fields(
         .collect()
 }
 
+/// `entries` with the ones named in `order` first, in that order, then every other entry
+/// in its original relative order. Names in `order` with no entry, and repeats, are
+/// skipped; every entry appears exactly once, entries sharing a name staying together
+/// in their original order.
+pub fn reorder_entries(entries: &[WorktreeEntry], order: &[String]) -> Vec<WorktreeEntry> {
+    let mut placed = vec![false; entries.len()];
+    let mut out = Vec::with_capacity(entries.len());
+    for name in order {
+        for (i, e) in entries.iter().enumerate() {
+            if !placed[i] && &e.name == name {
+                placed[i] = true;
+                out.push(e.clone());
+            }
+        }
+    }
+    out.extend(
+        entries
+            .iter()
+            .zip(&placed)
+            .filter(|(_, &p)| !p)
+            .map(|(e, _)| e.clone()),
+    );
+    out
+}
+
 /// A registered project: a name (the map key) plus the absolute path to its root,
 /// plus optional per-machine setting overrides. Each `Some(_)` is authoritative
 /// over the committed `keitora.toml`; `None` falls back to the committed value, then
@@ -2806,6 +2831,73 @@ mod tests {
         assert!(text.contains("diff_base"), "expected table form: {text}");
         let back: WorktreeEntry = toml::from_str(&text).unwrap();
         assert_eq!(back, entry);
+    }
+
+    fn names(entries: &[WorktreeEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    fn order_of(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn reorder_entries_applies_a_full_permutation() {
+        let entries = ["alpha", "bravo", "charlie"].map(WorktreeEntry::name_only);
+        let out = reorder_entries(&entries, &order_of(&["charlie", "alpha", "bravo"]));
+        assert_eq!(names(&out), ["charlie", "alpha", "bravo"]);
+    }
+
+    #[test]
+    fn reorder_entries_appends_unnamed_entries_in_their_order() {
+        let entries = ["alpha", "bravo", "charlie", "wt"].map(WorktreeEntry::name_only);
+        let out = reorder_entries(&entries, &order_of(&["charlie", "alpha"]));
+        assert_eq!(names(&out), ["charlie", "alpha", "bravo", "wt"]);
+    }
+
+    #[test]
+    fn reorder_entries_skips_unknown_and_repeated_names() {
+        let entries = ["alpha", "bravo", "charlie"].map(WorktreeEntry::name_only);
+        let out = reorder_entries(
+            &entries,
+            &order_of(&["bravo", "gone", "bravo", "charlie", "alpha"]),
+        );
+        assert_eq!(names(&out), ["bravo", "charlie", "alpha"]);
+    }
+
+    #[test]
+    fn reorder_entries_with_empty_order_keeps_the_list() {
+        let entries = ["alpha", "bravo"].map(WorktreeEntry::name_only);
+        assert_eq!(names(&reorder_entries(&entries, &[])), ["alpha", "bravo"]);
+        assert!(reorder_entries(&[], &order_of(&["alpha"])).is_empty());
+    }
+
+    #[test]
+    fn reorder_entries_keeps_entries_that_share_a_name() {
+        let entries = [
+            WorktreeEntry::new("alpha", "/tmp/a1"),
+            WorktreeEntry::new("bravo", "/tmp/b"),
+            WorktreeEntry::new("alpha", "/tmp/a2"),
+        ];
+        let out = reorder_entries(&entries, &order_of(&["alpha"]));
+        assert_eq!(
+            out,
+            vec![entries[0].clone(), entries[2].clone(), entries[1].clone()]
+        );
+    }
+
+    #[test]
+    fn reorder_entries_preserves_every_field() {
+        let alpha = WorktreeEntry {
+            cli: Some(CliKind::Codex),
+            codex_thread_id: Some("thread".into()),
+            claude_session_id: Some("session".into()),
+            diff_base: Some(DiffBase::Upstream),
+            ..WorktreeEntry::new("alpha", "/tmp/alpha")
+        };
+        let bravo = WorktreeEntry::new("bravo", "/tmp/bravo");
+        let out = reorder_entries(&[alpha.clone(), bravo.clone()], &order_of(&["bravo"]));
+        assert_eq!(out, vec![bravo, alpha]);
     }
 
     #[test]

@@ -7737,6 +7737,42 @@ mod tests {
         );
     }
 
+    /// herdr accepts the `agent prompt` argv `agent_prompt` builds: against a plain
+    /// shell pane (no agent, so no LLM turn) herdr parses the argv and answers with
+    /// an agent error code, never a usage exit. A dash-leading text exercises the
+    /// positional text argument. Gated behind `KEITORA_HERDR_BIN`.
+    #[test]
+    #[ignore = "spawns a REAL herdr server; isolated/CI only — never run on a machine with a live herdr (run with --ignored in a dedicated env)"]
+    fn agent_prompt_argv_is_accepted_by_herdr_gated() {
+        let Some(mut rig) =
+            RealHerdrRig::new("agent_prompt_argv_is_accepted_by_herdr_gated", "argv")
+        else {
+            return;
+        };
+        let (backend, _events) = rig.booted();
+
+        let key = real_key("argv");
+        backend
+            .spawn(
+                key.clone(),
+                env!("CARGO_MANIFEST_DIR").to_string(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
+            .expect("spawn");
+        let pane = backend.keymap.get_current(&key).expect("spawned pane");
+
+        let err = backend
+            .ops
+            .agent_prompt(&pane.pane_id, "-herdr argv check")
+            .expect_err("a shell pane has no agent to prompt");
+        assert!(
+            matches!(err.code(), Some("agent_not_found" | "agent_not_ready")),
+            "herdr must parse the argv and answer with an agent error, got {err:?}"
+        );
+    }
+
     /// Regression for the blank-pane bug: `spawn` must start the output bridge by
     /// itself, because the frontend's fresh-spawn path (`TerminalPane::spawn`) never
     /// calls `attach` afterwards. So output must reach the sink after spawn ALONE —
@@ -7774,8 +7810,8 @@ mod tests {
     }
 
     /// `spawn_agent` launches via `agent.start --kind`, `list_sessions`
-    /// folds the `agent.list` status into `state_hint`, and `write_line` dispatches via
-    /// `agent.prompt`. Gated behind `KEITORA_HERDR_BIN`.
+    /// folds the `agent.list` status into `state_hint`, and an empty `write_line`
+    /// submits Enter. Gated behind `KEITORA_HERDR_BIN`.
     ///
     /// Robustness / cost notes:
     /// - `--kind claude` needs a real `claude` on the pane PATH. If it is not resolvable
@@ -7784,18 +7820,15 @@ mod tests {
     ///   CI on a machine without claude.
     /// - We assert on launch/stream MECHANICS (a non-empty output frame), not an LLM
     ///   turn, to avoid cost + R1 blocked-startup flakiness.
-    /// - `write_line` is exercised on the empty (submit-only) path and on a `-`-leading
-    ///   prompt; in the fresh isolated env claude sits at its auth/trust screen
-    ///   (blocked), so `agent.prompt` is rejected with `agent_blocked` BEFORE any input
-    ///   reaches the model (no LLM turn). The assertion only requires the result map to
-    ///   `Ok`/`Queued`, never `Err(Other)`.
+    /// - `write_line` is exercised on the empty (submit-only) path only: it sends the
+    ///   Enter key and no prompt text (no LLM turn).
     ///
     /// Starts the user's REAL `claude` in this checkout, so it also needs
     /// `KEITORA_HERDR_TEST_AGENT` set; without it the test skips.
     #[test]
     #[ignore = "spawns a REAL herdr server; isolated/CI only — never run on a machine with a live herdr (run with --ignored in a dedicated env)"]
-    fn spawn_agent_launches_lists_and_prompts_gated() {
-        const TEST: &str = "spawn_agent_launches_lists_and_prompts_gated";
+    fn spawn_agent_launches_and_lists_gated() {
+        const TEST: &str = "spawn_agent_launches_and_lists_gated";
         if std::env::var_os("KEITORA_HERDR_TEST_AGENT").is_none() {
             eprintln!(
                 "skipping {TEST}: KEITORA_HERDR_TEST_AGENT not set (it starts a real claude)"
@@ -7865,17 +7898,9 @@ mod tests {
         // write_line, empty text → submit-only (Enter): no LLM content at all.
         let empty = backend.write_line(&key, "", 0);
 
-        // write_line with a `-`-leading prompt exercises the live `agent.prompt` CLI
-        // path WITHOUT an LLM turn: herdr parses argv before sending, and herdr 0.9.3
-        // rejects a leading-dash TEXT even after `--` ("unknown option"), so the model
-        // is never reached. Informational only (no assertion): a non-dash prompt would
-        // reach a ready agent and cost a real turn, so the happy path stays in the unit
-        // tests + manual `yarn dev:herdr`. Records the observed outcome for Open Q4.
-        let probe = backend.write_line(&key, "-herdr probe (no-op)", 0);
-
         eprintln!(
-            "spawn_agent_launches_lists_and_prompts_gated: gen={gen} present={present} \
-             state_hint={hint:?} streamed={streamed} empty_write={empty:?} dash_probe={probe:?}"
+            "spawn_agent_launches_and_lists_gated: gen={gen} present={present} \
+             state_hint={hint:?} streamed={streamed} empty_write={empty:?}"
         );
 
         // R1: even a "blocked during startup" agent LAUNCHED → a valid generation.

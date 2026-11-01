@@ -546,6 +546,9 @@ impl<A: GhApi> TaskBackend for GitHubBackend<A> {
                     && older_than_days(&t.updated_at, archive_days))
             })
             .collect();
+        // Clippy 1.98 reports `unnecessary_sort_by` on this descending sort; the comparator
+        // stays as written because `sort_by_key` with `Reverse` gives the same order.
+        #[allow(clippy::unnecessary_sort_by)]
         tasks.sort_by(|a, b| b.id.cmp(&a.id));
         Ok(tasks)
     }
