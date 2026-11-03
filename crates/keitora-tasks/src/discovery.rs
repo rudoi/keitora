@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::{
-    canonical_key, classify_worktree, effective_config, git_user_slug, ProjectConfig, UserConfig,
-    WorktreeEntry,
+    canonical_key, classify_worktree, effective_config, git_user_slug, reorder_entries,
+    ProjectConfig, UserConfig, WorktreeEntry,
 };
 use crate::model::{ResolvedWorktree, WorktreeCandidate};
 use crate::{Error, Result};
@@ -95,16 +95,56 @@ pub fn discover_worktrees(
 /// project we write there and the committed `keitora.toml` is left untouched. For an
 /// unregistered project (fresh clone, not yet onboarded) we fall back to the
 /// surgical committed-file rewrite so existing behavior is preserved.
+///
+/// A registered project keeps its current order: worktrees already listed stay where
+/// they are, new ones follow in `entries` order, and ones absent from `entries` leave
+/// the list. The current list is read under the registry lock, so a concurrent reorder
+/// in this process is never undone.
 pub fn set_project_worktrees(project_root: &Path, entries: &[WorktreeEntry]) -> Result<()> {
     let _registry = UserConfig::write_lock();
     let mut registry = UserConfig::load().map_err(|e| Error::Config(e.to_string()))?;
+    let ordered = match registry.project_ref_by_root(project_root) {
+        Some(pref) => {
+            // The registry list when it has one; the committed file only otherwise.
+            let current = match &pref.worktrees {
+                Some(list) => list.clone(),
+                None => effective_config(pref)
+                    .map_err(|e| Error::Config(e.to_string()))?
+                    .worktree_entries(),
+            };
+            let names: Vec<String> = current.into_iter().map(|e| e.name).collect();
+            reorder_entries(entries, &names)
+        }
+        None => entries.to_vec(),
+    };
     if registry
-        .set_project_worktrees_by_root(project_root, entries)
+        .set_project_worktrees_by_root(project_root, &ordered)
         .map_err(|e| Error::Config(e.to_string()))?
     {
         return Ok(());
     }
     set_committed_worktrees(project_root, entries)
+}
+
+/// Write the worktree list of the project registered as `project` in the order `order`
+/// (worktree names; may be partial, see [`reorder_entries`]). The list starts from the
+/// project's effective entries, so a project whose list came from its committed file
+/// gets that list, reordered, in the registry.
+pub fn reorder_project_worktrees(project: &str, order: &[String]) -> Result<()> {
+    let _registry = UserConfig::write_lock();
+    let mut registry = UserConfig::load().map_err(|e| Error::Config(e.to_string()))?;
+    let pref = registry
+        .projects
+        .get(project)
+        .ok_or_else(|| Error::Config(format!("No project named '{project}' is registered.")))?;
+    let current = effective_config(pref)
+        .map_err(|e| Error::Config(e.to_string()))?
+        .worktree_entries();
+    let root = pref.path.clone();
+    registry
+        .set_project_worktrees_by_root(&root, &reorder_entries(&current, order))
+        .map_err(|e| Error::Config(e.to_string()))?;
+    Ok(())
 }
 
 /// Surgically set `[tasks].worktrees` in `<project_root>/keitora.toml` to `entries`,
@@ -1013,6 +1053,126 @@ detached
         );
         // …and the committed file is untouched (still just "repo").
         assert_eq!(committed_worktrees(&root), vec!["repo".to_string()]);
+
+        std::env::remove_var("KEITORA_CONFIG_HOME");
+    }
+
+    #[test]
+    fn set_project_worktrees_keeps_the_registered_order() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("KEITORA_CONFIG_HOME", tmp.path().join("user_config"));
+        let mut reg = UserConfig::default();
+        reg.register("repo", root.clone());
+        reg.projects.get_mut("repo").unwrap().worktrees = Some(
+            ["charlie", "alpha", "bravo"]
+                .map(WorktreeEntry::name_only)
+                .to_vec(),
+        );
+        reg.save().unwrap();
+
+        // Discovery order, with "bravo" untracked and "delta", "wt" new.
+        set_project_worktrees(
+            &root,
+            &["alpha", "charlie", "wt", "delta"].map(WorktreeEntry::name_only),
+        )
+        .unwrap();
+
+        let reloaded = UserConfig::load().unwrap();
+        assert_eq!(
+            reloaded.projects["repo"].worktrees,
+            Some(
+                ["charlie", "alpha", "wt", "delta"]
+                    .map(WorktreeEntry::name_only)
+                    .to_vec()
+            )
+        );
+
+        std::env::remove_var("KEITORA_CONFIG_HOME");
+    }
+
+    #[test]
+    fn reorder_project_worktrees_writes_the_order_and_keeps_fields() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("KEITORA_CONFIG_HOME", tmp.path().join("user_config"));
+        let alpha = WorktreeEntry {
+            cli: Some(crate::config::CliKind::Codex),
+            codex_thread_id: Some("thread".into()),
+            claude_session_id: Some("session".into()),
+            diff_base: Some(crate::config::DiffBase::Upstream),
+            ..WorktreeEntry::new("alpha", root.join("alpha"))
+        };
+        let mut reg = UserConfig::default();
+        reg.register("proj", root.clone());
+        reg.projects.get_mut("proj").unwrap().worktrees = Some(vec![
+            alpha.clone(),
+            WorktreeEntry::new("bravo", root.join("bravo")),
+            WorktreeEntry::new("charlie", root.join("charlie")),
+        ]);
+        reg.save().unwrap();
+
+        reorder_project_worktrees("proj", &["charlie".into(), "alpha".into()]).unwrap();
+
+        let list = UserConfig::load().unwrap().projects["proj"]
+            .worktrees
+            .clone()
+            .unwrap();
+        let names: Vec<&str> = list.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["charlie", "alpha", "bravo"]);
+        assert_eq!(list[1], alpha);
+
+        std::env::remove_var("KEITORA_CONFIG_HOME");
+    }
+
+    #[test]
+    fn reorder_project_worktrees_copies_a_committed_list_into_the_registry() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("keitora.toml"),
+            "[project]\nname = \"proj\"\nworktrees_dir = \"../wt\"\n\n\
+             [tasks]\ndb_path = \"shared/tasks.db\"\nworktrees = [\"alpha\", \"bravo\"]\n",
+        )
+        .unwrap();
+        std::env::set_var("KEITORA_CONFIG_HOME", tmp.path().join("user_config"));
+        let mut reg = UserConfig::default();
+        reg.register("proj", root.clone());
+        reg.save().unwrap();
+
+        reorder_project_worktrees("proj", &["bravo".into()]).unwrap();
+
+        assert_eq!(
+            UserConfig::load().unwrap().projects["proj"].worktrees,
+            Some(vec![
+                WorktreeEntry::name_only("bravo"),
+                WorktreeEntry::name_only("alpha"),
+            ])
+        );
+        assert_eq!(
+            committed_worktrees(&root),
+            vec!["alpha".to_string(), "bravo".to_string()]
+        );
+
+        std::env::remove_var("KEITORA_CONFIG_HOME");
+    }
+
+    #[test]
+    fn reorder_project_worktrees_rejects_an_unknown_project() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("KEITORA_CONFIG_HOME", tmp.path().join("user_config"));
+
+        let err = reorder_project_worktrees("other-proj", &[]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("No project named 'other-proj' is registered."));
 
         std::env::remove_var("KEITORA_CONFIG_HOME");
     }

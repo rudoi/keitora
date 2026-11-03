@@ -478,6 +478,7 @@ export function Rail({
   onLaneAction,
   onNewWorktree,
   onReorder,
+  onReorderWorktrees,
   onAddProject,
   onOpenSettings,
   onOpenHelp,
@@ -498,6 +499,8 @@ export function Rail({
   onNewWorktree: (g: GroupModel) => void;
   /** Persist a new project order (registry keys). */
   onReorder: (keys: string[]) => Promise<void>;
+  /** Persist a new worktree order (worktree names) for the project with registry key `project`. */
+  onReorderWorktrees: (project: string, order: string[]) => Promise<void>;
   onAddProject: () => void;
   onOpenSettings: () => void;
   onOpenHelp: () => void;
@@ -681,6 +684,7 @@ export function Rail({
           onNewWorktree={onNewWorktree}
           onOpenMenu={openProjectMenu}
           onReorder={onReorder}
+          onReorderWorktrees={onReorderWorktrees}
         />
       </div>
       <div className="rail-dock">

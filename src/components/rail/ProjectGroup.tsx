@@ -8,7 +8,8 @@
 // threshold, so a click still toggles), and the grip button is the keyboard one (Space
 // picks up, arrows move, Space drops, Escape cancels). While a drag runs, the group stays
 // in place, dimmed, and a lifted copy of its header (ProjectGroupOverlay) follows the
-// pointer; RailProjects draws the line where it will land.
+// pointer; RailProjects draws the line where it will land. Worktree lanes inside an open
+// group drag the same way, by mouse only, within their group.
 
 import { useDraggable } from "@dnd-kit/core";
 import { ChevronRight, Ellipsis, GripVertical, Plus } from "lucide-react";
@@ -218,6 +219,7 @@ export const ProjectGroup = memo(function ProjectGroup({
   // transform: the group never moves mid-drag (and a transform would break sticky).
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, isDragging } = useDraggable({
     id: group.key,
+    data: { kind: "group" },
   });
   const sentinel = useRef<HTMLDivElement>(null);
   // Whether the sticky header is pinned to the top of the rail's scroll area: its 1px
@@ -265,7 +267,7 @@ export const ProjectGroup = memo(function ProjectGroup({
   };
 
   return (
-    <div className={groupCls} style={hueStyle(key)}>
+    <div className={groupCls} style={hueStyle(key)} data-group={key}>
       <div ref={sentinel} className="rail-group-sentinel" aria-hidden="true" />
       <div
         ref={setNodeRef}
@@ -339,6 +341,7 @@ export const ProjectGroup = memo(function ProjectGroup({
               lanes.map((lane) => (
                 <Lane
                   key={lane.name}
+                  groupKey={key}
                   lane={lane}
                   isSelected={isActive && lane.name === selected}
                   hintBadge={badges?.get(lane.name)}

@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyLaneOrders,
   applyOrder,
+  laneDragId,
+  laneNamesByGroup,
   latestWins,
+  latestWinsBy,
   moveToSlot,
   sameKeys,
   sameOrder,
+  settleLaneOverrides,
   settleOverride,
 } from "./railOrder";
 
@@ -150,5 +155,121 @@ describe("moveToSlot", () => {
     expect(moveToSlot(keys, "z", 0)).toBeNull();
     expect(moveToSlot(keys, "a", -1)).toBeNull();
     expect(moveToSlot(keys, "a", 5)).toBeNull();
+  });
+});
+
+describe("latestWinsBy", () => {
+  const flush = async () => {
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+  };
+
+  it("queues per key: keys run independently, and within a key the latest waiting call wins", async () => {
+    const calls: { key: string; arg: string; resolve: () => void }[] = [];
+    const run = latestWinsBy(
+      (key: string, arg: string) =>
+        new Promise<void>((resolve) => {
+          calls.push({ key, arg, resolve });
+        }),
+    );
+
+    void run("proj", "a");
+    void run("other-proj", "x");
+    void run("proj", "b");
+    void run("proj", "c");
+    await flush();
+    expect(calls.map((c) => `${c.key}:${c.arg}`)).toEqual(["proj:a", "other-proj:x"]);
+
+    calls[0].resolve();
+    await flush();
+    expect(calls.map((c) => `${c.key}:${c.arg}`)).toEqual(["proj:a", "other-proj:x", "proj:c"]);
+  });
+});
+
+describe("applyLaneOrders", () => {
+  const lanes = (...names: string[]) => names.map((name) => ({ name }));
+  const groups = [
+    { key: "proj", lanes: lanes("alpha", "bravo", "charlie") },
+    { key: "other-proj", lanes: lanes("main", "wt") },
+  ];
+  const names = (g: { lanes: { name: string }[] }) => g.lanes.map((l) => l.name);
+
+  it("reorders an overridden group and returns the others as they are", () => {
+    const out = applyLaneOrders(groups, new Map([["proj", ["charlie", "alpha", "bravo"]]]));
+    expect(names(out[0])).toEqual(["charlie", "alpha", "bravo"]);
+    expect(out[1]).toBe(groups[1]);
+  });
+
+  it("puts lanes missing from the override after it, in their order", () => {
+    const out = applyLaneOrders(groups, new Map([["proj", ["charlie"]]]));
+    expect(names(out[0])).toEqual(["charlie", "alpha", "bravo"]);
+  });
+
+  it("returns every group as it is with no overrides", () => {
+    const out = applyLaneOrders(groups, new Map());
+    expect(out[0]).toBe(groups[0]);
+    expect(out[1]).toBe(groups[1]);
+  });
+});
+
+describe("laneNamesByGroup", () => {
+  it("maps each group key to its worktree names in lane order", () => {
+    const groups = [
+      { key: "proj", lanes: [{ name: "bravo" }, { name: "alpha" }] },
+      { key: "other-proj", lanes: [] },
+    ];
+    expect(laneNamesByGroup(groups)).toEqual(
+      new Map([
+        ["proj", ["bravo", "alpha"]],
+        ["other-proj", []],
+      ]),
+    );
+  });
+});
+
+describe("settleLaneOverrides", () => {
+  const override = ["bravo", "alpha"];
+
+  it("clears an override once its group reports that order", () => {
+    const out = settleLaneOverrides(
+      new Map([["proj", override]]),
+      new Map([["proj", ["bravo", "alpha"]]]),
+    );
+    expect(out.size).toBe(0);
+  });
+
+  it("clears an override when its group's worktrees change", () => {
+    const out = settleLaneOverrides(
+      new Map([["proj", override]]),
+      new Map([["proj", ["alpha", "bravo", "charlie"]]]),
+    );
+    expect(out.size).toBe(0);
+  });
+
+  it("keeps an override, and the same map, while the old order is reported", () => {
+    const overrides = new Map([["proj", override]]);
+    expect(settleLaneOverrides(overrides, new Map([["proj", ["alpha", "bravo"]]]))).toBe(overrides);
+  });
+
+  it("removes an override for a group no longer reported", () => {
+    const out = settleLaneOverrides(new Map([["proj", override]]), new Map());
+    expect(out.size).toBe(0);
+  });
+});
+
+describe("laneDragId", () => {
+  it("is stable for the same group and worktree", () => {
+    expect(laneDragId("proj", "alpha")).toBe(laneDragId("proj", "alpha"));
+  });
+
+  it("differs for the same worktree name in two groups", () => {
+    expect(laneDragId("proj", "main")).not.toBe(laneDragId("other-proj", "main"));
+  });
+
+  it("starts with a NUL character", () => {
+    expect(laneDragId("main", "main").startsWith("\0")).toBe(true);
+  });
+
+  it("differs when the split between group and worktree differs", () => {
+    expect(laneDragId("proj", "a-b")).not.toBe(laneDragId("proj-a", "b"));
   });
 });
