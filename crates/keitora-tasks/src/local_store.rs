@@ -284,6 +284,41 @@ impl LocalStore {
         Ok(())
     }
 
+    /// Unconditionally record `session_id` as the running session of `(project, worktree)`.
+    /// Unlike [`Self::resume_observe`] there is no newest-wins check and no cleared-id guard:
+    /// the row is overwritten (or created) with `agent_present = true` and no `cleared_id`.
+    pub fn resume_replace(
+        &self,
+        project: &str,
+        worktree: &str,
+        cli: CliKind,
+        session_id: &str,
+        source: &str,
+        observed_at_ms: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO resume_sessions \
+               (project, worktree, cli, session_id, source, agent_present, cleared_id, observed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, ?6) \
+             ON CONFLICT(project, worktree) DO UPDATE SET \
+               cli = excluded.cli, \
+               session_id = excluded.session_id, \
+               source = excluded.source, \
+               agent_present = 1, \
+               cleared_id = NULL, \
+               observed_at = excluded.observed_at",
+            params![
+                project,
+                worktree,
+                cli_to_sql(cli),
+                session_id,
+                source,
+                observed_at_ms
+            ],
+        )?;
+        Ok(())
+    }
+
     /// The resume row for `(project, worktree)`, if any.
     pub fn resume_get(&self, project: &str, worktree: &str) -> Result<Option<ResumeRow>> {
         let row = self
@@ -817,6 +852,52 @@ mod tests {
         observe(&ls, CliKind::Claude, None, true, 10);
         assert_eq!(row(&ls), None);
         assert!(ls.resume_list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resume_replace_overwrites_a_claude_row() {
+        let db = TempDb::new();
+        let ls = db.open();
+        observe(&ls, CliKind::Claude, Some("A"), false, 10);
+        ls.resume_replace("p", "w", CliKind::Codex, "thr-1", "keitora:transfer", 20)
+            .unwrap();
+        assert_eq!(
+            row(&ls),
+            Some(ResumeRow {
+                cli: CliKind::Codex,
+                session_id: Some("thr-1".into()),
+                source: "keitora:transfer".into(),
+                agent_present: true,
+                cleared_id: None,
+                observed_at: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn resume_replace_ignores_newest_wins_and_cleared_id() {
+        let db = TempDb::new();
+        let ls = db.open();
+        observe(&ls, CliKind::Codex, Some("thr-1"), true, 100);
+        ls.resume_clear("p", "w").unwrap();
+        assert_eq!(row(&ls).unwrap().cleared_id.as_deref(), Some("thr-1"));
+        // Older timestamp and the id equals the cleared id: still replaced.
+        ls.resume_replace("p", "w", CliKind::Codex, "thr-1", "keitora:transfer", 5)
+            .unwrap();
+        let r = row(&ls).unwrap();
+        assert_eq!(r.session_id.as_deref(), Some("thr-1"));
+        assert_eq!(r.cleared_id, None);
+        assert_eq!(r.observed_at, 5);
+    }
+
+    #[test]
+    fn resume_replace_creates_a_missing_row() {
+        let db = TempDb::new();
+        let ls = db.open();
+        assert_eq!(row(&ls), None);
+        ls.resume_replace("p", "w", CliKind::Codex, "thr-1", "keitora:transfer", 1)
+            .unwrap();
+        assert_eq!(row(&ls).unwrap().session_id.as_deref(), Some("thr-1"));
     }
 
     #[test]

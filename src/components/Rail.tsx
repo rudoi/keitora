@@ -13,7 +13,13 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import { formatBytes, formatCpu, formatUptime } from "../lib/format";
 import type { CliKind, DaemonInfo } from "../lib/ipc";
 import { daemonRestart, daemonStatus } from "../lib/ipc";
-import { laneMenuAction, type WorktreeMenuItem, worktreeMenuItems } from "../lib/laneState";
+import {
+  laneMenuAction,
+  sessionItemDisabledReason,
+  transferDisabledReason,
+  type WorktreeMenuItem,
+  worktreeMenuItems,
+} from "../lib/laneState";
 import type { PendingAction } from "../lib/pendingIntent";
 import { isMac, isWindows, modKeyLabel } from "../lib/platform";
 import {
@@ -29,6 +35,7 @@ import type { GroupModel } from "../lib/railGroups";
 import { canRestartNow, showRailRestart } from "../lib/recovery";
 import { useDaemonStats, useRecovery } from "../lib/sessions";
 import { removeProject } from "../lib/settings";
+import { transferKey } from "../lib/transferPhase";
 import { useLocalStorageJson } from "../lib/useLocalStorageState";
 import { usePrefersReducedMotion } from "../lib/usePrefersReducedMotion";
 import { useConfirmDialog } from "./ConfirmDialog";
@@ -285,11 +292,14 @@ function WorktreeMenu({
   onOpenChange,
   onPick,
   codexAvailable,
+  transferBusy,
 }: {
   state: WorktreeMenuState | null;
   onOpenChange: (open: boolean) => void;
   onPick: (state: WorktreeMenuState, item: WorktreeMenuItem, targetCli: CliKind) => void;
   codexAvailable: boolean;
+  /** A transfer is already in flight for the menu's worktree. */
+  transferBusy: boolean;
 }) {
   const targetCli: CliKind = state?.cli === "codex" ? "claude" : "codex";
   // Claude is never surfaced as unavailable here — it's the default agent and a
@@ -297,14 +307,17 @@ function WorktreeMenu({
   // when no path is configured or discovered), so only a Codex *target* can be
   // disabled.
   const codexMissing = targetCli === "codex" && !codexAvailable;
+  const transferReason = transferDisabledReason({ codexMissing, busy: transferBusy });
   const items = worktreeMenuItems(state?.terminated ?? false, { inactive: state?.inactive });
   const item = (kind: WorktreeMenuItem) => {
-    const off = kind === "transfer" && codexMissing;
+    const reason =
+      kind === "transfer" ? transferReason : sessionItemDisabledReason(kind, transferBusy);
+    const off = reason !== null;
     return (
       <Fragment key={kind}>
         <DropdownMenu.Item
           disabled={off}
-          title={off ? "Codex isn't installed" : undefined}
+          title={reason ?? undefined}
           onSelect={() => {
             if (state && !off) onPick(state, kind, targetCli);
           }}
@@ -486,6 +499,7 @@ export function Rail({
   daemonInfo,
   hintVisible,
   codexAvailable,
+  transferBusyKeys,
 }: {
   groups: GroupModel[];
   /** The active project's selected worktree. */
@@ -507,10 +521,17 @@ export function Rail({
   daemonInfo: DaemonInfo;
   hintVisible: boolean;
   codexAvailable: boolean;
+  /** Transfer keys (`project/worktree`) with a transfer in flight. */
+  transferBusyKeys: ReadonlySet<string>;
 }) {
   // Right-click context menu: which worktree row it's anchored to, and the
   // click coordinates it should pop up at. Null = closed.
   const [menu, setMenu] = useState<WorktreeMenuState | null>(null);
+  const menuBusy =
+    menu !== null &&
+    transferBusyKeys.has(
+      transferKey(groups.find((g) => g.key === menu.projectKey)?.resolvedName ?? "", menu.name),
+    );
   // The project header menu, and the element to hand focus back to when it closes (the
   // ⋯ button that opened it; null for a right-click).
   const [projectMenu, setProjectMenu] = useState<ProjectMenuState | null>(null);
@@ -712,6 +733,7 @@ export function Rail({
         }}
         onPick={pickLaneItem}
         codexAvailable={codexAvailable}
+        transferBusy={menuBusy}
       />
       <ProjectMenu
         state={projectMenu}

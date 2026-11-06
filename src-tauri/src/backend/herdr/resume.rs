@@ -238,7 +238,7 @@ impl ResumeStore {
     /// Decide how to launch `key`'s agent. In order:
     /// 1. `fresh` → clear the record, start fresh;
     /// 2. the stored id for the same cli, if its transcript exists (claude);
-    /// 3. the registry's id, with the same checks;
+    /// 3. the registry's id, with the same checks, unless the row cleared it;
     /// 4. claude: continue when the worktree has any transcript, else fresh;
     ///    codex: continue (`resume --last` starts fresh when there is nothing);
     /// 5. fresh.
@@ -273,14 +273,21 @@ impl ResumeStore {
         let stored = self
             .with_db_do("get", |db| db.resume_get(&key.project, &key.worktree))
             .flatten();
+        // An id cleared for this cli (a fresh start, or a resume that failed) is
+        // not accepted from the registry either.
+        let mut cleared: Option<String> = None;
         if let Some(row) = stored {
             if row.cli == ctx.cli {
                 if let Some(id) = row.session_id.filter(|id| usable(id)) {
                     return ResumeDecision::Resume { cli: ctx.cli, id };
                 }
+                cleared = row.cleared_id;
             }
         }
-        if let Some(id) = ctx.registry_id.filter(|id| usable(id)) {
+        if let Some(id) = ctx
+            .registry_id
+            .filter(|id| usable(id) && cleared.as_deref() != Some(*id))
+        {
             return ResumeDecision::Resume {
                 cli: ctx.cli,
                 id: id.to_string(),
@@ -305,6 +312,25 @@ impl ResumeStore {
     /// accepted again.
     pub fn clear(&self, key: &SessionKey) {
         self.with_db_do("clear", |db| db.resume_clear(&key.project, &key.worktree));
+    }
+
+    /// Overwrite `key`'s record with `session_id` for `cli`, whatever was stored
+    /// (no newest-wins check, no cleared-id guard): a transfer has decided what
+    /// the worktree resumes. A missing DB or a failed write is an `Err` the
+    /// caller reports (it treats the write as best-effort).
+    pub fn replace(&self, key: &SessionKey, cli: CliKind, session_id: &str) -> Result<(), String> {
+        let now = (self.now_ms)();
+        let db = self.db.lock().unwrap();
+        let db = db.as_ref().ok_or("resume store unavailable")?;
+        db.resume_replace(
+            &key.project,
+            &key.worktree,
+            cli,
+            session_id,
+            "keitora:transfer",
+            now,
+        )
+        .map_err(|e| format!("replace resume record for {key}: {e}"))
     }
 }
 
@@ -482,6 +508,29 @@ mod tests {
     }
 
     #[test]
+    fn resolve_skips_a_registry_id_the_row_cleared() {
+        let f = Fixture::new();
+        f.store
+            .replace(&key("a"), CliKind::Codex, "thr-failed")
+            .unwrap();
+        f.store.clear(&key("a"));
+        assert_eq!(
+            f.store
+                .resolve(&key("a"), &f.ctx(CliKind::Codex, Some("thr-failed"))),
+            ResumeDecision::Continue
+        );
+        // Another registry id is still honoured.
+        assert_eq!(
+            f.store
+                .resolve(&key("a"), &f.ctx(CliKind::Codex, Some("thr-other"))),
+            ResumeDecision::Resume {
+                cli: CliKind::Codex,
+                id: "thr-other".into()
+            }
+        );
+    }
+
+    #[test]
     fn resolve_registry_without_transcript_continues_when_any_transcript_exists() {
         let f = Fixture::new();
         f.add_transcript("something-else");
@@ -535,6 +584,58 @@ mod tests {
         assert_eq!(row.session_id, None);
         assert_eq!(row.cleared_id.as_deref(), Some("sess-a"));
         // The cleared id is never re-adopted from a stale observation.
+        f.observe_session("a", "claude", "sess-a");
+        assert_eq!(f.row("a").unwrap().session_id, None);
+    }
+
+    #[test]
+    fn store_replace_then_resolve_returns_resume_codex() {
+        let f = Fixture::new();
+        f.observe_session("a", "claude", "sess-a");
+        f.store.replace(&key("a"), CliKind::Codex, "thr-1").unwrap();
+        let row = f.row("a").unwrap();
+        assert_eq!(row.cli, CliKind::Codex);
+        assert_eq!(row.session_id.as_deref(), Some("thr-1"));
+        assert_eq!(row.source, "keitora:transfer");
+        assert!(row.agent_present);
+        assert_eq!(row.cleared_id, None);
+        // The stored row outranks the registry id.
+        assert_eq!(
+            f.store
+                .resolve(&key("a"), &f.ctx(CliKind::Codex, Some("other"))),
+            ResumeDecision::Resume {
+                cli: CliKind::Codex,
+                id: "thr-1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn store_replace_without_a_db_is_an_error() {
+        let store = ResumeStore::with_db(None, Box::new(|| 0));
+        assert!(store.replace(&key("a"), CliKind::Codex, "thr-1").is_err());
+    }
+
+    #[test]
+    fn store_clear_then_resolve_never_returns_the_cleared_claude_id() {
+        let f = Fixture::new();
+        f.observe_session("a", "claude", "sess-a");
+        f.add_transcript("sess-a");
+        f.store.clear(&key("a"));
+        // Codex with no registry id continues (the strict launch never asks).
+        assert_eq!(
+            f.store.resolve(&key("a"), &f.ctx(CliKind::Codex, None)),
+            ResumeDecision::Continue
+        );
+        // The cleared claude id is not resumed, nor re-adopted from a stale
+        // observation.
+        assert_ne!(
+            f.store.resolve(&key("a"), &f.ctx(CliKind::Claude, None)),
+            ResumeDecision::Resume {
+                cli: CliKind::Claude,
+                id: "sess-a".into()
+            }
+        );
         f.observe_session("a", "claude", "sess-a");
         assert_eq!(f.row("a").unwrap().session_id, None);
     }

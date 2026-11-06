@@ -577,7 +577,8 @@ export function listWorktrees(): Promise<WorktreeInfo[]> {
  * Spawn the session for `id` in `cwd` under `project`. `command` overrides the
  * default Claude launcher. `project` is the daemon namespace. The default launch
  * resumes the worktree's conversation; `fresh` starts a new, empty one instead.
- * `size` is `null` when the pane is unmeasured (the backend picks one).
+ * `size` is `null` when the pane is unmeasured (the backend picks one). `transfer`
+ * marks the restart that completes a CLI transfer (the backend launches it strictly).
  */
 export function ptySpawn(
   project: string,
@@ -586,6 +587,7 @@ export function ptySpawn(
   size: Dims | null,
   command?: string,
   fresh?: boolean,
+  transfer?: boolean,
 ): Promise<number> {
   return invoke<number>("pty_spawn", {
     project,
@@ -594,6 +596,8 @@ export function ptySpawn(
     ...sizeArgs(size),
     command: command ?? null,
     fresh: fresh ?? false,
+    // Only sent when set: a missing key means "not a transfer restart" on the backend.
+    ...(transfer ? { transfer: true } : {}),
   });
 }
 
@@ -1041,32 +1045,113 @@ export interface ConfirmPreview {
 }
 
 /**
- * Phase A: resolve the worktree's live Claude session and return a preview.
- * Lock-free and side-effect-free (no import, no PTY teardown).
+ * Resolve the worktree's live Claude session and return a preview. Lock-free and
+ * side-effect-free (no import, no PTY teardown). `project` is the resolved
+ * `[project].name`.
  */
-export function previewClaudeTransfer(worktree: string): Promise<ConfirmPreview> {
-  return invoke<ConfirmPreview>("preview_claude_transfer", { worktree });
+export function previewClaudeTransfer(project: string, worktree: string): Promise<ConfirmPreview> {
+  return invoke<ConfirmPreview>("preview_claude_transfer", { project, worktree });
+}
+
+/** Why a Claude to Codex import fell back to a fresh Codex session (diagnostics only). */
+export type TransferFailure =
+  | { kind: "codex_not_found"; message: string; stderrTail: string }
+  | { kind: "codex_too_old"; version: string | null; message: string; stderrTail: string }
+  | { kind: "session_not_detected"; message: string; stderrTail: string }
+  | {
+      kind: "skipped";
+      reason: "no_op" | "deferred" | "continued_in";
+      message: string;
+      stderrTail: string;
+    }
+  | {
+      kind: "timeout";
+      phase: "initialize" | "import" | "completion";
+      message: string;
+      stderrTail: string;
+    }
+  | { kind: "protocol_error"; message: string; stderrTail: string }
+  | { kind: "other"; message: string; stderrTail: string };
+
+/**
+ * What a transfer produced. `imported`: resume the imported Codex thread. `fresh`: the
+ * import failed but the worktree is now Codex; start fresh (`reasonText` is the
+ * plain-language reason, never ending with a period). `done`: the Codex to Claude
+ * handoff completed. `cancelled`: nothing changed.
+ */
+export type TransferOutcome =
+  | { kind: "imported"; threadId: string }
+  | { kind: "fresh"; reason: TransferFailure; reasonText: string }
+  | { kind: "done" }
+  | { kind: "cancelled" };
+
+/** Payload of the advisory `transfer://progress` event. */
+export interface TransferProgress {
+  project: string;
+  worktree: string;
+  phase:
+    | "preflight"
+    | "starting_codex"
+    | "initializing"
+    | "importing"
+    | "awaiting_completion"
+    | "reading_ledger"
+    | "persisting"
+    | "cancelling";
+  message: string | null;
+  elapsedMs: number;
+  deadlineMs: number;
 }
 
 /**
- * Phase B: transfer the worktree to `targetCli` — a live Claude→Codex import
- * (`codex`) or a Codex→Claude summary handoff (`claude`). Persists the new CLI /
- * thread state on success; the caller then drives the PTY restart via
- * `restartNonces` (contract C2). Resolves once persistence is committed.
+ * Transfer the worktree to `targetCli`: a live Claude to Codex import (`codex`) or a
+ * Codex to Claude summary handoff (`claude`). Resolves with the outcome once the new
+ * CLI state is persisted (or the user cancelled); rejects when nothing changed. `jsonl`
+ * (Claude to Codex) is the transcript the user confirmed (`ConfirmPreview.path`): the
+ * backend imports exactly that file, or refuses if it is not this worktree's. Omitted, the
+ * backend picks the newest transcript.
  */
-export function transferWorktree(worktree: string, targetCli: CliKind): Promise<void> {
-  return invoke("transfer_worktree", { worktree, targetCli });
+export function transferWorktree(
+  project: string,
+  worktree: string,
+  targetCli: CliKind,
+  jsonl?: string,
+): Promise<TransferOutcome> {
+  return invoke<TransferOutcome>("transfer_worktree", {
+    project,
+    worktree,
+    targetCli,
+    ...(jsonl === undefined ? {} : { jsonl }),
+  });
 }
 
 /**
- * Best-effort Codex → Claude handoff-summary injection.
- * Called once the freshly-restarted worktree's session reports `idle`. Resolves
- * `true` when a pending handoff summary was found and injected, `false` when
- * there was nothing to inject (a Claude→Codex transfer, or it was already
- * injected) — NOT an error either way.
+ * Best-effort Codex to Claude handoff-summary injection, once the restarted session
+ * reports `idle`. Resolves `true` when a pending summary was injected, `false` when
+ * there was nothing to inject. NOT an error either way.
  */
-export function injectHandoffSummary(worktree: string): Promise<boolean> {
-  return invoke<boolean>("inject_handoff_summary", { worktree });
+export function injectHandoffSummary(project: string, worktree: string): Promise<boolean> {
+  return invoke<boolean>("inject_handoff_summary", { project, worktree });
+}
+
+/** Ask an in-flight Claude to Codex import to stop. A no-op once it has committed. */
+export function cancelTransfer(project: string, worktree: string): Promise<void> {
+  return invoke("cancel_transfer", { project, worktree });
+}
+
+/** Tell the backend the transfer's restart settled; clears its transferring marker. */
+export function transferSettled(project: string, worktree: string): Promise<void> {
+  return invoke("transfer_settled", { project, worktree });
+}
+
+/** The scrubbed trail of the worktree's last transfer, or `null` if there is none. */
+export function transferDiagnostics(project: string, worktree: string): Promise<string | null> {
+  return invoke<string | null>("transfer_diagnostics", { project, worktree });
+}
+
+/** Subscribe to transfer progress for every worktree (filter by project/worktree). */
+export function onTransferProgress(cb: (p: TransferProgress) => void): Promise<UnlistenFn> {
+  return listen<TransferProgress>("transfer://progress", cb);
 }
 
 export interface CliStatus {

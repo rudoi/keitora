@@ -377,6 +377,7 @@ impl PtyBackend for FakeBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::LaunchPolicy;
 
     #[test]
     fn spawn_agent_records_the_launch_and_returns_generation_one() {
@@ -391,6 +392,7 @@ mod tests {
             autonomy: true,
             resume_target: Some("thr_1".into()),
             fresh: false,
+            policy: LaunchPolicy::Default,
         };
         let gen = fake
             .spawn_agent(

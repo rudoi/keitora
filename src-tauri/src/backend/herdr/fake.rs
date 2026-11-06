@@ -47,6 +47,32 @@ pub enum AgentStartScript {
     NotReady,
     /// Fail with this error.
     Err(HerdrError),
+    /// The agent launches, but herdr's own call reports a startup timeout
+    /// (a slow-loading agent): same launch effects as `Ok`, then the error.
+    TimedOutLaunched,
+}
+
+/// Scripted answer of one `pane_get` (global FIFO; `Live` once exhausted).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaneGetScript {
+    /// Answer from the fake's live pane state.
+    Live,
+    /// The pane exists but reports no agent, status or session (a bare shell).
+    /// Does not change the fake's state.
+    NoAgent,
+    /// Report this agent (status "idle") and session whatever the state says.
+    /// Does not change the fake's state.
+    Agent {
+        agent: String,
+        session: Option<AgentSession>,
+    },
+    /// Fail with this error.
+    Err(HerdrError),
+}
+
+/// `n` copies of `script`, to avoid long literals.
+pub fn repeat_pane_get(script: PaneGetScript, n: usize) -> Vec<PaneGetScript> {
+    vec![script; n]
 }
 
 /// One recorded call: the operation and a readable rendering of its arguments.
@@ -96,6 +122,7 @@ struct FakeState {
     /// How many times `rediscover` ran.
     rediscoveries: u32,
     agent_scripts: VecDeque<AgentStartScript>,
+    pane_get_scripts: VecDeque<PaneGetScript>,
     /// Exit of each server process by pid, once it has exited.
     exits: HashMap<u32, ExitInfo>,
     /// Server processes whose exit was collected (`wait`, or `try_wait`
@@ -338,6 +365,7 @@ impl FakeHerdr {
                     exe_missing: false,
                     rediscoveries: 0,
                     agent_scripts: VecDeque::new(),
+                    pane_get_scripts: VecDeque::new(),
                     exits: HashMap::new(),
                     reaped: HashSet::new(),
                     bridges: HashMap::new(),
@@ -361,8 +389,6 @@ impl FakeHerdr {
     }
 }
 
-// Used by tests added alongside later behaviour (resume, reconcile, recovery).
-#[allow(dead_code)]
 impl FakeHerdr {
     /// Add a live pane at `cwd` (its own workspace), optionally running `agent`
     /// with a recorded session. Not recorded as a call.
@@ -525,6 +551,11 @@ impl FakeHerdr {
     /// Outcomes of the next `agent start` calls (FIFO; `Ok` once exhausted).
     pub fn script_agent_start(&self, results: Vec<AgentStartScript>) {
         self.state().agent_scripts.extend(results);
+    }
+
+    /// Answers of the next `pane_get` calls (FIFO; `Live` once exhausted).
+    pub fn script_pane_get(&self, results: Vec<PaneGetScript>) {
+        self.state().pane_get_scripts.extend(results);
     }
 
     /// Make `ndjson_line` (plus a newline) appear on `terminal_id`'s bridge stdout.
@@ -849,7 +880,28 @@ impl HerdrOps for FakeHerdr {
     fn pane_get(&self, pane_id: &str) -> Result<Option<PaneInfo>, HerdrError> {
         let mut st = self.state();
         st.control(Op::PaneGet, pane_id.to_string())?;
-        st.pane_mut(pane_id).map(|p| Some(p.clone()))
+        let script = st
+            .pane_get_scripts
+            .pop_front()
+            .unwrap_or(PaneGetScript::Live);
+        match script {
+            PaneGetScript::Live => st.pane_mut(pane_id).map(|p| Some(p.clone())),
+            PaneGetScript::NoAgent => {
+                let mut pane = st.pane_mut(pane_id)?.clone();
+                pane.agent = None;
+                pane.agent_status = None;
+                pane.agent_session = None;
+                Ok(Some(pane))
+            }
+            PaneGetScript::Agent { agent, session } => {
+                let mut pane = st.pane_mut(pane_id)?.clone();
+                pane.agent = Some(agent);
+                pane.agent_status = Some("idle".into());
+                pane.agent_session = session;
+                Ok(Some(pane))
+            }
+            PaneGetScript::Err(e) => Err(e),
+        }
     }
 
     /// The info scripted with [`FakeHerdr::set_process_info`]; a pane without
@@ -878,8 +930,11 @@ impl HerdrOps for FakeHerdr {
         )?;
         st.pane_mut(pane_id)?;
         let script = st.agent_scripts.pop_front().unwrap_or(AgentStartScript::Ok);
+        let timed_out = script == AgentStartScript::TimedOutLaunched;
         match script {
-            AgentStartScript::Ok | AgentStartScript::NotReady => {
+            AgentStartScript::Ok
+            | AgentStartScript::NotReady
+            | AgentStartScript::TimedOutLaunched => {
                 let value = match resume_id_from(args) {
                     Some(id) => id,
                     None => {
@@ -896,6 +951,9 @@ impl HerdrOps for FakeHerdr {
                     kind: AgentSessionKind::Id,
                     value,
                 });
+                if timed_out {
+                    return Err(api("timeout", "timed out waiting for agent startup"));
+                }
                 Ok(())
             }
             AgentStartScript::EarlyExit => {
@@ -1272,6 +1330,59 @@ mod tests {
             .agent_start("n", "claude", "w9:p9", &[], 5000)
             .unwrap_err()
             .is_not_found());
+    }
+
+    #[test]
+    fn script_pane_get_is_fifo_then_live() {
+        let fake = FakeHerdr::new();
+        let p = fake.workspace_create("/w", &[]).unwrap();
+        fake.agent_start("n", "codex", &p.pane_id, &[], 5000)
+            .unwrap();
+        let live = fake.panes()[0].clone();
+        assert!(live.agent.is_some());
+        fake.script_pane_get(vec![PaneGetScript::NoAgent]);
+        fake.script_pane_get(repeat_pane_get(
+            PaneGetScript::Agent {
+                agent: "other".into(),
+                session: None,
+            },
+            2,
+        ));
+        fake.script_pane_get(vec![PaneGetScript::Err(HerdrError::Timeout)]);
+
+        let bare = fake.pane_get(&p.pane_id).unwrap().unwrap();
+        assert!(
+            bare.agent.is_none() && bare.agent_status.is_none() && bare.agent_session.is_none()
+        );
+        for _ in 0..2 {
+            let other = fake.pane_get(&p.pane_id).unwrap().unwrap();
+            assert_eq!(other.agent.as_deref(), Some("other"));
+            assert_eq!(other.agent_session, None);
+        }
+        assert_eq!(fake.pane_get(&p.pane_id), Err(HerdrError::Timeout));
+        // Exhausted: live again, and the scripted answers never changed the state.
+        assert_eq!(fake.pane_get(&p.pane_id).unwrap(), Some(live.clone()));
+        assert_eq!(fake.panes()[0], live);
+    }
+
+    #[test]
+    fn timed_out_launched_sets_the_agent_then_fails_with_the_timeout_code() {
+        let fake = FakeHerdr::new();
+        let p = fake.workspace_create("/w", &[]).unwrap();
+        fake.script_agent_start(vec![AgentStartScript::TimedOutLaunched]);
+        let err = fake
+            .agent_start(
+                "n",
+                "codex",
+                &p.pane_id,
+                &["resume".into(), "thr-1".into()],
+                5000,
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), Some("timeout"));
+        let pane = fake.panes()[0].clone();
+        assert_eq!(pane.agent.as_deref(), Some("codex"));
+        assert_eq!(pane.agent_session, Some(session("codex", "thr-1")));
     }
 
     #[test]

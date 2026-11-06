@@ -20,8 +20,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::backend::herdr::recovery::RecoveryHandle;
 use crate::backend::unavailable::UnavailableBackend;
 use crate::backend::{
-    session_hint, AgentLaunch, AttachResult, DaemonStats, OutputSink, PtyBackend, PtyBackendError,
-    ScrollDirection, ScrollSource, SessionHint, SessionKey, SharedBackend, StatusPayload,
+    session_hint, AgentLaunch, AttachResult, DaemonStats, LaunchPolicy, OutputSink, PtyBackend,
+    PtyBackendError, ScrollDirection, ScrollSource, SessionHint, SessionKey, SharedBackend,
+    StatusPayload,
 };
 use crate::{bg_notifier, codex_hooks, dispatch, hooks, tasks};
 
@@ -1224,6 +1225,7 @@ pub(crate) fn spawn_pty(
     cols: Option<u16>,
     command: Option<String>,
     fresh: bool,
+    transfer: bool,
 ) -> Result<u64, String> {
     let size = requested_size(cols, rows);
     // The PTY identity is the explicit `project` param; `active_project()` is kept
@@ -1233,15 +1235,6 @@ pub(crate) fn spawn_pty(
         project,
         worktree: id,
     };
-
-    // An explicit `command` goes straight to `spawn`. The default path builds an
-    // `AgentLaunch` from persisted state and goes through `spawn_agent`; the backend
-    // derives the pane PATH from `launch.path` (see `backend::herdr::env::pane_env`).
-    if let Some(command) = command {
-        return client
-            .spawn(key, cwd, db_path, size, Some(command))
-            .map_err(spawn_err_kind);
-    }
     // Re-derive the default launch from persisted state on EVERY spawn.
     // This runs on first launch, hard-restart, daemon-crash re-attach, and
     // app relaunch alike — the frontend's `ptySpawn` never carries a command — so
@@ -1251,17 +1244,78 @@ pub(crate) fn spawn_pty(
     // to Claude). There is no session-manager-side cache to lean on instead.
     // The same resolver recovery resumes with; a key it cannot place falls back
     // to the active project's settings.
-    let launch = resolve_agent_launch(&key)
-        .map(|(_, launch)| launch)
-        .unwrap_or_else(|| {
-            let project = keitora_tasks::resolve_active().ok();
-            agent_launch_in(project.as_ref(), &key.worktree)
-        });
-    let launch = AgentLaunch { fresh, ..launch };
+    let resolve = |key: &SessionKey| {
+        resolve_agent_launch(key)
+            .map(|(_, launch)| launch)
+            .unwrap_or_else(|| {
+                let project = keitora_tasks::resolve_active().ok();
+                agent_launch_in(project.as_ref(), &key.worktree)
+            })
+    };
+    spawn_pty_with(
+        client, key, cwd, db_path, size, command, fresh, transfer, resolve,
+    )
+}
 
+/// [`spawn_pty`] once the key, size and `db_path` are known, with the launch
+/// resolution injected.
+// The spawn's parameters, passed through one to one.
+#[allow(clippy::too_many_arguments)]
+fn spawn_pty_with(
+    client: &dyn PtyBackend,
+    key: SessionKey,
+    cwd: String,
+    db_path: String,
+    size: Option<(u16, u16)>,
+    command: Option<String>,
+    fresh: bool,
+    transfer: bool,
+    resolve: impl FnOnce(&SessionKey) -> AgentLaunch,
+) -> Result<u64, String> {
+    // An explicit `command` goes straight to `spawn` (and ignores `transfer`). The
+    // default path builds an `AgentLaunch` from persisted state and goes through
+    // `spawn_agent`; the backend derives the pane PATH from `launch.path` (see
+    // `backend::herdr::env::pane_env`).
+    if let Some(command) = command {
+        return client
+            .spawn(key, cwd, db_path, size, Some(command))
+            .map_err(spawn_err_kind);
+    }
+    let launch = launch_for_spawn(resolve(&key), fresh, transfer);
     client
         .spawn_agent(key, cwd, db_path, size, launch)
         .map_err(spawn_err_kind)
+}
+
+/// The launch a pane spawn uses: `fresh` as asked, and the strict policy for a
+/// spawn that follows a transfer, which applies to Codex only (a transfer back
+/// to Claude launches the default way).
+fn launch_for_spawn(launch: AgentLaunch, fresh: bool, transfer: bool) -> AgentLaunch {
+    let policy = if transfer && launch.cli == keitora_tasks::CliKind::Codex {
+        LaunchPolicy::TransferStrict
+    } else {
+        if transfer {
+            log::info!("transfer: strict launch applies to codex only");
+        }
+        LaunchPolicy::Default
+    };
+    AgentLaunch {
+        fresh,
+        policy,
+        ..launch
+    }
+}
+
+/// Hand the backend's launch trail for `project`/`id` to the transfer
+/// diagnostics (runs after a transfer spawn, whether it succeeded or not).
+fn drain_launch_trail(client: &dyn PtyBackend, project: &str, id: &str) {
+    let key = SessionKey {
+        project: project.to_string(),
+        worktree: id.to_string(),
+    };
+    for entry in client.take_launch_trail(&key) {
+        crate::transfer_registry::trail(project, id, entry.stage, entry.detail);
+    }
 }
 
 /// The agent launch for `worktree` from its registry entry in `project` (its
@@ -1278,6 +1332,34 @@ fn agent_launch_with(
     project: Option<&keitora_tasks::ProjectConfig>,
     worktree: &str,
 ) -> AgentLaunch {
+    agent_launch_with_discovery(user, project, worktree, &discover_for_launch)
+}
+
+/// Where an unconfigured agent executable is found: the cached CLI discovery
+/// in the app; nothing under test (tests never run a login shell or read the
+/// real filesystem).
+fn discover_for_launch(cli: keitora_tasks::CliKind) -> Option<String> {
+    #[cfg(test)]
+    {
+        let _ = cli;
+        None
+    }
+    #[cfg(not(test))]
+    {
+        keitora_tasks::discover_cli_cached(cli)
+    }
+}
+
+/// [`agent_launch_with`] with the executable discovery injected. The path is
+/// the configured one, else (Codex only) the discovered one, else the bare
+/// `claude`/`codex` name. A discovered absolute path also puts its directory on
+/// the pane's PATH.
+fn agent_launch_with_discovery(
+    user: &keitora_tasks::UserConfig,
+    project: Option<&keitora_tasks::ProjectConfig>,
+    worktree: &str,
+    discover: &dyn Fn(keitora_tasks::CliKind) -> Option<String>,
+) -> AgentLaunch {
     // The worktree's registry entry (found by name), carrying its `cli` and
     // `codex_thread_id`.
     let entry = project.and_then(|p| {
@@ -1286,8 +1368,12 @@ fn agent_launch_with(
             .find(|e| e.name == worktree)
     });
     let cli = keitora_tasks::resolve_cli(entry.as_ref(), user);
-    let path =
-        keitora_tasks::resolve_provider_path(cli, project, user).unwrap_or_else(|| match cli {
+    let path = keitora_tasks::resolve_provider_path(cli, project, user)
+        .or_else(|| match cli {
+            keitora_tasks::CliKind::Codex => discover(cli),
+            keitora_tasks::CliKind::Claude => None,
+        })
+        .unwrap_or_else(|| match cli {
             keitora_tasks::CliKind::Claude => "claude".to_string(),
             keitora_tasks::CliKind::Codex => "codex".to_string(),
         });
@@ -1302,6 +1388,7 @@ fn agent_launch_with(
         autonomy,
         resume_target,
         fresh: false,
+        policy: LaunchPolicy::Default,
     }
 }
 
@@ -1375,7 +1462,10 @@ fn worktree_listed(
 }
 
 /// Tauri command wrapper for `spawn_pty`. Resolves the managed backend and
-/// delegates to the inner `pub(crate)` function.
+/// delegates to the inner `pub(crate)` function. `transfer` (absent = false)
+/// marks a spawn that follows a transfer: a Codex worktree then launches
+/// through the backend's strict, verified path, and its launch trail is handed
+/// to the transfer diagnostics afterwards, on success and failure alike.
 #[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 fn pty_spawn(
@@ -1387,17 +1477,25 @@ fn pty_spawn(
     cols: Option<u16>,
     command: Option<String>,
     fresh: Option<bool>,
+    transfer: Option<bool>,
 ) -> Result<u64, String> {
-    spawn_pty(
-        client.inner().as_ref(),
-        project,
-        id,
+    let backend = client.inner().as_ref();
+    let transfer = transfer.unwrap_or(false);
+    let result = spawn_pty(
+        backend,
+        project.clone(),
+        id.clone(),
         cwd,
         rows,
         cols,
         command,
         fresh.unwrap_or(false),
-    )
+        transfer,
+    );
+    if transfer {
+        drain_launch_trail(backend, &project, &id);
+    }
+    result
 }
 
 /// Attach to an existing live daemon session (re-attach after a reload/respawn).
@@ -1778,6 +1876,7 @@ fn session_launch(
                 cols,
                 None,
                 fresh.unwrap_or(false),
+                false,
             )
         },
     )
@@ -2080,7 +2179,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         // Serializes dispatch_apply so concurrent dispatches can't double-inject.
-        .manage(crate::dispatch::DispatchGate::default());
+        .manage(crate::dispatch::DispatchGate::default())
+        // In-flight transfer markers, cancel flags and diagnostics trails.
+        .manage(crate::transfer_registry::TransferRegistry::global());
 
     builder
         .setup(|app| {
@@ -2215,6 +2316,9 @@ pub fn run() {
             crate::transfer::preview_claude_transfer,
             crate::transfer::transfer_worktree,
             crate::transfer::inject_handoff_summary,
+            crate::transfer::cancel_transfer,
+            crate::transfer::transfer_settled,
+            crate::transfer::transfer_diagnostics,
             crate::diff::worktree_diff_summary,
             crate::diff::worktree_diff_committed,
             crate::diff::worktree_file_diff,
@@ -2591,10 +2695,12 @@ mod tests {
             assert_eq!(Path::new(&cwd), tmp.path().join("wt-a"));
             assert!(launch.autonomy, "alpha's own settings");
             assert!(!launch.fresh);
+            assert_eq!(launch.policy, crate::backend::LaunchPolicy::Default);
 
             let (cwd, launch) = super::super::launch_for(&user, &key("beta", "wb")).unwrap();
             assert_eq!(Path::new(&cwd), tmp.path().join("wt-b"));
             assert!(!launch.autonomy, "beta's own settings");
+            assert_eq!(launch.policy, crate::backend::LaunchPolicy::Default);
         }
 
         #[test]
@@ -3263,5 +3369,149 @@ mod tests {
     #[test]
     fn config_watcher_stop_sender_replaced_on_restart() {
         assert_replace_stop_swaps(&super::CONFIG_WATCHER_STOP);
+    }
+
+    mod spawn_launch {
+        use super::super::{agent_launch_with_discovery, spawn_pty_with};
+        use crate::backend::fake::{Call, FakeBackend};
+        use crate::backend::{AgentLaunch, LaunchPolicy, SessionKey};
+        use keitora_tasks::{CliKind, UserConfig};
+
+        fn key() -> SessionKey {
+            SessionKey {
+                project: "proj-a".into(),
+                worktree: "alpha".into(),
+            }
+        }
+
+        fn launch(cli: CliKind) -> AgentLaunch {
+            AgentLaunch {
+                cli,
+                path: "agent".into(),
+                autonomy: false,
+                resume_target: Some("thr-1".into()),
+                fresh: false,
+                policy: LaunchPolicy::Default,
+            }
+        }
+
+        /// Spawn through `spawn_pty_with` on a fake backend; the calls it saw.
+        fn spawn(cli: CliKind, command: Option<&str>, fresh: bool, transfer: bool) -> Vec<Call> {
+            let fake = FakeBackend::new();
+            spawn_pty_with(
+                &fake,
+                key(),
+                "/w".into(),
+                "/db".into(),
+                Some((80, 24)),
+                command.map(str::to_string),
+                fresh,
+                transfer,
+                |_: &SessionKey| launch(cli),
+            )
+            .unwrap();
+            fake.calls()
+        }
+
+        fn spawned_launch(calls: &[Call]) -> AgentLaunch {
+            match calls {
+                [Call::SpawnAgent { launch, .. }] => launch.clone(),
+                other => panic!("expected one spawn_agent, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn spawn_pty_transfer_false_is_default_policy() {
+            let got = spawned_launch(&spawn(CliKind::Codex, None, false, false));
+            assert_eq!(got.policy, LaunchPolicy::Default);
+            assert!(!got.fresh);
+            let got = spawned_launch(&spawn(CliKind::Codex, None, true, false));
+            assert_eq!(got.policy, LaunchPolicy::Default);
+            assert!(got.fresh);
+        }
+
+        #[test]
+        fn spawn_pty_transfer_true_codex_is_strict() {
+            let got = spawned_launch(&spawn(CliKind::Codex, None, false, true));
+            assert_eq!(
+                got,
+                AgentLaunch {
+                    policy: LaunchPolicy::TransferStrict,
+                    ..launch(CliKind::Codex)
+                }
+            );
+            let got = spawned_launch(&spawn(CliKind::Codex, None, true, true));
+            assert_eq!(got.policy, LaunchPolicy::TransferStrict);
+            assert!(got.fresh, "fresh travels unchanged");
+        }
+
+        #[test]
+        fn spawn_pty_transfer_true_claude_stays_default() {
+            let got = spawned_launch(&spawn(CliKind::Claude, None, false, true));
+            assert_eq!(got.policy, LaunchPolicy::Default);
+            assert_eq!(got.cli, CliKind::Claude);
+        }
+
+        #[test]
+        fn spawn_pty_transfer_with_command_ignores_policy() {
+            let calls = spawn(CliKind::Codex, Some("echo hi"), false, true);
+            assert_eq!(
+                calls,
+                vec![Call::Spawn {
+                    key: key(),
+                    cwd: "/w".into(),
+                    db_path: "/db".into(),
+                    size: Some((80, 24)),
+                    command: Some("echo hi".into()),
+                }]
+            );
+        }
+
+        fn codex_user() -> UserConfig {
+            UserConfig {
+                default_cli: Some(CliKind::Codex),
+                ..UserConfig::default()
+            }
+        }
+
+        #[test]
+        fn agent_launch_with_discovery_uses_discovered_path_for_codex_when_unconfigured() {
+            let launch = agent_launch_with_discovery(&codex_user(), None, "alpha", &|cli| {
+                assert_eq!(cli, CliKind::Codex);
+                Some("/opt/x/bin/codex".into())
+            });
+            assert_eq!(launch.cli, CliKind::Codex);
+            assert_eq!(launch.path, "/opt/x/bin/codex");
+            assert_eq!(launch.policy, LaunchPolicy::Default);
+        }
+
+        #[test]
+        fn agent_launch_with_discovery_keeps_configured_path() {
+            let mut user = codex_user();
+            user.codex.path = Some("/Users/me/bin/codex".into());
+            let launch = agent_launch_with_discovery(&user, None, "alpha", &|_| {
+                panic!("a configured path is never discovered")
+            });
+            assert_eq!(launch.path, "/Users/me/bin/codex");
+        }
+
+        #[test]
+        fn agent_launch_with_discovery_claude_unchanged_bare_fallback() {
+            let user = UserConfig {
+                default_cli: Some(CliKind::Claude),
+                ..UserConfig::default()
+            };
+            let launch = agent_launch_with_discovery(&user, None, "alpha", &|_| {
+                Some("/found/claude".into())
+            });
+            assert_eq!(launch.cli, CliKind::Claude);
+            assert_eq!(launch.path, "claude");
+        }
+
+        #[test]
+        fn agent_launch_with_discovery_bare_codex_when_discovery_finds_nothing() {
+            let launch = agent_launch_with_discovery(&codex_user(), None, "alpha", &|_| None);
+            assert_eq!(launch.path, "codex");
+        }
     }
 }

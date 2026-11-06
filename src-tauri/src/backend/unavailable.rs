@@ -174,6 +174,7 @@ impl PtyBackend for UnavailableBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::LaunchPolicy;
     use crate::backend::{map_write_line_result, DaemonStats, WriteLineOutcome};
     use serde_json::Value;
     use std::sync::Mutex;
@@ -239,6 +240,7 @@ mod tests {
             autonomy: false,
             resume_target: None,
             fresh: false,
+            policy: LaunchPolicy::Default,
         };
         assert_refused(b.spawn_agent(key(), "/w".into(), "/db".into(), Some((80, 24)), launch));
         assert_refused(b.attach(key(), Some((80, 24)), Arc::new(NoOutput)));

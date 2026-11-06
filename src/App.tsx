@@ -35,15 +35,20 @@ import {
 } from "./lib/fontSize";
 import {
   type CliKind,
+  cancelTransfer,
   createWorktree,
   currentProject,
   injectHandoffSummary,
   listWorktrees,
   onProjectChanged,
+  onPtyResume,
+  onTransferProgress,
   type ProjectSummary,
   previewClaudeTransfer,
   reorderProjects,
   takeXdgLeakNotice,
+  transferDiagnostics,
+  transferSettled,
   transferWorktree,
 } from "./lib/ipc";
 import { type KeyCtx, useKeybindings } from "./lib/keybindings";
@@ -80,6 +85,16 @@ import {
   paneElementAtPoint,
 } from "./lib/terminalFileDrop";
 import { useTheme } from "./lib/theme";
+import {
+  createTransferController,
+  isMidTurn,
+  MID_TURN_NOTE,
+  shouldStartTransfer,
+  type TransferController,
+  type TransferEffect,
+  type TransferMap,
+  transferKey,
+} from "./lib/transferPhase";
 import { useAppFocus } from "./lib/useAppFocus";
 import { useKeitoraCliInstall } from "./lib/useKeitoraCliInstall";
 import { useLiveResource } from "./lib/useLiveResource";
@@ -216,25 +231,26 @@ function AppInner() {
   // (`:593`), so the target project is always the current `warm.active`, read via `warmRef`
   // so this stays fully stable (no deps) rather than churning on every switch.
   const [restartNonces, setRestartNonces] = useState<Map<string, RestartSignal>>(() => new Map());
-  // Shared by onRestartSession and onTransfer — bumps the nonce the mounted
+  // Shared by onRestartSession and the transfer controller — bumps the nonce the mounted
   // TerminalPane's prop-driven effect reacts to (kill → spawn → attach). Extracted
   // so a completed transfer converges on identical restart semantics to a manual
   // restart, rather than attempting its own respawn path (contract C2 — never a
   // backend same-SessionKey respawn).
   // `project` may be passed explicitly by callers that captured the active project
-  // BEFORE an await (e.g. onTransfer — the active project can change during the
+  // BEFORE an await (e.g. a transfer — the active project can change during the
   // transfer); it defaults to the current active project for the synchronous
   // restart path (onRestartSession), which never awaits.
-  // `fresh` asks the pane to start a new, empty conversation instead of resuming.
+  // `fresh` asks the pane to start a new, empty conversation instead of resuming;
+  // `transfer` marks the restart as part of a CLI transfer (no confirm, spawn reported back).
   const bumpRestartNonce = useCallback(
-    (worktree: string, project?: string | null, fresh = false) => {
+    (worktree: string, project?: string | null, fresh = false, transfer = false) => {
       // Use the explicitly-passed project (even if null) when provided; otherwise the
       // current active project for the synchronous restart path.
       const proj = project === undefined ? warmRef.current.active : project;
       const key = `${proj}/${worktree}`;
       setRestartNonces((prev) => {
         const next = new Map(prev);
-        next.set(key, nextRestartSignal(next.get(key), fresh));
+        next.set(key, nextRestartSignal(next.get(key), fresh, transfer));
         return next;
       });
     },
@@ -454,10 +470,10 @@ function AppInner() {
       // Abandon quietly if the user switched projects since the transfer: both the
       // live-session map read below and the backend injection resolve the CURRENT
       // active project, so proceeding would target the wrong project.
-      if (warmRef.current.active !== project) return;
+      if (project === null || warmRef.current.active !== project) return;
       const state = liveSessionsRef.current.get(worktree)?.state;
       if (state === "idle") {
-        void injectHandoffSummary(worktree).catch(() => {});
+        void injectHandoffSummary(project, worktree).catch(() => {});
         return;
       }
       if (Date.now() < deadline) {
@@ -467,92 +483,175 @@ function AppInner() {
       // not removed), so nothing is lost; the user can retry the transfer's
       // restart manually if they notice the injection never landed.
     };
-    // A short initial delay lets the restart's kill→spawn actually begin before
-    // the first check — otherwise a session that was already idle a moment ago
-    // (the pre-transfer state, not yet reflecting the restart) could pass the
-    // check instantly and inject into the dying old session.
+    // Run only after the restarted session reported its spawn (the phase machine emits
+    // it on `spawn_settled`). A short initial delay still lets the live-session map
+    // catch up, so a stale `idle` from the replaced session cannot pass the check.
     window.setTimeout(tick, 800);
   }, []);
 
-  // Which worktree is mid-transfer, and to which CLI. Drives the
-  // matching TerminalPane's "Transferring to Claude/Codex…" indicator in place of
-  // the recovery overlay (Codex→Claude: the backend kills the live PTY BEFORE the
-  // summary step, so the mounted pane would otherwise flash "session ended") and
-  // suppresses that pane's confirm-kill prompt on the restart-nonce bump (the user
-  // already confirmed the transfer in the rail dialog below).
-  const [transferring, setTransferring] = useState<{ worktree: string; to: CliKind } | null>(null);
-  // Tracks whether the transferring worktree's session has been observed offline
-  // (or absent) since `transferring` was last set — see the clearing effect below.
-  const transferSawOfflineRef = useRef(false);
-  // Clears `transferring` once the transferred worktree's session is confirmed live
-  // again post-restart, using the SAME live-session source the rail/
-  // injectHandoffWhenIdle key on (`liveSessions`/`liveSessionsRef`). A worktree's
-  // OLD session is typically still live (non-offline) at the instant `transferring`
-  // is set — before `transferWorktree`'s kill/respawn ever runs — so clearing on the
-  // first non-offline reading would dismiss the indicator immediately, before the
-  // transfer even starts. Instead this only clears once the session has been
-  // observed offline (or absent from the map) at least once since `transferring`
-  // was set, and THEN reports live again — i.e. an actual post-kill respawn. A
-  // bounded fallback timeout (below) guards against a session that never comes
-  // back (e.g. a downstream spawn failure) so the indicator can't get stuck.
+  // CLI transfers in flight, one entry per `project/worktree`. The controller is the source
+  // of truth (async callbacks read `transferCtl.getMap()`, never a stale closure); the
+  // `transfers` state only mirrors it to re-render the panes and the rail.
+  const [transfers, setTransfers] = useState<TransferMap>(() => new Map());
+  // Runs the controller's effects; reassigned every render so it sees current callbacks.
+  const runTransferEffectRef = useRef<(e: TransferEffect) => void>(() => {});
+  const transferCtlRef = useRef<TransferController | null>(null);
+  if (transferCtlRef.current === null) {
+    transferCtlRef.current = createTransferController({
+      run: (e) => runTransferEffectRef.current(e),
+      onChange: setTransfers,
+    });
+  }
+  const transferCtl = transferCtlRef.current;
+  useEffect(() => () => transferCtl.dispose(), [transferCtl]);
+  const transferBusyKeys = useMemo(() => new Set(transfers.keys()), [transfers]);
+  // Per-transfer resume-event listeners (for the "fell back to fresh" signal), by key.
+  const resumeUnlistenRef = useRef(new Map<string, () => void>());
   useEffect(() => {
-    if (!transferring) {
-      transferSawOfflineRef.current = false;
-      return;
-    }
-    const state = liveSessions.get(transferring.worktree)?.state;
-    if (state === undefined || state === "offline") {
-      transferSawOfflineRef.current = true;
-      return;
-    }
-    if (transferSawOfflineRef.current) {
-      setTransferring(null);
-    }
-  }, [transferring, liveSessions]);
-  // Safety-net: never let "Transferring…" get stuck showing if the session never
-  // reports live again after the observed offline gap above.
-  useEffect(() => {
-    if (!transferring) return;
-    const timer = window.setTimeout(() => setTransferring(null), 20_000);
-    return () => window.clearTimeout(timer);
-  }, [transferring]);
+    const listeners = resumeUnlistenRef.current;
+    return () => {
+      for (const un of listeners.values()) un();
+      listeners.clear();
+    };
+  }, []);
 
-  // Mirrors `onRestartSession`: focuses the target worktree first (the
-  // confirm dialog / toast must render on a visible pane), then drives the
-  // direction-specific confirm → transfer → restart sequence.
-  // Confirmation always runs BEFORE any backend side effect (Risk 7 / C2).
+  const copyTransferDiagnostics = useCallback(
+    async (project: string, worktree: string) => {
+      try {
+        const text = await transferDiagnostics(project, worktree);
+        if (text === null) {
+          showToast("No diagnostics available.");
+          return;
+        }
+        await navigator.clipboard.writeText(text);
+        showToast("Diagnostics copied.");
+      } catch (e) {
+        showToast(`Could not copy diagnostics: ${String(e)}`);
+      }
+    },
+    [showToast],
+  );
+
+  runTransferEffectRef.current = (e: TransferEffect) => {
+    switch (e.kind) {
+      case "restart":
+        bumpRestartNonce(e.worktree, e.project, e.fresh, true);
+        return;
+      case "inject_handoff":
+        injectHandoffWhenIdle(e.worktree, e.project);
+        return;
+      case "toast": {
+        const diag = e.diagnostics;
+        showToast(
+          e.message,
+          diag
+            ? {
+                action: {
+                  label: "Copy diagnostics",
+                  onClick: () => void copyTransferDiagnostics(diag.project, diag.worktree),
+                },
+              }
+            : undefined,
+        );
+        return;
+      }
+      case "settle": {
+        void transferSettled(e.project, e.worktree).catch(() => {});
+        const key = transferKey(e.project, e.worktree);
+        resumeUnlistenRef.current.get(key)?.();
+        resumeUnlistenRef.current.delete(key);
+        return;
+      }
+    }
+  };
+
+  // Import progress from the backend; events for worktrees not mid-transfer are ignored.
+  useEffect(() => {
+    let cancelled = false;
+    let un: (() => void) | undefined;
+    void onTransferProgress((p) =>
+      transferCtl.dispatch({
+        type: "progress",
+        key: transferKey(p.project, p.worktree),
+        progress: p,
+      }),
+    ).then((u) => {
+      if (cancelled) u();
+      else un = u;
+    });
+    return () => {
+      cancelled = true;
+      un?.();
+    };
+  }, [transferCtl]);
+
+  // Listen for the transfer restart's resume notice from the moment the transfer begins:
+  // the backend emits it during the spawn, so subscribing later could miss it.
+  const subscribeResume = useCallback(
+    (key: string, project: string, worktree: string) => {
+      void onPtyResume(project, worktree, (notice) =>
+        transferCtl.dispatch({ type: "resume_notice", key, notice }),
+      )
+        .then((un) => {
+          if (transferCtl.getMap().has(key)) resumeUnlistenRef.current.set(key, un);
+          else un();
+        })
+        .catch(() => {});
+    },
+    [transferCtl],
+  );
+
+  const onCancelTransfer = useCallback(
+    (project: string, worktree: string) => {
+      transferCtl.dispatch({ type: "cancel_requested", key: transferKey(project, worktree) });
+      void cancelTransfer(project, worktree).catch(() => {});
+    },
+    [transferCtl],
+  );
+
+  // Mirrors `onRestartSession`: focuses the target worktree first (the confirm dialog and
+  // the transfer overlay must render on a visible pane), then confirms, imports and lets
+  // the phase controller drive the restart, toasts and settle. Confirmation always runs
+  // BEFORE any backend side effect.
   const onTransfer = useCallback(
     (worktree: string, targetCli: CliKind) => {
       setSelected(worktree);
       setView("focus");
-      // Capture the active project NOW, before the transfer await. bumpRestartNonce
-      // + injectHandoffWhenIdle below both key on the active project; if the user
-      // switches projects during the await, reading it post-await would target the
-      // wrong project.
-      const activeProject = warmRef.current.active;
-      const label = targetCli === "codex" ? "Codex" : "Claude";
+      // Captured NOW: every step below targets this project even if the user switches
+      // projects while the transfer runs.
+      const project = warmRef.current.active;
+      if (project === null) return;
+      const key = transferKey(project, worktree);
+      if (!shouldStartTransfer(transferCtl.getMap(), key)) {
+        showToast("A transfer is already in progress for this worktree.");
+        return;
+      }
       void (async () => {
+        // Claude → Codex: the transcript the user confirmed; the backend imports exactly it.
+        let confirmedJsonl: string | undefined;
         try {
           if (targetCli === "codex") {
             // Claude → Codex is a full, IRREVERSIBLE live import (it writes
             // Codex's ledger). Show the lock-free preview and require explicit
             // confirmation before anything imports.
-            const preview = await previewClaudeTransfer(worktree);
+            const preview = await previewClaudeTransfer(project, worktree);
+            const midTurn = isMidTurn(liveSessionsRef.current.get(worktree)?.state);
             const ok = await confirmDialog({
               title: `Transfer ${worktree} to Codex?`,
               body:
                 `Codex will import this Claude session and it cannot be undone:\n` +
                 `• ${preview.filename} (modified ${preview.mtime})\n` +
                 `“${preview.first_user_line}”\n\n` +
-                `If this isn't the session you expect, cancel and check the worktree first.`,
+                `If this isn't the session you expect, cancel and check the worktree first.` +
+                (midTurn ? `\n\n${MID_TURN_NOTE}` : ""),
               confirmLabel: "Transfer to Codex",
               danger: true,
             });
             if (!ok) return; // no side effects have happened yet
+            confirmedJsonl = preview.path;
           } else {
-            // Codex → Claude is a lossy SUMMARY handoff (Risk 7), not a full-
-            // history transfer — the copy must say so, distinctly from the
-            // Claude→Codex irreversible-import warning above.
+            // Codex → Claude is a lossy SUMMARY handoff, not a full-history transfer —
+            // the copy must say so, distinctly from the irreversible-import warning above.
             const ok = await confirmDialog({
               title: `Transfer ${worktree} to Claude?`,
               body:
@@ -563,32 +662,23 @@ function AppInner() {
             });
             if (!ok) return;
           }
-          showToast(`Transferring ${worktree} to ${label}…`);
-          // Set AFTER the user confirms, BEFORE the backend transfer starts, so the
-          // pane's overlay/confirm-kill suppression is in place
-          // before `transferWorktree` can kill the live PTY (Codex→Claude) or the
-          // restart-nonce bump can pop a confirm (Claude→Codex). Left set on
-          // success — the clearing effect above dismisses it once the respawned
-          // session is live again, not immediately here, so the indicator survives
-          // across the respawn.
-          setTransferring({ worktree, to: targetCli });
-          await transferWorktree(worktree, targetCli);
-          bumpRestartNonce(worktree, activeProject, false);
-          showToast(`Transferred ${worktree} to ${label}.`);
-          if (targetCli === "claude") {
-            // Best-effort: inject the Codex→Claude handoff summary once the fresh
-            // session is ready. No-ops (false) for a Claude→Codex transfer target
-            // is impossible here (gated by the branch above) — this path only
-            // ever runs after a Codex→Claude transfer.
-            injectHandoffWhenIdle(worktree, activeProject);
-          }
         } catch (e) {
-          setTransferring(null);
           showToast(String(e));
+          return;
+        }
+        // The confirm dialog is async: another transfer may have started meanwhile.
+        if (!shouldStartTransfer(transferCtl.getMap(), key)) return;
+        transferCtl.dispatch({ type: "begin", project, worktree, to: targetCli, now: Date.now() });
+        subscribeResume(key, project, worktree);
+        try {
+          const outcome = await transferWorktree(project, worktree, targetCli, confirmedJsonl);
+          transferCtl.dispatch({ type: "outcome", key, outcome });
+        } catch (e) {
+          transferCtl.dispatch({ type: "failed", key, error: String(e) });
         }
       })();
     },
-    [bumpRestartNonce, showToast, confirmDialog, injectHandoffWhenIdle],
+    [showToast, confirmDialog, transferCtl, subscribeResume],
   );
 
   // Set of task ids that are currently active — used to gate the Rail chip.
@@ -1093,6 +1183,7 @@ function AppInner() {
           daemonInfo={daemonInfo}
           hintVisible={hintVisible}
           codexAvailable={codexAvailable}
+          transferBusyKeys={transferBusyKeys}
         />
         <SettingsDrawer
           open={settingsOpen}
@@ -1180,7 +1271,19 @@ function AppInner() {
                   }
                   restartNonce={restartNonces.get(`${wp.summary.name}/${w.name}`)?.n ?? 0}
                   restartFresh={restartNonces.get(`${wp.summary.name}/${w.name}`)?.fresh ?? false}
-                  transferringTo={transferring?.worktree === w.name ? transferring.to : null}
+                  restartTransfer={
+                    restartNonces.get(transferKey(wp.summary.name, w.name))?.transfer ?? false
+                  }
+                  cli={w.cli}
+                  transfer={transfers.get(transferKey(wp.summary.name, w.name)) ?? null}
+                  onSpawnSettled={(r) =>
+                    transferCtl.dispatch({
+                      type: "spawn_settled",
+                      key: transferKey(wp.summary.name, w.name),
+                      result: r,
+                    })
+                  }
+                  onCancelTransfer={() => onCancelTransfer(wp.summary.name, w.name)}
                   terminated={w.terminated}
                   terminateNonce={terminateNonces.get(`${wp.summary.name}/${w.name}`)?.n ?? 0}
                   launchNonce={launchNonces.get(`${wp.summary.name}/${w.name}`)?.n ?? 0}

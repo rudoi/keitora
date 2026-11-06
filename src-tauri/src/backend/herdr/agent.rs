@@ -37,6 +37,18 @@ pub fn herdr_kind(cli: CliKind) -> &'static str {
 /// An id that is not a plain session id (it is passed as a bare argument) degrades
 /// the resume to a continue.
 pub fn build_agent_args(cli: CliKind, autonomy: bool, resume: &ResumeDecision) -> Vec<String> {
+    build_agent_args_opts(cli, autonomy, resume, true)
+}
+
+/// [`build_agent_args`] with the optional codex `--dangerously-bypass-hook-trust`
+/// flag under the caller's control. It is the only optional flag: the autonomy
+/// flag is user policy and is never dropped, and claude args ignore `hook_trust`.
+pub fn build_agent_args_opts(
+    cli: CliKind,
+    autonomy: bool,
+    resume: &ResumeDecision,
+    hook_trust: bool,
+) -> Vec<String> {
     let resume = match resume {
         ResumeDecision::Resume { cli: for_cli, id } => {
             debug_assert_eq!(*for_cli, cli, "resume decision for another cli");
@@ -70,7 +82,9 @@ pub fn build_agent_args(cli: CliKind, autonomy: bool, resume: &ResumeDecision) -
             if autonomy {
                 args.push("--dangerously-bypass-approvals-and-sandbox".into());
             }
-            args.push("--dangerously-bypass-hook-trust".into());
+            if hook_trust {
+                args.push("--dangerously-bypass-hook-trust".into());
+            }
         }
     }
     args
@@ -244,6 +258,76 @@ mod tests {
                 want,
                 "{cli:?} autonomy={autonomy} {decision:?}"
             );
+        }
+    }
+
+    /// Every decision a launch can carry, for the matrix tests.
+    fn all_decisions() -> Vec<ResumeDecision> {
+        vec![
+            ResumeDecision::Fresh,
+            ResumeDecision::Continue,
+            resume(CliKind::Claude, "sess-1"),
+            resume(CliKind::Codex, "thr-1"),
+            resume(CliKind::Codex, "a b; --last"),
+        ]
+    }
+
+    fn decision_cli(d: &ResumeDecision, fallback: CliKind) -> CliKind {
+        match d {
+            ResumeDecision::Resume { cli, .. } => *cli,
+            _ => fallback,
+        }
+    }
+
+    #[test]
+    fn build_agent_args_opts_true_equals_legacy() {
+        for cli in [CliKind::Claude, CliKind::Codex] {
+            for autonomy in [false, true] {
+                for d in all_decisions() {
+                    if decision_cli(&d, cli) != cli {
+                        continue;
+                    }
+                    assert_eq!(
+                        build_agent_args(cli, autonomy, &d),
+                        build_agent_args_opts(cli, autonomy, &d, true),
+                        "{cli:?} autonomy={autonomy} {d:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn build_agent_args_opts_false_drops_only_hook_trust() {
+        const HOOK: &str = "--dangerously-bypass-hook-trust";
+        for cli in [CliKind::Claude, CliKind::Codex] {
+            for autonomy in [false, true] {
+                for d in all_decisions() {
+                    if decision_cli(&d, cli) != cli {
+                        continue;
+                    }
+                    let with = build_agent_args_opts(cli, autonomy, &d, true);
+                    let without = build_agent_args_opts(cli, autonomy, &d, false);
+                    let expect: Vec<String> = with
+                        .iter()
+                        .filter(|a| a.as_str() != HOOK)
+                        .cloned()
+                        .collect();
+                    assert_eq!(without, expect, "{cli:?} autonomy={autonomy} {d:?}");
+                    if cli == CliKind::Claude {
+                        assert_eq!(with, without, "claude never carries the flag");
+                    } else {
+                        assert_eq!(with.len(), without.len() + 1);
+                        assert_eq!(
+                            autonomy,
+                            without
+                                .iter()
+                                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+                            "the autonomy flag is never dropped"
+                        );
+                    }
+                }
+            }
         }
     }
 

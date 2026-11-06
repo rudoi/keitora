@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { createFrameCoalescer } from "./frameCoalescer";
 import { createOutputGate } from "./paneOutput";
 
 /** A target that records what the pane would have shown, as text. */
@@ -73,5 +74,79 @@ describe("createOutputGate", () => {
     gate.open();
     gate.open();
     expect(log).toEqual(["a"]);
+  });
+});
+
+/**
+ * The pane's wiring: frames go through a coalescer, and an exit ends the pane once
+ * the output before it is written. A restart resets the coalescer.
+ */
+function paneWiring() {
+  let next = 1;
+  const frames = new Map<number, () => void>();
+  const timers = new Map<number, () => void>();
+  const dones: (() => void)[] = [];
+  const ended = vi.fn();
+  const coalescer = createFrameCoalescer({
+    write: (_bytes, done) => dones.push(done),
+    onNeedsRepaint: () => {},
+    visible: true,
+    scheduler: {
+      request: (cb) => {
+        frames.set(next, cb);
+        return next++;
+      },
+      cancel: (h) => {
+        frames.delete(h);
+      },
+      timeout: (cb) => {
+        timers.set(next, cb);
+        return next++;
+      },
+      clearTimeout: (h) => {
+        timers.delete(h);
+      },
+    },
+  });
+  const gate = createOutputGate({
+    write: (bytes, full) => coalescer.push(bytes, undefined, full),
+    exit: () => coalescer.end(ended),
+  });
+  const settle = () => {
+    // Run scheduled flushes, then complete every write they issued.
+    const pending = [...frames.values(), ...timers.values()];
+    frames.clear();
+    timers.clear();
+    for (const cb of pending) cb();
+    while (dones.length) dones.shift()?.();
+  };
+  return { gate, coalescer, ended, settle };
+}
+
+describe("exit around a restart", () => {
+  it("exit before the restart's reset does not end the pane", () => {
+    const { gate, coalescer, ended, settle } = paneWiring();
+    gate.open();
+    gate.onMessage(frame("output"));
+    gate.onMessage({ type: "exit" });
+    coalescer.reset();
+    settle();
+    expect(ended).not.toHaveBeenCalled();
+  });
+
+  // The backend stops an old session's bridge (joining its reader) before the kill
+  // returns, so its exit is sent before the replacement starts. The one remaining
+  // window is transport delivery order between the kill's reply and the output
+  // channel, which the backend cannot rule out; an exit landing after the reset is
+  // indistinguishable from the new session's own, so it ends the pane. A session
+  // generation on the exit message would close this, but is not added without
+  // evidence that the late delivery happens.
+  it("exit that arrives after the restart's reset ends the pane (known gap)", () => {
+    const { gate, coalescer, ended, settle } = paneWiring();
+    gate.open();
+    coalescer.reset();
+    gate.onMessage({ type: "exit" });
+    settle();
+    expect(ended).toHaveBeenCalledTimes(1);
   });
 });

@@ -67,8 +67,15 @@ describe("resumeNoticeLine", () => {
 describe("nextRestartSignal", () => {
   it("bumps the counter and carries the latest flavour", () => {
     const first = nextRestartSignal(undefined, true);
-    expect(first).toEqual({ n: 1, fresh: true });
-    // A transfer restart is never fresh, even right after a fresh one.
-    expect(nextRestartSignal(first, false)).toEqual({ n: 2, fresh: false });
+    expect(first).toEqual({ n: 1, fresh: true, transfer: false });
+    // Each bump carries only its own flavour: a resume right after a fresh start is not fresh.
+    expect(nextRestartSignal(first, false)).toEqual({ n: 2, fresh: false, transfer: false });
+  });
+
+  it("carries transfer when asked", () => {
+    const first = nextRestartSignal(undefined, false, true);
+    expect(first).toEqual({ n: 1, fresh: false, transfer: true });
+    // A following plain bump is not a transfer restart.
+    expect(nextRestartSignal(first, false)).toEqual({ n: 2, fresh: false, transfer: false });
   });
 });

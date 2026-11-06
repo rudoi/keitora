@@ -9,6 +9,7 @@ mod backend;
 mod bg_notifier;
 mod cli_install;
 mod clipboard_image;
+mod codex_env;
 mod codex_hooks;
 
 mod db_watch;
@@ -25,6 +26,7 @@ mod perf;
 mod tasks;
 mod terminal_links;
 mod transfer;
+mod transfer_registry;
 
 /// Desktop entry: the full host app (PTY backend, board, dispatch, watchers).
 pub fn run() {
