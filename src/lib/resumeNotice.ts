@@ -12,10 +12,15 @@ export interface ResumeNotice {
   fell_back: boolean;
 }
 
-/** The per-worktree restart signal: a bump counter plus the flavour of the latest bump. */
+/**
+ * The per-worktree restart signal: a bump counter plus the flavour of the latest bump.
+ * `fresh` starts a new, empty conversation; `transfer` marks the restart that completes a
+ * CLI transfer (already confirmed, so the pane skips its confirm-kill prompt).
+ */
 export interface RestartSignal {
   n: number;
   fresh: boolean;
+  transfer: boolean;
 }
 
 /** The confirm surface's message and confirm-button label for `mode`. */
@@ -74,7 +79,11 @@ export function dimLine(line: string): string {
   return `\x1b[2m${line}\x1b[m`;
 }
 
-/** The next restart signal after `prev` for a restart of flavour `fresh`. */
-export function nextRestartSignal(prev: RestartSignal | undefined, fresh: boolean): RestartSignal {
-  return { n: (prev?.n ?? 0) + 1, fresh };
+/** The next restart signal after `prev` for a restart of flavour `fresh` (and `transfer`). */
+export function nextRestartSignal(
+  prev: RestartSignal | undefined,
+  fresh: boolean,
+  transfer = false,
+): RestartSignal {
+  return { n: (prev?.n ?? 0) + 1, fresh, transfer };
 }

@@ -92,3 +92,25 @@ export function laneMenuAction(item: WorktreeMenuItem, transferTo: CliKind): Pen
       return { kind: "launch", fresh: true };
   }
 }
+
+/**
+ * Why the worktree menu's transfer entry is disabled, or `null` when it is enabled. A
+ * transfer already in flight wins over a missing Codex install.
+ */
+export function transferDisabledReason(o: { codexMissing: boolean; busy: boolean }): string | null {
+  if (o.busy) return "A transfer is already in progress";
+  if (o.codexMissing) return "Codex isn't installed";
+  return null;
+}
+
+/**
+ * Why a session-killing worktree-menu entry (restart, start fresh, terminate) is disabled,
+ * or `null` when it is enabled: the pane ignores those signals while a transfer owns it.
+ */
+export function sessionItemDisabledReason(
+  item: WorktreeMenuItem,
+  transferBusy: boolean,
+): string | null {
+  const kills = item === "restart" || item === "fresh" || item === "terminate";
+  return kills && transferBusy ? "A transfer is in progress" : null;
+}

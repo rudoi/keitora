@@ -312,6 +312,35 @@ pub struct AgentLaunch {
     pub resume_target: Option<String>,
     /// The user asked for a new, empty conversation instead of a resume.
     pub fresh: bool,
+    /// How the spawn behaves when the agent does not come up cleanly.
+    pub policy: LaunchPolicy,
+}
+
+/// How a spawn behaves when the agent does not come up cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LaunchPolicy {
+    /// Every existing caller: boot-resume, recovery, plain restarts.
+    #[default]
+    Default,
+    /// A spawn that follows a transfer to Codex: verified, never `continue`,
+    /// and polled until the agent is seen.
+    TransferStrict,
+}
+
+/// The resume-store row a transfer leaves behind for a worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeRecord {
+    /// The worktree now resumes this Codex thread.
+    Codex { thread_id: String },
+    /// The stored session is cleared: no conversation is owed.
+    Cleared,
+}
+
+/// One step of a strict launch, handed to the caller for its diagnostics trail.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaunchTrailEntry {
+    pub stage: crate::transfer_registry::TrailStage,
+    pub detail: serde_json::Value,
 }
 
 /// JSON payload emitted on the `daemon://status` Tauri event / returned by the
@@ -597,6 +626,23 @@ pub trait PtyBackend: Send + Sync + 'static {
     /// Persist (or clear) the user's terminate of `key`. A terminated session is
     /// never resumed by recovery and refuses a spawn until the flag is cleared.
     fn set_terminated(&self, key: &SessionKey, terminated: bool) -> Result<(), PtyBackendError>;
+
+    /// Overwrite (or clear) the stored resume row of `key`. Backends without a
+    /// resume store ignore it.
+    fn set_resume_record(
+        &self,
+        key: &SessionKey,
+        record: ResumeRecord,
+    ) -> Result<(), PtyBackendError> {
+        let _ = (key, record);
+        Ok(())
+    }
+
+    /// Drain the launch trail buffered for `key`'s last strict spawn.
+    fn take_launch_trail(&self, key: &SessionKey) -> Vec<LaunchTrailEntry> {
+        let _ = key;
+        Vec::new()
+    }
 
     /// The terminate's kill, once the flag is set: kill whatever session of
     /// `key` is live now and drop `key` from recovery. `gen` is the generation
@@ -898,6 +944,30 @@ mod tests {
     #[test]
     fn perf_source_defaults_to_none() {
         assert!(FakeBackend::new().perf_source().is_none());
+    }
+
+    #[test]
+    fn launch_policy_default_is_default() {
+        assert_eq!(LaunchPolicy::default(), LaunchPolicy::Default);
+    }
+
+    #[test]
+    fn default_trait_set_resume_record_is_a_noop() {
+        let fake = FakeBackend::new();
+        let key = SessionKey {
+            project: "proj".into(),
+            worktree: "wt".into(),
+        };
+        assert!(fake
+            .set_resume_record(
+                &key,
+                ResumeRecord::Codex {
+                    thread_id: "thr-1".into()
+                }
+            )
+            .is_ok());
+        assert!(fake.set_resume_record(&key, ResumeRecord::Cleared).is_ok());
+        assert!(fake.take_launch_trail(&key).is_empty());
     }
 
     #[test]

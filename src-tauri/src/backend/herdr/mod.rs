@@ -34,7 +34,7 @@
 //! fidelity is deferred to the human sign-off; DB-offline-on-exit is not yet
 //! ported.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,8 +47,9 @@ use crate::headroom::Headroom;
 use crate::lifecycle::{self, LifecycleEvent, ResumeResult, ServerStartHow};
 
 use super::{
-    AgentLaunch, AttachResult, DaemonStats, OutputSink, OutputSinks, PtyBackend, PtyBackendError,
-    ScrollDirection, ScrollSource, SessionKey, SessionSummary, StatusPayload,
+    AgentLaunch, AttachResult, DaemonStats, LaunchPolicy, LaunchTrailEntry, OutputSink,
+    OutputSinks, PtyBackend, PtyBackendError, ResumeRecord, ScrollDirection, ScrollSource,
+    SessionKey, SessionSummary, StatusPayload,
 };
 
 pub mod agent;
@@ -71,6 +72,7 @@ pub mod reconcile;
 pub mod recovery;
 pub mod resume;
 pub mod status_loop;
+mod strict;
 pub mod supervisor;
 pub mod watchdog;
 pub mod writer;
@@ -184,9 +186,10 @@ impl SizeMemory {
     }
 }
 
-/// Apply the platform spawn flags for a short-lived herdr child (CLI call or
-/// bridge): on Windows, `CREATE_NO_WINDOW` so no console flashes; a no-op
-/// elsewhere. The long-lived server launches through [`crate::backend::launch`].
+/// Apply the platform spawn flags for a short-lived, piped child (a herdr CLI
+/// call or bridge, a Codex probe): on Windows, `CREATE_NO_WINDOW` so no console
+/// flashes; a no-op elsewhere. The long-lived server launches through
+/// [`crate::backend::launch`].
 pub(crate) fn configure_command(cmd: &mut Command) {
     #[cfg(windows)]
     {
@@ -301,7 +304,13 @@ pub struct HerdrBackend {
     exe_missing: Arc<ExeMissing>,
     /// Each session's last measured size, for takeovers sent without one.
     sizes: SizeMemory,
+    /// The launch trail of each key's last strict spawn, until the caller
+    /// drains it.
+    trails: LaunchTrails,
 }
+
+/// Per-key launch trails of strict spawns (see [`PtyBackend::take_launch_trail`]).
+type LaunchTrails = Arc<Mutex<HashMap<SessionKey, VecDeque<LaunchTrailEntry>>>>;
 
 /// When a bridge stream's end last proved the server gone: in which
 /// generation, and when. Shared by every bridge so a server death that ends
@@ -771,6 +780,8 @@ struct Spawner {
     exit_authority: ExitAuthority,
     /// Each session's last measured size (a resume takes over at it).
     sizes: SizeMemory,
+    /// The launch trails strict spawns write.
+    trails: LaunchTrails,
 }
 
 impl Spawner {
@@ -1410,9 +1421,21 @@ impl Executor for BackendExecutor {
     }
 }
 
+/// `text` cut to at most `max` bytes without splitting a UTF-8 character.
+pub(crate) fn truncate_at_char_boundary(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// Whether a failure text is herdr's agent-startup timeout: its JSON error
 /// code, or the message it gives.
-fn is_timeout_text(text: &str) -> bool {
+pub(super) fn is_timeout_text(text: &str) -> bool {
     let text = text.to_lowercase();
     text.contains("\"code\":\"timeout\"") || text.contains("timed out waiting for agent startup")
 }
@@ -1795,6 +1818,7 @@ impl HerdrBackend {
             exit_verdict: Arc::default(),
             writers: Writers::default(),
             sizes: SizeMemory::default(),
+            trails: Arc::default(),
         }
     }
 
@@ -1910,6 +1934,7 @@ impl HerdrBackend {
             projects_dir: self.projects_dir.clone(),
             exit_authority: self.exit_authority(),
             sizes: self.sizes.clone(),
+            trails: Arc::clone(&self.trails),
         }
     }
 
@@ -2300,8 +2325,20 @@ impl PtyBackend for HerdrBackend {
         // resume store picks. `agent_not_ready` / "blocked during startup" is already
         // folded to `Ok` (launched).
         let spawner = self.spawner();
-        let decision = spawner.resolve(&key, &cwd, &launch);
-        let (gen, _, _) = spawner.spawn_agent_with(&key, cwd, cols, rows, &launch, decision)?;
+        let gen = match launch.policy {
+            LaunchPolicy::Default => {
+                let decision = spawner.resolve(&key, &cwd, &launch);
+                let (gen, _, _) =
+                    spawner.spawn_agent_with(&key, cwd, cols, rows, &launch, decision)?;
+                gen
+            }
+            // A spawn after a transfer: verified, with its own fallback chain.
+            LaunchPolicy::TransferStrict => {
+                spawner
+                    .spawn_agent_transfer_strict(&key, cwd, cols, rows, &launch)?
+                    .0
+            }
+        };
         Ok(gen)
     }
 
@@ -2660,6 +2697,32 @@ impl PtyBackend for HerdrBackend {
             .map_err(PtyBackendError::Other)
     }
 
+    fn set_resume_record(
+        &self,
+        key: &SessionKey,
+        record: ResumeRecord,
+    ) -> Result<(), PtyBackendError> {
+        match record {
+            ResumeRecord::Codex { thread_id } => self
+                .store
+                .replace(key, keitora_tasks::CliKind::Codex, &thread_id)
+                .map_err(PtyBackendError::Other),
+            ResumeRecord::Cleared => {
+                self.store.clear(key);
+                Ok(())
+            }
+        }
+    }
+
+    fn take_launch_trail(&self, key: &SessionKey) -> Vec<LaunchTrailEntry> {
+        self.trails
+            .lock()
+            .unwrap()
+            .remove(key)
+            .map(Vec::from)
+            .unwrap_or_default()
+    }
+
     fn live_set_snapshot(&self) -> HashSet<SessionKey> {
         self.live.lock().unwrap().clone()
     }
@@ -2798,6 +2861,7 @@ impl PtyBackend for HerdrBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::LaunchPolicy;
     use base64::Engine as _;
     use serde_json::Value;
     use std::path::PathBuf;
@@ -4977,6 +5041,7 @@ mod tests {
             autonomy: false,
             resume_target: None,
             fresh: false,
+            policy: LaunchPolicy::Default,
         }
     }
 
@@ -7024,6 +7089,183 @@ mod tests {
         assert!(resume_events(&events).is_empty());
     }
 
+    // ---- Default launch policy baseline ----
+
+    fn codex_launch() -> AgentLaunch {
+        AgentLaunch {
+            cli: keitora_tasks::CliKind::Codex,
+            path: "codex".into(),
+            autonomy: false,
+            resume_target: Some("thr-1".into()),
+            fresh: false,
+            policy: LaunchPolicy::Default,
+        }
+    }
+
+    fn codex_spawn(
+        fake: &Arc<fake::FakeHerdr>,
+        backend: &HerdrBackend,
+        launch: AgentLaunch,
+    ) -> Result<u64, PtyBackendError> {
+        let cwd = worktree_dir(fake, "wt", None);
+        backend.spawn_agent(skey("wt"), cwd, String::new(), Some((80, 24)), launch)
+    }
+
+    const HOOK: &str = "--dangerously-bypass-hook-trust";
+
+    #[test]
+    fn default_policy_timeout_still_errs_and_closes_the_pane() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        fake.script_agent_start(vec![fake::AgentStartScript::Err(ops::HerdrError::Api {
+            code: "timeout".into(),
+            message: "timed out waiting for agent startup".into(),
+        })]);
+        let err = codex_spawn(&fake, &backend, codex_launch()).unwrap_err();
+        let PtyBackendError::Other(m) = &err else {
+            panic!("unexpected error {err:?}");
+        };
+        assert!(is_timeout_text(m), "{m}");
+        assert!(is_load_related_error(&err, false));
+        assert_eq!(count(&fake, ops::Op::AgentStart), 1);
+        assert_eq!(count(&fake, ops::Op::PaneClose), 1);
+        assert_eq!(count(&fake, ops::Op::PaneGet), 0);
+        assert!(fake.panes().is_empty());
+    }
+
+    #[test]
+    fn default_policy_resume_exit_falls_back_continue_then_fresh() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        fake.script_agent_start(vec![
+            fake::AgentStartScript::EarlyExit,
+            fake::AgentStartScript::EarlyExit,
+            fake::AgentStartScript::Ok,
+        ]);
+        codex_spawn(&fake, &backend, codex_launch()).unwrap();
+        assert_eq!(
+            agent_start_args(&fake),
+            vec![
+                format!("resume thr-1 {HOOK}"),
+                format!("resume --last {HOOK}"),
+                HOOK.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn default_policy_never_polls_pane_get() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        codex_spawn(&fake, &backend, codex_launch()).unwrap();
+        assert_eq!(count(&fake, ops::Op::AgentStart), 1);
+        assert_eq!(count(&fake, ops::Op::PaneGet), 0);
+    }
+
+    #[test]
+    fn default_policy_no_silent_fresh_downgrade_on_other_errors() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, events) = fake_backend(&fake);
+        fake.script_agent_start(vec![fake::AgentStartScript::Err(ops::HerdrError::Api {
+            code: "pane_busy".into(),
+            message: "busy".into(),
+        })]);
+        assert!(codex_spawn(&fake, &backend, codex_launch()).is_err());
+        assert_eq!(count(&fake, ops::Op::AgentStart), 1);
+        assert_eq!(count(&fake, ops::Op::WorkspaceCreate), 1);
+        assert!(resume_events(&events).is_empty());
+    }
+
+    #[test]
+    fn default_policy_fresh_variants_keep_the_hook_trust_flag() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let launch = AgentLaunch {
+            fresh: true,
+            ..codex_launch()
+        };
+        codex_spawn(&fake, &backend, launch).unwrap();
+        assert_eq!(agent_start_args(&fake), vec![HOOK.to_string()]);
+    }
+
+    /// Recovery and boot-resume launches always come from the resolver, which
+    /// never asks for the strict policy, so they spawn through the unchanged
+    /// path: no `pane_get` polling.
+    #[test]
+    fn boot_resume_launcher_is_always_default() {
+        let fake = fake::FakeHerdr::new();
+        let cwd = worktree_dir(&fake, "wt", None);
+        let launcher: LaunchResolver = Arc::new(move |_: &SessionKey| {
+            Some((
+                cwd.clone(),
+                AgentLaunch {
+                    cli: keitora_tasks::CliKind::Codex,
+                    path: "codex".into(),
+                    ..claude_launch()
+                },
+            ))
+        });
+        let (backend, _) = fake_backend_with(&fake, Some(launcher.clone()));
+        let (_, launch) = launcher(&skey("wt")).unwrap();
+        assert_eq!(launch.policy, LaunchPolicy::Default);
+        backend.keymap.begin_recovery(&[skey("wt")]);
+        assert_eq!(
+            run_resume(&backend, "wt").outcome,
+            ResumeOutcomeKind::Continued
+        );
+        assert_eq!(count(&fake, ops::Op::AgentStart), 1);
+        assert_eq!(count(&fake, ops::Op::PaneGet), 0);
+    }
+
+    #[test]
+    fn launch_policy_default_is_default() {
+        assert_eq!(LaunchPolicy::default(), LaunchPolicy::Default);
+        assert_eq!(claude_launch().policy, LaunchPolicy::Default);
+        assert_eq!(codex_launch().policy, LaunchPolicy::Default);
+    }
+
+    #[test]
+    fn default_policy_event_payload_unchanged() {
+        let payload = |script: Vec<fake::AgentStartScript>, launch: AgentLaunch| {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            fake.script_agent_start(script);
+            codex_spawn(&fake, &backend, launch).unwrap();
+            resume_events(&events)
+        };
+        let event = |outcome: &str, fell_back: bool| {
+            vec![(
+                "pty://resume/p/wt".to_string(),
+                serde_json::json!({"outcome": outcome, "fell_back": fell_back}),
+            )]
+        };
+        // resumed
+        assert_eq!(payload(vec![], codex_launch()), event("resumed", false));
+        // continued: no id to resume, not fresh
+        let no_target = AgentLaunch {
+            resume_target: None,
+            ..codex_launch()
+        };
+        assert_eq!(payload(vec![], no_target), event("continued", false));
+        // a plain fresh start says nothing
+        let fresh = AgentLaunch {
+            fresh: true,
+            ..codex_launch()
+        };
+        assert!(payload(vec![], fresh).is_empty());
+        // fallback all the way to fresh
+        assert_eq!(
+            payload(
+                vec![
+                    fake::AgentStartScript::EarlyExit,
+                    fake::AgentStartScript::EarlyExit,
+                ],
+                codex_launch()
+            ),
+            event("fresh", true)
+        );
+    }
+
     #[test]
     fn spawn_agent_fresh_clears_store_and_removes_from_should_be_running() {
         let fake = fake::FakeHerdr::new();
@@ -7246,6 +7488,14 @@ mod tests {
             "{report:?}"
         );
         assert!(!report.load_related);
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_respects_char_boundaries() {
+        assert_eq!(truncate_at_char_boundary("abc", 10), "abc");
+        assert_eq!(truncate_at_char_boundary("abcdef", 3), "abc");
+        // 'é' is two bytes; cutting inside it backs off.
+        assert_eq!(truncate_at_char_boundary("aé", 2), "a");
     }
 
     #[test]
@@ -7819,6 +8069,7 @@ mod tests {
             autonomy: false,
             resume_target: None,
             fresh: false,
+            policy: LaunchPolicy::Default,
         };
 
         let spawned = backend.spawn_agent(
@@ -8235,5 +8486,640 @@ mod tests {
         assert_eq!(second.supervisor.spawned_pid(), Some(after.pid));
         assert_eq!(second.keymap.instance(), Some(after));
         assert!(second.keymap.generation().0 > generation.0);
+    }
+
+    // ---- strict launch (a spawn that follows a transfer to Codex) ----
+
+    mod strict_launch {
+        use super::*;
+        use crate::backend::herdr::strict::{StrictTiming, TRAIL_CAP};
+        use crate::transfer_registry::TrailStage;
+        use cli::{AgentSession, AgentSessionKind, PaneProcessInfo};
+        use fake::{AgentStartScript as Start, PaneGetScript as Get};
+
+        fn strict() -> AgentLaunch {
+            AgentLaunch {
+                policy: LaunchPolicy::TransferStrict,
+                ..codex_launch()
+            }
+        }
+
+        fn codex_agent(session: Option<&str>) -> Get {
+            Get::Agent {
+                agent: "codex".into(),
+                session: session.map(|v| AgentSession {
+                    source: "herdr:codex".into(),
+                    agent: "codex".into(),
+                    kind: AgentSessionKind::Id,
+                    value: v.into(),
+                }),
+            }
+        }
+
+        fn endless(script: Get) -> Vec<Get> {
+            fake::repeat_pane_get(script, 5000)
+        }
+
+        fn event(outcome: &str, fell_back: bool) -> Vec<(String, Value)> {
+            vec![(
+                "pty://resume/p/wt".to_string(),
+                serde_json::json!({ "outcome": outcome, "fell_back": fell_back }),
+            )]
+        }
+
+        fn trail(backend: &HerdrBackend) -> Vec<LaunchTrailEntry> {
+            backend.take_launch_trail(&skey("wt"))
+        }
+
+        fn has(entries: &[LaunchTrailEntry], stage: TrailStage, key: &str) -> usize {
+            entries
+                .iter()
+                .filter(|e| e.stage == stage && e.detail.get(key).is_some())
+                .count()
+        }
+
+        const EXHAUSTED: &str = "codex did not start: agent never appeared \
+             (tried: resume thr-1 -> fresh -> fresh without optional flags)";
+
+        #[test]
+        fn strict_resume_confirmed_by_matching_session() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            assert_eq!(
+                agent_start_args(&fake),
+                vec![format!("resume thr-1 {HOOK}")]
+            );
+            assert_eq!(resume_events(&events), event("resumed", false));
+            assert!(backend.is_live(&skey("wt")));
+            assert_eq!(backend.keymap.get(&skey("wt")).unwrap().pane_id, "w1:p1");
+            assert!(fake.closed_pane_ids().is_empty());
+        }
+
+        #[test]
+        fn strict_fresh_launch_confirmed_by_agent_label() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            let launch = AgentLaunch {
+                fresh: true,
+                ..strict()
+            };
+            codex_spawn(&fake, &backend, launch).unwrap();
+            assert_eq!(agent_start_args(&fake), vec![HOOK.to_string()]);
+            assert!(count(&fake, ops::Op::PaneGet) >= 2, "two observations");
+            // A plain fresh start that did not fall back says nothing, as the
+            // default launch does.
+            assert!(resume_events(&events).is_empty());
+            assert!(backend.is_live(&skey("wt")));
+        }
+
+        #[test]
+        fn strict_vanished_agent_advances_to_fresh() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            fake.script_pane_get(vec![codex_agent(None), Get::NoAgent]);
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            assert_eq!(
+                agent_start_args(&fake),
+                vec![format!("resume thr-1 {HOOK}"), HOOK.to_string()]
+            );
+            assert_eq!(fake.closed_pane_ids(), vec!["w1:p1".to_string()]);
+            assert_eq!(resume_events(&events), event("fresh", true));
+        }
+
+        #[test]
+        fn strict_fall_back_forgets_the_failed_thread() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            // The transfer recorded the imported thread before the restart.
+            backend
+                .store
+                .replace(&skey("wt"), keitora_tasks::CliKind::Codex, "thr-1")
+                .unwrap();
+            let cwd = worktree_dir(&fake, "wt", None);
+            let spawner = backend.spawner();
+            assert_eq!(
+                spawner.resolve(&skey("wt"), &cwd, &codex_launch()),
+                ResumeDecision::Resume {
+                    cli: keitora_tasks::CliKind::Codex,
+                    id: "thr-1".into()
+                }
+            );
+            fake.script_pane_get(vec![codex_agent(None), Get::NoAgent]);
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            // The next default restart (registry still naming thr-1) continues.
+            assert_eq!(
+                spawner.resolve(&skey("wt"), &cwd, &codex_launch()),
+                ResumeDecision::Continue
+            );
+        }
+
+        #[test]
+        fn strict_confirmed_resume_keeps_the_thread() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            backend
+                .store
+                .replace(&skey("wt"), keitora_tasks::CliKind::Codex, "thr-1")
+                .unwrap();
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            let cwd = worktree_dir(&fake, "wt", None);
+            assert_eq!(
+                backend
+                    .spawner()
+                    .resolve(&skey("wt"), &cwd, &codex_launch()),
+                ResumeDecision::Resume {
+                    cli: keitora_tasks::CliKind::Codex,
+                    id: "thr-1".into()
+                }
+            );
+        }
+
+        #[test]
+        fn strict_start_timeout_keeps_polling_then_confirms() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            fake.script_agent_start(vec![Start::TimedOutLaunched]);
+            fake.script_pane_get(vec![Get::NoAgent, Get::NoAgent, Get::Live]);
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            assert_eq!(count(&fake, ops::Op::AgentStart), 1);
+            assert_eq!(resume_events(&events), event("resumed", false));
+            assert_eq!(has(&trail(&backend), TrailStage::Launch, "startTimeout"), 1);
+        }
+
+        #[test]
+        fn strict_start_timeout_is_bounded_by_the_step_cap() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            fake.script_agent_start(vec![Start::TimedOutLaunched]);
+            fake.script_pane_get(endless(Get::NoAgent));
+            let started = Instant::now();
+            let _ = codex_spawn(&fake, &backend, strict());
+            let elapsed = started.elapsed();
+            assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+            let args = agent_start_args(&fake);
+            assert!(args.len() >= 2, "{args:?}");
+            assert_eq!(args[1], HOOK, "advanced to fresh");
+            // The timed-out step kept polling past the verify window, up to its cap.
+            assert!(elapsed >= StrictTiming::fast().step_cap, "{elapsed:?}");
+        }
+
+        #[test]
+        fn strict_session_mismatch_advances() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            fake.script_pane_get(endless(codex_agent(Some("other"))));
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            assert_eq!(
+                agent_start_args(&fake),
+                vec![format!("resume thr-1 {HOOK}"), HOOK.to_string()]
+            );
+            assert_eq!(resume_events(&events), event("fresh", true));
+        }
+
+        #[test]
+        fn strict_late_session_match_wins_over_earlier_mismatch() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            fake.script_pane_get(vec![codex_agent(Some("other")), codex_agent(Some("thr-1"))]);
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            assert_eq!(count(&fake, ops::Op::AgentStart), 1);
+            assert_eq!(resume_events(&events), event("resumed", false));
+        }
+
+        #[test]
+        fn strict_present_unknown_is_accepted() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            fake.script_pane_get(endless(codex_agent(None)));
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            assert_eq!(count(&fake, ops::Op::AgentStart), 1);
+            assert_eq!(resume_events(&events), event("resumed", false));
+            let entries = trail(&backend);
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.detail["present_unknown"] == true
+                        && e.detail["reason"] == "no_session")
+            );
+        }
+
+        #[test]
+        fn strict_agent_never_appeared_with_foreground_process_is_accepted() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            fake.script_pane_get(endless(Get::NoAgent));
+            fake.set_process_info(
+                "w1:p1",
+                PaneProcessInfo {
+                    shell_pid: 1,
+                    foreground_pids: vec![2],
+                },
+            );
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            assert_eq!(count(&fake, ops::Op::AgentStart), 1);
+            assert_eq!(count(&fake, ops::Op::PaneProcessInfo), 1);
+            assert_eq!(resume_events(&events), event("resumed", false));
+            let entries = trail(&backend);
+            assert!(entries.iter().any(|e| e.stage == TrailStage::Verify
+                && e.detail["present_unknown"] == true
+                && e.detail["reason"] == "foreground_process"
+                && e.detail["foregroundProcesses"] == 1));
+        }
+
+        #[test]
+        fn strict_agent_never_appeared_with_empty_foreground_still_fails() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            fake.script_pane_get(endless(Get::NoAgent));
+            for pane in ["w1:p1", "w2:p1", "w3:p1"] {
+                fake.set_process_info(
+                    pane,
+                    PaneProcessInfo {
+                        shell_pid: 1,
+                        foreground_pids: vec![],
+                    },
+                );
+            }
+            let err = codex_spawn(&fake, &backend, strict()).unwrap_err();
+            assert!(
+                matches!(&err, PtyBackendError::Other(m) if m == EXHAUSTED),
+                "{err:?}"
+            );
+            assert_eq!(count(&fake, ops::Op::AgentStart), 3);
+            assert_eq!(count(&fake, ops::Op::PaneProcessInfo), 3);
+        }
+
+        #[test]
+        fn strict_agent_never_appeared_exhausts_with_structured_error() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            fake.script_pane_get(endless(Get::NoAgent));
+            let err = codex_spawn(&fake, &backend, strict()).unwrap_err();
+            assert!(
+                matches!(&err, PtyBackendError::Other(m) if m == EXHAUSTED),
+                "{err:?}"
+            );
+            assert_eq!(
+                agent_start_args(&fake),
+                vec![
+                    format!("resume thr-1 {HOOK}"),
+                    HOOK.to_string(),
+                    String::new()
+                ]
+            );
+            assert_eq!(
+                fake.closed_pane_ids(),
+                vec!["w1:p1".to_string(), "w2:p1".into(), "w3:p1".into()]
+            );
+            assert!(fake.panes().is_empty());
+            assert!(!backend.is_live(&skey("wt")));
+            assert!(backend.keymap.get(&skey("wt")).is_none());
+            assert!(resume_events(&events).is_empty());
+        }
+
+        #[test]
+        fn strict_early_exit_flag_rejection_drops_the_flag() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            fake.script_agent_start(vec![Start::EarlyExit, Start::EarlyExit, Start::Ok]);
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            assert_eq!(
+                agent_start_args(&fake),
+                vec![
+                    format!("resume thr-1 {HOOK}"),
+                    HOOK.to_string(),
+                    String::new()
+                ]
+            );
+            assert_eq!(resume_events(&events), event("fresh", true));
+        }
+
+        fn busy() -> Start {
+            Start::Err(ops::HerdrError::Api {
+                code: "pane_busy".into(),
+                message: "busy".into(),
+            })
+        }
+
+        fn agent_start_panes(fake: &fake::FakeHerdr) -> Vec<String> {
+            fake.calls()
+                .into_iter()
+                .filter(|c| c.op == ops::Op::AgentStart)
+                .map(|c| c.args.split(' ').nth(2).unwrap_or_default().to_string())
+                .collect()
+        }
+
+        #[test]
+        fn strict_reissues_agent_start_on_other_errors() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            fake.script_agent_start(vec![busy(), busy(), Start::Ok]);
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            assert_eq!(agent_start_panes(&fake), vec!["w1:p1"; 3]);
+            assert_eq!(count(&fake, ops::Op::WorkspaceCreate), 1);
+            assert_eq!(resume_events(&events), event("resumed", false));
+            assert_eq!(has(&trail(&backend), TrailStage::Launch, "reissue"), 2);
+        }
+
+        #[test]
+        fn strict_reissue_gives_up_after_two_retries() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            fake.script_agent_start(vec![busy(), busy(), busy()]);
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            assert_eq!(
+                agent_start_panes(&fake),
+                vec!["w1:p1", "w1:p1", "w1:p1", "w2:p1"]
+            );
+            assert_eq!(count(&fake, ops::Op::WorkspaceCreate), 2);
+            assert_eq!(resume_events(&events), event("fresh", true));
+        }
+
+        #[test]
+        fn strict_does_not_reissue_early_exit_or_not_found() {
+            for first in [
+                Start::EarlyExit,
+                Start::Err(ops::HerdrError::Api {
+                    code: "pane_not_found".into(),
+                    message: "no pane".into(),
+                }),
+            ] {
+                let fake = fake::FakeHerdr::new();
+                let (backend, _) = fake_backend(&fake);
+                fake.script_agent_start(vec![first.clone()]);
+                codex_spawn(&fake, &backend, strict()).unwrap();
+                assert_eq!(
+                    agent_start_panes(&fake),
+                    vec!["w1:p1", "w2:p1"],
+                    "{first:?}: one start for the failed step"
+                );
+            }
+        }
+
+        #[test]
+        fn strict_never_issues_continue() {
+            let launches = [
+                strict(),
+                AgentLaunch {
+                    fresh: true,
+                    ..strict()
+                },
+                AgentLaunch {
+                    resume_target: None,
+                    ..strict()
+                },
+                AgentLaunch {
+                    resume_target: Some("a b; --last".into()),
+                    ..strict()
+                },
+            ];
+            for launch in launches {
+                for scripted in [true, false] {
+                    let fake = fake::FakeHerdr::new();
+                    let (backend, _) = fake_backend(&fake);
+                    if scripted {
+                        fake.script_agent_start(vec![Start::EarlyExit; 3]);
+                    } else {
+                        fake.script_pane_get(endless(Get::NoAgent));
+                    }
+                    let _ = codex_spawn(&fake, &backend, launch.clone());
+                    let args = agent_start_args(&fake);
+                    assert!(!args.is_empty());
+                    assert!(
+                        args.iter().all(|a| !a.contains("--last")),
+                        "{launch:?}: {args:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn strict_resume_target_missing_without_fresh_starts_fresh() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            let launch = AgentLaunch {
+                resume_target: None,
+                ..strict()
+            };
+            codex_spawn(&fake, &backend, launch).unwrap();
+            assert_eq!(agent_start_args(&fake), vec![HOOK.to_string()]);
+        }
+
+        #[test]
+        fn strict_workspace_create_failure_returns_err_immediately() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            fake.fail_next(
+                ops::Op::WorkspaceCreate,
+                ops::HerdrError::Api {
+                    code: "workspace_failed".into(),
+                    message: "no".into(),
+                },
+            );
+            assert!(codex_spawn(&fake, &backend, strict()).is_err());
+            assert_eq!(count(&fake, ops::Op::AgentStart), 0);
+            assert_eq!(count(&fake, ops::Op::WorkspaceCreate), 1);
+        }
+
+        #[test]
+        fn strict_replaces_a_live_same_key_pane_each_step() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            let cwd = worktree_dir(&fake, "wt", None);
+            backend
+                .spawn(skey("wt"), cwd, String::new(), Some((80, 24)), None)
+                .unwrap();
+            assert_eq!(backend.keymap.get(&skey("wt")).unwrap().pane_id, "w1:p1");
+            fake.script_agent_start(vec![Start::EarlyExit]);
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            assert_eq!(
+                fake.closed_pane_ids(),
+                vec!["w1:p1".to_string(), "w2:p1".into()],
+                "the old pane once, then the failed step's pane"
+            );
+            assert_eq!(backend.keymap.get(&skey("wt")).unwrap().pane_id, "w3:p1");
+            assert!(backend.is_live(&skey("wt")));
+        }
+
+        #[test]
+        fn strict_gates_are_unchanged() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            backend.set_terminated(&skey("wt"), true).unwrap();
+            assert!(matches!(
+                codex_spawn(&fake, &backend, strict()),
+                Err(PtyBackendError::Terminated)
+            ));
+            assert_eq!(count(&fake, ops::Op::WorkspaceCreate), 0);
+
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = unready_backend(&fake, None);
+            assert!(matches!(
+                codex_spawn(&fake, &backend, strict()),
+                Err(PtyBackendError::NotConnected)
+            ));
+            assert_eq!(count(&fake, ops::Op::WorkspaceCreate), 0);
+        }
+
+        fn workspace_env(fake: &fake::FakeHerdr) -> String {
+            fake.calls()
+                .into_iter()
+                .find(|c| c.op == ops::Op::WorkspaceCreate)
+                .expect("a workspace")
+                .args
+        }
+
+        #[test]
+        fn strict_passes_codex_home_to_the_pane_only_when_set() {
+            for (home, expect) in [(Some("/x/codex-home"), true), (None, false)] {
+                let fake = fake::FakeHerdr::new();
+                let (backend, _) = fake_backend(&fake);
+                let cwd = worktree_dir(&fake, "wt", None);
+                backend
+                    .spawner()
+                    .spawn_agent_transfer_strict_with(
+                        &skey("wt"),
+                        cwd,
+                        80,
+                        24,
+                        &strict(),
+                        &StrictTiming::fast(),
+                        home.map(str::to_string),
+                    )
+                    .unwrap();
+                let env = workspace_env(&fake);
+                assert_eq!(
+                    env.contains("(\"CODEX_HOME\", \"/x/codex-home\")"),
+                    expect,
+                    "{env}"
+                );
+                assert_eq!(env.contains("CODEX_HOME"), expect, "{env}");
+            }
+        }
+
+        #[test]
+        fn strict_trail_records_every_step_and_observation() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            fake.script_pane_get(endless(Get::NoAgent));
+            let _ = codex_spawn(&fake, &backend, strict());
+            let entries = trail(&backend);
+            let launches: Vec<&LaunchTrailEntry> = entries
+                .iter()
+                .filter(|e| e.stage == TrailStage::Launch && e.detail.get("label").is_some())
+                .collect();
+            assert_eq!(launches.len(), 3);
+            assert_eq!(launches[0].detail["label"], "resume thr-1");
+            assert_eq!(
+                launches[0].detail["args"],
+                serde_json::json!(["resume", "thr-1", HOOK])
+            );
+            assert_eq!(launches[2].detail["args"], serde_json::json!([]));
+            // One observation entry per step, not one per poll.
+            assert!(count(&fake, ops::Op::PaneGet) > 6);
+            assert_eq!(has(&entries, TrailStage::Verify, "agent"), 3);
+            assert_eq!(has(&entries, TrailStage::Verify, "paneTail"), 3);
+            assert!(trail(&backend).is_empty(), "drained");
+
+            // A new strict spawn clears stale entries.
+            let fake2 = fake::FakeHerdr::new();
+            let (backend2, _) = fake_backend(&fake2);
+            backend2.spawner().push_trail(
+                &skey("wt"),
+                TrailStage::Launch,
+                serde_json::json!({ "stale": true }),
+            );
+            codex_spawn(&fake2, &backend2, strict()).unwrap();
+            let fresh = trail(&backend2);
+            assert!(!fresh.is_empty());
+            assert_eq!(has(&fresh, TrailStage::Launch, "stale"), 0);
+
+            // Capped per key, oldest dropped.
+            let spawner = backend.spawner();
+            for i in 0..(TRAIL_CAP + 50) {
+                spawner.push_trail(
+                    &skey("wt"),
+                    TrailStage::Verify,
+                    serde_json::json!({ "i": i }),
+                );
+            }
+            let capped = trail(&backend);
+            assert_eq!(capped.len(), TRAIL_CAP);
+            assert_eq!(capped[0].detail, serde_json::json!({ "i": 50 }));
+        }
+
+        #[test]
+        fn strict_failure_still_hands_over_the_trail() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            fake.script_pane_get(endless(Get::NoAgent));
+            assert!(codex_spawn(&fake, &backend, strict()).is_err());
+            assert!(!trail(&backend).is_empty());
+        }
+
+        #[test]
+        fn strict_chain_never_exceeds_budget() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            fake.script_agent_start(vec![Start::TimedOutLaunched; 3]);
+            fake.script_pane_get(endless(Get::NoAgent));
+            let timing = StrictTiming {
+                chain_budget: Duration::from_millis(250),
+                ..StrictTiming::fast()
+            };
+            let cwd = worktree_dir(&fake, "wt", None);
+            let started = Instant::now();
+            let res = backend.spawner().spawn_agent_transfer_strict_with(
+                &skey("wt"),
+                cwd,
+                80,
+                24,
+                &strict(),
+                &timing,
+                None,
+            );
+            let elapsed = started.elapsed();
+            assert!(res.is_err());
+            // One poll of slack, plus scheduler granularity on a loaded machine.
+            let limit = timing.chain_budget + timing.poll + Duration::from_millis(100);
+            assert!(elapsed <= limit, "{elapsed:?} > {limit:?}");
+            assert!(
+                count(&fake, ops::Op::AgentStart) < 3,
+                "the budget cut the chain"
+            );
+        }
+
+        #[test]
+        fn herdr_set_resume_record_codex_and_cleared() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            record_session(&fake, &skey("wt"), "sess-1");
+            let row = || {
+                keitora_tasks::LocalStore::open(&fake.env().resume_db_path().to_string_lossy())
+                    .unwrap()
+                    .resume_get("p", "wt")
+                    .unwrap()
+                    .expect("row")
+            };
+            backend
+                .set_resume_record(
+                    &skey("wt"),
+                    ResumeRecord::Codex {
+                        thread_id: "thr-1".into(),
+                    },
+                )
+                .unwrap();
+            let r = row();
+            assert_eq!(r.cli, keitora_tasks::CliKind::Codex);
+            assert_eq!(r.session_id.as_deref(), Some("thr-1"));
+            assert_eq!(r.source, "keitora:transfer");
+            backend
+                .set_resume_record(&skey("wt"), ResumeRecord::Cleared)
+                .unwrap();
+            let r = row();
+            assert_eq!(r.session_id, None);
+            assert_eq!(r.cleared_id.as_deref(), Some("thr-1"));
+        }
     }
 }

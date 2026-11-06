@@ -69,7 +69,7 @@ pub(crate) fn expand_tilde(s: &str) -> PathBuf {
 /// Mirrors [`crate::model::WorktreeStatus`]'s `rename_all = "snake_case"`
 /// convention, extended to `Deserialize` since — unlike `WorktreeStatus` — this
 /// type must round-trip through TOML.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CliKind {
     #[default]
@@ -502,6 +502,26 @@ pub struct WorktreeEntry {
     pub diff_base: Option<DiffBase>,
 }
 
+/// What a writer should do with one optional registry field: leave it, set it, or clear it.
+/// Unlike an `Option`, `Clear` is distinguishable from "not mentioned", so a clear survives
+/// the carry-forward merge semantics of the other registry writers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldIntent<T> {
+    Keep,
+    Set(T),
+    Clear,
+}
+
+impl<T> FieldIntent<T> {
+    fn apply(self, slot: &mut Option<T>) {
+        match self {
+            FieldIntent::Keep => {}
+            FieldIntent::Set(v) => *slot = Some(v),
+            FieldIntent::Clear => *slot = None,
+        }
+    }
+}
+
 impl WorktreeEntry {
     /// A legacy / unmigrated entry: name only, path to be backfilled by repair.
     pub fn name_only(name: impl Into<String>) -> Self {
@@ -917,6 +937,65 @@ impl UserConfig {
             self.save()?;
         }
         Ok(matched)
+    }
+
+    /// Set the CLI and the per-provider session ids of one worktree for the registered
+    /// project(s) whose root matches `root`. Like [`Self::set_worktree_diff_base_by_root`] it
+    /// bypasses the registry-field carry-forward merge, so [`FieldIntent::Clear`] persists.
+    /// `current` is the effective worktree list (used when the registry list is still unset, or
+    /// to materialize a missing entry). The entry's path and diff base are untouched. Returns
+    /// `true` if a project matched and the registry was saved. Does not take the write lock.
+    pub fn set_worktree_provider_state_by_root(
+        &mut self,
+        root: &Path,
+        worktree: &str,
+        cli: CliKind,
+        codex_thread_id: FieldIntent<String>,
+        claude_session_id: FieldIntent<String>,
+        current: &[WorktreeEntry],
+    ) -> Result<bool, ResolveError> {
+        let target = canonical_key(root);
+        let mut matched = false;
+        for pref in self.projects.values_mut() {
+            if canonical_key(&pref.path) == target {
+                let mut list = pref.worktrees.clone().unwrap_or_else(|| current.to_vec());
+                let idx = match list.iter().position(|e| e.name == worktree) {
+                    Some(i) => i,
+                    None => {
+                        let entry = current
+                            .iter()
+                            .find(|e| e.name == worktree)
+                            .cloned()
+                            .unwrap_or_else(|| WorktreeEntry::name_only(worktree));
+                        list.push(entry);
+                        list.len() - 1
+                    }
+                };
+                let entry = &mut list[idx];
+                entry.cli = Some(cli);
+                codex_thread_id.clone().apply(&mut entry.codex_thread_id);
+                claude_session_id
+                    .clone()
+                    .apply(&mut entry.claude_session_id);
+                pref.worktrees = Some(list);
+                matched = true;
+            }
+        }
+        if matched {
+            self.save()?;
+        }
+        Ok(matched)
+    }
+
+    /// The effective config of the registered project whose resolved `[project].name` is `name`.
+    /// Registry map keys are not consulted: session keys and IPC carry the resolved name.
+    /// Entries whose config fails to resolve are skipped (as `launch_for` does). If two registry
+    /// entries resolve to the same name, the first in `BTreeMap` (registry-key) order wins.
+    pub fn project_config_by_name(&self, name: &str) -> Option<ProjectConfig> {
+        self.projects
+            .values()
+            .filter_map(|pref| effective_config(pref).ok())
+            .find(|pc| pc.project.name == name)
     }
 
     /// The registered project whose root matches `root` (canonical comparison), if
@@ -2259,13 +2338,75 @@ pub fn discover_cli(cli: CliKind) -> Option<String> {
                     return Some(found.to_string_lossy().into_owned());
                 }
             }
-            // Only the `~/.local/bin` fallback generalizes directly; the Homebrew
-            // locations are Claude-installer-specific and are NOT carried over.
-            let home = dirs::home_dir()?;
-            let cand = home.join(".local/bin/codex");
-            is_executable_file(&cand).then(|| cand.to_string_lossy().into_owned())
+            first_executable(
+                &codex_unix_candidates(dirs::home_dir().as_deref()),
+                &is_executable_file,
+            )
+            .map(|p| p.to_string_lossy().into_owned())
         }
     }
+}
+
+/// Well-known unix install locations for `codex`, in priority order: Homebrew (Apple silicon),
+/// `/usr/local/bin`, then `<home>/.local/bin`. A `None` home drops the last entry.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn codex_unix_candidates(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut v = vec![
+        PathBuf::from("/opt/homebrew/bin/codex"),
+        PathBuf::from("/usr/local/bin/codex"),
+    ];
+    if let Some(h) = home {
+        v.push(h.join(".local/bin/codex"));
+    }
+    v
+}
+
+/// The first candidate `is_exec` accepts.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn first_executable(
+    cands: &[PathBuf],
+    is_exec: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    cands.iter().find(|p| is_exec(p)).cloned()
+}
+
+type CliCache =
+    std::sync::Mutex<std::collections::HashMap<CliKind, (std::time::Instant, Option<String>)>>;
+
+/// How long a failed discovery is remembered before the probe runs again.
+pub const DISCOVER_NONE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn discover_cached_with(
+    cache: &CliCache,
+    cli: CliKind,
+    now: std::time::Instant,
+    probe: &dyn Fn(CliKind) -> Option<String>,
+) -> Option<String> {
+    {
+        let map = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, found)) = map.get(&cli) {
+            match found {
+                Some(_) => return found.clone(),
+                None if now.saturating_duration_since(*at) < DISCOVER_NONE_TTL => return None,
+                None => {}
+            }
+        }
+    }
+    let found = probe(cli);
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(cli, (now, found.clone()));
+    found
+}
+
+/// [`discover_cli`] with a process-wide cache: a hit is kept for the process, a miss for 30 s,
+/// so an install made mid-session is found without running the login shell on every call.
+/// Never call it on the app's setup thread (the first call may run the login shell).
+pub fn discover_cli_cached(cli: CliKind) -> Option<String> {
+    static CACHE: std::sync::OnceLock<CliCache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    discover_cached_with(cache, cli, std::time::Instant::now(), &discover_cli)
 }
 
 /// Windows `codex` discovery, in priority order: native-installer
@@ -2887,6 +3028,345 @@ mod tests {
         );
 
         std::env::remove_var("KEITORA_CONFIG_HOME");
+    }
+
+    fn two_projects(tmp: &TempDir) -> (UserConfig, PathBuf, PathBuf) {
+        let a = tmp.path().join("proj-a");
+        let b = tmp.path().join("proj-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let mut reg = UserConfig::default();
+        reg.register("key-one", a.clone());
+        reg.register("key-two", b.clone());
+        (reg, a, b)
+    }
+
+    #[test]
+    fn project_config_by_name_matches_resolved_name_not_registry_key() {
+        let tmp = TempDir::new().unwrap();
+        let (reg, _a, b) = two_projects(&tmp);
+        let found = reg.project_config_by_name("proj-b").unwrap();
+        assert_eq!(canonical_key(&found.root), canonical_key(&b));
+        assert!(reg.project_config_by_name("key-two").is_none());
+    }
+
+    #[test]
+    fn project_config_by_name_unknown_is_none() {
+        let tmp = TempDir::new().unwrap();
+        let (reg, _, _) = two_projects(&tmp);
+        assert!(reg.project_config_by_name("nope").is_none());
+        assert!(UserConfig::default()
+            .project_config_by_name("nope")
+            .is_none());
+    }
+
+    #[test]
+    fn project_config_by_name_skips_unresolvable_entries() {
+        let tmp = TempDir::new().unwrap();
+        let (mut reg, _a, _b) = two_projects(&tmp);
+        let bad = tmp.path().join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("keitora.toml"), "this is = not [valid toml").unwrap();
+        reg.register("aaa-bad", bad);
+        assert!(reg.project_config_by_name("proj-a").is_some());
+    }
+
+    /// Registry with one project at `/code/acme` and its effective worktree list.
+    fn provider_fixture() -> (UserConfig, PathBuf, Vec<WorktreeEntry>) {
+        let root = PathBuf::from("/code/acme");
+        let mut reg = UserConfig::default();
+        reg.register("acme", root.clone());
+        let current = vec![
+            WorktreeEntry::new("acme", "/code/acme"),
+            WorktreeEntry::new("feat", "/code/acme-wt/feat"),
+        ];
+        (reg, root, current)
+    }
+
+    fn entry_of<'a>(reg: &'a UserConfig, project: &str, name: &str) -> &'a WorktreeEntry {
+        reg.projects[project]
+            .worktrees
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap()
+    }
+
+    /// Run `f` with an isolated config home.
+    fn with_config_home(f: impl FnOnce(&TempDir)) {
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("KEITORA_CONFIG_HOME", tmp.path());
+        f(&tmp);
+        std::env::remove_var("KEITORA_CONFIG_HOME");
+    }
+
+    #[test]
+    fn provider_state_set_writes_cli_and_thread() {
+        with_config_home(|_| {
+            let (mut reg, root, mut current) = provider_fixture();
+            current[1].claude_session_id = Some("sess-1".into());
+            let matched = reg
+                .set_worktree_provider_state_by_root(
+                    &root,
+                    "feat",
+                    CliKind::Codex,
+                    FieldIntent::Set("thr-1".into()),
+                    FieldIntent::Keep,
+                    &current,
+                )
+                .unwrap();
+            assert!(matched);
+            let e = entry_of(&reg, "acme", "feat");
+            assert_eq!(e.cli, Some(CliKind::Codex));
+            assert_eq!(e.codex_thread_id.as_deref(), Some("thr-1"));
+            assert_eq!(e.claude_session_id.as_deref(), Some("sess-1"));
+        });
+    }
+
+    #[test]
+    fn provider_state_clear_survives_the_merge() {
+        with_config_home(|_| {
+            let (mut reg, root, mut current) = provider_fixture();
+            current[1].codex_thread_id = Some("old".into());
+            reg.projects.get_mut("acme").unwrap().worktrees = Some(current.clone());
+            reg.set_worktree_provider_state_by_root(
+                &root,
+                "feat",
+                CliKind::Codex,
+                FieldIntent::Clear,
+                FieldIntent::Keep,
+                &current,
+            )
+            .unwrap();
+            let reloaded = UserConfig::load().unwrap();
+            assert_eq!(entry_of(&reloaded, "acme", "feat").codex_thread_id, None);
+        });
+    }
+
+    #[test]
+    fn provider_state_keep_leaves_both_ids() {
+        with_config_home(|_| {
+            let (mut reg, root, mut current) = provider_fixture();
+            current[1].codex_thread_id = Some("thr-1".into());
+            current[1].claude_session_id = Some("sess-1".into());
+            reg.set_worktree_provider_state_by_root(
+                &root,
+                "feat",
+                CliKind::Claude,
+                FieldIntent::Keep,
+                FieldIntent::Keep,
+                &current,
+            )
+            .unwrap();
+            let e = entry_of(&reg, "acme", "feat");
+            assert_eq!(e.cli, Some(CliKind::Claude));
+            assert_eq!(e.codex_thread_id.as_deref(), Some("thr-1"));
+            assert_eq!(e.claude_session_id.as_deref(), Some("sess-1"));
+        });
+    }
+
+    #[test]
+    fn provider_state_fresh_leaves_claude_session_id() {
+        with_config_home(|_| {
+            let (mut reg, root, mut current) = provider_fixture();
+            current[1].codex_thread_id = Some("thr-1".into());
+            current[1].claude_session_id = Some("sess-1".into());
+            reg.set_worktree_provider_state_by_root(
+                &root,
+                "feat",
+                CliKind::Codex,
+                FieldIntent::Clear,
+                FieldIntent::Keep,
+                &current,
+            )
+            .unwrap();
+            let e = entry_of(&reg, "acme", "feat");
+            assert_eq!(e.codex_thread_id, None);
+            assert_eq!(e.claude_session_id.as_deref(), Some("sess-1"));
+        });
+    }
+
+    #[test]
+    fn provider_state_creates_missing_entry_from_current() {
+        with_config_home(|_| {
+            let (mut reg, root, current) = provider_fixture();
+            reg.projects.get_mut("acme").unwrap().worktrees =
+                Some(vec![WorktreeEntry::new("acme", "/code/acme")]);
+            reg.set_worktree_provider_state_by_root(
+                &root,
+                "feat",
+                CliKind::Codex,
+                FieldIntent::Set("thr-1".into()),
+                FieldIntent::Keep,
+                &current,
+            )
+            .unwrap();
+            let e = entry_of(&reg, "acme", "feat");
+            assert_eq!(e.path, Some(PathBuf::from("/code/acme-wt/feat")));
+            assert_eq!(e.codex_thread_id.as_deref(), Some("thr-1"));
+        });
+    }
+
+    #[test]
+    fn provider_state_preserves_path_and_diff_base() {
+        with_config_home(|_| {
+            let (mut reg, root, mut current) = provider_fixture();
+            current[1].diff_base = Some(DiffBase::Upstream);
+            reg.set_worktree_provider_state_by_root(
+                &root,
+                "feat",
+                CliKind::Codex,
+                FieldIntent::Set("thr-1".into()),
+                FieldIntent::Keep,
+                &current,
+            )
+            .unwrap();
+            let e = entry_of(&reg, "acme", "feat");
+            assert_eq!(e.path, Some(PathBuf::from("/code/acme-wt/feat")));
+            assert_eq!(e.diff_base, Some(DiffBase::Upstream));
+        });
+    }
+
+    #[test]
+    fn provider_state_unknown_root_returns_false_and_does_not_save() {
+        with_config_home(|_| {
+            let (mut reg, _root, current) = provider_fixture();
+            let matched = reg
+                .set_worktree_provider_state_by_root(
+                    Path::new("/code/other"),
+                    "feat",
+                    CliKind::Codex,
+                    FieldIntent::Set("thr-1".into()),
+                    FieldIntent::Keep,
+                    &current,
+                )
+                .unwrap();
+            assert!(!matched);
+            assert!(reg.projects["acme"].worktrees.is_none());
+            assert!(!user_config_path().unwrap().exists(), "nothing was saved");
+        });
+    }
+
+    #[test]
+    fn provider_state_updates_only_the_named_worktree() {
+        with_config_home(|_| {
+            let (mut reg, root, current) = provider_fixture();
+            reg.set_worktree_provider_state_by_root(
+                &root,
+                "feat",
+                CliKind::Codex,
+                FieldIntent::Set("thr-1".into()),
+                FieldIntent::Keep,
+                &current,
+            )
+            .unwrap();
+            let other = entry_of(&reg, "acme", "acme");
+            assert_eq!(other.cli, None);
+            assert_eq!(other.codex_thread_id, None);
+        });
+    }
+
+    #[test]
+    fn provider_state_non_active_project() {
+        with_config_home(|_| {
+            let mut reg = UserConfig::default();
+            reg.register("a", PathBuf::from("/code/a"));
+            reg.register("b", PathBuf::from("/code/b"));
+            reg.set_active("a");
+            let current = vec![WorktreeEntry::new("wt", "/code/b-wt/wt")];
+            reg.set_worktree_provider_state_by_root(
+                Path::new("/code/b"),
+                "wt",
+                CliKind::Codex,
+                FieldIntent::Set("thr-1".into()),
+                FieldIntent::Keep,
+                &current,
+            )
+            .unwrap();
+            assert_eq!(
+                entry_of(&reg, "b", "wt").codex_thread_id.as_deref(),
+                Some("thr-1")
+            );
+            assert!(reg.projects["a"].worktrees.is_none());
+        });
+    }
+
+    #[test]
+    fn codex_unix_candidates_order_and_home() {
+        let with = codex_unix_candidates(Some(Path::new("/home/u")));
+        assert_eq!(
+            with,
+            vec![
+                PathBuf::from("/opt/homebrew/bin/codex"),
+                PathBuf::from("/usr/local/bin/codex"),
+                PathBuf::from("/home/u/.local/bin/codex"),
+            ]
+        );
+        assert_eq!(codex_unix_candidates(None).len(), 2);
+    }
+
+    #[test]
+    fn first_executable_picks_first_match() {
+        let cands = codex_unix_candidates(Some(Path::new("/home/u")));
+        let hit = first_executable(&cands, &|p| {
+            p == Path::new("/usr/local/bin/codex") || p == Path::new("/home/u/.local/bin/codex")
+        });
+        assert_eq!(hit, Some(PathBuf::from("/usr/local/bin/codex")));
+        assert_eq!(first_executable(&cands, &|_| false), None);
+    }
+
+    #[test]
+    fn discover_cli_cached_caches_some_and_expires_none() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        let cache = CliCache::default();
+        let base = Instant::now();
+
+        // A miss is remembered for the TTL, then re-probed.
+        let calls = Cell::new(0);
+        let missing = |_c: CliKind| {
+            calls.set(calls.get() + 1);
+            None
+        };
+        assert_eq!(
+            discover_cached_with(&cache, CliKind::Codex, base, &missing),
+            None
+        );
+        let soon = base + Duration::from_secs(10);
+        assert_eq!(
+            discover_cached_with(&cache, CliKind::Codex, soon, &missing),
+            None
+        );
+        assert_eq!(calls.get(), 1);
+        let later = base + Duration::from_secs(31);
+        assert_eq!(
+            discover_cached_with(&cache, CliKind::Codex, later, &missing),
+            None
+        );
+        assert_eq!(calls.get(), 2);
+
+        // A hit is kept for good, whatever the clock says.
+        let found = |_c: CliKind| {
+            calls.set(calls.get() + 1);
+            Some("/x/codex".to_string())
+        };
+        let expired = later + Duration::from_secs(31);
+        let got = discover_cached_with(&cache, CliKind::Codex, expired, &found);
+        assert_eq!(got.as_deref(), Some("/x/codex"));
+        assert_eq!(calls.get(), 3);
+        let far = expired + Duration::from_secs(3600);
+        let again = discover_cached_with(&cache, CliKind::Codex, far, &missing);
+        assert_eq!(again.as_deref(), Some("/x/codex"));
+        assert_eq!(calls.get(), 3);
+
+        // Other CLIs have their own slot.
+        assert_eq!(
+            discover_cached_with(&cache, CliKind::Claude, far, &missing),
+            None
+        );
+        assert_eq!(calls.get(), 4);
     }
 
     #[test]

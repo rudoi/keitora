@@ -88,8 +88,19 @@ import {
 import { installTerminalLinks } from "../lib/terminalLinks";
 import { deliverPaste, fallbackPasteRefusedMessage, preparePasteText } from "../lib/terminalPaste";
 import { type ResolvedTheme, useResolvedTheme } from "../lib/theme";
+import {
+  blocksInput,
+  restartAfterFailure,
+  restartNeedsConfirm,
+  restartPlan,
+  type SpawnResult,
+  shouldHonourSignal,
+  spawnFailedCopy,
+  type TransferEntry,
+} from "../lib/transferPhase";
 import { type HistoryView, TerminalSearch } from "./TerminalSearch";
 import { useToast } from "./Toast";
+import { TransferOverlay } from "./TransferOverlay";
 import "@xterm/xterm/css/xterm.css";
 
 // Keitora ANSI palettes — the shell + Claude render in the app's own theme. One per
@@ -200,7 +211,11 @@ export function TerminalPane({
   isDropTarget = false,
   restartNonce,
   restartFresh = false,
-  transferringTo,
+  cli,
+  transfer = null,
+  restartTransfer = false,
+  onSpawnSettled,
+  onCancelTransfer,
   terminated,
   terminateNonce,
   launchNonce,
@@ -220,10 +235,18 @@ export function TerminalPane({
   /** Whether the latest `restartNonce` bump asked for a new, empty conversation
    * instead of resuming the current one. */
   restartFresh?: boolean;
-  /** Set while this worktree is mid CLI-transfer — the target CLI
-   * being transferred TO. Swaps the recovery overlay for a "Transferring…"
-   * indicator and skips the restart-nonce confirm (already confirmed in the rail). */
-  transferringTo?: CliKind | null;
+  /** The worktree's resolved CLI; names the CLI on the spawn-failed screen. */
+  cli: CliKind;
+  /** This worktree's CLI-transfer entry while one is in flight: covers the pane with the
+   * transfer overlay and, during the import, blocks input. */
+  transfer?: TransferEntry | null;
+  /** Whether the latest `restartNonce` bump belongs to a transfer: restart without the
+   * confirm (already confirmed in the rail) and report the spawn via `onSpawnSettled`. */
+  restartTransfer?: boolean;
+  /** How a transfer restart's spawn ended. Fires only for transfer restarts. */
+  onSpawnSettled?: (r: SpawnResult) => void;
+  /** The transfer overlay's Cancel button. */
+  onCancelTransfer?: () => void;
   /** The user terminated this worktree's session (from the worktree list). The single
    * source of truth for the terminated state: the pane never attaches, spawns or
    * restarts on its own while it is set. */
@@ -319,10 +342,23 @@ export function TerminalPane({
   // The open confirm surface, by restart flavour or a terminate (`false` = closed).
   const [confirmKill, setConfirmKill] = useState<false | "resume" | "fresh" | "terminate">(false);
 
-  // Mirrors the `transferringTo` prop so the restart-nonce effect
-  // below can read it live without adding a churny prop dependency.
-  const transferringRef = useRef(transferringTo ?? null);
-  transferringRef.current = transferringTo ?? null;
+  // Mirrors of the transfer props for callbacks (the input gates, spawn's failure path and
+  // the restart-nonce effect) that must read them live.
+  const transferRef = useRef<TransferEntry | null>(transfer);
+  transferRef.current = transfer;
+  const cliRef = useRef(cli);
+  cliRef.current = cli;
+  const onSpawnSettledRef = useRef(onSpawnSettled);
+  onSpawnSettledRef.current = onSpawnSettled;
+  // How the last spawn failed (cleared by the next spawn): the CLI it ran (a transfer's
+  // target, since the entry is gone by the time the screen shows), the backend's error, and
+  // the launch flavour, which the spawn-failed buttons repeat.
+  const [spawnFailure, setSpawnFailure] = useState<{
+    cli: CliKind;
+    error: string;
+    transfer: boolean;
+    fresh: boolean;
+  } | null>(null);
 
   // The latest daemon state and recovery state, for async callbacks that
   // finish after either changed.
@@ -560,10 +596,17 @@ export function TerminalPane({
   // `via: "launch"` brings a terminated session back (`sessionLaunch` clears the mark,
   // then spawns); a plain spawn never runs for a terminated pane.
   const spawn = useCallback(
-    async (fresh = false, via: "spawn" | "launch" = "spawn") => {
+    async (
+      fresh = false,
+      via: "spawn" | "launch" = "spawn",
+      transfer = false,
+    ): Promise<SpawnResult> => {
+      setSpawnFailure(null);
       const term = termRef.current;
-      if (!term) return;
-      if (via === "spawn" && terminatedRef.current) return;
+      if (!term) return { ok: false, error: "The terminal is not ready." };
+      if (via === "spawn" && terminatedRef.current) {
+        return { ok: false, error: "The session is terminated." };
+      }
       try {
         // An unmeasured pane spawns with no size; the backend picks one, and its
         // first fit sends the real size.
@@ -571,7 +614,7 @@ export function TerminalPane({
         const gen =
           via === "launch"
             ? await sessionLaunch(projectName, name, path, size, fresh)
-            : await ptySpawn(projectName, name, path, size, undefined, fresh);
+            : await ptySpawn(projectName, name, path, size, undefined, fresh, transfer);
         genRef.current = gen;
         updateStatus("running");
         // A fit may have changed the size while the spawn was in flight: send the
@@ -581,16 +624,29 @@ export function TerminalPane({
           void ptyResize(projectName, name, sizeNow.rows, sizeNow.cols);
         }
         if (attachmentsRef.current.live == null) await attachAfterSpawn(term);
+        return { ok: true };
       } catch (e) {
-        // A spawn refused because herdr is recovering is not a launch failure:
-        // the backend resumes the session itself.
         const msg = String(e);
-        if (msg.includes("Recovering")) settleRecoveringRefusal();
-        else if (msg.includes("Terminated")) {
+        if (msg.includes("Recovering")) {
+          // A spawn refused because herdr is recovering is not a launch failure:
+          // the backend resumes the session itself.
+          settleRecoveringRefusal();
+          return { ok: true };
+        }
+        if (msg.includes("Terminated")) {
           // The backend refused: the session is terminated (the worktree list may lag).
           genRef.current = null;
           updateStatus("terminated");
-        } else updateStatus("spawn-failed");
+          return { ok: false, error: "The session is terminated." };
+        }
+        setSpawnFailure({
+          cli: transferRef.current?.to ?? cliRef.current,
+          error: msg,
+          transfer,
+          fresh,
+        });
+        updateStatus("spawn-failed");
+        return { ok: false, error: msg };
       }
     },
     [name, path, projectName, updateStatus, settleRecoveringRefusal, attachAfterSpawn],
@@ -746,7 +802,7 @@ export function TerminalPane({
   doAttachRef.current = doAttach;
 
   const restart = useCallback(
-    async (fresh = false) => {
+    async (fresh = false, opts?: { transfer?: boolean }): Promise<SpawnResult> => {
       // Kill any existing session before spawning again (resuming its conversation
       // unless `fresh`).
       if (genRef.current != null) {
@@ -773,7 +829,7 @@ export function TerminalPane({
       }
       // A visible pane spawns at its real size; a hidden one sends none.
       fitBeforeTakeover();
-      await spawn(fresh);
+      return await spawn(fresh, "spawn", opts?.transfer ?? false);
     },
     [name, projectName, spawn, fitBeforeTakeover],
   );
@@ -884,40 +940,52 @@ export function TerminalPane({
   // Prop-driven restart signal. The Rail's "Restart session" menu bumps a per-worktree
   // nonce (in App) to reach THIS mounted pane regardless of status — including a wedged pane
   // still reporting "running", where the overlay (gated on `status !== "running"`, below) never
-  // renders and so has no button to drive restart(). Mirrors the "single owner of daemon
-  // reactions" prop-driven effect above: react only when the prop actually changes, tracking
-  // the last-seen value in a ref (seeded on mount) so this never fires on initial mount, only
-  // when restartNonce increments past what we've already handled. Same confirm-or-restart
-  // decision as the existing "Kill & Restart" button (handleKillRestart, below): needsConfirm
-  // gates on the CURRENT status via statusRef, not a stale closure. `restartFresh` says which
-  // flavour the bump asked for; it changes together with the nonce.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: needsConfirm is a pure inline predicate (no stable identity to track); statusRef/transferringRef read live; restartFresh only matters alongside a nonce change
+  // renders and so has no button to drive restart(). React only when the prop actually
+  // changes, tracking the last-seen value in a ref (seeded on mount) so this never fires on
+  // initial mount. `restartPlan` decides: a plain restart of a live session asks first (as the
+  // "Kill & Restart" button does); a transfer restart was already confirmed in the rail, so it
+  // restarts straight away with the bump's flavour and reports how the spawn ended.
+  // `restartFresh`/`restartTransfer` change together with the nonce.
   useEffect(() => {
     if (restartNonce <= lastSeenRestartNonceRef.current) return;
     lastSeenRestartNonceRef.current = restartNonce;
+    // While a transfer owns the pane only its own restart may kill and respawn it.
+    if (!shouldHonourSignal({ transfer: restartTransfer }, transferRef.current)) return;
     // A terminated session is only brought back by a launch.
-    if (terminatedRef.current || statusRef.current === "terminated") return;
-    // A CLI transfer was already confirmed in the rail dialog
-    // before this nonce bump — never re-prompt with the "Kill & Restart?" confirm
-    // even though the session is still `running` (Claude→Codex transfer target).
-    if (transferringRef.current) {
-      void restart(false);
-    } else if (needsConfirm(statusRef.current)) {
-      setConfirmKill(restartFresh ? "fresh" : "resume");
-    } else {
-      void restart(restartFresh);
+    if (terminatedRef.current || statusRef.current === "terminated") {
+      if (restartTransfer) {
+        onSpawnSettledRef.current?.({ ok: false, error: "The session is terminated." });
+      }
+      return;
     }
-  }, [restartNonce, restartFresh, restart]);
+    const plan = restartPlan({ fresh: restartFresh, transfer: restartTransfer }, statusRef.current);
+    if (plan.transfer) {
+      void restart(plan.fresh, { transfer: true })
+        .then((r) => onSpawnSettledRef.current?.(r))
+        .catch((e) => onSpawnSettledRef.current?.({ ok: false, error: String(e) }));
+    } else if (plan.confirm) {
+      setConfirmKill(plan.fresh ? "fresh" : "resume");
+    } else {
+      void restart(plan.fresh);
+    }
+  }, [restartNonce, restartFresh, restartTransfer, restart]);
+
+  // Keystrokes must not reach the terminal while the import reads the conversation.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: only the phase matters
+  useEffect(() => {
+    if (blocksInput(transfer)) termRef.current?.blur();
+  }, [transfer?.phase]);
 
   // Prop-driven terminate / launch signals from the rail menu, handled like the restart
-  // signal above (react only past the seeded last-seen nonce). A terminate of a live
-  // session asks first; a launch never does, and is ignored unless the pane is terminated.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: needsConfirm is a pure inline predicate; statusRef/terminatedRef read live
+  // signal above (react only past the seeded last-seen nonce, ignored mid-transfer). A
+  // terminate of a live session asks first; a launch never does, and is ignored unless the
+  // pane is terminated.
   useEffect(() => {
     if (terminateNonce <= lastSeenTerminateNonceRef.current) return;
     lastSeenTerminateNonceRef.current = terminateNonce;
+    if (!shouldHonourSignal({ transfer: false }, transferRef.current)) return;
     if (terminatedRef.current || statusRef.current === "terminated") return;
-    if (needsConfirm(statusRef.current)) setConfirmKill("terminate");
+    if (restartNeedsConfirm(statusRef.current)) setConfirmKill("terminate");
     else void terminate();
   }, [terminateNonce, terminate]);
 
@@ -974,7 +1042,7 @@ export function TerminalPane({
     const sendPaste = (raw: string) => {
       const text = preparePasteText(raw);
       if (!text) return;
-      if (inputBlocked(statusRef.current)) return;
+      if (inputBlocked(statusRef.current) || blocksInput(transferRef.current)) return;
       void deliverPaste(text, (t) => ptyPaste(projectName, name, t), {
         // herdr snaps the viewport back to the live tail on input it took.
         accepted: () => liveTailRef.current?.noteInput(),
@@ -1130,7 +1198,7 @@ export function TerminalPane({
     // Input gating: suppress keystrokes while attaching, detached-alive, daemon-down,
     // while recovery holds the session (recovering / suspended), or once terminated.
     const dataDisp = term.onData((d) => {
-      if (inputBlocked(statusRef.current)) return;
+      if (inputBlocked(statusRef.current) || blocksInput(transferRef.current)) return;
       // herdr snaps the viewport back to the live tail on any input.
       liveTailRef.current?.noteInput();
       const t0 = stamp();
@@ -1605,21 +1673,18 @@ export function TerminalPane({
     void daemonStatus();
   }, []);
 
-  // Determine if "Kill & Restart" needs an inline confirm step.
-  const needsConfirm = (s: Status): boolean =>
-    s !== "ended" &&
-    s !== "ended-while-away" &&
-    s !== "lost" &&
-    s !== "spawn-failed" &&
-    s !== "terminated";
-
-  const handleKillRestart = (fresh = false) => {
-    if (needsConfirm(statusRef.current)) {
-      setConfirmKill(fresh ? "fresh" : "resume");
+  const handleKillRestart = (choice: "kill_restart" | "start_fresh") => {
+    // After a failed launch the buttons repeat its flavour (a failed transfer launch never
+    // falls back to the default resume); any other state restarts as chosen.
+    const failure = statusRef.current === "spawn-failed" ? spawnFailure : null;
+    const a = restartAfterFailure(failure, choice);
+    if (restartNeedsConfirm(statusRef.current)) {
+      setConfirmKill(a.fresh ? "fresh" : "resume");
     } else {
-      void restart(fresh);
+      void restart(a.fresh, { transfer: a.transfer });
     }
   };
+  const failedCopy = spawnFailedCopy(spawnFailure?.cli ?? cli, spawnFailure?.error ?? null);
   const confirmCopy =
     confirmKill === "terminate"
       ? terminateConfirmCopy()
@@ -1666,149 +1731,132 @@ export function TerminalPane({
         </button>
       )}
 
+      {/* CLI transfer in flight: covers the pane whatever its status (a running pane stays
+          running through the import and the restart). */}
+      {transfer && <TransferOverlay entry={transfer} onCancel={onCancelTransfer ?? (() => {})} />}
+
       {/* Per-state overlay — matches the full table in 04-frontend-ux.md §4.2 */}
-      {status !== "running" && (
+      {status !== "running" && !transfer && (
         // A suspended pane resumes on a click anywhere; its Resume button is the
         // keyboard path.
         <div
           className="pane-overlay"
-          onClick={
-            status === "suspended" && !transferringTo
-              ? () => void recoveryFocus(projectName, name)
-              : undefined
-          }
+          onClick={status === "suspended" ? () => void recoveryFocus(projectName, name) : undefined}
         >
-          {transferringTo ? (
-            // CLI transfer in progress: the backend may have
-            // already killed this pane's live session (Codex→Claude, before the
-            // seconds-long summary step) — show an intentional "Transferring…"
-            // indicator instead of the alarming recovery overlay/"Kill & Restart"
-            // the underlying status would otherwise render.
+          {status === "attaching" && showSpinner && (
             <>
-              <div className="pane-spinner" aria-label="Transferring" />
-              <div className="pane-msg">
-                Transferring to {transferringTo === "codex" ? "Codex" : "Claude"}…
+              <div className="pane-spinner" aria-label="Connecting" />
+              <div className="pane-msg">Connecting to session…</div>
+            </>
+          )}
+
+          {status === "detached-alive" && (
+            <div className="pane-msg">Session active — reattaching…</div>
+          )}
+
+          {status === "recovering" && (
+            <>
+              <div className="pane-spinner" aria-label="Recovering" />
+              <div className="pane-msg">{recoveryPaneMessage(recovery, recItem)}</div>
+              {recItem && (
+                <div className="pane-btn-row">
+                  <button
+                    type="button"
+                    className="pane-btn pane-btn-secondary"
+                    onClick={() => void startFreshFromRecovery()}
+                  >
+                    Start fresh conversation
+                  </button>
+                </div>
+              )}
+            </>
+          )}
+
+          {status === "suspended" && (
+            <>
+              <div className="pane-msg">Suspended after herdr crash — click to resume</div>
+              <div className="pane-btn-row">
+                <button
+                  type="button"
+                  ref={restartBtnRef}
+                  className="pane-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void recoveryFocus(projectName, name);
+                  }}
+                >
+                  Resume
+                </button>
+                <button
+                  type="button"
+                  className="pane-btn pane-btn-secondary"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void startFreshFromRecovery();
+                  }}
+                >
+                  Start fresh conversation
+                </button>
               </div>
             </>
-          ) : (
+          )}
+
+          {status === "daemon-down" && (
             <>
-              {status === "attaching" && showSpinner && (
-                <>
-                  <div className="pane-spinner" aria-label="Connecting" />
-                  <div className="pane-msg">Connecting to session…</div>
-                </>
-              )}
+              <div className="pane-msg">Session paused — daemon unreachable</div>
+              <button ref={restartBtnRef} className="pane-btn" onClick={retryConnection}>
+                Retry connection
+              </button>
+            </>
+          )}
 
-              {status === "detached-alive" && (
-                <div className="pane-msg">Session active — reattaching…</div>
-              )}
+          {status === "terminated" && (
+            <>
+              <div className="pane-msg">Session terminated</div>
+              <div className="pane-btn-row">
+                <button ref={restartBtnRef} className="pane-btn" onClick={() => void launch()}>
+                  Launch
+                </button>
+                <button className="pane-btn pane-btn-secondary" onClick={() => void launch(true)}>
+                  Launch fresh
+                </button>
+              </div>
+            </>
+          )}
 
-              {status === "recovering" && (
-                <>
-                  <div className="pane-spinner" aria-label="Recovering" />
-                  <div className="pane-msg">{recoveryPaneMessage(recovery, recItem)}</div>
-                  {recItem && (
-                    <div className="pane-btn-row">
-                      <button
-                        type="button"
-                        className="pane-btn pane-btn-secondary"
-                        onClick={() => void startFreshFromRecovery()}
-                      >
-                        Start fresh conversation
-                      </button>
-                    </div>
-                  )}
-                </>
+          {(status === "spawn-failed" ||
+            status === "ended" ||
+            status === "ended-while-away" ||
+            status === "lost") && (
+            <>
+              <div className="pane-msg">
+                {status === "spawn-failed" && failedCopy.message}
+                {status === "ended" && "session ended"}
+                {status === "ended-while-away" && "Session ended while away — restart to continue"}
+                {status === "lost" && "Session lost (daemon restarted) — start a new session"}
+              </div>
+              {status === "spawn-failed" && failedCopy.detail && (
+                <div className="pane-msg pane-msg-detail">{failedCopy.detail}</div>
               )}
-
-              {status === "suspended" && (
-                <>
-                  <div className="pane-msg">Suspended after herdr crash — click to resume</div>
-                  <div className="pane-btn-row">
-                    <button
-                      type="button"
-                      ref={restartBtnRef}
-                      className="pane-btn"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void recoveryFocus(projectName, name);
-                      }}
-                    >
-                      Resume
-                    </button>
-                    <button
-                      type="button"
-                      className="pane-btn pane-btn-secondary"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void startFreshFromRecovery();
-                      }}
-                    >
-                      Start fresh conversation
-                    </button>
-                  </div>
-                </>
-              )}
-
-              {status === "daemon-down" && (
-                <>
-                  <div className="pane-msg">Session paused — daemon unreachable</div>
-                  <button ref={restartBtnRef} className="pane-btn" onClick={retryConnection}>
-                    Retry connection
-                  </button>
-                </>
-              )}
-
-              {status === "terminated" && (
-                <>
-                  <div className="pane-msg">Session terminated</div>
-                  <div className="pane-btn-row">
-                    <button ref={restartBtnRef} className="pane-btn" onClick={() => void launch()}>
-                      Launch
-                    </button>
-                    <button
-                      className="pane-btn pane-btn-secondary"
-                      onClick={() => void launch(true)}
-                    >
-                      Launch fresh
-                    </button>
-                  </div>
-                </>
-              )}
-
-              {(status === "spawn-failed" ||
-                status === "ended" ||
-                status === "ended-while-away" ||
-                status === "lost") && (
-                <>
-                  <div className="pane-msg">
-                    {status === "spawn-failed" && "Failed to launch claude — is it on PATH?"}
-                    {status === "ended" && "session ended"}
-                    {status === "ended-while-away" &&
-                      "Session ended while away — restart to continue"}
-                    {status === "lost" && "Session lost (daemon restarted) — start a new session"}
-                  </div>
-                  {/* Confirm surface (when needed) is hoisted below, outside this
+              {/* Confirm surface (when needed) is hoisted below, outside this
                       status !== "running" gate — see the standalone `confirmKill` block. Hide this
                       button while it's open so the two don't render on top of each other. */}
-                  {!confirmKill && (
-                    <div className="pane-btn-row">
-                      <button
-                        ref={restartBtnRef}
-                        className="pane-btn"
-                        onClick={() => handleKillRestart()}
-                      >
-                        Kill &amp; Restart
-                      </button>
-                      <button
-                        className="pane-btn pane-btn-secondary"
-                        onClick={() => handleKillRestart(true)}
-                      >
-                        Start fresh conversation
-                      </button>
-                    </div>
-                  )}
-                </>
+              {!confirmKill && (
+                <div className="pane-btn-row">
+                  <button
+                    ref={restartBtnRef}
+                    className="pane-btn"
+                    onClick={() => handleKillRestart("kill_restart")}
+                  >
+                    Kill &amp; Restart
+                  </button>
+                  <button
+                    className="pane-btn pane-btn-secondary"
+                    onClick={() => handleKillRestart("start_fresh")}
+                  >
+                    Start fresh conversation
+                  </button>
+                </div>
               )}
             </>
           )}
@@ -1821,7 +1869,7 @@ export function TerminalPane({
           "Kill & Restart" button above and the prop-driven restartNonce effect. Wrapped in its
           OWN `.pane-overlay` because `.pane-confirm` has no standalone positioning — outside the
           overlay it renders as an invisible zero-context block. */}
-      {confirmKill && !transferringTo && (
+      {confirmKill && !transfer && (
         <div className="pane-overlay">
           <div className="pane-confirm">
             <div className="pane-msg">{confirmCopy.message}</div>

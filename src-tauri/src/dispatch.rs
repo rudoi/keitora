@@ -19,6 +19,7 @@ use crate::backend::{
     background_set, map_write_line_result, PtyBackend, PtyBackendError, SessionKey, SharedBackend,
     WriteLineOutcome,
 };
+use crate::transfer_registry::TransferRegistry;
 
 /// Serializes `dispatch_apply` so its idempotency check, reserve, PTY inject, and
 /// `dispatched` log write run as one critical section. Without it, two concurrent
@@ -236,6 +237,7 @@ pub async fn dispatch_apply(
     task_id: i64,
     client: State<'_, SharedBackend>,
     gate: State<'_, DispatchGate>,
+    registry: State<'_, TransferRegistry>,
 ) -> Result<DispatchOutcome, String> {
     // Hold the dispatch gate for the whole command so the guard-check → reserve →
     // inject → log sequence is atomic vs. concurrent dispatch_apply calls.
@@ -244,6 +246,10 @@ pub async fn dispatch_apply(
     let _gate = gate.0.lock().await;
 
     let (backend, config) = crate::tasks::open_backend()?;
+    // Before anything is reserved: a worktree mid-transfer is never injected into.
+    if let Some(reason) = transfer_refusal(&registry, &config.project.name, &worktree) {
+        return Err(reason);
+    }
 
     // Idempotency guard + reserve in one intent-level call. If this task is
     // already dispatched and still reserved to this worktree, `dispatch_reserve`
@@ -362,9 +368,60 @@ pub async fn dispatch_apply(
     }
 }
 
+/// `Some(error)` when `worktree` of `project` is mid-transfer; dispatch must not
+/// inject into it.
+fn transfer_refusal(registry: &TransferRegistry, project: &str, worktree: &str) -> Option<String> {
+    registry.is_transferring(project, worktree).then(|| {
+        format!("a transfer is in progress for worktree `{worktree}`; try again when it finishes")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_refusal_blocks_only_the_transferring_worktree() {
+        let r = TransferRegistry::new();
+        let _guard = r.begin("proj-a", "alpha").unwrap();
+        let refusal = transfer_refusal(&r, "proj-a", "alpha").expect("refused");
+        assert!(refusal.contains("`alpha`"));
+        assert!(refusal.contains("in progress"));
+        assert_eq!(transfer_refusal(&r, "proj-a", "bravo"), None);
+        assert_eq!(transfer_refusal(&r, "proj-b", "alpha"), None);
+    }
+
+    #[test]
+    fn transfer_refusal_clears_after_settle() {
+        let r = TransferRegistry::new();
+        {
+            let _guard = r.begin("proj-a", "alpha").unwrap();
+            assert!(r.mark_committed("proj-a", "alpha"));
+        }
+        assert!(transfer_refusal(&r, "proj-a", "alpha").is_some());
+        r.settle("proj-a", "alpha");
+        assert_eq!(transfer_refusal(&r, "proj-a", "alpha"), None);
+
+        // The commit backstop releases a marker nobody settled.
+        let base = std::time::Instant::now();
+        {
+            let _guard = r.begin_at("proj-a", "alpha", base).unwrap();
+            assert!(r.mark_committed_at("proj-a", "alpha", base));
+        }
+        assert!(r.is_transferring_at("proj-a", "alpha", base + Duration::from_secs(179)));
+        assert!(!r.is_transferring_at("proj-a", "alpha", base + Duration::from_secs(181)));
+        assert_eq!(transfer_refusal(&r, "proj-a", "alpha"), None);
+    }
+
+    #[test]
+    fn transfer_refusal_message_is_exact() {
+        let r = TransferRegistry::new();
+        let _guard = r.begin("proj-a", "alpha").unwrap();
+        assert_eq!(
+            transfer_refusal(&r, "proj-a", "alpha").as_deref(),
+            Some("a transfer is in progress for worktree `alpha`; try again when it finishes")
+        );
+    }
 
     #[test]
     fn decide_truth_table() {

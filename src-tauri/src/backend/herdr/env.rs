@@ -752,6 +752,16 @@ pub fn pane_env(
     original: &OriginalXdg,
     herdr_path: Option<&str>,
 ) -> Vec<(String, String)> {
+    pane_env_with(exe, original, herdr_path, &[])
+}
+
+/// [`pane_env`] with `extra` variables appended last.
+pub fn pane_env_with(
+    exe: &str,
+    original: &OriginalXdg,
+    herdr_path: Option<&str>,
+    extra: &[(String, String)],
+) -> Vec<(String, String)> {
     let alias = keitora_alias_dir();
     let mut env = Vec::new();
     if let Some(path) = pane_path_with(
@@ -764,6 +774,7 @@ pub fn pane_env(
         env.push(("PATH".to_string(), path));
     }
     env.extend(pane_xdg_env(original));
+    env.extend(extra.iter().cloned());
     env
 }
 
@@ -1405,6 +1416,22 @@ mod tests {
         #[cfg(unix)]
         assert!(env[0].1.starts_with("/agents/bin"), "{}", env[0].1);
         assert_eq!(env[1..], pane_xdg_env(&original)[..]);
+    }
+
+    #[test]
+    fn pane_env_with_appends_extra_and_pane_env_is_unchanged() {
+        let original = sample_original();
+        #[cfg(windows)]
+        let exe = r"C:\agents\bin\codex.exe";
+        #[cfg(unix)]
+        let exe = "/agents/bin/codex";
+        let base = pane_env(exe, &original, Some("/base/bin"));
+        assert_eq!(base, pane_env_with(exe, &original, Some("/base/bin"), &[]));
+        let extra = vec![("CODEX_HOME".to_string(), "/x/codex-home".to_string())];
+        let with = pane_env_with(exe, &original, Some("/base/bin"), &extra);
+        assert_eq!(with.len(), base.len() + 1);
+        assert_eq!(with[..base.len()], base[..]);
+        assert_eq!(with.last(), extra.last());
     }
 
     fn pairs(want: &[(&str, &str)]) -> Vec<(String, String)> {

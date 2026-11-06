@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { blockAnimates, blockStateCls, laneMenuAction, worktreeMenuItems } from "./laneState";
+import {
+  blockAnimates,
+  blockStateCls,
+  laneMenuAction,
+  sessionItemDisabledReason,
+  transferDisabledReason,
+  worktreeMenuItems,
+} from "./laneState";
 import type { SessionState, WorktreeSession } from "./sessions";
 
 // Minimal session fixture — blockStateCls only reads `state` (and whether a session exists).
@@ -140,5 +147,32 @@ describe("laneMenuAction", () => {
 
   it("runs nothing for focus", () => {
     expect(laneMenuAction("focus", "codex")).toBeNull();
+  });
+});
+
+describe("transferDisabledReason", () => {
+  it("is null when enabled, names a missing Codex, and lets a busy transfer win", () => {
+    expect(transferDisabledReason({ codexMissing: false, busy: false })).toBeNull();
+    expect(transferDisabledReason({ codexMissing: true, busy: false })).toBe(
+      "Codex isn't installed",
+    );
+    expect(transferDisabledReason({ codexMissing: false, busy: true })).toBe(
+      "A transfer is already in progress",
+    );
+    expect(transferDisabledReason({ codexMissing: true, busy: true })).toBe(
+      "A transfer is already in progress",
+    );
+  });
+});
+
+describe("sessionItemDisabledReason", () => {
+  it("disables restart, start fresh and terminate only while a transfer is in flight", () => {
+    for (const item of ["restart", "fresh", "terminate"] as const) {
+      expect(sessionItemDisabledReason(item, false)).toBeNull();
+      expect(sessionItemDisabledReason(item, true)).toBe("A transfer is in progress");
+    }
+    for (const item of ["focus", "transfer", "launch", "launch-fresh"] as const) {
+      expect(sessionItemDisabledReason(item, true)).toBeNull();
+    }
   });
 });

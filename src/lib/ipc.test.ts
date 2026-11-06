@@ -6,10 +6,14 @@ vi.mock("./transport", () => ({
 }));
 
 import {
+  cancelTransfer,
   daemonStatus,
+  injectHandoffSummary,
   type OutputMsg,
   onPtyPasteRefused,
   onPtyResume,
+  onTransferProgress,
+  previewClaudeTransfer,
   ptyAttach,
   ptyDetach,
   ptyPaste,
@@ -19,6 +23,11 @@ import {
   ptyWrite,
   sessionLaunch,
   sessionTerminate,
+  type TransferOutcome,
+  type TransferProgress,
+  transferDiagnostics,
+  transferSettled,
+  transferWorktree,
 } from "./ipc";
 
 describe("daemonStatus", () => {
@@ -82,6 +91,124 @@ describe("ptySpawn", () => {
       "pty_spawn",
       expect.objectContaining({ command: null, fresh: true }),
     );
+  });
+  it("omits the transfer key unless true", async () => {
+    const size = { rows: 24, cols: 80 };
+    await ptySpawn("proj", "alpha", "/wt", size, undefined, false, false);
+    await ptySpawn("proj", "alpha", "/wt", size, undefined, false, undefined);
+    await ptySpawn("proj", "alpha", "/wt", size);
+    expect(transport.invoke).toHaveBeenCalledTimes(3);
+    for (const [, payload] of transport.invoke.mock.calls) {
+      expect(payload).not.toHaveProperty("transfer");
+    }
+  });
+
+  it("forwards transfer when true", async () => {
+    await ptySpawn("proj", "alpha", "/wt", { rows: 24, cols: 80 }, undefined, false, true);
+    expect(transport.invoke).toHaveBeenCalledWith("pty_spawn", {
+      project: "proj",
+      id: "alpha",
+      cwd: "/wt",
+      rows: 24,
+      cols: 80,
+      command: null,
+      fresh: false,
+      transfer: true,
+    });
+  });
+});
+
+describe("transfer wrappers", () => {
+  beforeEach(() => {
+    transport.invoke.mockReset();
+  });
+
+  it("pass project then worktree", async () => {
+    transport.invoke.mockResolvedValue(undefined);
+    await previewClaudeTransfer("proj", "alpha");
+    expect(transport.invoke).toHaveBeenLastCalledWith("preview_claude_transfer", {
+      project: "proj",
+      worktree: "alpha",
+    });
+    await injectHandoffSummary("proj", "alpha");
+    expect(transport.invoke).toHaveBeenLastCalledWith("inject_handoff_summary", {
+      project: "proj",
+      worktree: "alpha",
+    });
+    await cancelTransfer("proj", "alpha");
+    expect(transport.invoke).toHaveBeenLastCalledWith("cancel_transfer", {
+      project: "proj",
+      worktree: "alpha",
+    });
+    await transferSettled("other-proj", "bravo");
+    expect(transport.invoke).toHaveBeenLastCalledWith("transfer_settled", {
+      project: "other-proj",
+      worktree: "bravo",
+    });
+  });
+
+  it("transferWorktree sends targetCli and resolves the outcome unchanged", async () => {
+    const outcome: TransferOutcome = {
+      kind: "fresh",
+      reason: { kind: "skipped", reason: "continued_in", message: "m", stderrTail: "" },
+      reasonText: "x",
+    };
+    transport.invoke.mockResolvedValue(outcome);
+    await expect(transferWorktree("proj", "alpha", "codex")).resolves.toBe(outcome);
+    expect(transport.invoke).toHaveBeenCalledWith("transfer_worktree", {
+      project: "proj",
+      worktree: "alpha",
+      targetCli: "codex",
+    });
+    // Without a confirmed transcript the key is left out entirely.
+    const calls = transport.invoke.mock.calls;
+    expect(Object.keys(calls[calls.length - 1]?.[1] ?? {})).not.toContain("jsonl");
+  });
+
+  it("transferWorktree sends the confirmed transcript as jsonl", async () => {
+    transport.invoke.mockResolvedValue({ kind: "imported", threadId: "t1" });
+    await transferWorktree("proj", "alpha", "codex", "/home/u/.claude/projects/enc/s-1.jsonl");
+    expect(transport.invoke).toHaveBeenCalledWith("transfer_worktree", {
+      project: "proj",
+      worktree: "alpha",
+      targetCli: "codex",
+      jsonl: "/home/u/.claude/projects/enc/s-1.jsonl",
+    });
+  });
+
+  it("transferDiagnostics resolves null unchanged", async () => {
+    transport.invoke.mockResolvedValue(null);
+    await expect(transferDiagnostics("proj", "alpha")).resolves.toBeNull();
+    expect(transport.invoke).toHaveBeenCalledWith("transfer_diagnostics", {
+      project: "proj",
+      worktree: "alpha",
+    });
+  });
+});
+
+describe("onTransferProgress", () => {
+  beforeEach(() => {
+    transport.listen.mockReset();
+  });
+
+  it("listens on transfer://progress and hands the payload to the callback", async () => {
+    const payload: TransferProgress = {
+      project: "proj",
+      worktree: "alpha",
+      phase: "importing",
+      message: null,
+      elapsedMs: 10,
+      deadlineMs: 150_000,
+    };
+    const un = vi.fn();
+    transport.listen.mockImplementation((_channel: string, cb: (p: unknown) => void) => {
+      cb(payload);
+      return Promise.resolve(un);
+    });
+    const cb = vi.fn();
+    await expect(onTransferProgress(cb)).resolves.toBe(un);
+    expect(transport.listen).toHaveBeenCalledWith("transfer://progress", cb);
+    expect(cb).toHaveBeenCalledWith(payload);
   });
 });
 
