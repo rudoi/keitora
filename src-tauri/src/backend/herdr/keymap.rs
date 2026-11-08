@@ -29,16 +29,19 @@
 //! wires that to `pane_list()` after `ensure_server`, so `attach(key)` finds the
 //! restored pane and the frontend never spawns a duplicate workspace.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use keitora_tasks::CliKind;
 use serde::{Deserialize, Serialize};
 
 use crate::backend::SessionKey;
 
+use super::agent::{agent_name, agent_names_for, herdr_kind};
+use super::cli::AgentInfo;
 use super::ops::{Generation, ServerInstance};
 
 /// herdr's identity for one pane the backend owns, plus the backend-side `gen` and
@@ -416,6 +419,16 @@ impl KeyMap {
             .collect()
     }
 
+    /// The key whose entry maps `pane_id`, if any.
+    pub fn pane_owner(&self, pane_id: &str) -> Option<SessionKey> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, p)| p.pane_id == pane_id)
+            .map(|(k, _)| k.clone())
+    }
+
     /// Changes whenever the map or its lineage changes (a cache built from it
     /// is stale once this moves on).
     pub fn version(&self) -> u64 {
@@ -671,24 +684,86 @@ fn resolve_links(cwd: &str) -> String {
 /// when the ids are unchanged (the server survived; same pane) and bumped when they
 /// differ (a restore produced a fresh pane) so a stale `kill(key, old_gen)` is rejected.
 /// Persisted entries with no live match are dropped; unmatched live panes are ignored
-/// (they belong to no known session). A live pane is matched at most once.
+/// (they belong to no known session, and are left open). A live pane is matched at
+/// most once.
+///
+/// A cwd can hold more than one live pane (a restore can bring back a plain shell
+/// next to the session's agent), so an entry takes an unused cwd match by these rules,
+/// each applied to every entry before the next is tried:
+/// 1. the pane with the entry's own `pane_id`, only when `same_server` (the server
+///    survived; after a restore herdr renumbers panes, so a persisted id can name
+///    a different pane);
+/// 2. the pane whose herdr agent carries one of the key's names
+///    ([`agent_names_for`](super::agent::agent_names_for)), from `agents`;
+/// 3. the first cwd match.
+///
+/// For rule 2, `kind_of` gives the key's last known agent kind (the resume store's
+/// record); a pane running that kind's name wins. With no known kind either name is
+/// accepted, which can pick a stale agent of the other kind when both are live. With
+/// no kind, or when neither matches it, a pane whose agent is not `done` wins over one
+/// that is (the live conversation is the one to keep); after that, the first listed.
+/// An empty `agents` keeps plain cwd matching. Applying the result and reconciling
+/// again on the same server gives the same mapping: rule 1 then holds every adopted
+/// pane.
 pub fn reconcile_panes(
     persisted: &[(SessionKey, HerdrPane)],
     live: &[LivePane],
+    agents: &[AgentInfo],
+    kind_of: &dyn Fn(&SessionKey) -> Option<CliKind>,
+    same_server: bool,
 ) -> Vec<(SessionKey, HerdrPane)> {
+    let wants: Vec<String> = persisted.iter().map(|(_, p)| held_cwd(&p.cwd)).collect();
+    let live_cwds: Vec<String> = live.iter().map(|lp| normalize_cwd(&lp.cwd)).collect();
     let mut used = vec![false; live.len()];
-    let mut out = Vec::new();
-    for (key, pane) in persisted {
-        let want = held_cwd(&pane.cwd);
-        let found = live
-            .iter()
-            .enumerate()
-            .find(|(i, lp)| !used[*i] && normalize_cwd(&lp.cwd) == want);
-        if let Some((i, lp)) = found {
-            used[i] = true;
+    let mut chosen: Vec<Option<usize>> = vec![None; persisted.len()];
+    // Unused live panes in entry `e`'s cwd, in listed order.
+    let candidates = |e: usize, used: &[bool]| -> Vec<usize> {
+        (0..live.len())
+            .filter(|i| !used[*i] && live_cwds[*i] == wants[e])
+            .collect()
+    };
+    let mut warned: HashSet<&str> = HashSet::new();
+    for (e, want) in wants.iter().enumerate() {
+        if !warned.insert(want.as_str()) {
+            continue; // one warning per cwd, however many entries share it
+        }
+        let n = candidates(e, &used).len();
+        if n > 1 {
+            log::warn!("herdr: reconcile found {n} unused live panes in one session's cwd");
+        }
+    }
+    // Each rule runs over every entry before the next, so an entry falling back to
+    // a plain cwd match never takes the pane another entry holds by id or name.
+    for rule in [Rule::OwnPane, Rule::NamedAgent, Rule::FirstInCwd] {
+        for (e, (key, pane)) in persisted.iter().enumerate() {
+            if chosen[e].is_some() {
+                continue;
+            }
+            let cands = candidates(e, &used);
+            let pick = match rule {
+                Rule::OwnPane if !same_server => None,
+                Rule::OwnPane => cands
+                    .iter()
+                    .copied()
+                    .find(|i| live[*i].pane_id == pane.pane_id),
+                Rule::NamedAgent => named_agent_pane(key, live, &cands, agents, || kind_of(key)),
+                Rule::FirstInCwd => cands.first().copied(),
+            };
+            if let Some(i) = pick {
+                used[i] = true;
+                chosen[e] = Some(i);
+            }
+        }
+    }
+    persisted
+        .iter()
+        .zip(chosen)
+        .filter_map(|((key, pane), found)| {
+            // no live match → the pane is gone; drop the entry.
+            let lp = &live[found?];
             let ids_changed = lp.pane_id != pane.pane_id || lp.workspace_id != pane.workspace_id;
             let gen = if ids_changed { pane.gen + 1 } else { pane.gen };
-            out.push((
+            Some((
                 key.clone(),
                 HerdrPane {
                     workspace_id: lp.workspace_id.clone(),
@@ -700,11 +775,55 @@ pub fn reconcile_panes(
                     cwd: pane.cwd.clone(),
                     server_generation: pane.server_generation,
                 },
-            ));
-        }
-        // no live match → the pane is gone; drop the entry.
+            ))
+        })
+        .collect()
+}
+
+/// The [`reconcile_panes`] match rules, strongest first.
+#[derive(Clone, Copy)]
+enum Rule {
+    OwnPane,
+    NamedAgent,
+    FirstInCwd,
+}
+
+/// The candidate (an index into `live`; `candidates` in listed order) whose herdr
+/// agent carries one of `key`'s names, ranked as [`reconcile_panes`] describes.
+/// `kind` (a store read) is only asked for when more than one candidate matches.
+fn named_agent_pane(
+    key: &SessionKey,
+    live: &[LivePane],
+    candidates: &[usize],
+    agents: &[AgentInfo],
+    kind: impl FnOnce() -> Option<CliKind>,
+) -> Option<usize> {
+    let names = agent_names_for(key);
+    let matches: Vec<(usize, &AgentInfo)> = candidates
+        .iter()
+        .filter_map(|&i| {
+            agents
+                .iter()
+                .find(|a| {
+                    a.pane_id == live[i].pane_id
+                        && a.name.as_ref().is_some_and(|n| names.contains(n))
+                })
+                .map(|a| (i, a))
+        })
+        .collect();
+    if matches.len() < 2 {
+        return matches.first().map(|(i, _)| *i);
     }
-    out
+    let preferred = kind().map(|k| agent_name(herdr_kind(k), key));
+    let rank = |a: &AgentInfo| {
+        let other_kind = preferred.is_some() && a.name != preferred;
+        (other_kind, a.agent_status == "done")
+    };
+    matches
+        .into_iter()
+        // `min_by_key` keeps the first of equal ranks: listed order breaks ties.
+        .min_by_key(|(_, a)| rank(a))
+        .map(|(i, _)| i)
 }
 
 #[cfg(test)]
@@ -757,6 +876,21 @@ mod tests {
         assert_eq!(p.gen, 1);
         assert_eq!(p.cwd, "/wt/sayo");
         assert!(m.get(&key("alpha", "other")).is_none());
+    }
+
+    #[test]
+    fn pane_owner_names_the_mapping_key() {
+        let m = KeyMap::new();
+        let k = key("proj", "alpha");
+        m.record(
+            k.clone(),
+            "w2".into(),
+            "w2:p1".into(),
+            "term_abc".into(),
+            "/wt/alpha".into(),
+        );
+        assert_eq!(m.pane_owner("w2:p1"), Some(k));
+        assert_eq!(m.pane_owner("w3:p1"), None);
     }
 
     #[test]
@@ -1139,7 +1273,7 @@ mod tests {
 
         let persisted = vec![(key("p", "w"), pane("ws", "pane", "term", 3, &held))];
         let listed = vec![live("ws", "pane", "term", &real.to_string_lossy())];
-        let out = reconcile_panes(&persisted, &listed);
+        let out = reconcile_panes(&persisted, &listed, &[], &no_kind, true);
 
         assert_eq!(out.len(), 1, "the pane is adopted");
         assert_eq!(out[0].1.gen, 3);
@@ -1188,7 +1322,7 @@ mod tests {
             "new_term",
             &reported("D:/repos/proj/beta"),
         )];
-        let out = reconcile_panes(&persisted, &live_panes);
+        let out = reconcile_panes(&persisted, &live_panes, &[], &no_kind, true);
         assert_eq!(out.len(), 1);
         let (k, p) = &out[0];
         assert_eq!(k, &key("proj", "beta"));
@@ -1206,7 +1340,7 @@ mod tests {
             pane("w2", "w2:p1", "term", 5, "D:/repos/proj/beta"),
         )];
         let live_panes = vec![live("w2", "w2:p1", "term", "D:/repos/proj/beta")];
-        let out = reconcile_panes(&persisted, &live_panes);
+        let out = reconcile_panes(&persisted, &live_panes, &[], &no_kind, true);
         assert_eq!(out[0].1.gen, 5, "unchanged ids → gen preserved");
     }
 
@@ -1223,7 +1357,7 @@ mod tests {
             ),
         ];
         let live_panes = vec![live("w7", "w7:p1", "t2", "/repos/beta")];
-        let out = reconcile_panes(&persisted, &live_panes);
+        let out = reconcile_panes(&persisted, &live_panes, &[], &no_kind, true);
         assert_eq!(out.len(), 1, "the entry with no live pane is dropped");
         assert_eq!(out[0].0, key("proj", "beta"));
     }
@@ -1238,7 +1372,7 @@ mod tests {
             live("w7", "w7:p1", "t2", "/repos/beta"),
             live("w8", "w8:p1", "t3", "/repos/unmanaged"),
         ];
-        let out = reconcile_panes(&persisted, &live_panes);
+        let out = reconcile_panes(&persisted, &live_panes, &[], &no_kind, true);
         assert_eq!(out.len(), 1, "an unmatched live pane is ignored");
         assert_eq!(out[0].1.pane_id, "w7:p1");
     }
@@ -1260,13 +1394,192 @@ mod tests {
             live("w9", "w9:p1", "t9", "D:/repos/proj/gamma"),
             live("w8", "w8:p1", "t8", "D:/repos/proj/beta"),
         ];
-        let mut out = reconcile_panes(&persisted, &live_panes);
+        let mut out = reconcile_panes(&persisted, &live_panes, &[], &no_kind, true);
         out.sort_by(|a, b| a.0.worktree.cmp(&b.0.worktree));
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].0.worktree, "beta");
         assert_eq!(out[0].1.pane_id, "w8:p1");
         assert_eq!(out[1].0.worktree, "gamma");
         assert_eq!(out[1].1.pane_id, "w9:p1");
+    }
+
+    fn no_kind(_: &SessionKey) -> Option<CliKind> {
+        None
+    }
+
+    /// herdr's record of an agent `name` of `kind` running in `pane_id`.
+    fn agent_in(pane_id: &str, kind: &str, name: &str, status: &str) -> AgentInfo {
+        AgentInfo {
+            pane_id: pane_id.into(),
+            agent: Some(kind.into()),
+            agent_status: status.into(),
+            launch_pending: false,
+            name: Some(name.into()),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn reconcile_prefers_the_entrys_own_pane_even_when_listed_second() {
+        let k = key("proj", "alpha");
+        let persisted = vec![(k.clone(), pane("w2", "w2:p2", "t2", 4, "/repos/alpha"))];
+        let live_panes = vec![
+            live("w1", "w1:p1", "t1", "/repos/alpha"),
+            live("w2", "w2:p2", "t2", "/repos/alpha"),
+        ];
+        // Even a pane holding the key's name does not beat the entry's own pane.
+        let [claude, _] = agent_names_for(&k);
+        let agents = [agent_in("w1:p1", "claude", &claude, "idle")];
+        for agents in [&agents[..], &[]] {
+            let out = reconcile_panes(&persisted, &live_panes, agents, &no_kind, true);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].1.pane_id, "w2:p2", "the entry's own pane");
+            assert_eq!(out[0].1.gen, 4, "same pane → gen kept");
+        }
+    }
+
+    #[test]
+    fn reconcile_prefers_the_named_agent_over_a_shell_listed_first() {
+        let k = key("proj", "alpha");
+        let persisted = vec![(k.clone(), pane("w9", "w9:p9", "t9", 1, "/repos/alpha"))];
+        let live_panes = vec![
+            live("w1", "w1:p1", "t1", "/repos/alpha"), // a restored plain shell
+            live("w2", "w2:p2", "t2", "/repos/alpha"), // the session's agent
+        ];
+        let [claude, _] = agent_names_for(&k);
+        let agents = vec![agent_in("w2:p2", "claude", &claude, "idle")];
+        let unread =
+            |_: &SessionKey| -> Option<CliKind> { panic!("one named agent needs no kind") };
+        let out = reconcile_panes(&persisted, &live_panes, &agents, &unread, true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1.pane_id, "w2:p2", "the named agent, not the shell");
+        assert_eq!(out[0].1.gen, 2);
+        // Reconciling the result again keeps the same pane.
+        let again = reconcile_panes(&out, &live_panes, &agents, &no_kind, true);
+        assert_eq!(again, out, "a second reconcile is idempotent");
+    }
+
+    #[test]
+    fn a_restore_ignores_a_persisted_pane_id_reused_by_a_shell() {
+        // After a server restart herdr renumbers panes: the persisted id now names a
+        // restored shell, and the session's agent came back under another id.
+        let k = key("proj", "alpha");
+        let persisted = vec![(k.clone(), pane("w1", "w1:p1", "t1", 3, "/repos/alpha"))];
+        let live_panes = vec![
+            live("w1", "w1:p1", "t1", "/repos/alpha"), // a shell reusing the old id
+            live("w1", "w1:p2", "t2", "/repos/alpha"), // the session's agent
+        ];
+        let [claude, _] = agent_names_for(&k);
+        let agents = vec![agent_in("w1:p2", "claude", &claude, "idle")];
+        let out = reconcile_panes(&persisted, &live_panes, &agents, &no_kind, false);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].1.pane_id, "w1:p2",
+            "the named agent, not the reused id"
+        );
+        assert_eq!(out[0].1.gen, 4, "a different pane → gen bumped");
+        // On the same server the id is still trusted.
+        let out = reconcile_panes(&persisted, &live_panes, &agents, &no_kind, true);
+        assert_eq!(out[0].1.pane_id, "w1:p1");
+    }
+
+    #[test]
+    fn reconcile_ignores_an_agent_named_for_another_key() {
+        let k = key("proj", "alpha");
+        let persisted = vec![(k.clone(), pane("w9", "w9:p9", "t9", 1, "/repos/alpha"))];
+        let live_panes = vec![
+            live("w1", "w1:p1", "t1", "/repos/alpha"),
+            live("w2", "w2:p2", "t2", "/repos/alpha"),
+        ];
+        let [foreign, _] = agent_names_for(&key("proj", "bravo"));
+        let agents = vec![agent_in("w2:p2", "claude", &foreign, "idle")];
+        let out = reconcile_panes(&persisted, &live_panes, &agents, &no_kind, true);
+        assert_eq!(out[0].1.pane_id, "w1:p1", "first cwd match");
+    }
+
+    #[test]
+    fn reconcile_without_agents_takes_the_first_cwd_match() {
+        let persisted = vec![(
+            key("proj", "alpha"),
+            pane("w9", "w9:p9", "t9", 1, "/repos/alpha"),
+        )];
+        let live_panes = vec![
+            live("w1", "w1:p1", "t1", "/repos/alpha"),
+            live("w2", "w2:p2", "t2", "/repos/alpha"),
+        ];
+        let out = reconcile_panes(&persisted, &live_panes, &[], &no_kind, true);
+        assert_eq!(out[0].1.pane_id, "w1:p1");
+    }
+
+    #[test]
+    fn reconcile_uses_each_live_pane_at_most_once_across_keys() {
+        // Two keys sharing one cwd, two panes there. bravo's named agent is listed
+        // first; alpha, with no agent of its own, must not take it by cwd.
+        let a = key("proj", "alpha");
+        let b = key("proj", "bravo");
+        let persisted = vec![
+            (a.clone(), pane("w8", "w8:p8", "t8", 1, "/repos/shared")),
+            (b.clone(), pane("w9", "w9:p9", "t9", 1, "/repos/shared")),
+        ];
+        let live_panes = vec![
+            live("w1", "w1:p1", "t1", "/repos/shared"),
+            live("w2", "w2:p2", "t2", "/repos/shared"),
+        ];
+        let [b_name, _] = agent_names_for(&b);
+        let agents = vec![agent_in("w1:p1", "claude", &b_name, "idle")];
+        let out = reconcile_panes(&persisted, &live_panes, &agents, &no_kind, true);
+        let got: Vec<(&str, &str)> = out
+            .iter()
+            .map(|(k, p)| (k.worktree.as_str(), p.pane_id.as_str()))
+            .collect();
+        assert_eq!(got, vec![("alpha", "w2:p2"), ("bravo", "w1:p1")]);
+        // A third key with no third pane is dropped; no pane is matched twice.
+        let mut three = persisted.clone();
+        three.push((
+            key("proj", "charlie"),
+            pane("w7", "w7:p7", "t7", 1, "/repos/shared"),
+        ));
+        let out = reconcile_panes(&three, &live_panes, &agents, &no_kind, true);
+        assert_eq!(out.len(), 2);
+        assert_ne!(out[0].1.pane_id, out[1].1.pane_id);
+    }
+
+    #[test]
+    fn reconcile_prefers_the_keys_known_kind_between_two_named_agents() {
+        let k = key("proj", "alpha");
+        let persisted = vec![(k.clone(), pane("w9", "w9:p9", "t9", 1, "/repos/alpha"))];
+        let live_panes = vec![
+            live("w1", "w1:p1", "t1", "/repos/alpha"),
+            live("w2", "w2:p2", "t2", "/repos/alpha"),
+        ];
+        let [claude, codex] = agent_names_for(&k);
+        let agents = vec![
+            agent_in("w1:p1", "claude", &claude, "idle"),
+            agent_in("w2:p2", "codex", &codex, "idle"),
+        ];
+        let codex_kind = |_: &SessionKey| Some(CliKind::Codex);
+        let out = reconcile_panes(&persisted, &live_panes, &agents, &codex_kind, true);
+        assert_eq!(out[0].1.pane_id, "w2:p2", "the known kind wins");
+        // No kind: the first listed of two equally live agents.
+        let out = reconcile_panes(&persisted, &live_panes, &agents, &no_kind, true);
+        assert_eq!(out[0].1.pane_id, "w1:p1");
+    }
+
+    #[test]
+    fn reconcile_without_a_kind_prefers_a_named_agent_that_is_not_done() {
+        let k = key("proj", "alpha");
+        let persisted = vec![(k.clone(), pane("w9", "w9:p9", "t9", 1, "/repos/alpha"))];
+        let live_panes = vec![
+            live("w1", "w1:p1", "t1", "/repos/alpha"),
+            live("w2", "w2:p2", "t2", "/repos/alpha"),
+        ];
+        let [claude, codex] = agent_names_for(&k);
+        let agents = vec![
+            agent_in("w1:p1", "claude", &claude, "done"),
+            agent_in("w2:p2", "codex", &codex, "working"),
+        ];
+        let out = reconcile_panes(&persisted, &live_panes, &agents, &no_kind, true);
+        assert_eq!(out[0].1.pane_id, "w2:p2");
     }
 
     #[test]

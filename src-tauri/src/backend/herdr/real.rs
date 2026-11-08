@@ -3,8 +3,8 @@
 //! Every control-plane op runs `herdr <group> <cmd> …` with the isolated env from
 //! [`HerdrEnv`], captures stdout, and parses the single JSON object herdr prints.
 //! Control commands wrap their payload as `{"id":…,"result":{…}}`; errors print
-//! `{"error":{"code","message"},"id":…}` with a non-zero exit (both verified
-//! against herdr 0.9.3). `herdr status server --json` is the one flat
+//! `{"error":{"code","message"},"id":…}` with a non-zero exit, on stderr (the
+//! herdr 0.9.3 macOS behavior, with an empty stdout) or possibly on stdout. `herdr status server --json` is the one flat
 //! (un-wrapped) shape. The pure parsers live in [`super::cli`].
 //!
 //! Also owns the two long-lived spawns (the detached server and the per-pane
@@ -111,16 +111,13 @@ impl RealHerdr {
     /// [`HerdrError::Exit`]; an overrun is [`HerdrError::Timeout`].
     fn run(&self, class: CallClass, args: &[&str]) -> Result<Value, HerdrError> {
         let output = self.run_timed(class, args)?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let trimmed = stdout.trim();
-        if !trimmed.is_empty() {
-            if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-                if let Some(err) = value.get("error") {
-                    return Err(api_error_from_value(err));
-                }
-                return Ok(value);
-            }
+        if let Some(err) = output_error(&output) {
+            return Err(err);
+        }
+        if let Ok(value) =
+            serde_json::from_str::<Value>(String::from_utf8_lossy(&output.stdout).trim())
+        {
+            return Ok(value);
         }
         if output.status.success() {
             // Some commands (e.g. `server stop`) succeed with no stdout.
@@ -136,6 +133,8 @@ impl RealHerdr {
         let output = self.run_timed(class, args)?;
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else if let Some(err) = output_error(&output) {
+            Err(err)
         } else {
             Err(exit_error(output.status, &output.stderr))
         }
@@ -165,6 +164,23 @@ fn subcommand(args: &[&str]) -> String {
 /// the leaf to the calling pane, so `--pane` is always passed.
 fn pane_process_info_args(pane_id: &str) -> [&str; 4] {
     ["pane", "process-info", "--pane", pane_id]
+}
+
+/// The API error in a finished herdr command's output, if any (see [`error_body`]).
+fn output_error(output: &Output) -> Option<HerdrError> {
+    error_body(
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// The API error herdr printed, if any. A JSON stdout decides on its own (its
+/// `error` member, or none); otherwise stderr is checked (herdr 0.9.3 on macOS
+/// prints error bodies there, with an empty stdout).
+fn error_body(stdout: &str, stderr: &str) -> Option<HerdrError> {
+    let parse = |stream: &str| serde_json::from_str::<Value>(stream.trim()).ok();
+    let value = parse(stdout).or_else(|| parse(stderr))?;
+    value.get("error").map(api_error_from_value)
 }
 
 fn exit_error(status: ExitStatus, stderr: &[u8]) -> HerdrError {
@@ -661,6 +677,45 @@ fn pane_read_args(pane_id: &str, source: &str, format: &str, lines: Option<u32>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STDERR_BODY: &str = r#"{"error":{"code":"pane_not_found","message":"pane w0:p0 not found"},"id":"cli:pane:close"}"#;
+
+    fn api(code: &str, message: &str) -> HerdrError {
+        HerdrError::Api {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn error_body_reads_stderr_shape() {
+        let err = error_body("", &format!("{STDERR_BODY}\n")).unwrap();
+        assert_eq!(err, api("pane_not_found", "pane w0:p0 not found"));
+    }
+
+    #[test]
+    fn error_body_reads_stdout_shape() {
+        let err = error_body(STDERR_BODY, "").unwrap();
+        assert_eq!(err, api("pane_not_found", "pane w0:p0 not found"));
+    }
+
+    #[test]
+    fn error_body_prefers_stdout() {
+        let other = r#"{"error":{"code":"other","message":"m"}}"#;
+        assert_eq!(
+            error_body(STDERR_BODY, other).unwrap(),
+            api("pane_not_found", "pane w0:p0 not found")
+        );
+    }
+
+    #[test]
+    fn error_body_ignores_non_errors() {
+        assert!(error_body(r#"{"id":"x","result":{}}"#, "").is_none());
+        // A JSON stdout without an error is a result; stderr is not consulted.
+        assert!(error_body(r#"{"id":"x","result":{}}"#, STDERR_BODY).is_none());
+        assert!(error_body("boom: not json", "also plain text").is_none());
+        assert!(error_body("", "").is_none());
+    }
 
     #[test]
     fn pane_read_adds_lines_only_when_capped() {

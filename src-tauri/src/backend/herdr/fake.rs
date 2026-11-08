@@ -141,6 +141,8 @@ struct FakeState {
     close_linger: u32,
     /// Closed panes still listed, with their remaining `pane_list` answers.
     lingering: Vec<(PaneIdentity, u32)>,
+    /// Agent name -> id of the live pane holding it.
+    names: HashMap<String, String>,
     /// Run right after a call of the op is recorded (under the fake's lock, so
     /// a hook must not call the fake).
     hooks: HashMap<Op, CallHook>,
@@ -248,6 +250,12 @@ impl FakeState {
             .ok_or_else(|| pane_not_found(pane_id))
     }
 
+    /// The live pane (other than `except`) currently holding agent `name`.
+    fn name_holder(&self, name: &str, except: &str) -> Option<PaneIdentity> {
+        let id = self.names.get(name).filter(|id| *id != except)?;
+        self.panes.iter().find(|p| p.pane_id == *id).cloned()
+    }
+
     fn new_pane(&mut self, cwd: &str) -> PaneIdentity {
         self.next_workspace += 1;
         self.next_terminal += 1;
@@ -297,14 +305,22 @@ impl FakeState {
         let i = self.next_instance();
         self.running = true;
         let old = std::mem::take(&mut self.panes);
+        let old_names = std::mem::take(&mut self.names);
         self.next_workspace = 0;
         for p in old {
+            let old_id = p.pane_id.clone();
             let mut restored = self.new_pane(p.cwd.as_deref().unwrap_or_default());
             restored.cwd = p.cwd;
             restored.agent_session = p.agent_session;
             if self.restore_mode == RestoreMode::Agents {
                 restored.agent = p.agent;
                 restored.agent_status = p.agent_status;
+                // Restored agents keep their names under the renumbered pane id.
+                for (name, id) in &old_names {
+                    if *id == old_id {
+                        self.names.insert(name.clone(), restored.pane_id.clone());
+                    }
+                }
             }
             *self.panes.last_mut().unwrap() = restored;
         }
@@ -374,6 +390,7 @@ impl FakeHerdr {
                     blocked_input: HashSet::new(),
                     close_linger: 0,
                     lingering: Vec::new(),
+                    names: HashMap::new(),
                     hooks: HashMap::new(),
                     bridge_kill_hook: None,
                 }),
@@ -494,6 +511,18 @@ impl FakeHerdr {
         let mut st = self.state();
         st.next_instance();
         st.running = true;
+    }
+
+    /// Seed a pane in `cwd` that holds agent `name`, as an orphan left by an
+    /// earlier run would.
+    pub fn seed_named_agent(&self, name: &str, kind: &str, cwd: &str) -> PaneIdentity {
+        let mut st = self.state();
+        let mut pane = st.new_pane(cwd);
+        pane.agent = Some(kind.to_string());
+        pane.agent_status = Some("idle".into());
+        *st.panes.last_mut().unwrap() = pane.clone();
+        st.names.insert(name.to_string(), pane.pane_id.clone());
+        pane
     }
 
     /// A closed pane keeps appearing in the next `n` `pane_list` answers (herdr
@@ -823,6 +852,15 @@ impl HerdrOps for FakeHerdr {
             .ok_or_else(|| pane_not_found(pane_id))?;
         let pane = st.panes.remove(idx);
         st.closed.push(pane.pane_id.clone());
+        let freed: Vec<String> = st
+            .names
+            .iter()
+            .filter(|(_, id)| **id == pane.pane_id)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in freed {
+            st.names.remove(&name);
+        }
         if st.close_linger > 0 {
             let n = st.close_linger;
             st.lingering.push((pane.clone(), n));
@@ -929,6 +967,19 @@ impl HerdrOps for FakeHerdr {
             format!("{name} {kind} {pane_id} {timeout_ms} {}", args.join(" ")),
         )?;
         st.pane_mut(pane_id)?;
+        if let Some(holder) = st.name_holder(name, pane_id) {
+            return Err(api(
+                "agent_name_taken",
+                &format!(
+                    "agent name {name} is already used; candidates: terminal_id={} pane_id={} workspace_id={} tab_id={}:t1 cwd={} status=Idle",
+                    holder.terminal_id,
+                    holder.pane_id,
+                    holder.workspace_id,
+                    holder.workspace_id,
+                    holder.cwd.as_deref().unwrap_or_default(),
+                ),
+            ));
+        }
         let script = st.agent_scripts.pop_front().unwrap_or(AgentStartScript::Ok);
         let timed_out = script == AgentStartScript::TimedOutLaunched;
         match script {
@@ -951,6 +1002,9 @@ impl HerdrOps for FakeHerdr {
                     kind: AgentSessionKind::Id,
                     value,
                 });
+                // herdr keeps one name per pane: a new name replaces the old.
+                st.names.retain(|n, p| p != pane_id || n == name);
+                st.names.insert(name.to_string(), pane_id.to_string());
                 if timed_out {
                     return Err(api("timeout", "timed out waiting for agent startup"));
                 }
@@ -976,11 +1030,18 @@ impl HerdrOps for FakeHerdr {
     fn agent_list(&self) -> Result<Vec<AgentInfo>, HerdrError> {
         let mut st = self.state();
         st.control(Op::AgentList, String::new())?;
+        let st = &*st;
         Ok(st
             .panes
             .iter()
             .filter(|p| p.agent.is_some())
             .map(|p| AgentInfo {
+                name: st
+                    .names
+                    .iter()
+                    .find(|(_, id)| **id == p.pane_id)
+                    .map(|(n, _)| n.clone()),
+                cwd: p.cwd.clone(),
                 pane_id: p.pane_id.clone(),
                 agent: p.agent.clone(),
                 agent_status: p.agent_status.clone().unwrap_or_else(|| "unknown".into()),
@@ -1330,6 +1391,92 @@ mod tests {
             .agent_start("n", "claude", "w9:p9", &[], 5000)
             .unwrap_err()
             .is_not_found());
+    }
+
+    #[test]
+    fn agent_names_are_unique_across_live_panes() {
+        let fake = FakeHerdr::new();
+        let a = fake.workspace_create("/Users/me/code/proj", &[]).unwrap();
+        let b = fake
+            .workspace_create("/Users/me/code/other-proj", &[])
+            .unwrap();
+        fake.agent_start("claude-1a2b3c4d", "claude", &a.pane_id, &[], 5000)
+            .unwrap();
+
+        // Re-using its own name on the same pane is fine.
+        fake.agent_start("claude-1a2b3c4d", "claude", &a.pane_id, &[], 5000)
+            .unwrap();
+
+        // Another pane is refused with herdr's candidates list.
+        let e = fake
+            .agent_start("claude-1a2b3c4d", "claude", &b.pane_id, &[], 5000)
+            .unwrap_err();
+        assert_eq!(e.code(), Some("agent_name_taken"));
+        assert!(
+            e.to_string().contains(&format!("pane_id={} ", a.pane_id)),
+            "{e}"
+        );
+        assert!(fake.panes()[1].agent.is_none());
+
+        // The list reports names and cwds.
+        let list = fake.agent_list().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name.as_deref(), Some("claude-1a2b3c4d"));
+        assert_eq!(list[0].cwd.as_deref(), Some("/Users/me/code/proj"));
+
+        // Closing the holder frees the name.
+        fake.pane_close(&a.pane_id).unwrap();
+        fake.agent_start("claude-1a2b3c4d", "claude", &b.pane_id, &[], 5000)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_pane_starting_under_a_new_name_drops_its_old_one() {
+        let fake = FakeHerdr::new();
+        let p = fake.workspace_create("/Users/me/code/proj", &[]).unwrap();
+        fake.agent_start("claude-1a2b3c4d", "claude", &p.pane_id, &[], 5000)
+            .unwrap();
+        fake.agent_start("codex-1a2b3c4d", "codex", &p.pane_id, &[], 5000)
+            .unwrap();
+        let list = fake.agent_list().unwrap();
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0].name.as_deref(), Some("codex-1a2b3c4d"));
+        // The old name is free for another pane.
+        let q = fake.workspace_create("/Users/me/code/proj", &[]).unwrap();
+        fake.agent_start("claude-1a2b3c4d", "claude", &q.pane_id, &[], 5000)
+            .unwrap();
+    }
+
+    #[test]
+    fn seeded_orphan_holds_its_name() {
+        let fake = FakeHerdr::new();
+        let orphan = fake.seed_named_agent("codex-1a2b3c4d", "codex", "/Users/me/code/proj");
+        let p = fake.workspace_create("/Users/me/code/proj", &[]).unwrap();
+        let e = fake
+            .agent_start("codex-1a2b3c4d", "codex", &p.pane_id, &[], 5000)
+            .unwrap_err();
+        assert_eq!(e.code(), Some("agent_name_taken"));
+        assert!(
+            e.to_string()
+                .contains(&format!("pane_id={} ", orphan.pane_id)),
+            "{e}"
+        );
+        fake.pane_close(&orphan.pane_id).unwrap();
+        fake.agent_start("codex-1a2b3c4d", "codex", &p.pane_id, &[], 5000)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_restart_without_agent_restore_frees_names() {
+        let fake = FakeHerdr::new();
+        let a = fake.workspace_create("/w", &[]).unwrap();
+        fake.agent_start("n", "claude", &a.pane_id, &[], 5000)
+            .unwrap();
+        fake.kill_server(Some(1));
+        fake.spawn_server().unwrap();
+        let b = fake.workspace_create("/w2", &[]).unwrap();
+        fake.agent_start("n", "claude", &b.pane_id, &[], 5000)
+            .unwrap();
     }
 
     #[test]

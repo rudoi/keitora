@@ -188,8 +188,6 @@ pub trait HerdrOps: Send + Sync {
         timeout_ms: u64,
     ) -> Result<(), HerdrError>;
     fn agent_prompt(&self, pane_id: &str, text: &str) -> Result<(), HerdrError>;
-    // See `cli::AgentInfo`: no production caller lists agents now.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn agent_list(&self) -> Result<Vec<AgentInfo>, HerdrError>;
     fn integration_status(&self, target: &str) -> Result<IntegrationStatus, HerdrError>;
     fn integration_install(&self, target: &str) -> Result<(), HerdrError>;

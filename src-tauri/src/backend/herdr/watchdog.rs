@@ -109,10 +109,12 @@ pub fn classify_sample(r: &Result<ServerStatus, HerdrError>) -> ProbeSample {
         Ok(_) => ProbeSample::Refused,
         Err(HerdrError::Timeout) => ProbeSample::Timeout,
         Err(e @ HerdrError::Exit { .. }) if !e.is_resource_pressure() => ProbeSample::ExitFail,
+        // herdr ran and printed an error body (on stderr with a non-zero exit, or
+        // on stdout): the status probe failed just as a bare non-zero exit does.
+        Err(HerdrError::Api { .. }) => ProbeSample::ExitFail,
         Err(HerdrError::Exit { .. })
         | Err(HerdrError::SpawnFailed { .. })
-        | Err(HerdrError::Parse { .. })
-        | Err(HerdrError::Api { .. }) => ProbeSample::Ignored,
+        | Err(HerdrError::Parse { .. }) => ProbeSample::Ignored,
     }
 }
 
@@ -435,7 +437,8 @@ mod tests {
                 code: "x".into(),
                 message: "y".into(),
             })),
-            ProbeSample::Ignored
+            ProbeSample::ExitFail,
+            "an error body is a failed probe, like a bare non-zero exit"
         );
     }
 

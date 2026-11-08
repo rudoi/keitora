@@ -30,7 +30,7 @@ use super::cli::{AgentSessionKind, PaneIdentity, PaneInfo, PaneProcessInfo};
 use super::ops::HerdrError;
 use super::resume::ResumeDecision;
 use super::{
-    agent, env, session_event, start_bridge_in, stop_bridge_in, Spawner, AGENT_START_TIMEOUT_MS,
+    agent, env, session_event, start_bridge_in, Spawner, AGENT_START_TIMEOUT_MS,
     SHELL_READY_DELAY_MS,
 };
 
@@ -96,6 +96,26 @@ pub(super) fn strict_timing() -> StrictTiming {
         StrictTiming::fast()
     } else {
         StrictTiming::production()
+    }
+}
+
+/// Why a strict step did not start its agent.
+#[derive(Debug)]
+enum StepError {
+    /// Another pane holds the agent's name (the chain may recover once).
+    NameTaken(HerdrError),
+    /// Any other failure, as the trail and final error quote it.
+    Failed(String),
+}
+
+impl StepError {
+    /// The failure reason the trail, log and final error carry. A name-taken
+    /// error is reduced to its code: its message lists the holders' cwds.
+    fn reason(self) -> String {
+        match self {
+            StepError::NameTaken(e) => e.code().unwrap_or("agent_name_taken").to_string(),
+            StepError::Failed(reason) => reason,
+        }
     }
 }
 
@@ -445,7 +465,12 @@ impl Spawner {
         let chain_start = Instant::now();
         let mut tried: Vec<String> = Vec::new();
         let mut last_reason = String::new();
-        for (index, step) in chain.iter().enumerate() {
+        // One `agent_name_taken` per launch is recovered from: the holders are
+        // closed and the same step runs again in a fresh pane.
+        let mut name_recovered = false;
+        self.evict_key_panes(key, &cwd);
+        let mut index = 0;
+        while let Some(step) = chain.get(index) {
             let remaining = timing.chain_budget.saturating_sub(chain_start.elapsed());
             if index > 0 && remaining < timing.poll.max(Duration::from_millis(1)) {
                 self.push_trail(
@@ -455,15 +480,7 @@ impl Spawner {
                 );
                 break;
             }
-            // Replace any live same-key pane (frees the agent name for re-use);
-            // drop its keymap entry and live membership now, as the default
-            // launch does.
-            if let Some(old) = self.keymap.get(key) {
-                stop_bridge_in(&self.bridges, key);
-                let _ = self.ops.pane_close(&old.pane_id);
-                self.keymap.remove(key);
-                self.live.lock().unwrap().remove(key);
-            }
+            self.drop_mapped_pane(key);
             let id = match self.ops.workspace_create(&cwd, &pane_env) {
                 Ok(id) => id,
                 Err(e) => {
@@ -494,7 +511,29 @@ impl Spawner {
                 .step_cap
                 .min(timing.chain_budget.saturating_sub(chain_start.elapsed()));
             let step_deadline = Instant::now() + step_cap;
-            match self.strict_step(key, &name, &id.pane_id, &args, step, timing, step_deadline) {
+            let outcome =
+                match self.strict_step(key, &name, &id.pane_id, &args, step, timing, step_deadline)
+                {
+                    Err(StepError::NameTaken(e)) if !name_recovered => {
+                        match self.recover_name_taken(key, &name, &cwd, &id.pane_id) {
+                            Some(closed) => {
+                                self.push_trail(
+                                    key,
+                                    TrailStage::Launch,
+                                    json!({ "index": index, "nameTaken": closed }),
+                                );
+                                name_recovered = true;
+                                // The same step runs again; it is listed once.
+                                tried.pop();
+                                continue;
+                            }
+                            // `agent list` failed: nothing was closed; the step fails.
+                            None => Err(StepError::NameTaken(e)),
+                        }
+                    }
+                    other => other,
+                };
+            match outcome {
                 Ok(()) => {
                     let (gen, result, fell_back) = self.finish_strict_launch(
                         key,
@@ -512,7 +551,9 @@ impl Spawner {
                     );
                     return Ok((gen, result, fell_back));
                 }
-                Err(reason) => {
+                Err(failure) => {
+                    let name_taken = matches!(failure, StepError::NameTaken(_));
+                    let reason = failure.reason();
                     let tail = self
                         .ops
                         .pane_read(&id.pane_id, "recent", "text", Some(20))
@@ -526,7 +567,7 @@ impl Spawner {
                             "paneTail": super::truncate_at_char_boundary(&tail, PANE_TAIL_CAP),
                         }),
                     );
-                    let _ = self.ops.pane_close(&id.pane_id);
+                    self.close_quietly(key, &id.pane_id);
                     lifecycle::record(LifecycleEvent::ResumeOutcome {
                         key: key.clone(),
                         outcome: ResumeResult::Failed {
@@ -538,8 +579,13 @@ impl Spawner {
                         step.label
                     );
                     last_reason = reason;
+                    // Every later step would start under the same name.
+                    if name_taken {
+                        break;
+                    }
                 }
             }
+            index += 1;
         }
         Err(PtyBackendError::Other(format_final_error(
             &last_reason,
@@ -547,8 +593,9 @@ impl Spawner {
         )))
     }
 
-    /// Run one step on `pane_id`: `agent.start` (re-issued on unexpected errors),
-    /// then watch the pane. `Err` carries the step's failure reason.
+    /// Run one step on `pane_id`: `agent.start` (re-issued on unexpected errors,
+    /// but not on `agent_name_taken`, which only closing the holder clears),
+    /// then watch the pane.
     #[allow(clippy::too_many_arguments)]
     fn strict_step(
         &self,
@@ -559,7 +606,7 @@ impl Spawner {
         step: &StrictStep,
         timing: &StrictTiming,
         step_deadline: Instant,
-    ) -> Result<(), String> {
+    ) -> Result<(), StepError> {
         let kind = agent::herdr_kind(STRICT_CLI);
         let mut reissues = 0usize;
         let window_end = loop {
@@ -568,7 +615,10 @@ impl Spawner {
                 .agent_start(name, kind, pane_id, args, AGENT_START_TIMEOUT_MS)
             {
                 Ok(()) => break (Instant::now() + timing.verify_window).min(step_deadline),
-                Err(e) if agent::is_early_exit(&e) => return Err(early_exit_reason(&e)),
+                Err(e) if agent::is_early_exit(&e) => {
+                    return Err(StepError::Failed(early_exit_reason(&e)))
+                }
+                Err(e) if agent::is_name_taken(&e) => return Err(StepError::NameTaken(e)),
                 // Not a failure: the agent may still be loading a large thread.
                 Err(e) if is_agent_start_timeout(&e) => {
                     self.push_trail(
@@ -592,7 +642,7 @@ impl Spawner {
                         json!({ "reissue": reissues, "error": e.to_string() }),
                     );
                 }
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(StepError::Failed(e.to_string())),
             }
         };
         let verdict = self.verify(
@@ -604,7 +654,7 @@ impl Spawner {
         );
         match verdict.failure() {
             None => Ok(()),
-            Some(reason) => Err(reason),
+            Some(reason) => Err(StepError::Failed(reason)),
         }
     }
 

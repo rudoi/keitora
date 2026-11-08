@@ -109,6 +109,11 @@ pub fn is_early_exit(e: &HerdrError) -> bool {
     )
 }
 
+/// Did `agent start` fail because another pane still holds the agent's name?
+pub fn is_name_taken(e: &HerdrError) -> bool {
+    e.code() == Some("agent_name_taken")
+}
+
 /// Map a herdr `agent_status` (+ `launch_pending`) to Keitora's `state_hint`.
 ///
 /// A still-launching, `working`, or `blocked` agent is BUSY; `idle`/`done`/unknown
@@ -132,6 +137,15 @@ pub fn agent_status_to_state_hint(status: &str, launch_pending: bool) -> Option<
 pub fn agent_name(kind: &str, key: &SessionKey) -> String {
     let id = format!("{}/{}", key.project, key.worktree);
     format!("{kind}-{:08x}", fnv1a32(id.as_bytes()))
+}
+
+/// Both agent names (one per `CliKind`) a session key can hold, sharing the hash
+/// suffix: `[claude-<hash>, codex-<hash>]`.
+pub fn agent_names_for(key: &SessionKey) -> [String; 2] {
+    [
+        agent_name(herdr_kind(CliKind::Claude), key),
+        agent_name(herdr_kind(CliKind::Codex), key),
+    ]
 }
 
 /// FNV-1a 32-bit hash (stable across runs/platforms; no external dep).
@@ -401,6 +415,29 @@ mod tests {
         assert!(n1
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'));
+    }
+
+    #[test]
+    fn agent_names_for_has_one_name_per_kind_with_a_shared_suffix() {
+        let k = SessionKey {
+            project: "proj".into(),
+            worktree: "alpha".into(),
+        };
+        let [c, x] = agent_names_for(&k);
+        assert_eq!(c, agent_name("claude", &k));
+        assert_eq!(x, agent_name("codex", &k));
+        assert_eq!(c.split_once('-').unwrap().1, x.split_once('-').unwrap().1);
+    }
+
+    #[test]
+    fn is_name_taken_matches_only_its_code() {
+        let err = |code: &str| HerdrError::Api {
+            code: code.into(),
+            message: "m".into(),
+        };
+        assert!(is_name_taken(&err("agent_name_taken")));
+        assert!(!is_name_taken(&err("agent_start_failed")));
+        assert!(!is_name_taken(&HerdrError::Timeout));
     }
 
     #[test]
