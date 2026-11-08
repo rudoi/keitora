@@ -64,10 +64,6 @@ pub enum AgentSessionKind {
     Path,
 }
 
-// Nothing lists agents now (the session listing reads the pane list's agent
-// status); the op stays for the agent-level detail (`launch_pending`) the pane
-// list lacks.
-#[cfg_attr(not(test), allow(dead_code))]
 /// One `herdr agent list` entry (the subset Keitora uses).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentInfo {
@@ -76,6 +72,11 @@ pub struct AgentInfo {
     /// `idle | working | blocked | done | unknown`, verbatim; `"unknown"` if absent.
     pub agent_status: String,
     pub launch_pending: bool,
+    /// The name the agent was started with; absent for agents herdr did not
+    /// start by name.
+    pub name: Option<String>,
+    /// herdr's pane cwd (not `foreground_cwd`, which follows the shell).
+    pub cwd: Option<String>,
 }
 
 /// The subset of `herdr status server --json` the backend surfaces.
@@ -128,10 +129,14 @@ pub fn api_error_from_value(err: &Value) -> HerdrError {
 }
 
 /// Map a herdr error `(code, message)` to a [`PtyBackendError`]: any `*_not_found`
-/// becomes [`PtyBackendError::NoSuchSession`]; everything else is `Other`.
+/// becomes [`PtyBackendError::NoSuchSession`]; everything else is `Other`. A
+/// `timeout` keeps its code in the text, so the resume path still reads it as a
+/// startup timeout whatever herdr's message says.
 pub fn map_error(code: &str, message: &str) -> PtyBackendError {
     if code.ends_with("_not_found") {
         PtyBackendError::NoSuchSession
+    } else if code == "timeout" {
+        PtyBackendError::Other(format!("herdr error timeout: {message}"))
     } else {
         PtyBackendError::Other(format!("herdr: {message}"))
     }
@@ -265,7 +270,6 @@ pub fn parse_integration_status(output: &str, target: &str) -> IntegrationStatus
 
 /// Parse one `agent list` entry; `None` if `pane_id` is missing. Other fields
 /// default (`agent_status` → "unknown", `launch_pending` → false).
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_agent_info(value: &Value) -> Option<AgentInfo> {
     Some(AgentInfo {
         pane_id: value.get("pane_id")?.as_str()?.to_string(),
@@ -282,11 +286,15 @@ pub fn parse_agent_info(value: &Value) -> Option<AgentInfo> {
             .get("launch_pending")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        name: value
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        cwd: value.get("cwd").and_then(Value::as_str).map(str::to_string),
     })
 }
 
 /// Parse a full `agent list` response (`/result/agents`), skipping bad entries.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_agent_list(value: &Value) -> Vec<AgentInfo> {
     value
         .pointer("/result/agents")
@@ -368,6 +376,8 @@ mod tests {
         let e = map_error("invalid_key", "unsupported key ctrl-c");
         assert!(matches!(e, PtyBackendError::Other(_)));
         assert_eq!(e.to_string(), "herdr: unsupported key ctrl-c");
+        let e = map_error("timeout", "agent took too long");
+        assert_eq!(e.to_string(), "herdr error timeout: agent took too long");
     }
 
     #[test]
@@ -518,11 +528,33 @@ mod tests {
                 agent: Some("claude".into()),
                 agent_status: "working".into(),
                 launch_pending: true,
+                name: None,
+                cwd: None,
             }
         );
         assert_eq!(agents[1].agent, None);
         assert_eq!(agents[1].agent_status, "unknown");
         assert!(!agents[1].launch_pending);
+    }
+
+    #[test]
+    fn parse_agent_info_reads_name_and_cwd_from_a_real_shape_entry() {
+        let v: Value = serde_json::from_str(
+            r#"{"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"sess-1"},"agent_status":"idle","cwd":"/Users/me/code/proj","foreground_cwd":"/Users/me/code/proj/sub","interactive_ready":true,"name":"claude-1a2b3c4d","pane_id":"w3:p1","revision":3,"state_change_seq":7,"tab_id":"w3:t1","terminal_id":"term_abc","terminal_title":"Claude Code","workspace_id":"w3"}"#,
+        )
+        .unwrap();
+        let info = parse_agent_info(&v).unwrap();
+        assert_eq!(
+            info,
+            AgentInfo {
+                pane_id: "w3:p1".into(),
+                agent: Some("claude".into()),
+                agent_status: "idle".into(),
+                launch_pending: false,
+                name: Some("claude-1a2b3c4d".into()),
+                cwd: Some("/Users/me/code/proj".into()),
+            }
+        );
     }
 
     #[test]

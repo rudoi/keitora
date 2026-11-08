@@ -15,7 +15,7 @@ use std::time::Duration;
 use crate::backend::{PtyBackendError, SessionKey};
 
 use super::bridge::Bridge;
-use super::cli::PaneInfo;
+use super::cli::{AgentInfo, PaneInfo};
 use super::keymap::{self, HerdrPane, KeyMap, LivePane};
 use super::ops::{Generation, HerdrOps, ServerInstance};
 use super::resume::{observation_pairs, ResumeStore};
@@ -220,6 +220,15 @@ fn poll_settled_panes(
     last
 }
 
+/// herdr's live agents, so reconcile can tell a session's named agent from a
+/// shell in the same cwd. A failure degrades to none (plain cwd matching).
+fn live_agents(ops: &dyn HerdrOps) -> Vec<AgentInfo> {
+    ops.agent_list().unwrap_or_else(|e| {
+        log::warn!("herdr: reconcile agent_list failed, matching by cwd only: {e}");
+        Vec::new()
+    })
+}
+
 /// Only panes that report a cwd can be matched to a worktree.
 fn with_cwd(panes: &[PaneInfo]) -> Vec<LivePane> {
     panes
@@ -253,11 +262,12 @@ pub fn adopt_live_panes(
     let Some(panes) = poll_restored_panes(ops) else {
         return;
     };
-    adopt_from(&panes, &persisted, keymap, live, store);
+    adopt_from(ops, &panes, &persisted, keymap, live, store);
 }
 
 /// The adopt step over an already-polled pane list.
 fn adopt_from(
+    ops: &dyn HerdrOps,
     panes: &[PaneInfo],
     persisted: &[(SessionKey, HerdrPane)],
     keymap: &KeyMap,
@@ -275,13 +285,16 @@ fn adopt_from(
         return;
     }
     let generation = keymap.generation();
-    let reconciled: Vec<(SessionKey, HerdrPane)> = keymap::reconcile_panes(persisted, &live_in)
-        .into_iter()
-        .map(|(k, mut p)| {
-            p.server_generation = generation;
-            (k, p)
-        })
-        .collect();
+    let agents = live_agents(ops);
+    let kind_of = |k: &SessionKey| store.last_cli(k);
+    let reconciled: Vec<(SessionKey, HerdrPane)> =
+        keymap::reconcile_panes(persisted, &live_in, &agents, &kind_of, true)
+            .into_iter()
+            .map(|(k, mut p)| {
+                p.server_generation = generation;
+                (k, p)
+            })
+            .collect();
     let adopted: Vec<SessionKey> = reconciled.iter().map(|(k, _)| k.clone()).collect();
     // Snapshot-CAS merge: a session spawned while we polled is left intact; a
     // gone-and-unchanged session is dropped.
@@ -435,7 +448,7 @@ fn reconcile_lineage(
     };
     if adopt {
         log::info!("herdr: the server still holds the sessions' panes; adopting them");
-        adopt_from(&panes, &persisted, ctx.keymap, ctx.live, ctx.store);
+        adopt_from(ctx.ops, &panes, &persisted, ctx.keymap, ctx.live, ctx.store);
         if observed.pid != 0 {
             let keep = identity_to_keep(ctx.keymap.instance(), observed);
             ctx.keymap.set_instance(Some(keep));
@@ -492,19 +505,22 @@ fn reconcile_lineage(
     // worktree can have been restored more than once); a session whose agent was
     // quit keeps one shell, adopted in the new generation.
     let live_in = with_cwd(&panes);
-    let keep: Vec<(SessionKey, HerdrPane)> = keymap::reconcile_panes(&persisted, &live_in)
-        .into_iter()
-        .filter(|(k, _)| !gone.contains(k))
-        .map(|(k, pane)| {
-            (
-                k,
-                HerdrPane {
-                    server_generation: next_generation,
-                    ..pane
-                },
-            )
-        })
-        .collect();
+    let agents = live_agents(ctx.ops);
+    let kind_of = |k: &SessionKey| ctx.store.last_cli(k);
+    let keep: Vec<(SessionKey, HerdrPane)> =
+        keymap::reconcile_panes(&persisted, &live_in, &agents, &kind_of, false)
+            .into_iter()
+            .filter(|(k, _)| !gone.contains(k))
+            .map(|(k, pane)| {
+                (
+                    k,
+                    HerdrPane {
+                        server_generation: next_generation,
+                        ..pane
+                    },
+                )
+            })
+            .collect();
     let kept_panes: HashSet<&str> = keep.iter().map(|(_, p)| p.pane_id.as_str()).collect();
     let gone_cwds: HashSet<String> = persisted
         .iter()
@@ -853,6 +869,35 @@ mod tests {
         assert_eq!(s.keymap.get(&key("a")).unwrap(), before, "panes untouched");
         assert_eq!(s.fake.panes().len(), 2);
         assert_eq!(s.keymap.instance(), s.fake.server_instance());
+    }
+
+    #[test]
+    fn same_instance_adopts_the_named_agent_over_a_shell_in_its_cwd() {
+        let s = Setup::new(&[]);
+        let cwd = "/repos/a";
+        // A restore left a plain shell and the session's named agent in one cwd,
+        // the shell listed first; the keymap still holds a pane that is gone.
+        let shell = s.fake.add_pane(cwd, None);
+        let [name, _] = crate::backend::herdr::agent::agent_names_for(&key("a"));
+        let agent = s.fake.seed_named_agent(&name, "claude", cwd);
+        s.keymap.record(
+            key("a"),
+            "w0".into(),
+            "gone".into(),
+            "t0".into(),
+            cwd.into(),
+        );
+        assert_eq!(s.run(&always), ReconcileOutcome::Adopted);
+        let adopted = s.keymap.get(&key("a")).unwrap();
+        assert_eq!(adopted.pane_id, agent.pane_id, "the named agent is adopted");
+        assert_ne!(adopted.pane_id, shell.pane_id);
+        assert!(
+            !s.ops().contains(&Op::PaneClose),
+            "the stray shell stays open"
+        );
+        // A second reconcile keeps it.
+        assert_eq!(s.run(&always), ReconcileOutcome::Adopted);
+        assert_eq!(s.keymap.get(&key("a")).unwrap().pane_id, agent.pane_id);
     }
 
     #[test]

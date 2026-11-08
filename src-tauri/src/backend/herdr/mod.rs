@@ -804,6 +804,116 @@ impl Spawner {
         )
     }
 
+    /// Close `pane_id`, warning on any failure but not-found (already gone).
+    fn close_quietly(&self, key: &SessionKey, pane_id: &str) {
+        if let Err(e) = self.ops.pane_close(pane_id) {
+            if !e.is_not_found() {
+                log::warn!(
+                    "herdr: closing pane {pane_id} of {} failed: {e}",
+                    key.worktree
+                );
+            }
+        }
+    }
+
+    /// Close `key`'s mapped pane, dropping its keymap entry and live membership
+    /// now, so nothing that fails before the launch records it again leaves a
+    /// stale entry pointing `attach`/`write_line` at a dead pane.
+    fn drop_mapped_pane(&self, key: &SessionKey) {
+        if let Some(old) = self.keymap.get(key) {
+            stop_bridge_in(&self.bridges, key);
+            self.close_quietly(key, &old.pane_id);
+            self.keymap.remove(key);
+            self.live.lock().unwrap().remove(key);
+        }
+    }
+
+    /// Clear the way for a launch of `key` in `cwd`: drop the key's mapped pane,
+    /// then close every agent pane in the same cwd holding one of the key's
+    /// names. When `agent list` fails only the mapped pane is closed; an
+    /// `agent_name_taken` from the launch then fails it.
+    fn evict_key_panes(&self, key: &SessionKey, cwd: &str) {
+        self.drop_mapped_pane(key);
+        let names = agent::agent_names_for(key);
+        if let Err(e) = self.close_name_holders(key, cwd, &names) {
+            log::warn!(
+                "herdr: agent list failed before launching {}; skipping name eviction: {e}",
+                key.worktree
+            );
+        }
+    }
+
+    /// Close every agent pane in `cwd` holding one of `names` that the keymap
+    /// maps to no session, returning the closed pane ids. Fails, closing
+    /// nothing, when `agent list` does.
+    fn close_name_holders(
+        &self,
+        key: &SessionKey,
+        cwd: &str,
+        names: &[String],
+    ) -> Result<Vec<String>, ops::HerdrError> {
+        let here = keymap::held_cwd(cwd);
+        let mut closed = Vec::new();
+        for a in self.ops.agent_list()? {
+            let Some(name) = a.name.filter(|n| names.contains(n)) else {
+                continue;
+            };
+            let same_cwd = a
+                .cwd
+                .as_deref()
+                .is_some_and(|c| keymap::normalize_cwd(c) == here);
+            if same_cwd && self.close_name_holder(key, &name, &a.pane_id) {
+                closed.push(a.pane_id);
+            }
+        }
+        Ok(closed)
+    }
+
+    /// Close `pane_id`, which holds agent `name`, for a launch of `key`, unless
+    /// the keymap maps it to a session (that session's pane is left alone; the
+    /// key's own mapping is dropped before any launch). Returns whether it was
+    /// closed.
+    fn close_name_holder(&self, key: &SessionKey, name: &str, pane_id: &str) -> bool {
+        if self.keymap.pane_owner(pane_id).is_some() {
+            log::warn!(
+                "herdr: pane {pane_id} holds agent name {name} but is mapped to a session; leaving it"
+            );
+            return false;
+        }
+        log::warn!(
+            "herdr: closing pane {pane_id} holding agent name {name} before launching {}",
+            key.worktree
+        );
+        self.close_quietly(key, pane_id);
+        true
+    }
+
+    /// Recover from an `agent_name_taken` launching `key` as `name` in `cwd`:
+    /// close the fresh pane the start failed in and every unmapped pane in `cwd`
+    /// holding `name`, returning the holders closed. `None` when `agent list`
+    /// fails: nothing is closed and the launch should fail.
+    fn recover_name_taken(
+        &self,
+        key: &SessionKey,
+        name: &str,
+        cwd: &str,
+        fresh_pane_id: &str,
+    ) -> Option<Vec<String>> {
+        match self.close_name_holders(key, cwd, &[name.to_string()]) {
+            Ok(closed) => {
+                self.close_quietly(key, fresh_pane_id);
+                Some(closed)
+            }
+            Err(e) => {
+                log::warn!(
+                    "herdr: agent list failed recovering agent name {name} for {}: {e}",
+                    key.worktree
+                );
+                None
+            }
+        }
+    }
+
     /// Launch `key`'s agent per `decision` under the key's lock.
     fn spawn_agent_with(
         &self,
@@ -819,11 +929,9 @@ impl Spawner {
         self.spawn_agent_locked(key, cwd, cols, rows, launch, decision)
     }
 
-    /// Launch `key`'s agent (the caller holds the key's lock). Each attempt gets a
-    /// fresh pane; an agent that exits during startup is retried with the next,
-    /// weaker decision (resume, then continue, then fresh). Every other error
-    /// closes the pane and is returned. Returns the session generation, the
-    /// outcome, and whether an early exit made it fall back to a weaker decision.
+    /// Launch `key`'s agent (the caller holds the key's lock), one fresh pane per
+    /// attempt, falling back to weaker decisions on an early exit. Returns the
+    /// session generation, the outcome, and whether it fell back.
     fn spawn_agent_locked(
         &self,
         key: &SessionKey,
@@ -845,17 +953,12 @@ impl Spawner {
             &self.ops.env().original_xdg,
             self.ops.env().path(),
         );
+        // One `agent_name_taken` per launch is recovered from by closing the
+        // unmapped holders in this cwd and starting over in a fresh pane.
+        let mut name_recovered = false;
+        self.evict_key_panes(key, &cwd);
         let (id, gen) = loop {
-            // Replace any live same-key pane (frees the old agent name so
-            // `agent.start` can re-use it). Drop the keymap entry + live membership
-            // NOW: if anything below fails before `record()` re-adds the key, a
-            // stale entry would point `attach`/`write_line` at a dead pane.
-            if let Some(old) = self.keymap.get(key) {
-                stop_bridge_in(&self.bridges, key);
-                let _ = self.ops.pane_close(&old.pane_id);
-                self.keymap.remove(key);
-                self.live.lock().unwrap().remove(key);
-            }
+            self.drop_mapped_pane(key);
             let id = self.ops.workspace_create(&cwd, &pane_env)?;
             // Give the fresh shell a brief, bounded moment to reach its prompt before
             // `agent.start` (which requires an interactive shell prompt).
@@ -877,8 +980,22 @@ impl Spawner {
                     );
                     break (id, gen);
                 }
+                // A failed start is not known to leave the shell clean, so the
+                // retry gets a fresh pane; the decision stays as it was.
+                Err(e) if agent::is_name_taken(&e) => {
+                    if !name_recovered
+                        && self
+                            .recover_name_taken(key, &name, &cwd, &id.pane_id)
+                            .is_some()
+                    {
+                        name_recovered = true;
+                        continue;
+                    }
+                    self.close_quietly(key, &id.pane_id);
+                    return Err(name_taken_error(&e));
+                }
                 Err(e) if agent::is_early_exit(&e) => {
-                    let _ = self.ops.pane_close(&id.pane_id);
+                    self.close_quietly(key, &id.pane_id);
                     let Some(next) = agent::next_fallback(&decision) else {
                         return Err(e.into());
                     };
@@ -895,7 +1012,7 @@ impl Spawner {
                 }
                 Err(e) => {
                     // Close the leaked pane before returning the error.
-                    let _ = self.ops.pane_close(&id.pane_id);
+                    self.close_quietly(key, &id.pane_id);
                     return Err(e.into());
                 }
             }
@@ -1433,11 +1550,22 @@ pub(crate) fn truncate_at_char_boundary(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
-/// Whether a failure text is herdr's agent-startup timeout: its JSON error
-/// code, or the message it gives.
+/// The launch error for an `agent_name_taken` that was not recovered from,
+/// reduced to its code: herdr's message lists the holders' cwds.
+fn name_taken_error(e: &ops::HerdrError) -> PtyBackendError {
+    PtyBackendError::Other(format!(
+        "herdr error {}: another pane holds this session's agent name",
+        e.code().unwrap_or("agent_name_taken")
+    ))
+}
+
+/// Whether a failure text is herdr's agent-startup timeout: its error code (as
+/// JSON, or kept by [`cli::map_error`]), or the message it gives.
 pub(super) fn is_timeout_text(text: &str) -> bool {
     let text = text.to_lowercase();
-    text.contains("\"code\":\"timeout\"") || text.contains("timed out waiting for agent startup")
+    text.contains("\"code\":\"timeout\"")
+        || text.contains("herdr error timeout")
+        || text.contains("timed out waiting for agent startup")
 }
 
 /// Whether a resume error points at an overloaded machine. A herdr call that
@@ -2371,12 +2499,10 @@ impl PtyBackend for HerdrBackend {
             .keymap
             .get(&key)
             .ok_or(PtyBackendError::NoSuchSession)?;
-        // Validate the pane is actually live before binding a bridge to it. Use
-        // `pane_list` (JSON, proper error-code mapping) — NOT `pane_read`'s error code,
-        // which `run_raw` discards on a non-zero exit (so a dead pane reads as `Other`,
-        // not `NoSuchSession`). A stale/dead id → drop the keymap entry and report
-        // `NoSuchSession`, which `attach_err_kind` maps to the `"NoLiveSession"` token the
-        // frontend respawns on. A `pane_list` transport error is NOT treated as "dead"
+        // Validate the pane is actually live before binding a bridge to it, via
+        // `pane_list`: it returns JSON with a proper error code. A stale/dead id →
+        // drop the keymap entry and report `NoSuchSession`, which `attach_err_kind`
+        // maps to the `"NoLiveSession"` token the frontend respawns on. A `pane_list` transport error is NOT treated as "dead"
         // (that would wrongly respawn a live pane on a transient blip): fall through and
         // attach best-effort.
         // The same listing gives the pane's rows, for a takeover sent without a size.
@@ -7061,6 +7187,303 @@ mod tests {
         );
     }
 
+    // ---- evicting panes that hold a session's agent name ----
+
+    /// `cwd` as herdr reports a pane running there (its symlinks resolved).
+    fn reported_cwd(cwd: &str) -> String {
+        std::fs::canonicalize(cwd)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The `agent list` entries holding one of `key`'s agent names.
+    fn agents_named_for(fake: &fake::FakeHerdr, key: &SessionKey) -> Vec<cli::AgentInfo> {
+        let names = agent::agent_names_for(key);
+        fake.agent_list()
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.name.as_ref().is_some_and(|n| names.contains(n)))
+            .collect()
+    }
+
+    fn claude_name(key: &SessionKey) -> String {
+        agent::agent_name("claude", key)
+    }
+
+    fn name_taken(pane_id: &str) -> ops::HerdrError {
+        ops::HerdrError::Api {
+            code: "agent_name_taken".into(),
+            message: format!(
+                "agent name is already used; candidates: pane_id={pane_id} status=Idle"
+            ),
+        }
+    }
+
+    fn claude_spawn(
+        backend: &HerdrBackend,
+        key: SessionKey,
+        cwd: String,
+    ) -> Result<u64, PtyBackendError> {
+        backend.spawn_agent(key, cwd, String::new(), Some((80, 24)), claude_launch())
+    }
+
+    #[test]
+    fn an_unmapped_orphan_holding_the_name_is_evicted_before_launch() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let cwd = worktree_dir(&fake, "wt", None);
+        let orphan =
+            fake.seed_named_agent(&claude_name(&skey("wt")), "claude", &reported_cwd(&cwd));
+        claude_spawn(&backend, skey("wt"), cwd).unwrap();
+        assert_eq!(fake.closed_pane_ids(), vec![orphan.pane_id.clone()]);
+        assert_eq!(count(&fake, ops::Op::AgentStart), 1);
+        let pane = backend.keymap.get(&skey("wt")).unwrap();
+        let held = agents_named_for(&fake, &skey("wt"));
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].pane_id, pane.pane_id);
+    }
+
+    #[test]
+    fn a_codex_session_and_a_claude_orphan_leave_one_agent_after_a_claude_launch() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let cwd = worktree_dir(&fake, "wt", None);
+        codex_spawn(&fake, &backend, codex_launch()).unwrap();
+        let codex = backend.keymap.get(&skey("wt")).unwrap();
+        let orphan =
+            fake.seed_named_agent(&claude_name(&skey("wt")), "claude", &reported_cwd(&cwd));
+        claude_spawn(&backend, skey("wt"), cwd).unwrap();
+        let closed = fake.closed_pane_ids();
+        assert!(closed.contains(&codex.pane_id), "{closed:?}");
+        assert!(closed.contains(&orphan.pane_id), "{closed:?}");
+        let held = agents_named_for(&fake, &skey("wt"));
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(
+            held[0].name.as_deref(),
+            Some(claude_name(&skey("wt")).as_str())
+        );
+        assert_eq!(
+            held[0].pane_id,
+            backend.keymap.get(&skey("wt")).unwrap().pane_id
+        );
+    }
+
+    #[test]
+    fn eviction_spares_other_worktrees_and_unnamed_agents() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let cwd = worktree_dir(&fake, "wt", None);
+        let other_cwd = worktree_dir(&fake, "other", None);
+        // Another worktree's agent, mapped and unmapped.
+        claude_spawn(&backend, skey("other"), other_cwd.clone()).unwrap();
+        let mapped_other = backend.keymap.get(&skey("other")).unwrap();
+        let unmapped_other = fake.seed_named_agent(
+            &claude_name(&skey("alpha")),
+            "claude",
+            &reported_cwd(&other_cwd),
+        );
+        // The user's own agent in this worktree, started without a name.
+        let unnamed = fake.add_pane(
+            &reported_cwd(&cwd),
+            Some((
+                "claude",
+                cli::AgentSession {
+                    source: "herdr:claude".into(),
+                    agent: "claude".into(),
+                    kind: cli::AgentSessionKind::Id,
+                    value: "user-session".into(),
+                },
+            )),
+        );
+        claude_spawn(&backend, skey("wt"), cwd).unwrap();
+        assert!(
+            fake.closed_pane_ids().is_empty(),
+            "{:?}",
+            fake.closed_pane_ids()
+        );
+        let live: Vec<String> = fake.panes().into_iter().map(|p| p.pane_id).collect();
+        for p in [
+            &mapped_other.pane_id,
+            &unmapped_other.pane_id,
+            &unnamed.pane_id,
+        ] {
+            assert!(live.contains(p), "{p} closed");
+        }
+    }
+
+    /// A pane holding the name but mapped to another key is closed by neither
+    /// the eviction nor the name-taken recovery; the second name-taken ends the
+    /// launch with its fresh pane closed.
+    #[test]
+    fn a_name_holder_mapped_to_another_key_is_never_closed() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let cwd = worktree_dir(&fake, "wt", None);
+        let holder =
+            fake.seed_named_agent(&claude_name(&skey("wt")), "claude", &reported_cwd(&cwd));
+        backend.keymap.record(
+            skey("other"),
+            holder.workspace_id.clone(),
+            holder.pane_id.clone(),
+            holder.terminal_id.clone(),
+            cwd.clone(),
+        );
+        let err = claude_spawn(&backend, skey("wt"), cwd).unwrap_err();
+        assert_name_taken_error(&err);
+        assert_eq!(
+            count(&fake, ops::Op::AgentStart),
+            2,
+            "one recovery, no third start"
+        );
+        assert!(!fake.closed_pane_ids().contains(&holder.pane_id));
+        let live: Vec<String> = fake.panes().into_iter().map(|p| p.pane_id).collect();
+        assert_eq!(
+            live,
+            vec![holder.pane_id.clone()],
+            "both fresh panes closed"
+        );
+        assert!(backend.keymap.get(&skey("wt")).is_none());
+    }
+
+    /// The launch error for an unrecovered `agent_name_taken`: its code, without
+    /// herdr's message (which lists the holders and their cwds).
+    fn assert_name_taken_error(err: &PtyBackendError) {
+        let PtyBackendError::Other(m) = err else {
+            panic!("{err:?}");
+        };
+        assert!(m.starts_with("herdr error agent_name_taken"), "{m}");
+        assert!(!m.contains("pane_id=") && !m.contains("cwd="), "{m}");
+    }
+
+    #[test]
+    fn a_second_name_taken_returns_the_error_and_closes_the_fresh_pane() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let cwd = worktree_dir(&fake, "wt", None);
+        fake.script_agent_start(vec![
+            fake::AgentStartScript::Err(name_taken("w90:p1")),
+            fake::AgentStartScript::Err(name_taken("w91:p1")),
+            fake::AgentStartScript::Ok,
+        ]);
+        let err = claude_spawn(&backend, skey("wt"), cwd).unwrap_err();
+        assert_name_taken_error(&err);
+        assert_eq!(count(&fake, ops::Op::AgentStart), 2, "no third start");
+        assert_eq!(count(&fake, ops::Op::WorkspaceCreate), 2);
+        assert!(fake.panes().is_empty(), "{:?}", fake.panes());
+        assert!(backend.keymap.get(&skey("wt")).is_none());
+        assert!(!backend.is_live(&skey("wt")));
+    }
+
+    /// With `agent list` failing, neither the eviction nor the recovery can
+    /// tell which holders are safe to close: the launch fails, closing only its
+    /// fresh pane.
+    #[test]
+    fn a_failing_agent_list_fails_a_name_taken_launch_without_closing_holders() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let cwd = worktree_dir(&fake, "wt", None);
+        let orphan =
+            fake.seed_named_agent(&claude_name(&skey("wt")), "claude", &reported_cwd(&cwd));
+        fake.fail_next(ops::Op::AgentList, ops::HerdrError::Timeout);
+        fake.fail_next(ops::Op::AgentList, ops::HerdrError::Timeout);
+        let err = claude_spawn(&backend, skey("wt"), cwd).unwrap_err();
+        assert_name_taken_error(&err);
+        assert_eq!(count(&fake, ops::Op::AgentStart), 1, "no retry");
+        assert_eq!(count(&fake, ops::Op::AgentList), 2);
+        let closed = fake.closed_pane_ids();
+        assert_eq!(closed.len(), 1, "only the fresh pane: {closed:?}");
+        assert_ne!(closed[0], orphan.pane_id);
+        let live: Vec<String> = fake.panes().into_iter().map(|p| p.pane_id).collect();
+        assert_eq!(live, vec![orphan.pane_id.clone()]);
+        assert!(backend.keymap.get(&skey("wt")).is_none());
+    }
+
+    /// A holder of the key's name in another cwd is not the key's to close,
+    /// on the recovery path as on the eviction: the launch fails instead.
+    #[test]
+    fn a_name_holder_in_another_cwd_is_never_closed_by_the_recovery() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let cwd = worktree_dir(&fake, "wt", None);
+        let elsewhere = worktree_dir(&fake, "other", None);
+        let holder = fake.seed_named_agent(
+            &claude_name(&skey("wt")),
+            "claude",
+            &reported_cwd(&elsewhere),
+        );
+        let err = claude_spawn(&backend, skey("wt"), cwd).unwrap_err();
+        assert_name_taken_error(&err);
+        assert_eq!(
+            count(&fake, ops::Op::AgentStart),
+            2,
+            "one recovery, no third start"
+        );
+        assert!(!fake.closed_pane_ids().contains(&holder.pane_id));
+        let live: Vec<String> = fake.panes().into_iter().map(|p| p.pane_id).collect();
+        assert_eq!(
+            live,
+            vec![holder.pane_id.clone()],
+            "both fresh panes closed"
+        );
+    }
+
+    /// herdr still reports the evicted orphan's name taken on the first start:
+    /// the name-taken recovery retries in a fresh pane, without a second sweep.
+    #[test]
+    fn a_name_freed_late_is_recovered_by_the_name_taken_retry() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let cwd = worktree_dir(&fake, "wt", None);
+        let orphan =
+            fake.seed_named_agent(&claude_name(&skey("wt")), "claude", &reported_cwd(&cwd));
+        fake.script_agent_start(vec![
+            fake::AgentStartScript::Err(name_taken(&orphan.pane_id)),
+            fake::AgentStartScript::Ok,
+        ]);
+        claude_spawn(&backend, skey("wt"), cwd).unwrap();
+        assert!(fake.closed_pane_ids().contains(&orphan.pane_id));
+        assert_eq!(count(&fake, ops::Op::AgentStart), 2);
+        assert_eq!(count(&fake, ops::Op::WorkspaceCreate), 2);
+        assert_eq!(
+            count(&fake, ops::Op::AgentList),
+            2,
+            "one sweep before the launch, one for the recovery"
+        );
+        let held = agents_named_for(&fake, &skey("wt"));
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            held[0].pane_id,
+            backend.keymap.get(&skey("wt")).unwrap().pane_id
+        );
+    }
+
+    /// The eviction leaves the resume decision alone: an early exit still falls
+    /// back resume → continue.
+    #[test]
+    fn an_early_exit_still_falls_back_after_an_orphan_is_evicted() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, events) = fake_backend(&fake);
+        let cwd = worktree_dir(&fake, "wt", Some("sess-1"));
+        record_session(&fake, &skey("wt"), "sess-1");
+        let orphan =
+            fake.seed_named_agent(&claude_name(&skey("wt")), "claude", &reported_cwd(&cwd));
+        fake.script_agent_start(vec![fake::AgentStartScript::EarlyExit]);
+        claude_spawn(&backend, skey("wt"), cwd).unwrap();
+        assert!(fake.closed_pane_ids().contains(&orphan.pane_id));
+        assert_eq!(
+            agent_start_args(&fake),
+            vec!["--resume sess-1", "--continue"]
+        );
+        assert_eq!(
+            resume_events(&events),
+            vec![(
+                "pty://resume/p/wt".to_string(),
+                serde_json::json!({"outcome": "continued", "fell_back": true})
+            )]
+        );
+    }
+
     #[test]
     fn spawn_agent_timeout_is_not_retried() {
         let fake = fake::FakeHerdr::new();
@@ -7507,6 +7930,13 @@ mod tests {
             "herdr: Timed out waiting for agent startup"
         ));
         assert!(!is_timeout_text("herdr: agent did not become ready"));
+        // An error body read from stderr arrives as an `Api` error, whatever its
+        // message says.
+        let body = PtyBackendError::from(ops::HerdrError::Api {
+            code: "timeout".into(),
+            message: "agent took too long".into(),
+        });
+        assert!(is_load_related_error(&body, false), "{body}");
         assert!(is_load_related_error(&PtyBackendError::NotConnected, false));
         assert!(is_load_related_error(
             &PtyBackendError::Other("herdr: timed out waiting for agent startup".into()),
@@ -8540,6 +8970,110 @@ mod tests {
 
         const EXHAUSTED: &str = "codex did not start: agent never appeared \
              (tried: resume thr-1 -> fresh -> fresh without optional flags)";
+
+        #[test]
+        fn strict_evicts_a_stale_claude_name_before_launching_codex() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            let cwd = worktree_dir(&fake, "wt", None);
+            let stale =
+                fake.seed_named_agent(&claude_name(&skey("wt")), "claude", &reported_cwd(&cwd));
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            assert_eq!(fake.closed_pane_ids(), vec![stale.pane_id.clone()]);
+            let held = agents_named_for(&fake, &skey("wt"));
+            assert_eq!(held.len(), 1, "{held:?}");
+            assert_eq!(
+                held[0].name.as_deref(),
+                Some(agent::agent_name("codex", &skey("wt")).as_str())
+            );
+        }
+
+        /// `agent_name_taken` is not re-issued in the same pane: the chain
+        /// closes the holder and runs the same step once more in a fresh one.
+        #[test]
+        fn strict_name_taken_is_not_reissued_and_recovers_once() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            let cwd = worktree_dir(&fake, "wt", None);
+            let holder = fake.seed_named_agent(
+                &agent::agent_name("codex", &skey("wt")),
+                "codex",
+                &reported_cwd(&cwd),
+            );
+            fake.fail_next(ops::Op::AgentList, ops::HerdrError::Timeout);
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            assert_eq!(
+                agent_start_args(&fake),
+                vec![
+                    format!("resume thr-1 {HOOK}"),
+                    format!("resume thr-1 {HOOK}")
+                ],
+                "one start per pane, the same step retried"
+            );
+            assert!(fake.closed_pane_ids().contains(&holder.pane_id));
+            assert_eq!(count(&fake, ops::Op::WorkspaceCreate), 2);
+            assert_eq!(resume_events(&events), event("resumed", false));
+            assert_eq!(has(&trail(&backend), TrailStage::Launch, "nameTaken"), 1);
+        }
+
+        /// With `agent list` failing, the recovery closes nothing and the
+        /// name-taken step ends the chain.
+        #[test]
+        fn strict_name_taken_with_a_failing_agent_list_ends_the_chain() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            let cwd = worktree_dir(&fake, "wt", None);
+            let holder = fake.seed_named_agent(
+                &agent::agent_name("codex", &skey("wt")),
+                "codex",
+                &reported_cwd(&cwd),
+            );
+            fake.fail_next(ops::Op::AgentList, ops::HerdrError::Timeout);
+            fake.fail_next(ops::Op::AgentList, ops::HerdrError::Timeout);
+            let err = codex_spawn(&fake, &backend, strict()).unwrap_err();
+            let PtyBackendError::Other(m) = &err else {
+                panic!("unexpected error {err:?}");
+            };
+            assert!(m.contains("agent_name_taken"), "{m}");
+            assert_eq!(count(&fake, ops::Op::AgentStart), 1);
+            let live: Vec<String> = fake.panes().into_iter().map(|p| p.pane_id).collect();
+            assert_eq!(
+                live,
+                vec![holder.pane_id.clone()],
+                "only the fresh pane closed"
+            );
+            assert_eq!(has(&trail(&backend), TrailStage::Launch, "nameTaken"), 0);
+        }
+
+        /// A second `agent_name_taken` ends the chain: later steps would start
+        /// under the same name.
+        #[test]
+        fn strict_second_name_taken_ends_the_chain() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            let cwd = worktree_dir(&fake, "wt", None);
+            let holder = fake.seed_named_agent(
+                &agent::agent_name("codex", &skey("wt")),
+                "codex",
+                &reported_cwd(&cwd),
+            );
+            backend.keymap.record(
+                skey("other"),
+                holder.workspace_id.clone(),
+                holder.pane_id.clone(),
+                holder.terminal_id.clone(),
+                cwd.clone(),
+            );
+            let err = codex_spawn(&fake, &backend, strict()).unwrap_err();
+            let PtyBackendError::Other(m) = &err else {
+                panic!("unexpected error {err:?}");
+            };
+            assert!(m.contains("agent_name_taken"), "{m}");
+            assert!(!m.contains(&cwd), "no path in the error: {m}");
+            assert_eq!(count(&fake, ops::Op::AgentStart), 2);
+            let live: Vec<String> = fake.panes().into_iter().map(|p| p.pane_id).collect();
+            assert_eq!(live, vec![holder.pane_id.clone()]);
+        }
 
         #[test]
         fn strict_resume_confirmed_by_matching_session() {

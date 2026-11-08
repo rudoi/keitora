@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use keitora_tasks::{is_safe_claude_session_id, CliKind, LocalStore};
+use keitora_tasks::{is_safe_claude_session_id, CliKind, LocalStore, ResumeRow};
 
 use crate::backend::SessionKey;
 
@@ -122,9 +122,18 @@ impl ResumeStore {
     /// Whether the latest observation of `key` saw its agent gone from the pane
     /// (the user quit it): such a session is not owed a resume.
     pub fn agent_quit(&self, key: &SessionKey) -> bool {
+        self.resume_row(key).is_some_and(|row| !row.agent_present)
+    }
+
+    /// The agent kind last recorded for `key`, if any.
+    pub fn last_cli(&self, key: &SessionKey) -> Option<CliKind> {
+        self.resume_row(key).map(|row| row.cli)
+    }
+
+    /// `key`'s stored resume row, if any (a missing DB or failed read is `None`).
+    fn resume_row(&self, key: &SessionKey) -> Option<ResumeRow> {
         self.with_db_do("get", |db| db.resume_get(&key.project, &key.worktree))
             .flatten()
-            .is_some_and(|row| !row.agent_present)
     }
 
     /// Persist whether the user terminated `key`. Unlike the rest of the store this
@@ -270,9 +279,7 @@ impl ResumeStore {
             }
         };
 
-        let stored = self
-            .with_db_do("get", |db| db.resume_get(&key.project, &key.worktree))
-            .flatten();
+        let stored = self.resume_row(key);
         // An id cleared for this cli (a fresh start, or a resume that failed) is
         // not accepted from the registry either.
         let mut cleared: Option<String> = None;
