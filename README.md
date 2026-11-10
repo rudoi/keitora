@@ -130,7 +130,8 @@ keitora task watch --json                              # stream session and disp
 drag onto an idle lane does. It only works on an idle session: a busy, waiting or offline one is
 refused and nothing is reserved (the board is the queue, and dispatch never starts an agent). The
 app picks up requests for any project in its registry, active or not, and refuses any it hasn't
-picked up within ten minutes.
+picked up within ten minutes. Add `--until-claimed` to keep waiting, within `--wait`, until the
+agent in that worktree has claimed the task.
 
 If `keitora` isn't on your `PATH`, the app offers to install it for you.
 
