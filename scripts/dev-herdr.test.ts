@@ -16,6 +16,7 @@ import {
   mayStopOnTeardown,
   parseReleaseVersion,
   seedDemoRegistryToml,
+  seedProjectToml,
   seedRegistryToml,
   sortReleasesNewestFirst,
 } from "./dev-herdr.mjs";
@@ -63,7 +64,30 @@ describe("herdrDevPaths", () => {
     // state + registry + throwaway repo are all under the dev home (so purging is safe).
     expect(p.herdrStateDir.replace(/\\/g, "/")).toBe("/dev/home-herdr/herdr");
     expect(p.configHome.replace(/\\/g, "/")).toBe("/dev/home-herdr/config");
-    expect(p.repoPath.replace(/\\/g, "/")).toBe("/dev/home-herdr/test-repo");
+    // The repo directory is named like its worktree: hooks report by basename.
+    expect(p.repoPath.replace(/\\/g, "/")).toBe("/dev/home-herdr/herdr-test-repo");
+    expect(p.tasksDir.replace(/\\/g, "/")).toBe("/dev/home-herdr/tasks");
+  });
+
+  it("names the throwaway repo directory after its registered worktree", () => {
+    const p = herdrDevPaths("C:\\scratch\\dev");
+    expect(seedRegistryToml(p.repoPath)).toContain('name = "herdr-test-repo"');
+    expect(p.repoPath.replace(/\\/g, "/").split("/").pop()).toBe("herdr-test-repo");
+  });
+});
+
+describe("seedProjectToml", () => {
+  it("pins the task DB and the hook CLI to the given (dev home) paths", () => {
+    const toml = seedProjectToml(
+      "herdr-test-repo",
+      "C:\\scratch\\dev\\tasks\\herdr-test-repo\\tasks.db",
+      "D:\\repos\\proj\\target\\debug\\keitora.exe",
+    );
+    expect(toml).toContain('name = "herdr-test-repo"');
+    expect(toml).toContain("db_path = 'C:/scratch/dev/tasks/herdr-test-repo/tasks.db'");
+    expect(toml).toContain("[cli]\npath = 'D:/repos/proj/target/debug/keitora.exe'");
+    // Never the default `~/.keitora/...` DB.
+    expect(toml).not.toContain("~");
   });
 });
 
