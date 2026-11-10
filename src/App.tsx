@@ -40,6 +40,7 @@ import {
   currentProject,
   injectHandoffSummary,
   listWorktrees,
+  onNotificationActivated,
   onProjectChanged,
   onPtyResume,
   onTransferProgress,
@@ -889,6 +890,23 @@ function AppInner() {
     },
     [railGroups, selectLane],
   );
+  // Clicking a session notification lands on its worktree, switching project when needed.
+  const focusSessionRef = useRef(focusPerfSession);
+  focusSessionRef.current = focusPerfSession;
+  useEffect(() => {
+    let cancelled = false;
+    let un: (() => void) | undefined;
+    void onNotificationActivated(({ project, worktree }) =>
+      focusSessionRef.current(project, worktree),
+    ).then((u) => {
+      if (cancelled) u();
+      else un = u;
+    });
+    return () => {
+      cancelled = true;
+      un?.();
+    };
+  }, []);
   const closePerf = useCallback(() => setPerfOpen(false), []);
   const togglePerf = useCallback(() => setPerfOpen((v) => !v), []);
   const openLaneDiff = useCallback((g: GroupModel, w: string) => {
