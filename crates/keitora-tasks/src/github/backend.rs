@@ -546,7 +546,7 @@ impl<A: GhApi> TaskBackend for GitHubBackend<A> {
                     && older_than_days(&t.updated_at, archive_days))
             })
             .collect();
-        tasks.sort_by(|a, b| b.id.cmp(&a.id));
+        tasks.sort_by_key(|t| std::cmp::Reverse(t.id));
         Ok(tasks)
     }
 
