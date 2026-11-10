@@ -481,6 +481,33 @@ export function onAppCloseRequested(cb: (sessionCount: number) => void): Promise
   return listen<number>("app://close-requested", (count) => cb(count));
 }
 
+// ── Session notifications ───────────────────────────────────────────────
+
+/** Where a clicked session notification points: a project (resolved name) + worktree. */
+export interface NotificationTarget {
+  project: string;
+  worktree: string;
+}
+
+/**
+ * Show an OS notification for a worktree that needs input. Clicking it (where the OS
+ * reports clicks) focuses Keitora and fires `onNotificationActivated` with the target.
+ */
+export function notifySession(
+  target: NotificationTarget,
+  title: string,
+  body: string,
+): Promise<void> {
+  return invoke("notify_session", { ...target, title, body });
+}
+
+/** Fires when the user clicks a session notification (`notification://activated`). */
+export function onNotificationActivated(
+  cb: (target: NotificationTarget) => void,
+): Promise<UnlistenFn> {
+  return listen<NotificationTarget>("notification://activated", cb);
+}
+
 /** Quit the GUI but leave the daemon + its live sessions running. */
 export function appQuitKeep(): Promise<void> {
   return invoke("app_quit_keep");

@@ -23,6 +23,7 @@ mod lifecycle;
 mod logging;
 mod paths;
 mod perf;
+mod session_toast;
 mod tasks;
 mod terminal_links;
 mod transfer;
