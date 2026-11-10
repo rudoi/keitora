@@ -2112,6 +2112,7 @@ fn start_tasks_watcher(app: AppHandle) {
         let local = keitora_tasks::LocalStore::open(&db_path_str).ok();
         let mut last_revision = String::new();
         let mut last_session_revision = String::new();
+        let app_for_requests = app.clone();
         // Emit `event` only when `rev` differs from the last value we sent.
         let emit_if_changed = |event: &str, rev: String, last: &mut String| {
             if rev != *last {
@@ -2138,6 +2139,18 @@ fn start_tasks_watcher(app: AppHandle) {
                     .and_then(|l| l.session_revision().ok())
                     .unwrap_or_default();
                 emit_if_changed("sessions://changed", srev, &mut last_session_revision);
+                // CLI dispatch requests (`keitora task dispatch`) arrive as rows in
+                // this DB; run them through the app's own dispatch path. The executor
+                // takes each row with a compare-and-set, so an overlapping run is harmless.
+                let has_pending = local
+                    .as_ref()
+                    .and_then(|l| l.dispatch_requests_pending().ok())
+                    .is_some_and(|p| !p.is_empty());
+                if has_pending {
+                    tauri::async_runtime::spawn(crate::dispatch::run_dispatch_requests(
+                        app_for_requests.clone(),
+                    ));
+                }
             },
         );
     });

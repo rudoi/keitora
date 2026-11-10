@@ -142,6 +142,23 @@ pub(crate) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
           updated_at TEXT NOT NULL DEFAULT (datetime('now')),
           PRIMARY KEY (project, worktree)
         );
+
+        -- Dispatch requests written by another process (the CLI) for the running app
+        -- to execute through its own dispatch path. SQLite is the only channel
+        -- between the CLI and the app, so the request and its outcome live here.
+        CREATE TABLE IF NOT EXISTS dispatch_requests (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          task_id      INTEGER NOT NULL,
+          worktree     TEXT NOT NULL,
+          queue_only   INTEGER NOT NULL DEFAULT 0,
+          requested_by TEXT NOT NULL DEFAULT '',
+          status       TEXT NOT NULL DEFAULT 'pending'
+                       CHECK(status IN ('pending','running','applied','queued','refused')),
+          reason       TEXT NOT NULL DEFAULT '',
+          created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+          resolved_at  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_dispatch_requests_status ON dispatch_requests(status);
         "#,
     )?;
 
