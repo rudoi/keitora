@@ -146,9 +146,37 @@ export function herdrDevPaths(devHome) {
     herdrStateDir: join(devHome, "herdr"),
     // A fresh registry home, pre-seeded with only the throwaway project.
     configHome: join(devHome, "config"),
-    // The throwaway git repo the app registers + spawns into.
-    repoPath: join(devHome, "test-repo"),
+    // The throwaway git repo the app registers + spawns into. Its directory name is
+    // the worktree name: session hooks report state under the git toplevel's
+    // basename, so the two must match or the session never leaves `offline`.
+    repoPath: join(devHome, "herdr-test-repo"),
+    // Task DBs for the run. Without an explicit `db_path` a project's DB defaults to
+    // the REAL `~/.keitora/<name>/shared/tasks.db`; this keeps it in the dev home.
+    tasksDir: join(devHome, "tasks"),
   };
+}
+
+/**
+ * The `keitora.toml` written into a throwaway project's root each run. It pins the
+ * task DB to `dbPath` (inside the dev home, not the real `~/.keitora`) and points the
+ * session hooks at this checkout's freshly built CLI (`cliPath`), so the app installs
+ * them instead of finding no `keitora` binary. Worktrees come from the seeded
+ * registry. Pure (returns the TOML text); both paths are forward-slashed TOML
+ * literal strings.
+ */
+export function seedProjectToml(name, dbPath, cliPath) {
+  const fwd = (p) => p.replace(/\\/g, "/");
+  return [
+    "[project]",
+    `name = "${name}"`,
+    "",
+    "[tasks]",
+    `db_path = '${fwd(dbPath)}'`,
+    "",
+    "[cli]",
+    `path = '${fwd(cliPath)}'`,
+    "",
+  ].join("\n");
 }
 
 /**
@@ -468,22 +496,34 @@ function main() {
   // KEITORA_DEV_PROJECTS=N seeds N throwaway projects instead of one, for UI that
   // needs several (e.g. the rail's project groups).
   const projectCount = demoProjectCount();
+  const appBin = join(targetDir(), "debug", `keitora-app${EXE}`);
+  // The session hooks run this CLI, built below next to the app.
+  const cliBin = join(targetDir(), "debug", `keitora${EXE}`);
+  // Each project's task DB lives in the dev home; see `seedProjectToml`.
+  const writeProjectToml = (name, root) =>
+    writeFileSync(
+      join(root, "keitora.toml"),
+      seedProjectToml(name, join(p.tasksDir, name, "tasks.db"), cliBin),
+    );
   let appCwd = p.repoPath;
   if (projectCount > 1) {
     const projects = demoProjects(devHome, projectCount);
-    for (const project of projects) ensureDemoProject(project);
+    for (const project of projects) {
+      ensureDemoProject(project);
+      writeProjectToml(project.name, project.root);
+    }
     appCwd = projects[0].root;
     writeFileSync(join(p.configHome, "keitora", "keitora.toml"), seedDemoRegistryToml(projects));
   } else {
     ensureTestRepo(p.repoPath);
+    writeProjectToml("herdr-test-repo", p.repoPath);
     writeFileSync(join(p.configHome, "keitora", "keitora.toml"), seedRegistryToml(p.repoPath));
   }
 
-  const appBin = join(targetDir(), "debug", `keitora-app${EXE}`);
-
-  // Build the app (tauri dev would do this, but we bypass it for cwd control).
+  // Build the app and the CLI its session hooks call (tauri dev would build the app,
+  // but we bypass it for cwd control).
   try {
-    execFileSync("cargo", ["build", "-p", "keitora"], {
+    execFileSync("cargo", ["build", "-p", "keitora", "-p", "keitora-cli"], {
       stdio: "inherit",
       cwd: repoRoot,
     });
@@ -512,6 +552,7 @@ function main() {
   console.log(`[dev:herdr] KEITORA_CONFIG_HOME ${p.configHome} (fresh; throwaway project only)`);
   console.log(`[dev:herdr] KEITORA_HERDR_BIN   ${herdrBin}`);
   console.log(`[dev:herdr] app cwd             ${appCwd} (throwaway repo)`);
+  console.log(`[dev:herdr] task DBs            ${p.tasksDir}`);
   if (projectCount > 1) console.log(`[dev:herdr] seeded ${projectCount} throwaway projects`);
   console.log("[dev:herdr] ISOLATED: no real project registered, herdr state purged.");
 

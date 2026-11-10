@@ -33,13 +33,15 @@ Use the isolated launcher instead:
 yarn dev:isolated
 ```
 
-It builds the app and runs it against a Vite server on port 1420, with its own herdr server, its own
-state (wiped on every run) and a throwaway git project. It doesn't install agent hooks into your
-real `~/.claude` or `~/.codex`. Its home is `~/.keitora-dev/<checkout>-<hash>-herdr`, keyed per
-checkout so several worktrees can each run one. Set `KEITORA_DEV_HOME` to change the base.
+It builds the app and the CLI and runs the app against a Vite server on port 1420, with its own
+herdr server, its own state (wiped on every run) and a throwaway git project. It doesn't install
+agent hooks into your real `~/.claude` or `~/.codex`. Its home is
+`~/.keitora-dev/<checkout>-<hash>-herdr`, keyed per checkout so several worktrees can each run one.
+Set `KEITORA_DEV_HOME` to change the base.
 
-Two things are still shared with your real setup: the herdr binary, and the task database. A dev
-build can write to your real tasks.
+The throwaway project gets a `keitora.toml` that keeps its task database under the dev home
+(`tasks/`) and points its session hooks at the CLI built from this checkout, so sessions report
+idle and busy as they do for real. The herdr binary is still shared with your real setup.
 
 herdr doesn't honour the isolation environment on every platform; on Windows it can reach your real
 server regardless. The launcher checks for this before starting and refuses to run if it can't
