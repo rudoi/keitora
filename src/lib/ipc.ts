@@ -567,7 +567,7 @@ export interface WorktreeInfo {
    *  no respawn) until launched again. */
   terminated: boolean;
   /** In the project's dispatch pool: may receive dispatched tasks (missing = true). Defaults to true
-   *  except for the project's main checkout. */
+   *  for every worktree, the main checkout included. */
   dispatch?: boolean;
 }
 

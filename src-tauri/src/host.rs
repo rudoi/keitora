@@ -805,7 +805,8 @@ fn set_worktree_diff_base(
 
 /// Put `worktree` of the active project in or out of the dispatch pool (`dispatch =
 /// true|false` on its registry entry). An excluded worktree accepts no drops, is never
-/// auto-picked and is refused by the CLI. Registry-only.
+/// auto-picked and is refused by the CLI. Registry-only. The rail and board refresh at
+/// once, and a worktree just put in the pool sends its front pending card right away.
 #[tauri::command(async)]
 fn set_worktree_dispatch(app: AppHandle, worktree: String, dispatch: bool) -> Result<(), String> {
     let pc = keitora_tasks::resolve_active().map_err(|e| e.to_string())?;
@@ -820,7 +821,14 @@ fn set_worktree_dispatch(app: AppHandle, worktree: String, dispatch: bool) -> Re
             return Err("this project isn't registered, so there is nowhere to save it".into());
         }
     }
+    let _ = app.emit("worktrees://changed", ());
     let _ = app.emit("project://changed", ());
+    if dispatch {
+        tauri::async_runtime::spawn(crate::dispatch::pump_lanes(
+            app.clone(),
+            pc.project.name.clone(),
+        ));
+    }
     Ok(())
 }
 

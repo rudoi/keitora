@@ -679,7 +679,7 @@ export function Rail({
       dispatch: lane.dispatch,
     });
   }, []);
-  // The worktree list refreshes on project://changed, which the command emits.
+  // The worktree list refreshes on worktrees://changed, which the command emits.
   const toggleDispatch = useCallback(
     (m: WorktreeMenuState) => {
       setMenu(null);
