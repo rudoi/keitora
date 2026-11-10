@@ -43,6 +43,12 @@ The throwaway project gets a `keitora.toml` that keeps its task database under t
 (`tasks/`) and points its session hooks at the CLI built from this checkout, so sessions report
 idle and busy as they do for real. The herdr binary is still shared with your real setup.
 
+The dev agents use your real Claude Code config unless you give them a credential that needs no
+login: set `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or `ANTHROPIC_API_KEY` before
+`yarn dev:isolated`. Then the launcher points `CLAUDE_CONFIG_DIR` at `<dev home>/claude` and
+pre-trusts the throwaway repos there, so Claude doesn't stop at "trust this folder?". Without one,
+a new dev repo asks once, and the answer is saved in your real config.
+
 herdr doesn't honour the isolation environment on every platform; on Windows it can reach your real
 server regardless. The launcher checks for this before starting and refuses to run if it can't
 confirm the herdr server is its own. It also only stops a herdr server on exit when that server is

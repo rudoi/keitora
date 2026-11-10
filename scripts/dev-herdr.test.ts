@@ -5,6 +5,7 @@ import { isAbsolute, join, resolve } from "node:path";
 
 import {
   checkSocketPath,
+  claudeDevConfig,
   demoProjectCount,
   demoProjects,
   devHomeFor,
@@ -19,6 +20,7 @@ import {
   seedProjectToml,
   seedRegistryToml,
   sortReleasesNewestFirst,
+  trustedClaudeConfig,
 } from "./dev-herdr.mjs";
 
 describe("devHomeFor", () => {
@@ -88,6 +90,44 @@ describe("seedProjectToml", () => {
     expect(toml).toContain("[cli]\npath = 'D:/repos/proj/target/debug/keitora.exe'");
     // Never the default `~/.keitora/...` DB.
     expect(toml).not.toContain("~");
+  });
+});
+
+describe("claudeDevConfig", () => {
+  it("stays on the real Claude config without a credential that needs no login", () => {
+    expect(claudeDevConfig({}, "/dev/home-herdr")).toBeNull();
+    expect(claudeDevConfig({ CLAUDE_CODE_OAUTH_TOKEN: "" }, "/dev/home-herdr")).toBeNull();
+  });
+
+  it("isolates Claude under the dev home when a token or API key is set", () => {
+    for (const env of [{ CLAUDE_CODE_OAUTH_TOKEN: "x" }, { ANTHROPIC_API_KEY: "x" }]) {
+      const c = claudeDevConfig(env, "/dev/home-herdr");
+      expect(c.configDir.replace(/\\/g, "/")).toBe("/dev/home-herdr/claude");
+      expect(c.configFile.replace(/\\/g, "/")).toBe("/dev/home-herdr/claude/.claude.json");
+      expect(c.env).toEqual({ CLAUDE_CONFIG_DIR: c.configDir });
+    }
+  });
+});
+
+describe("trustedClaudeConfig", () => {
+  it("trusts every repo, native and forward-slashed, and skips onboarding", () => {
+    const cfg = trustedClaudeConfig(null, ["C:\\scratch\\dev\\herdr-test-repo"]);
+    expect(cfg.hasCompletedOnboarding).toBe(true);
+    expect(cfg.projects["C:\\scratch\\dev\\herdr-test-repo"].hasTrustDialogAccepted).toBe(true);
+    expect(cfg.projects["C:/scratch/dev/herdr-test-repo"].hasTrustDialogAccepted).toBe(true);
+  });
+
+  it("keeps whatever Claude itself stored there", () => {
+    const existing = {
+      numStartups: 3,
+      projects: { "/dev/repo": { allowedTools: ["Bash"], hasTrustDialogAccepted: false } },
+    };
+    const cfg = trustedClaudeConfig(existing, ["/dev/repo", "/dev/other"]);
+    expect(cfg.numStartups).toBe(3);
+    expect(cfg.projects["/dev/repo"]).toEqual({ allowedTools: ["Bash"], hasTrustDialogAccepted: true });
+    expect(cfg.projects["/dev/other"].hasTrustDialogAccepted).toBe(true);
+    // Pure: the input is not modified.
+    expect(existing.projects["/dev/repo"].hasTrustDialogAccepted).toBe(false);
   });
 });
 
