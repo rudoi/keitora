@@ -830,6 +830,36 @@ pub(crate) async fn pump_lanes<R: tauri::Runtime>(app: tauri::AppHandle<R>, proj
     }
 }
 
+/// How often [`pump_tick`] re-checks the lanes of every registered project.
+const PUMP_TICK: Duration = Duration::from_secs(10);
+
+/// Run [`pump_lanes`] for every registered project with a card reserved to a lane,
+/// every [`PUMP_TICK`]. The tasks-DB watchers cover session hooks and task writes;
+/// this covers what changes liveness without a DB write (a pane coming up, a herdr
+/// agent leaving a dialog). Cheap when nothing is pending: one indexed read per
+/// project.
+pub(crate) async fn pump_tick<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
+    loop {
+        tokio::time::sleep(PUMP_TICK).await;
+        let Ok(user) = keitora_tasks::UserConfig::load() else {
+            continue;
+        };
+        let projects: Vec<String> = user
+            .projects
+            .values()
+            .filter_map(|pref| keitora_tasks::effective_config(pref).ok())
+            .filter(|pc| {
+                keitora_tasks::LocalStore::open(&pc.tasks.db_path.to_string_lossy())
+                    .is_ok_and(|l| l.has_reserved_tasks())
+            })
+            .map(|pc| pc.project.name)
+            .collect();
+        for project in projects {
+            pump_lanes(app.clone(), project).await;
+        }
+    }
+}
+
 /// Execute `project`'s pending CLI dispatch requests (`keitora task dispatch`),
 /// oldest first, each through [`apply`] in request mode, and record each outcome on
 /// its row. A request with no worktree is auto-picked, and its row is pointed at the

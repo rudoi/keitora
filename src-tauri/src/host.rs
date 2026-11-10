@@ -2219,6 +2219,9 @@ pub fn run() {
             // constructed, `UnavailableBackend` reports why so the app still starts.
             let backend: SharedBackend = select_pty_backend(app.handle().clone());
             backend.start();
+            // Lane auto-send on a slow tick too: a pane coming up or an agent dialog
+            // closing writes nothing to tasks.db, so the DB watchers can't see it.
+            tauri::async_runtime::spawn(crate::dispatch::pump_tick(app.handle().clone()));
             app.manage(backend);
             // Shared sysinfo System for the rail daemon card's 2s stats poll.
             // Per-worktree activity caches (workflow slots, branch cache, UBT engine).

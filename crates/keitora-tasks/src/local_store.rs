@@ -533,8 +533,10 @@ impl LocalStore {
     }
 
     /// Whether any task is pending on a worktree lane (open and reserved to one), i.e.
-    /// whether the app's auto-send has anything to look at. Cheap; `true` when the
-    /// `tasks` table isn't in this DB (another backend), so callers err on looking.
+    /// whether the app's auto-send has anything to look at. Cheap. `false` when the
+    /// `tasks` table isn't in this DB (a GitHub-backed project keeps its tasks
+    /// remotely): the auto-send would cost API calls on every pass, so those lanes
+    /// are sent by a drop or Dispatch only.
     pub fn has_reserved_tasks(&self) -> bool {
         self.conn
             .query_row(
@@ -542,7 +544,7 @@ impl LocalStore {
                 [],
                 |r| r.get::<_, bool>(0),
             )
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     /// Refuse every `pending` request older than `max_age_secs`, so an app that starts
@@ -1304,8 +1306,8 @@ mod tests {
             .execute("INSERT INTO tasks (title, status) VALUES ('a', 'open')", [])
             .is_ok();
         if !has_table {
-            // Another backend's DB: err on looking.
-            assert!(ls.has_reserved_tasks());
+            // Another backend's DB: nothing to auto-send from here.
+            assert!(!ls.has_reserved_tasks());
             return;
         }
         assert!(!ls.has_reserved_tasks());
