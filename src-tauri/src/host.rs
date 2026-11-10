@@ -2351,6 +2351,8 @@ pub fn run() {
             tasks::task_update,
             tasks::task_backlog,
             tasks::task_reopen,
+            tasks::task_add_dep,
+            tasks::task_remove_dep,
             tasks::task_new,
             tasks::task_release,
             tasks::task_delete,

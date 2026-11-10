@@ -104,6 +104,9 @@ enum TaskCmd {
         branch: Option<String>,
         #[arg(long = "pr")]
         pr: Option<String>,
+        /// Replace the tags (comma-separated; "" clears them)
+        #[arg(long = "tags")]
+        tags: Option<String>,
     },
     /// Search tasks by title/description
     Find { term: String },
@@ -225,6 +228,17 @@ async fn print_task_row(backend: &dyn TaskBackend, t: &Task) -> Result<(), Box<d
     Ok(())
 }
 
+/// Split a comma-separated `--tags` value: trimmed, empties and repeats dropped.
+fn parse_tags(raw: &str) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    for t in raw.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        if !tags.iter().any(|x| x == t) {
+            tags.push(t.to_string());
+        }
+    }
+    tags
+}
+
 fn validate(value: &str, allowed: &[&str], label: &str) -> Result<(), Box<dyn Error>> {
     if allowed.contains(&value) {
         Ok(())
@@ -332,14 +346,7 @@ async fn run_task(
             tags,
         } => {
             validate(&priority, &PRIORITIES, "priority")?;
-            let tag_vec: Vec<String> = tags
-                .map(|s| {
-                    s.split(',')
-                        .map(|x| x.trim().to_string())
-                        .filter(|x| !x.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
+            let tag_vec = tags.as_deref().map(parse_tags).unwrap_or_default();
             let task = backend
                 .create(
                     &me,
@@ -511,6 +518,7 @@ async fn run_task(
             status,
             branch,
             pr,
+            tags,
         } => {
             if let Some(p) = &priority {
                 validate(p, &PRIORITIES, "priority")?;
@@ -525,6 +533,7 @@ async fn run_task(
                 status,
                 branch,
                 pr_url: pr,
+                tags: tags.as_deref().map(parse_tags),
             };
             backend.update(id, &me, &upd).await?;
             emit_ok(json, &format!("  Updated task #{id}"))?;
@@ -1271,6 +1280,13 @@ fn emit_task_msg(json: bool, task: &Task, msg: &str) -> Result<(), Box<dyn Error
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_tags_trims_and_drops_empties_and_repeats() {
+        assert_eq!(parse_tags(" ui, backend,,ui ,"), vec!["ui", "backend"]);
+        assert!(parse_tags("").is_empty());
+        assert!(parse_tags(" , ").is_empty());
+    }
 
     // The `config` subcommand wiring is the new surface in this binary; the
     // heavy logic (scaffold defaults, migration) lives in (and is tested by)

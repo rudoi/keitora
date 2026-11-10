@@ -201,6 +201,8 @@ pub struct TaskUpdate {
     pub status: Option<String>,
     pub branch: Option<String>,
     pub pr_url: Option<String>,
+    /// Replaces the task's whole tag set (`Some(vec![])` clears it).
+    pub tags: Option<Vec<String>>,
 }
 
 impl TaskUpdate {
@@ -211,5 +213,6 @@ impl TaskUpdate {
             && self.status.is_none()
             && self.branch.is_none()
             && self.pr_url.is_none()
+            && self.tags.is_none()
     }
 }

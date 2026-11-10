@@ -224,6 +224,20 @@ fn tags_from_labels(labels: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The label edits that turn an issue's current tags into `tags`, as `(adds, removes)`.
+/// Reserved labels are never touched.
+fn tag_label_changes(labels: &[String], tags: &[String]) -> (Vec<String>, Vec<String>) {
+    let current = tags_from_labels(labels);
+    let mut adds: Vec<String> = Vec::new();
+    for t in tags {
+        if !current.contains(t) && !adds.contains(t) {
+            adds.push(t.clone());
+        }
+    }
+    let removes = current.into_iter().filter(|t| !tags.contains(t)).collect();
+    (adds, removes)
+}
+
 // ---------------------------------------------------------------------------
 // GitHubBackend
 // ---------------------------------------------------------------------------
@@ -938,6 +952,17 @@ impl<A: GhApi> TaskBackend for GitHubBackend<A> {
             meta.pr_url = Some(pr.clone());
             changed.push("pr_url");
         }
+        if let Some(tags) = &upd.tags {
+            if let Some(bad) = tags.iter().find(|t| is_reserved_label(t)) {
+                return Err(BackendError::Conflict(format!(
+                    "tag {bad:?} uses a prefix Keitora reserves ({PRIORITY_PREFIX}, {KEITORA_PREFIX})"
+                )));
+            }
+            let (adds, removes) = tag_label_changes(&issue.labels, tags);
+            label_adds.extend(adds);
+            label_removes.extend(removes);
+            changed.push("tags");
+        }
         // `status` updates via the patch are applied through the status column.
         let status_update = upd.status.clone();
 
@@ -1287,6 +1312,31 @@ fn parse_epoch_secs(s: &str) -> Option<i64> {
 // ---------------------------------------------------------------------------
 // Contract suite + Eventual-tier tests (over FakeGitHub).
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn tag_changes_diff_only_user_labels() {
+        let labels = strs(&["priority:high", "keitora:alpha", "ui", "backend"]);
+        let (adds, removes) = tag_label_changes(&labels, &strs(&["backend", "docs", "docs"]));
+        assert_eq!(adds, strs(&["docs"]));
+        assert_eq!(removes, strs(&["ui"]));
+    }
+
+    #[test]
+    fn clearing_tags_removes_every_user_label() {
+        let labels = strs(&["priority:normal", "ui", "backend"]);
+        let (adds, removes) = tag_label_changes(&labels, &[]);
+        assert!(adds.is_empty());
+        assert_eq!(removes, strs(&["ui", "backend"]));
+    }
+}
 
 #[cfg(test)]
 mod contract_tests {
