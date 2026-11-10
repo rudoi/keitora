@@ -501,8 +501,7 @@ pub struct WorktreeEntry {
     /// Registry-only — never written to the committed `[tasks].worktrees` file.
     pub diff_base: Option<DiffBase>,
     /// Whether this worktree is in the project's dispatch pool (may receive board /
-    /// CLI dispatches). `None` ⇒ the default: in the pool, except the project's main
-    /// checkout (the worktree whose path is the project root). See
+    /// CLI dispatches). `None` ⇒ the default: in the pool. See
     /// [`ProjectConfig::in_dispatch_pool`]. Registry-only.
     pub dispatch: Option<bool>,
 }
@@ -650,9 +649,9 @@ impl<'de> Deserialize<'de> for WorktreeEntry {
 }
 
 /// Pure: the dispatch-pool rule for one worktree. An explicit `flag` wins; otherwise
-/// every worktree is in the pool except the project's main checkout.
-pub fn dispatch_pool_default(flag: Option<bool>, is_main_checkout: bool) -> bool {
-    flag.unwrap_or(!is_main_checkout)
+/// every worktree (the main checkout included) is in the pool.
+pub fn dispatch_pool_default(flag: Option<bool>) -> bool {
+    flag.unwrap_or(true)
 }
 
 /// Merge registry-only fields from existing entries by name (hazard I2).
@@ -1314,18 +1313,15 @@ impl ProjectConfig {
 
     /// Whether `worktree_name` is in the dispatch pool: may receive board and CLI
     /// dispatches and be auto-picked. The entry's `dispatch` flag wins; a missing
-    /// flag means `true`, except for the project's main checkout (the worktree whose
-    /// path is the project root), which defaults to `false`. A name with no entry is
-    /// judged by the same default.
+    /// flag means `true` for every worktree, the main checkout included. A name with
+    /// no entry is judged by the same default.
     pub fn in_dispatch_pool(&self, worktree_name: &str) -> bool {
         let flag = self
             .worktree_entries()
             .into_iter()
             .find(|e| e.name == worktree_name)
             .and_then(|e| e.dispatch);
-        let is_main =
-            canonical_key(&self.worktree_path(worktree_name)) == canonical_key(&self.root);
-        dispatch_pool_default(flag, is_main)
+        dispatch_pool_default(flag)
     }
 
     /// The effective worktree names that are in the dispatch pool, in config order.
@@ -2935,35 +2931,39 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_pool_default_excludes_only_the_main_checkout() {
-        assert!(dispatch_pool_default(None, false));
-        assert!(!dispatch_pool_default(None, true));
-        assert!(dispatch_pool_default(Some(true), true));
-        assert!(!dispatch_pool_default(Some(false), false));
+    fn dispatch_pool_default_includes_every_worktree_unless_flagged_off() {
+        assert!(dispatch_pool_default(None));
+        assert!(dispatch_pool_default(Some(true)));
+        assert!(!dispatch_pool_default(Some(false)));
     }
 
     #[test]
-    fn in_dispatch_pool_reads_the_entry_flag_and_defaults_main_out() {
+    fn in_dispatch_pool_reads_the_entry_flag_and_defaults_every_worktree_in() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("acme");
         std::fs::create_dir_all(&root).unwrap();
         let mut pc = ProjectConfig::scaffold(&root);
         let mut off = WorktreeEntry::new("off", tmp.path().join("off"));
         off.dispatch = Some(false);
-        let mut main_on = WorktreeEntry::new("acme", root.clone());
-        main_on.dispatch = None;
         pc.effective_worktrees = Some(vec![
-            main_on,
+            WorktreeEntry::new("acme", root.clone()),
             WorktreeEntry::new("feat", tmp.path().join("feat")),
             off,
         ]);
-        assert!(!pc.in_dispatch_pool("acme"), "main checkout defaults out");
+        assert!(pc.in_dispatch_pool("acme"), "main checkout defaults in");
         assert!(pc.in_dispatch_pool("feat"), "missing flag means in");
+        assert!(
+            pc.in_dispatch_pool("unlisted"),
+            "a name with no entry defaults in"
+        );
         assert!(!pc.in_dispatch_pool("off"));
-        assert_eq!(pc.dispatch_pool(), vec!["feat".to_string()]);
-        // An explicit flag puts the main checkout back in.
-        pc.effective_worktrees.as_mut().unwrap()[0].dispatch = Some(true);
-        assert!(pc.in_dispatch_pool("acme"));
+        assert_eq!(
+            pc.dispatch_pool(),
+            vec!["acme".to_string(), "feat".to_string()]
+        );
+        // An explicit flag takes the main checkout out.
+        pc.effective_worktrees.as_mut().unwrap()[0].dispatch = Some(false);
+        assert!(!pc.in_dispatch_pool("acme"));
     }
 
     #[test]
