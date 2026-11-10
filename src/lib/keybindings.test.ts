@@ -8,6 +8,7 @@ import {
   type KeyCtx,
   matchesKey,
   paneScrollDirection,
+  resolveBinding,
 } from "./keybindings";
 
 // Build a KeyboardEvent-shaped object with sane defaults (no modifiers held).
@@ -334,5 +335,81 @@ describe("isFindChord", () => {
 
   it("is the search.open binding's chord", () => {
     expect(DEFAULT_BINDINGS.find((b) => b.id === "search.open")?.keys).toBe("Cmd+F");
+  });
+});
+
+// ── Text-editing keys stay with the focused field or terminal ─────────────────
+
+describe("project switching", () => {
+  const ctx = () => makeCtx({ projectNames: ["proj", "other-proj"], activeProjectName: "proj" });
+
+  it("is Ctrl+PageUp / Ctrl+PageDown (Cmd on macOS) and works over a focused field", () => {
+    const prev = resolveBinding(ev({ ctrlKey: true, key: "PageUp" }), ctx(), true);
+    const next = resolveBinding(ev({ metaKey: true, key: "PageDown" }), ctx(), true);
+    expect(prev?.id).toBe("project.prev");
+    expect(next?.id).toBe("project.next");
+  });
+
+  it("passes through a focused terminal to the window keymap", () => {
+    expect(isGlobalAppChord(ev({ ctrlKey: true, key: "PageUp" }))).toBe(true);
+    expect(isGlobalAppChord(ev({ ctrlKey: true, key: "PageDown" }))).toBe(true);
+  });
+
+  it("does not take Ctrl+Shift+PageUp or plain PageUp", () => {
+    expect(resolveBinding(ev({ ctrlKey: true, shiftKey: true, key: "PageUp" }), ctx(), true)).toBe(
+      null,
+    );
+    expect(resolveBinding(ev({ key: "PageDown" }), ctx(), true)).toBe(null);
+  });
+
+  it("leaves Ctrl+Left / Ctrl+Right (word jump) to an editable target", () => {
+    for (const key of ["ArrowLeft", "ArrowRight"]) {
+      for (const mod of [{ ctrlKey: true }, { metaKey: true }]) {
+        expect(resolveBinding(ev({ ...mod, key }), ctx(), true)).toBe(null);
+        expect(isGlobalAppChord(ev({ ...mod, key }))).toBe(false);
+      }
+    }
+  });
+});
+
+describe("global chords never take text or terminal editing keys", () => {
+  // Ctrl+<key> on Windows/Linux (Cmd is Ctrl there): word and line movement, deletion,
+  // the clipboard and undo, and the control keys shells use. Ctrl+Up/Down is left out:
+  // it is still the worktree cycle (see the worktree.prev/next bindings).
+  const CTRL_KEYS = [
+    "ArrowLeft",
+    "ArrowRight",
+    "Home",
+    "End",
+    "Backspace",
+    "Delete",
+    ..."acvxzyfdrlwukeh".split(""),
+  ];
+  // Ctrl+Shift+<key>: extend the selection by word or to the line/document edge, redo,
+  // and a Linux terminal's copy/paste.
+  const CTRL_SHIFT_KEYS = ["ArrowLeft", "ArrowRight", "Home", "End", "Z", "C", "V"];
+  const ctx = makeCtx({
+    view: "focus",
+    selected: "alpha",
+    availableWorktrees: ["alpha", "bravo"],
+    projectNames: ["proj", "other-proj"],
+    activeProjectName: "proj",
+  });
+
+  const cases = [
+    ...CTRL_KEYS.flatMap((key) => [
+      { ctrlKey: true, key },
+      { metaKey: true, key },
+    ]),
+    ...CTRL_SHIFT_KEYS.flatMap((key) => [
+      { ctrlKey: true, shiftKey: true, key },
+      { metaKey: true, shiftKey: true, key },
+    ]),
+  ];
+
+  it.each(cases)("%o", (p) => {
+    const e = ev(p);
+    expect(isGlobalAppChord(e)).toBe(false);
+    expect(resolveBinding(e, ctx, true)).toBe(null);
   });
 });

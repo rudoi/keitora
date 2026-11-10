@@ -6,7 +6,7 @@ import { useEffect } from "react";
 import { DEFAULT_BINDINGS, type Keybinding } from "../lib/keybindings";
 import { modKeyLabel } from "../lib/platform";
 
-/** Render a `keys` string ("Cmd+Left") as styled <kbd> chips. */
+/** Render a `keys` string ("Cmd+PageUp") as styled <kbd> chips. */
 function KeyChips({ keys }: { keys: string }) {
   const SYMBOL: Record<string, string> = {
     Cmd: modKeyLabel,
