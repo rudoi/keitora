@@ -351,10 +351,13 @@ export const DEFAULT_BINDINGS: Keybinding[] = [
       ctx.setView("focus");
     },
   })),
-  // Project cycling: Cmd+Left/Right moves between projects (wrapping).
+  // Project cycling: Cmd+PageUp/PageDown moves between projects (wrapping). Not
+  // Cmd+Left/Right: on Windows/Linux Cmd is Ctrl, and this global chord would swallow
+  // word-jump in every text field and terminal (and, on macOS, Cmd+Left/Right is
+  // line start/end in a text field).
   {
     id: "project.prev",
-    keys: "Cmd+Left",
+    keys: "Cmd+PageUp",
     label: "Previous project",
     group: "Global",
     global: true,
@@ -366,7 +369,7 @@ export const DEFAULT_BINDINGS: Keybinding[] = [
   },
   {
     id: "project.next",
-    keys: "Cmd+Right",
+    keys: "Cmd+PageDown",
     label: "Next project",
     group: "Global",
     global: true,
@@ -443,6 +446,29 @@ export function isScrollToLiveKey(e: KeyboardEvent): boolean {
 // ── Hook ─────────────────────────────────────────────────────────────────────
 
 /**
+ * The binding a keydown runs, or null when the key is left alone. The first binding
+ * whose `keys` match and whose `when(ctx)` holds wins. `inEditable` is true when the
+ * target is an INPUT, TEXTAREA or contentEditable (a focused terminal included, since
+ * xterm's input is a <textarea>).
+ */
+export function resolveBinding(
+  e: KeyboardEvent,
+  ctx: KeyCtx,
+  inEditable: boolean,
+): Keybinding | null {
+  for (const binding of DEFAULT_BINDINGS) {
+    if (!matchesKey(e, binding.keys)) continue;
+    // Non-global bindings yield to a focused field or terminal so the user
+    // can type `d`, `?`, search text, etc. Global chords (view switch,
+    // worktree cycle) fire everywhere — including over a focused terminal.
+    if (inEditable && !binding.global) continue;
+    if (!binding.when(ctx)) continue;
+    return binding;
+  }
+  return null;
+}
+
+/**
  * Install a single window keydown listener driven by DEFAULT_BINDINGS. The
  * shared input guard runs first; then the first binding whose `keys` match and
  * whose `when(ctx)` is true wins (preventDefault + run, stop).
@@ -465,17 +491,10 @@ export function useKeybindings(ctx: KeyCtx): void {
       // is left alone: a focused pane's own handler opens the terminal search.
       if (isFindChord(e)) e.preventDefault();
 
-      for (const binding of DEFAULT_BINDINGS) {
-        if (!matchesKey(e, binding.keys)) continue;
-        // Non-global bindings yield to a focused field or terminal so the user
-        // can type `d`, `?`, search text, etc. Global chords (view switch,
-        // worktree cycle) fire everywhere — including over a focused terminal
-        // (xterm's input is a <textarea>, which would otherwise trip the guard).
-        if (inEditable && !binding.global) continue;
-        if (!binding.when(cur)) continue;
+      const binding = resolveBinding(e, cur, inEditable);
+      if (binding) {
         e.preventDefault();
         binding.run(cur);
-        break;
       }
     };
     window.addEventListener("keydown", handler);

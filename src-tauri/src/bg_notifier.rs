@@ -29,7 +29,6 @@ use std::{
 };
 
 use tauri::{AppHandle, Runtime};
-use tauri_plugin_notification::NotificationExt;
 
 // ── Live watcher registry (idempotent restart) ──────────────────────────────────
 
@@ -288,12 +287,15 @@ fn spawn_project_watcher<R: Runtime + 'static>(
                             })
                             .unwrap_or_else(|| "needs attention".to_string());
 
-                        let _ = app
-                            .notification()
-                            .builder()
-                            .title(format!("Keitora \u{2014} {project_name}/{wt}"))
-                            .body(task_title)
-                            .show();
+                        crate::session_toast::show_session_toast(
+                            &app,
+                            format!("Keitora \u{2014} {project_name}/{wt}"),
+                            task_title,
+                            crate::session_toast::ToastTarget {
+                                project: resolved_name.clone(),
+                                worktree: wt.clone(),
+                            },
+                        );
                     }
                 }
 

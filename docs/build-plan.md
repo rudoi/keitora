@@ -466,7 +466,9 @@ Status: **Phase 0 ✅ done** · **Phase 1 ✅ done (PR #1)** · **Phase 2 ✅ do
   by a tab strip, since superseded by the rail's project groups; both are fed by a shared `useProjectList()` so
   the visible group order and the keymap cycle order share one fetch (no race/divergence). Platform-aware
   modifier label (Ctrl on Win/Linux, ⌘ on macOS). Accepted trade-off: global cycle chords shadow
-  terminal word/line nav (Ctrl+←/→) — revisit if it bites. No backend changes.
+  terminal word/line nav (Ctrl+←/→) — revisit if it bites. No backend changes. (It bit: project
+  cycling later moved to **Cmd/Ctrl+PageUp/PageDown**, so Ctrl+←/→ word-jumps again in text fields and
+  terminals.)
 - **#0004 — Task board scoped to the active project. ✅ done (PR #99).** Follow-up bug from #0001's
   purely-visual switching: terminals/worktrees flipped instantly but the task board lagged or showed another
   project's cards, because task data was global and unscoped — a slow/late `tasks_list` response from a

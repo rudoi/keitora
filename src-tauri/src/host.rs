@@ -2292,6 +2292,7 @@ pub fn run() {
             crate::latency_probe::latency_probe_enabled,
             save_clipboard_image,
             crate::terminal_links::open_terminal_file,
+            crate::session_toast::notify_session,
             pty_resize,
             pty_scroll,
             pty_scroll_offset,
