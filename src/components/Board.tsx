@@ -1,7 +1,12 @@
-// The task board: assignment lanes (Unassigned | per-worktree | Done).
-// A wrapping LaneLayout (full-height Unassigned left, worktree lanes
-// flowing into rows, Done trailing + collapsible) inside a DndContext for
-// drag-to-dispatch. Dispatch/release run through the shared useDispatchActions hook.
+// The task board: assignment lanes (Open | per-worktree | Done).
+// A wrapping LaneLayout (full-height Open left, worktree lanes flowing into rows,
+// Done trailing + collapsible) inside a DndContext for drag-to-dispatch.
+//
+// Each worktree lane is that worktree's queue. A drop on a pool lane assigns the
+// card at once (it shows pending there with why); the backend sends a lane's front
+// pending card when the lane is free, and keeps doing so on its own as sessions go
+// idle. Every outcome — sent, pending, refused, failed — is toasted; nothing snaps
+// back silently. Dispatch/release run through the shared useDispatchActions hook.
 
 import {
   DndContext,
@@ -15,59 +20,50 @@ import {
 } from "@dnd-kit/core";
 import { Plus } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { Reservation } from "../lib/dispatch";
+import { cardStates, sentIds } from "../lib/cardState";
+import type { DispatchFailure, Reservation } from "../lib/dispatch";
 import type { WorktreeSession } from "../lib/sessions";
-import { newTask, type TaskWithDeps } from "../lib/tasks";
+import { backlogTask, errorMessage, newTask, reopenTask, type TaskWithDeps } from "../lib/tasks";
 import { useDispatchActions } from "../lib/useDispatchActions";
-import { decideLane, useDispatchTargets } from "../lib/useDispatchTargets";
+import { judgeLane, type LaneContext, useDispatchTargets } from "../lib/useDispatchTargets";
 import { useLocalStorageState } from "../lib/useLocalStorageState";
+import type { CardEnv } from "./board/cardHelpers";
 import { LaneLayout } from "./board/LaneLayout";
 import { useBoardLanes } from "./board/useBoardLanes";
 import { TaskFormDialog } from "./TaskFormDialog";
 import { useToast } from "./Toast";
 
-const PRIORITY_RANK: Record<TaskWithDeps["priority"], number> = {
-  urgent: 0,
-  high: 1,
-  normal: 2,
-  low: 3,
-};
-
-/** Per worktree, the id of the *front* reserved (open+assigned) card — highest
- *  priority, then lowest id. Only that card flips to a live `Dispatch ↵` when its
- *  worktree is idle; the rest stay `queued`. */
-function frontReservedByWorktree(lanes: ReturnType<typeof useBoardLanes>): Map<string, number> {
-  const out = new Map<string, number>();
-  for (const lane of lanes) {
-    if (lane.kind !== "worktree") continue;
-    const reserved = lane.tasks.filter((t) => t.status === "open" && t.assigned_to === lane.key);
-    if (reserved.length === 0) continue;
-    const front = reserved.reduce((best, t) => {
-      const r = PRIORITY_RANK[t.priority] - PRIORITY_RANK[best.priority];
-      if (r < 0) return t;
-      if (r === 0 && t.id < best.id) return t;
-      return best;
-    });
-    out.set(lane.key, front.id);
-  }
-  return out;
+/** Pure: failures in `now` not in `seen` (keyed by task, lane and time), so the
+ *  board toasts each failed send once — including the auto-send's. */
+export function newFailures(seen: Set<string>, now: DispatchFailure[]): DispatchFailure[] {
+  return now.filter((f) => !seen.has(`${f.task_id}:${f.worktree}:${f.at}`));
 }
 
 // ── Board ─────────────────────────────────────────────────────────────────────
 
 export function Board({
   tasks,
+  backlog,
+  failures,
   worktreeNames,
+  pool,
   sessions,
   actor,
   selectedId,
   onSelect,
   reload,
   registerOpenCardMenu,
+  registerToggleBacklog,
   dispatched,
 }: {
   tasks: TaskWithDeps[];
+  /** Backlog tasks (the Open lane shows them when its backlog toggle is on). */
+  backlog: TaskWithDeps[];
+  /** Standing failed sends, from the snapshot. */
+  failures: DispatchFailure[];
   worktreeNames: string[];
+  /** Worktrees in the dispatch pool (may receive tasks). */
+  pool: string[];
   sessions: Map<string, WorktreeSession>;
   actor: string | null;
   selectedId: number | null;
@@ -76,7 +72,10 @@ export function Board({
   /** Hand App a stable callback that toggles the DispatchMenu for the selected
    *  card. The keymap's `board.dispatch` binding calls it. */
   registerOpenCardMenu?: (fn: () => void) => void;
-  /** Reservations already injected — cards in this set show `sent ✓`. */
+  /** Hand App a stable callback that backlogs / reopens the selected card
+   *  (`board.backlog`). */
+  registerToggleBacklog?: (fn: () => void) => void;
+  /** Reservations already sent — cards in this set show `sent ✓`. */
   dispatched: Reservation[];
 }) {
   const [err, setErr] = useState<string | null>(null);
@@ -87,56 +86,109 @@ export function Board({
   const [flyIn, setFlyIn] = useState<{ id: number; worktree: string } | null>(null);
   // Show-done toggle: persisted in localStorage (guarded helper); default OFF.
   const [showDone, setShowDone] = useLocalStorageState("keitora.board.showDone", false);
+  // The Open lane's backlog toggle, persisted the same way; default OFF.
+  const [showBacklog, setShowBacklog] = useLocalStorageState("keitora.board.showBacklog", false);
   const { showToast } = useToast();
 
-  // Derive lanes via the extracted pure hook.
-  const boardLanes = useBoardLanes(tasks, worktreeNames, sessions);
-  const frontReserved = useMemo(() => frontReservedByWorktree(boardLanes), [boardLanes]);
-  const byId = useMemo(() => new Map(tasks.map((t) => [t.id, t])), [tasks]);
-
-  // Stable lookup: "taskId:worktree" → already dispatched.
-  const dispatchedSet = useMemo(
-    () => new Set(dispatched.map((r) => `${r.task_id}:${r.worktree}`)),
-    [dispatched],
+  const allTasks = useMemo(
+    () => (showBacklog ? [...tasks, ...backlog] : tasks),
+    [tasks, backlog, showBacklog],
+  );
+  const boardLanes = useBoardLanes(allTasks, worktreeNames, sessions, showBacklog);
+  const byId = useMemo(
+    () => new Map([...tasks, ...backlog].map((t) => [t.id, t])),
+    [tasks, backlog],
+  );
+  const poolSet = useMemo(() => new Set(pool), [pool]);
+  const states = useMemo(
+    () => cardStates(tasks, backlog, worktreeNames, sessions, dispatched, failures, poolSet),
+    [tasks, backlog, worktreeNames, sessions, dispatched, failures, poolSet],
+  );
+  const laneCtx = useMemo<LaneContext>(
+    () => ({ sessions, tasks, sent: sentIds(dispatched) }),
+    [sessions, tasks, dispatched],
   );
 
-  // Lanes for useDispatchTargets: { key, isWorktree }
+  // Lanes for the drop rules: { key, isWorktree, inPool }.
   const lanesForTargets = useMemo(
-    () => boardLanes.map((l) => ({ key: l.key, isWorktree: l.kind === "worktree" })),
-    [boardLanes],
+    () =>
+      boardLanes.map((l) => ({
+        key: l.key,
+        isWorktree: l.kind === "worktree",
+        inPool: l.kind === "worktree" ? poolSet.has(l.key) : undefined,
+      })),
+    [boardLanes, poolSet],
   );
 
   const draggedCard = activeId !== null ? (byId.get(activeId) ?? null) : null;
-  const decisions = useDispatchTargets(draggedCard, lanesForTargets, sessions);
+  const decisions = useDispatchTargets(draggedCard, lanesForTargets, laneCtx);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor),
   );
 
-  // Run a mutation, surface any store error, then refetch immediately (the
-  // tasks://changed watcher will also fire, but this keeps the UI snappy).
+  // Run a mutation, surface any store error (inline + toast), then refetch
+  // immediately (the tasks://changed watcher will also fire, but this keeps the UI
+  // snappy).
   const act = useCallback(
     (fn: () => Promise<unknown>) => {
       setErr(null);
       void fn()
         .then(() => reload())
-        .catch((e) => setErr(String(e)));
+        .catch((e) => {
+          setErr(errorMessage(e));
+          showToast(errorMessage(e));
+        });
     },
-    [reload],
+    [reload, showToast],
   );
 
-  // Apply a dispatch / release via the shared hook. The backend decides
-  // inject-vs-queue; the fly-in animates the fresh-inject happy path inline and
-  // a toast covers the deferred (queued) case.
-  const { runDispatch: dispatchTask, runRelease } = useDispatchActions(reload, showToast, setErr);
+  const {
+    runDispatch: dispatchTask,
+    runAutoDispatch: autoDispatchTask,
+    runRelease,
+  } = useDispatchActions(reload, showToast, setErr);
   const runDispatch = useCallback(
     (worktree: string, taskId: number) => {
-      setErr(null);
       dispatchTask(worktree, taskId, (wt) => setFlyIn({ id: taskId, worktree: wt }));
     },
     [dispatchTask],
   );
+  const runAutoDispatch = useCallback(
+    (taskId: number) => {
+      autoDispatchTask(taskId, (wt) => setFlyIn({ id: taskId, worktree: wt }));
+    },
+    [autoDispatchTask],
+  );
+  const runBacklog = useCallback(
+    (taskId: number) => {
+      act(() => backlogTask(taskId).then(() => showToast(`Moved #${taskId} to the backlog`)));
+    },
+    [act, showToast],
+  );
+  const runReopen = useCallback(
+    (taskId: number) => {
+      act(() => reopenTask(taskId).then(() => showToast(`Reopened #${taskId}`)));
+    },
+    [act, showToast],
+  );
+
+  // Toast each failed send once, including those the backend's auto-send hit while
+  // nobody was dragging. Failures already standing when the board mounts are shown on
+  // their cards, not toasted again.
+  const seenFailures = useRef<Set<string> | null>(null);
+  useEffect(() => {
+    const key = (f: DispatchFailure) => `${f.task_id}:${f.worktree}:${f.at}`;
+    if (seenFailures.current === null) {
+      seenFailures.current = new Set(failures.map(key));
+      return;
+    }
+    for (const f of newFailures(seenFailures.current, failures)) {
+      seenFailures.current.add(key(f));
+      showToast(`Send failed: #${f.task_id} → @${f.worktree} — ${f.reason}`);
+    }
+  }, [failures, showToast]);
 
   // Clear the inline fly-in once the worktree's own Claude claims the task (it
   // flips open → active), or after a short window if it never does.
@@ -151,19 +203,31 @@ export function Board({
     return () => clearTimeout(timer);
   }, [flyIn, byId]);
 
-  // Toggle the "Dispatch to…" menu for the selected card (keyboard-first path,
-  // bound to `d` in the central keymap). The callback is stable across renders —
-  // it reads the live selection from a ref — so App can hold onto one reference.
+  // Keyboard paths for the selected card. The callbacks are stable across renders —
+  // they read the live selection from refs — so App can hold onto one reference.
   const selectedIdRef = useRef(selectedId);
   selectedIdRef.current = selectedId;
+  const byIdRef = useRef(byId);
+  byIdRef.current = byId;
   const openCardMenu = useCallback(() => {
     const id = selectedIdRef.current;
     if (id === null) return;
     setMenuTaskId((cur) => (cur === id ? null : id));
   }, []);
+  const toggleBacklog = useCallback(() => {
+    const id = selectedIdRef.current;
+    if (id === null) return;
+    const card = byIdRef.current.get(id);
+    if (!card || card.status === "done" || card.status === "cancelled") return;
+    if (card.status === "backlog") runReopen(id);
+    else runBacklog(id);
+  }, [runBacklog, runReopen]);
   useEffect(() => {
     registerOpenCardMenu?.(openCardMenu);
   }, [registerOpenCardMenu, openCardMenu]);
+  useEffect(() => {
+    registerToggleBacklog?.(toggleBacklog);
+  }, [registerToggleBacklog, toggleBacklog]);
 
   const handleDragStart = (e: DragStartEvent) => {
     setActiveId(Number(e.active.id));
@@ -173,40 +237,54 @@ export function Board({
     const id = Number(e.active.id);
     setActiveId(null);
     const overKey = e.over ? String(e.over.id) : null;
-    if (overKey === null) return;
+    if (overKey === null) return; // dropped outside every lane: a plain cancel
     const card = byId.get(id);
     if (!card) return;
     const lane = lanesForTargets.find((l) => l.key === overKey);
     if (!lane) return;
-    const decision = decideLane(card, lane, sessions);
+    const { decision, reason } = judgeLane(card, lane, laneCtx);
     if (decision === "dispatch" || decision === "queue") {
       runDispatch(overKey, id);
     } else if (decision === "release") {
       runRelease(id);
+    } else if (reason) {
+      // A refused drop says why instead of silently snapping back.
+      showToast(`Can't drop #${id} on ${lane.isWorktree ? `@${lane.key}` : lane.key}: ${reason}`);
     }
-    // invalid → ignored; the card snaps back.
   };
 
-  // The lane layout is identical on both surfaces; only the drag wrapper differs.
+  const env: CardEnv = {
+    states,
+    pool: poolSet,
+    laneCtx,
+    sessions,
+    actor,
+    selectedId,
+    worktreeNames,
+    flyIn,
+    menuTaskId,
+    onMenuOpenChange: (taskId, open) => setMenuTaskId(open ? taskId : null),
+    onSelect,
+    onAction: act,
+    onDispatch: runDispatch,
+    onAutoDispatch: runAutoDispatch,
+    onRelease: runRelease,
+    onBacklog: runBacklog,
+    onReopen: runReopen,
+  };
+
   const board = (
     <LaneLayout
       lanes={boardLanes}
       decisions={decisions}
       dragging={activeId !== null}
-      flyIn={flyIn}
-      sessions={sessions}
-      actor={actor}
-      selectedId={selectedId}
-      worktreeNames={worktreeNames}
-      dispatchedSet={dispatchedSet}
-      frontReserved={frontReserved}
-      menuTaskId={menuTaskId}
-      onMenuOpenChange={(taskId, open) => setMenuTaskId(open ? taskId : null)}
-      onSelect={onSelect}
-      onAction={act}
-      onDispatch={runDispatch}
-      onRelease={runRelease}
+      env={env}
       showDone={showDone}
+      backlog={{
+        shown: showBacklog,
+        count: backlog.length,
+        onToggle: () => setShowBacklog(!showBacklog),
+      }}
     />
   );
 

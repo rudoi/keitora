@@ -76,8 +76,11 @@ enum TaskCmd {
     Done { id: i64 },
     /// Mark a task cancelled
     Cancel { id: i64 },
-    /// Punt a task to the backlog
+    /// Punt a task to the backlog (hidden from the board and from dispatch)
     Backlog { id: i64 },
+    /// Bring a backlog task back to open
+    #[command(visible_alias = "unbacklog")]
+    Reopen { id: i64 },
     /// Update task fields
     Update {
         id: i64,
@@ -110,14 +113,17 @@ enum TaskCmd {
     /// Permanently delete a task.
     #[command(visible_alias = "rm")]
     Delete { id: i64 },
-    /// Ask the running Keitora app to send a task to a worktree's idle session now, as
-    /// a board drag would. A busy, waiting or offline session is refused (queue work on
-    /// the board instead). Needs the app running, with this project registered in it.
+    /// Ask the running Keitora app to dispatch a task, as a board drop would: the task
+    /// is assigned to the worktree's lane at once and sent when that session is idle
+    /// and the card is at the front of the lane (until then it is pending there).
+    /// Without --worktree the app picks one from the dispatch pool: an idle session
+    /// first, else the shortest queue. Needs the app running, with this project
+    /// registered in it.
     Dispatch {
         id: i64,
-        /// The worktree to dispatch onto
+        /// The worktree to dispatch onto (default: auto-pick from the dispatch pool)
         #[arg(long)]
-        worktree: String,
+        worktree: Option<String>,
         /// Wait up to this many seconds for the app's outcome (0: don't wait)
         #[arg(long, default_value_t = 0)]
         wait: u64,
@@ -459,6 +465,23 @@ async fn run_task(
             backend.backlog(id, &me).await?;
             emit_ok(json, &format!("  Moved task #{id} to backlog"))?;
         }
+        TaskCmd::Reopen { id } => {
+            let twd = backend
+                .get(id)
+                .await?
+                .ok_or_else(|| format!("task #{id} not found"))?;
+            if twd.task.status != "backlog" {
+                return Err(
+                    format!("task #{id} is {}, not in the backlog", twd.task.status).into(),
+                );
+            }
+            let upd = TaskUpdate {
+                status: Some("open".to_string()),
+                ..TaskUpdate::default()
+            };
+            backend.update(id, &me, &upd).await?;
+            emit_ok(json, &format!("  Reopened task #{id} from the backlog"))?;
+        }
 
         TaskCmd::Update {
             id,
@@ -633,7 +656,7 @@ async fn run_task(
                 config,
                 &me,
                 id,
-                &worktree,
+                worktree.as_deref(),
                 wait,
                 until_claimed,
                 json,
@@ -667,9 +690,11 @@ const DISPATCH_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis
 /// `keitora task dispatch`: write a dispatch request into the project's `tasks.db`
 /// for the running app to execute through its own dispatch path (the CLI never types
 /// into a pane itself, so it can't race the app's writer). The request is a
-/// short-lived "send it now" message, not a queue entry: the app sends the task to an
-/// idle session or refuses it. Checks what it can up front (the project is registered
-/// with the app, the worktree name, the task), then optionally waits for the outcome.
+/// short-lived message, not a queue entry: the app assigns the task to the lane (the
+/// lane is the queue) and sends it if the lane is free, or refuses it. `worktree:
+/// None` asks the app to auto-pick from the dispatch pool. Checks what it can up front
+/// (the project is registered with the app, the worktree name and pool, the task),
+/// then optionally waits for the outcome.
 #[allow(clippy::too_many_arguments)]
 async fn cmd_task_dispatch(
     backend: &dyn TaskBackend,
@@ -677,7 +702,7 @@ async fn cmd_task_dispatch(
     config: &Config,
     me: &str,
     id: i64,
-    worktree: &str,
+    worktree: Option<&str>,
     wait: u64,
     until_claimed: bool,
     json: bool,
@@ -692,22 +717,41 @@ async fn cmd_task_dispatch(
     if registry.project_ref_by_root(root).is_none() {
         return Err(unregistered_message(root).into());
     }
-    if !config.worktrees.is_empty() && !config.worktrees.iter().any(|w| w == worktree) {
-        return Err(format!(
-            "unknown worktree \"{worktree}\" — must be one of: {}",
-            config.worktrees.join(", ")
-        )
-        .into());
+    if let Some(worktree) = worktree {
+        if !config.worktrees.is_empty() && !config.worktrees.iter().any(|w| w == worktree) {
+            return Err(format!(
+                "unknown worktree \"{worktree}\" — must be one of: {}",
+                config.worktrees.join(", ")
+            )
+            .into());
+        }
+        if !config.project_config().in_dispatch_pool(worktree) {
+            return Err(pool_refusal_message(worktree).into());
+        }
+    } else if config.project_config().dispatch_pool().is_empty() {
+        return Err(
+            "no worktree is in the dispatch pool; add one in the app's worktree menu \
+             (or pass --worktree)"
+                .into(),
+        );
     }
     let twd = backend
         .get(id)
         .await?
         .ok_or_else(|| format!("task #{id} not found"))?;
-    if let Some(reason) = keitora_tasks::dispatch::task_refusal(&twd, worktree) {
+    // Task-side checks; an auto-pick judges them against no particular lane.
+    let target = worktree.unwrap_or("");
+    let check = if worktree.is_none() && twd.task.status == "open" {
+        // An auto-pick of a card pending on a pool lane retries it there.
+        twd.task.assigned_to.clone().unwrap_or_default()
+    } else {
+        target.to_string()
+    };
+    if let Some(reason) = keitora_tasks::dispatch::task_refusal(&twd, &check) {
         return Err(reason.into());
     }
 
-    let mut req = local.dispatch_request_add(id, worktree, me)?;
+    let mut req = local.dispatch_request_add(id, target, me)?;
     // One budget for the whole wait: the app's outcome, then (with --until-claimed)
     // the agent's claim.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
@@ -729,14 +773,21 @@ async fn cmd_task_dispatch(
         }
     }
 
-    // `applied` means the prompt was typed; --until-claimed waits on until the agent
-    // in that worktree has actually taken the task.
+    // `applied` means the task is on the lane: sent, or pending there until the lane
+    // frees up. --until-claimed waits on until the agent in that worktree has taken it.
+    let worktree = req.worktree.clone();
+    let sent = req.status == "applied"
+        && backend
+            .dispatched_reservations()
+            .await?
+            .iter()
+            .any(|r| r.task_id == id && r.worktree == worktree);
     let mut claim = None;
     if until_claimed && req.status == "applied" {
         let mut progress = ClaimProgress::Waiting;
         loop {
             if let Some(twd) = backend.get(id).await? {
-                progress = claim_progress(&twd.task, worktree);
+                progress = claim_progress(&twd.task, &worktree);
             }
             if progress != ClaimProgress::Waiting || std::time::Instant::now() >= deadline {
                 break;
@@ -746,36 +797,52 @@ async fn cmd_task_dispatch(
         claim = Some(progress);
     }
 
+    let shown = if worktree.is_empty() {
+        "(auto)".to_string()
+    } else {
+        worktree.clone()
+    };
     if json {
         let mut v = serde_json::to_value(&req)?;
-        if let (Some(p), Some(obj)) = (&claim, v.as_object_mut()) {
-            obj.insert("claimed".into(), json!(*p == ClaimProgress::Claimed));
+        if let Some(obj) = v.as_object_mut() {
+            if req.status == "applied" {
+                obj.insert("sent".into(), json!(sent));
+            }
+            if let Some(p) = &claim {
+                obj.insert("claimed".into(), json!(*p == ClaimProgress::Claimed));
+            }
         }
         println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
-        println!("{}", dispatch_request_message(&req, wait > 0));
+        println!("{}", dispatch_request_message(&req, wait > 0, sent));
         if claim == Some(ClaimProgress::Claimed) {
             println!("  Claimed by @{worktree}");
         }
     }
     match req.status.as_str() {
-        "refused" => {
-            Err(format!("dispatch of #{id} to @{worktree} refused: {}", req.reason).into())
-        }
+        "refused" => Err(format!("dispatch of #{id} to @{shown} refused: {}", req.reason).into()),
         "running" => {
-            Err(format!("dispatch of #{id} to @{worktree} still running after {wait}s").into())
+            Err(format!("dispatch of #{id} to @{shown} still running after {wait}s").into())
         }
         _ => match claim {
             Some(ClaimProgress::Waiting) => Err(format!(
-                "dispatch of #{id} to @{worktree} applied, but not claimed within {wait}s"
+                "dispatch of #{id} to @{shown} applied, but not claimed within {wait}s"
             )
             .into()),
             Some(ClaimProgress::Lost(why)) => {
-                Err(format!("dispatch of #{id} to @{worktree} applied, but {why}").into())
+                Err(format!("dispatch of #{id} to @{shown} applied, but {why}").into())
             }
             _ => Ok(()),
         },
     }
+}
+
+/// The refusal for a worktree outside the dispatch pool (mirrors the app's).
+fn pool_refusal_message(worktree: &str) -> String {
+    format!(
+        "@{worktree} is not in the dispatch pool, so it takes no tasks; add it from its \
+         worktree menu in the app"
+    )
 }
 
 /// Where a dispatched task stands, for `--until-claimed`.
@@ -814,16 +881,24 @@ fn unregistered_message(root: &std::path::Path) -> String {
 }
 
 /// The human-readable line for a dispatch request's current state. `waited` is
-/// whether the caller waited for the outcome (a bare `pending` is expected otherwise).
-fn dispatch_request_message(req: &DispatchRequest, waited: bool) -> String {
-    let (id, wt) = (req.task_id, &req.worktree);
+/// whether the caller waited for the outcome (a bare `pending` is expected otherwise);
+/// `sent` is whether an applied request's prompt reached the session (else the task
+/// is pending on the lane, and the reason says why).
+fn dispatch_request_message(req: &DispatchRequest, waited: bool, sent: bool) -> String {
+    let id = req.task_id;
+    let wt = if req.worktree.is_empty() {
+        "(auto-pick)"
+    } else {
+        &req.worktree
+    };
     let suffix = if req.reason.is_empty() {
         String::new()
     } else {
         format!(" ({})", req.reason)
     };
     match req.status.as_str() {
-        "applied" => format!("  Dispatched #{id} to @{wt}{suffix}"),
+        "applied" if sent => format!("  Dispatched #{id} to @{wt}{suffix}"),
+        "applied" => format!("  Assigned #{id} to @{wt}{suffix}"),
         "refused" => format!("  Refused #{id} → @{wt}{suffix}"),
         "pending" if !waited => format!(
             "  Requested dispatch of #{id} to @{wt} (request {}); the running Keitora app applies it",
@@ -1245,8 +1320,8 @@ mod tests {
                 until_claimed,
             }) => {
                 assert_eq!(
-                    (id, worktree.as_str(), wait, until_claimed),
-                    (7, "alpha", 0, false)
+                    (id, worktree.as_deref(), wait, until_claimed),
+                    (7, Some("alpha"), 0, false)
                 );
             }
             _ => panic!("expected `task dispatch`"),
@@ -1279,8 +1354,27 @@ mod tests {
             "--queue"
         ])
         .is_err());
-        // The worktree is required.
-        assert!(Cli::try_parse_from(["keitora", "task", "dispatch", "7"]).is_err());
+        // No worktree: the app auto-picks one from the pool.
+        match Cli::try_parse_from(["keitora", "task", "dispatch", "7"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Task(TaskCmd::Dispatch { worktree, .. }) => assert_eq!(worktree, None),
+            _ => panic!("expected `task dispatch`"),
+        }
+        // Backlog in and out.
+        assert!(matches!(
+            Cli::try_parse_from(["keitora", "task", "reopen", "7"])
+                .unwrap()
+                .cmd,
+            Cmd::Task(TaskCmd::Reopen { id: 7 })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["keitora", "task", "unbacklog", "7"])
+                .unwrap()
+                .cmd,
+            Cmd::Task(TaskCmd::Reopen { id: 7 })
+        ));
 
         match Cli::try_parse_from(["keitora", "task", "watch"])
             .unwrap()
@@ -1472,22 +1566,30 @@ mod tests {
     #[test]
     fn dispatch_request_messages() {
         let mut r = request(3, "alpha", "pending");
-        assert!(dispatch_request_message(&r, false).contains("Requested dispatch of #5 to @alpha"));
+        assert!(dispatch_request_message(&r, false, false)
+            .contains("Requested dispatch of #5 to @alpha"));
         assert_eq!(
-            dispatch_request_message(&r, true),
+            dispatch_request_message(&r, true, false),
             "  Request 3 for #5 → @alpha is pending"
         );
         r.status = "applied".into();
         assert_eq!(
-            dispatch_request_message(&r, true),
+            dispatch_request_message(&r, true, true),
             "  Dispatched #5 to @alpha"
         );
-        r.status = "refused".into();
-        r.reason = "@alpha is busy".into();
+        r.reason = "pending: @alpha is busy".into();
         assert_eq!(
-            dispatch_request_message(&r, true),
-            "  Refused #5 → @alpha (@alpha is busy)"
+            dispatch_request_message(&r, true, false),
+            "  Assigned #5 to @alpha (pending: @alpha is busy)"
         );
+        r.status = "refused".into();
+        r.reason = "@alpha is not in the dispatch pool".into();
+        assert_eq!(
+            dispatch_request_message(&r, true, false),
+            "  Refused #5 → @alpha (@alpha is not in the dispatch pool)"
+        );
+        let auto = request(4, "", "pending");
+        assert!(dispatch_request_message(&auto, false, false).contains("@(auto-pick)"));
     }
 
     #[test]

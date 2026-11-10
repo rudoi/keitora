@@ -35,10 +35,10 @@ pub use backend::{
 };
 pub use config::{
     cached_login_path, classify_worktree, config_path, current_worktree, discover_claude,
-    discover_cli, discover_cli_cached, effective_config, git_toplevel, herdr_bin_candidates,
-    herdr_on_path, herdr_release_paths, herdr_well_known_paths, is_executable_file,
-    is_safe_claude_session_id, keitora_on_path, login_path, resolve, resolve_active,
-    resolve_autonomy, resolve_claude_path, resolve_cli, resolve_keitora_path,
+    discover_cli, discover_cli_cached, dispatch_pool_default, effective_config, git_toplevel,
+    herdr_bin_candidates, herdr_on_path, herdr_release_paths, herdr_well_known_paths,
+    is_executable_file, is_safe_claude_session_id, keitora_on_path, login_path, resolve,
+    resolve_active, resolve_autonomy, resolve_claude_path, resolve_cli, resolve_keitora_path,
     resolve_provider_path, resolve_skip_permissions, short_path, stamp_from_registry,
     strip_extended_prefix_str, CliConfig, CliKind, Config, DiffBase, DispatchConfig, FieldIntent,
     HerdrPtyConfig, ProjectConfig, ProjectMeta, ProjectRef, ProjectSettingsPatch, ProviderConfig,

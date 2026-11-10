@@ -1,28 +1,37 @@
-//! Manual board dispatch: a state-aware apply reserves the task always but
-//! injects only into an idle worktree with a live PTY (`dispatch_apply`). The
-//! human stays in the loop — Keitora only performs the mechanical injection, and
-//! only into idle sessions.
+//! Board dispatch: assign a task to a worktree lane at once, and send (type) the
+//! front pending card of a lane into its session only when the lane is free: the
+//! session is live and idle, nothing on the lane is active, and no sent card is still
+//! waiting for its claim (`keitora_tasks::dispatch::lane_hold`). The board's
+//! worktree lanes are the queue: a card assigned to a lane that isn't free stays
+//! *pending* there and is sent automatically when it reaches the front and the lane
+//! frees up (`pump_lanes`, run from the tasks-DB watchers).
 //!
-//! The same apply also serves CLI dispatch requests (`keitora task dispatch`), which
-//! arrive as `dispatch_requests` rows in a registered project's `tasks.db` and are
-//! executed by `run_dispatch_requests` when a tasks-DB watcher sees one. Going
-//! through this one path keeps the gate, the reserve, the inject and the audit log
-//! shared, so a CLI dispatch can't race a board dispatch. A request is stricter than
-//! a drag: only an idle session takes it, and one that sends nothing leaves nothing
-//! reserved (the board, not the request table, is the queue).
+//! One apply serves the board (`dispatch_apply`, and `dispatch_auto` for one-click
+//! Dispatch) and CLI dispatch requests (`keitora task dispatch`), which arrive as
+//! `dispatch_requests` rows in a registered project's `tasks.db` and are executed by
+//! `run_dispatch_requests`. Going through this one path keeps the gate, the reserve,
+//! the inject and the audit log shared, so nothing can double-send. Only worktrees in
+//! the project's dispatch pool (`ProjectConfig::in_dispatch_pool`) take dispatches.
 //!
-//! The IPC-facing command is thin; the testable core is pure functions:
-//! `decide` (dispatch-vs-queue), `render_steps` (the ritual lines),
-//! `injection_outcome` (the write result → audit decision), and for requests
-//! `request_refusal` (the lane rule) and `request_outcome` (result → row status).
+//! The IPC-facing commands are thin; the testable core is pure functions:
+//! `render_steps` (the ritual lines), `injection_outcome` (the write result → audit
+//! decision), `board_refusal` / `request_refusal` (the up-front checks) and the lane
+//! rules in `keitora_tasks::dispatch` (`lane_queue`, `lane_hold`, `pick_worktree`).
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use serde::Serialize;
 use tauri::State;
 
-use keitora_tasks::dispatch::{interpolate, DispatchContext};
-use keitora_tasks::{CliKind, DispatchConfig, ReserveOutcome};
+use keitora_tasks::dispatch::{
+    interpolate, lane_hold, lane_queue, pending_reason, pick_worktree, DispatchContext, LaneHold,
+    PoolLane,
+};
+use keitora_tasks::{
+    CliKind, DispatchConfig, ListFilter, ProjectConfig, ReserveOutcome, TaskBackend, TaskWithDeps,
+    WorktreeSession,
+};
 
 use crate::backend::{
     background_set, map_write_line_result, PtyBackend, PtyBackendError, SessionKey, SharedBackend,
@@ -30,44 +39,40 @@ use crate::backend::{
 };
 use crate::transfer_registry::TransferRegistry;
 
-/// Serializes `dispatch_apply` so its idempotency check, reserve, PTY inject, and
-/// `dispatched` log write run as one critical section. Without it, two concurrent
-/// calls for the same task could both read the log before either writes its
-/// `dispatched` row, both pass the guard, and both inject (the double-inject this
-/// module exists to prevent). Dispatch is human-driven and rare, so a single
-/// global lock held across the (bounded) inject is cheap.
+/// Serializes every dispatch (board, CLI request, auto-send) so its checks, reserve,
+/// PTY inject and `dispatched` log write run as one critical section. Without it, two
+/// concurrent calls could both see a lane free before either logs its send, and both
+/// inject. Dispatch is rare, so a single global lock held across the (bounded) inject
+/// is cheap. It also guards [`SendMemo`].
 ///
-/// Uses `tokio::sync::Mutex` because the gate is held across `.await` points after
-/// migrating `dispatch_apply` to `async` (a `std::sync::Mutex` guard is `!Send`
-/// across await boundaries).
+/// Uses `tokio::sync::Mutex` because the gate is held across `.await` points (a
+/// `std::sync::Mutex` guard is `!Send` across await boundaries).
 #[derive(Default)]
-pub struct DispatchGate(pub(crate) tokio::sync::Mutex<()>);
+pub struct DispatchGate(pub(crate) tokio::sync::Mutex<SendMemo>);
 
-/// The result of `dispatch_apply`: whether the task was actually injected
-/// (`dispatched`) or merely reserved (`queued`), plus a human-readable `reason`
-/// when it was deferred.
+/// What the automatic send remembers between watcher passes: per `(project,
+/// worktree)`, the card whose send last failed and the session heartbeat at the time.
+/// The auto-send doesn't retry that card until the session reports again (a new
+/// heartbeat), so a failing pane can't spin the watcher (each attempt writes the
+/// dispatch log, which wakes the watcher again). A manual retry ignores it.
+#[derive(Default)]
+pub struct SendMemo {
+    failed: HashMap<(String, String), (i64, String)>,
+}
+
+/// The result of a dispatch, for the board and for CLI requests.
 #[derive(Debug, Clone, Serialize)]
 pub struct DispatchOutcome {
+    /// The prompt reached the session (a fresh or partial send, or a card that was
+    /// already sent there).
     pub dispatched: bool,
+    /// `sent`, `already_sent`, `pending` (assigned, waiting on its lane) or `failed`
+    /// (assigned, but the send errored; it stays pending).
+    pub state: &'static str,
+    /// The lane the task is on (the picked one, for an auto-pick).
+    pub worktree: String,
+    /// Why it is pending or failed, or a partial-send note.
     pub reason: Option<String>,
-}
-
-/// The dispatch-vs-defer decision (internal; never crosses IPC).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Decision {
-    Dispatched,
-    Queued,
-}
-
-/// Pure: dispatch (inject now) iff the worktree is idle AND we hold a live PTY for
-/// it; otherwise queue (reserve only). Encodes the safety rule "never write into a
-/// busy PTY" — the only state we ever inject into is a live, idle session.
-fn decide(state: &str, has_live_pty: bool) -> Decision {
-    if state == "idle" && has_live_pty {
-        Decision::Dispatched
-    } else {
-        Decision::Queued
-    }
 }
 
 /// Pure: map the AUTHORITATIVE final `write_line` outcome (D6) of a dispatch's
@@ -77,7 +82,8 @@ fn decide(state: &str, has_live_pty: bool) -> Decision {
 ///
 /// NB: this NEVER yields an `Err`; the task is already reserved, and a retry would
 /// re-inject. A partial inject reports `dispatched` (the agent has input and may be
-/// acting); a clean miss reports `queued` (safe to retry).
+/// acting); a clean miss reports `failed` (the card stays pending;
+/// safe to retry).
 fn injection_outcome(
     final_outcome: WriteLineOutcome,
     sent_any: bool,
@@ -89,6 +95,8 @@ fn injection_outcome(
             "dispatched",
             DispatchOutcome {
                 dispatched: true,
+                state: "sent",
+                worktree: worktree.to_string(),
                 reason: None,
             },
         ),
@@ -98,29 +106,23 @@ fn injection_outcome(
             "dispatched",
             DispatchOutcome {
                 dispatched: true,
+                state: "sent",
+                worktree: worktree.to_string(),
                 reason: Some(format!("{worktree}: partially injected ({detail})")),
             },
         ),
-        // Nothing reached the pane → safe to leave reserved/queued for retry.
+        // Nothing reached the pane → the card stays pending on its lane; safe to retry.
         WriteLineOutcome::Queued | WriteLineOutcome::Error => (
-            "queued",
+            "failed",
             DispatchOutcome {
                 dispatched: false,
+                state: "failed",
+                worktree: worktree.to_string(),
                 reason: Some(format!(
-                    "{worktree}: reserved — could not inject ({detail})"
+                    "could not send to @{worktree} ({detail}); it stays pending"
                 )),
             },
         ),
-    }
-}
-
-/// Why a dispatch to `worktree` was only reserved: its session is busy, or the
-/// user terminated it.
-fn queued_reason(worktree: &str, terminated: bool) -> String {
-    if terminated {
-        format!("{worktree} is terminated — reserved")
-    } else {
-        format!("{worktree} busy — reserved")
     }
 }
 
@@ -237,24 +239,201 @@ fn select_ritual_steps(cfg: &DispatchConfig, cli: CliKind) -> &[String] {
     }
 }
 
-/// Who is asking for a dispatch, which decides how strict the apply is.
+/// Every lane input the rules read, loaded once per apply or pump under the gate.
+struct Lanes {
+    tasks: Vec<TaskWithDeps>,
+    /// Ids of cards already typed into their lane's session and not yet claimed.
+    sent: HashSet<i64>,
+    sessions: Vec<WorktreeSession>,
+}
+
+impl Lanes {
+    async fn load(
+        backend: &dyn TaskBackend,
+        config: &ProjectConfig,
+        client: &SharedBackend,
+    ) -> Result<Self, String> {
+        // Live state via the shared reconciled view, so the idle rule matches
+        // `sessions_list`. The AUTHORITATIVE liveness check is still the daemon's
+        // `write_line` result when a send happens (D6).
+        let live = client.live_set_snapshot();
+        let bg = background_set(client.as_ref()); // on-demand, exact; empty on RPC error
+        let sessions = crate::tasks::reconciled_sessions(&live, &bg, &config.project.name, config)?;
+        let filter = ListFilter {
+            archive_days: config.tasks.archive_days,
+            ..ListFilter::default()
+        };
+        let tasks = backend.list(&filter).await.map_err(|e| e.to_string())?;
+        let sent = backend
+            .dispatched_reservations()
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|r| r.task_id)
+            .collect();
+        Ok(Lanes {
+            tasks,
+            sent,
+            sessions,
+        })
+    }
+
+    /// `(state, last_heartbeat)` of `worktree`'s session; `offline` when it has none.
+    fn session(&self, worktree: &str) -> (String, String) {
+        self.sessions
+            .iter()
+            .find(|s| s.worktree == worktree)
+            .map(|s| (s.state.clone(), s.last_heartbeat.clone()))
+            .unwrap_or_else(|| ("offline".to_string(), String::new()))
+    }
+
+    fn hold(&self, worktree: &str) -> Option<LaneHold> {
+        lane_hold(&self.tasks, worktree, &self.session(worktree).0, &self.sent)
+    }
+
+    /// The lane's pending card ids, in send order.
+    fn queue(&self, worktree: &str) -> Vec<i64> {
+        lane_queue(&self.tasks, worktree, &self.sent)
+            .iter()
+            .map(|t| t.task.id)
+            .collect()
+    }
+
+    /// Record a fresh reserve so the rules see it without a re-read.
+    fn upsert(&mut self, twd: TaskWithDeps) {
+        match self.tasks.iter_mut().find(|t| t.task.id == twd.task.id) {
+            Some(t) => *t = twd,
+            None => self.tasks.push(twd),
+        }
+    }
+}
+
+/// What a lane did when asked to send its front pending card.
+#[derive(Debug, Clone, PartialEq)]
+enum FrontSend {
+    /// The lane isn't free, has nothing pending, or (auto-send) its front card failed
+    /// and the session hasn't reported since.
+    Nothing,
+    /// The card's prompt reached the session (`reason`: a partial-send note).
+    Sent {
+        task_id: i64,
+        reason: Option<String>,
+    },
+    /// The send errored and nothing reached the pane; the card stays pending.
+    Failed { task_id: i64, reason: String },
+}
+
+/// Pure: whether the auto-send should skip `task_id` on a lane because its last send
+/// failed and the session (now at `heartbeat`) hasn't reported since.
+fn skip_failed(memo: &SendMemo, key: &(String, String), task_id: i64, heartbeat: &str) -> bool {
+    memo.failed
+        .get(key)
+        .is_some_and(|(id, hb)| *id == task_id && hb == heartbeat)
+}
+
+/// Send `worktree`'s front pending card if the lane is free. `auto` is the
+/// watcher-driven send, which skips a card whose last send failed until the session
+/// reports again ([`SendMemo`]); a manual dispatch always tries. Logs the attempt.
+#[allow(clippy::too_many_arguments)]
+async fn send_front(
+    backend: &dyn TaskBackend,
+    config: &ProjectConfig,
+    lanes: &mut Lanes,
+    worktree: &str,
+    client: &SharedBackend,
+    memo: &mut SendMemo,
+    user: &keitora_tasks::UserConfig,
+    auto: bool,
+) -> FrontSend {
+    if lanes.hold(worktree).is_some() {
+        return FrontSend::Nothing;
+    }
+    let Some(&task_id) = lanes.queue(worktree).first() else {
+        return FrontSend::Nothing;
+    };
+    let project = config.project.name.clone();
+    let memo_key = (project.clone(), worktree.to_string());
+    let heartbeat = lanes.session(worktree).1;
+    if auto && skip_failed(memo, &memo_key, task_id, &heartbeat) {
+        return FrontSend::Nothing;
+    }
+    let Some(task) = lanes
+        .tasks
+        .iter()
+        .find(|t| t.task.id == task_id)
+        .map(|t| t.task.clone())
+    else {
+        return FrontSend::Nothing;
+    };
+
+    let ctx = DispatchContext {
+        task: &task,
+        worktree,
+    };
+    // Resolve the target worktree's CLI so the injected ritual matches it: worktree
+    // entry `cli` → user `default_cli` → `CliKind::Claude`. Only reached for a live,
+    // idle session (the lane is free), which for Codex needs its own liveness signal
+    // (`.codex/hooks.json`).
+    let entry = config
+        .worktree_entries()
+        .into_iter()
+        .find(|e| e.name == worktree);
+    let resolved_cli = keitora_tasks::resolve_cli(entry.as_ref(), user);
+    let steps = render_steps(select_ritual_steps(&config.dispatch, resolved_cli), &ctx);
+    let key = SessionKey {
+        project: project.clone(),
+        worktree: worktree.to_string(),
+    };
+    // Each step goes out as one atomic daemon `WriteLine` (text, pause, `\r`). The
+    // result is AUTHORITATIVE for liveness (D6); see `injection_outcome`.
+    let (result, sent_any) = inject_steps(
+        client.as_ref(),
+        &key,
+        &steps,
+        SUBMIT_DELAY.as_millis() as u32,
+        INTER_STEP_DELAY,
+    );
+    let terminated = client.terminated_keys(&project).contains(worktree);
+    let detail = injection_detail(&result, terminated);
+    let (decision, outcome) =
+        injection_outcome(map_write_line_result(&result), sent_any, worktree, &detail);
+    // Best-effort audit: the task is reserved either way, so a failed log write must
+    // not turn into an error (a retry would re-inject).
+    let _ = backend
+        .dispatch_log_add(task_id, worktree, decision, &detail)
+        .await;
+    if outcome.dispatched {
+        lanes.sent.insert(task_id);
+        memo.failed.remove(&memo_key);
+        FrontSend::Sent {
+            task_id,
+            reason: outcome.reason,
+        }
+    } else {
+        log::warn!("dispatch: #{task_id} → {project}/{worktree} failed: {detail}");
+        memo.failed.insert(memo_key, (task_id, heartbeat));
+        FrontSend::Failed {
+            task_id,
+            reason: outcome.reason.unwrap_or_default(),
+        }
+    }
+}
+
+/// Who is asking for a dispatch, which decides the up-front task checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplyMode {
-    /// A board drag or the card menu. The board already ran its lane rule
-    /// (`decideLane`), so the apply reserves and decides inject-vs-queue: a busy
-    /// session gets the card queued on its lane.
+    /// A board drag, the card's Dispatch button or menu: a pending (unsent) card may
+    /// be moved here from another lane.
     Board,
-    /// A CLI dispatch request from `tasks.db`: "send this task to that session now".
-    /// Nobody has checked anything yet, so the apply does it before reserving: an
-    /// unknown worktree, a terminal, blocked or elsewhere-reserved task, and any
-    /// session that isn't idle (busy, waiting or offline) are refused, not queued.
-    /// The board is the queue; a request either lands or leaves nothing behind.
+    /// A CLI dispatch request from `tasks.db`: the worktree name is checked, and a
+    /// card reserved to another lane is refused (release it first).
     Request,
 }
 
-/// State-aware apply: reserve the task for `worktree` always, then inject it iff
-/// the worktree is idle with a live PTY (else leave it reserved/queued). The
-/// backend is authoritative on the idle decision so we never write into a busy PTY.
+/// Assign `task_id` to `worktree` (in the board's view, drop it on that lane) and
+/// send the lane's front card if the lane is free. The card is assigned and shown
+/// pending at once whatever the session state; refusals are an `Err` with nothing
+/// changed.
 #[tauri::command]
 pub async fn dispatch_apply(
     worktree: String,
@@ -264,7 +443,7 @@ pub async fn dispatch_apply(
     registry: State<'_, TransferRegistry>,
 ) -> Result<DispatchOutcome, String> {
     apply(
-        &worktree,
+        Some(&worktree),
         task_id,
         ApplyMode::Board,
         None,
@@ -275,25 +454,43 @@ pub async fn dispatch_apply(
     .await
 }
 
-/// The body of [`dispatch_apply`], shared with the CLI request executor
-/// ([`run_dispatch_requests`]) so both go through one gate, one reserve, one
-/// inject and one audit log. `project` is the project to dispatch in; `None` means
-/// the active one (the board's).
+/// One-click Dispatch: auto-pick a worktree from the pool ([`pick_worktree`]) and
+/// apply as [`dispatch_apply`] does.
+#[tauri::command]
+pub async fn dispatch_auto(
+    task_id: i64,
+    client: State<'_, SharedBackend>,
+    gate: State<'_, DispatchGate>,
+    registry: State<'_, TransferRegistry>,
+) -> Result<DispatchOutcome, String> {
+    apply(
+        None,
+        task_id,
+        ApplyMode::Board,
+        None,
+        client.inner(),
+        &gate,
+        &registry,
+    )
+    .await
+}
+
+/// The body of [`dispatch_apply`] / [`dispatch_auto`], shared with the CLI request
+/// executor ([`run_dispatch_requests`]). `worktree: None` (or empty) auto-picks.
+/// `project` is the project to dispatch in; `None` means the active one (the
+/// board's).
 async fn apply(
-    worktree: &str,
+    worktree: Option<&str>,
     task_id: i64,
     mode: ApplyMode,
-    project: Option<keitora_tasks::ProjectConfig>,
+    project: Option<ProjectConfig>,
     client: &SharedBackend,
     gate: &DispatchGate,
     registry: &TransferRegistry,
 ) -> Result<DispatchOutcome, String> {
-    let worktree = worktree.to_string();
-    // Hold the dispatch gate for the whole command so the guard-check → reserve →
-    // inject → log sequence is atomic vs. concurrent dispatch_apply calls.
-    // `tokio::sync::Mutex::lock` is cancel-safe and does not poison, so the guard is
-    // always acquired cleanly.
-    let _gate = gate.0.lock().await;
+    // Hold the gate for the whole apply so checks → reserve → send → log are atomic
+    // vs. every other dispatch. Cancel-safe and non-poisoning.
+    let mut memo = gate.0.lock().await;
 
     let (backend, config) = match project {
         Some(pc) => (
@@ -302,56 +499,50 @@ async fn apply(
         ),
         None => crate::tasks::open_backend()?,
     };
+    let backend = backend.as_ref();
+    let mut lanes = Lanes::load(backend, &config, client).await?;
+    let project = config.project.name.clone();
+
+    let worktree = match worktree.filter(|w| !w.is_empty()) {
+        Some(w) => w.to_string(),
+        None => auto_pick(backend, &config, &lanes, registry, task_id).await?,
+    };
     // Before anything is reserved: a worktree mid-transfer is never injected into.
-    if let Some(reason) = transfer_refusal(registry, &config.project.name, &worktree) {
+    if let Some(reason) = transfer_refusal(registry, &project, &worktree) {
         return Err(reason);
     }
-
-    // Live state via the shared reconciled view, so the idle rule matches
-    // `sessions_list`. `decide` is a pre-filter on the idle rule;
-    // the AUTHORITATIVE liveness check is the daemon's `write_line` result below
-    // (D6). A reconciled non-`offline` session is one the daemon holds live, so we
-    // feed `state != "offline"` for `has_live_pty` — but the daemon is the final
-    // word on whether the write actually landed. Read before the reserve, so a
-    // failure here is an `Err` with nothing reserved.
-    // Reuse the `config` already resolved by `open_backend` for both the project
-    // name and the LocalStore open inside `reconciled_sessions` (FIX 6).
-    let project = config.project.name.clone();
-    let live = client.live_set_snapshot();
-    let bg = background_set(client.as_ref()); // on-demand, exact; empty on RPC error
-    let sessions = crate::tasks::reconciled_sessions(&live, &bg, &project, &config)?;
-    let state = sessions
-        .iter()
-        .find(|s| s.worktree == worktree)
-        .map(|s| s.state.clone())
-        .unwrap_or_else(|| "offline".to_string());
-    let has_live_pty = state != "offline";
-
-    // Request mode: refuse up front, and note whether the task was already reserved
-    // here (a card queued on this lane), so a failed inject leaves it as it was.
-    let mut reserved_before = false;
-    if mode == ApplyMode::Request {
-        let twd = backend.get(task_id).await.map_err(|e| e.to_string())?;
-        if let Some(reason) = request_refusal(
-            twd.as_ref(),
-            task_id,
-            &worktree,
-            &config.worktrees(),
-            &state,
-        ) {
-            return Err(reason);
-        }
-        reserved_before =
-            twd.is_some_and(|t| t.task.assigned_to.as_deref() == Some(worktree.as_str()));
+    if !config.in_dispatch_pool(&worktree) {
+        return Err(pool_refusal(&worktree));
     }
 
-    // Idempotency guard + reserve in one intent-level call. If this task is
-    // already dispatched and still reserved to this worktree, `dispatch_reserve`
-    // returns `AlreadyDispatched` and performs NO write, so a re-click / re-drag /
-    // keyboard re-apply no-ops. Otherwise it commits the reserve and returns the
-    // post-assign `Task`. Errors (blocked / terminal / assigned elsewhere) bubble up
-    // from the reserve as before — but only BEFORE the write (never-Err-after-reserve).
-    let task = match backend
+    let twd = backend.get(task_id).await.map_err(|e| e.to_string())?;
+    let refusal = match mode {
+        ApplyMode::Request => {
+            request_refusal(twd.as_ref(), task_id, &worktree, &config.worktrees())
+        }
+        ApplyMode::Board => board_refusal(twd.as_ref(), task_id, &worktree, &lanes.sent),
+    };
+    if let Some(reason) = refusal {
+        return Err(reason);
+    }
+    let twd = twd.ok_or_else(|| format!("task #{task_id} not found"))?;
+
+    // A pending card dragged from another lane moves: release it there first.
+    if let Some(from) = twd.task.assigned_to.as_deref().filter(|a| *a != worktree) {
+        backend
+            .release(task_id, "keitora")
+            .await
+            .map_err(|e| e.to_string())?;
+        let _ = backend
+            .dispatch_log_add(task_id, from, "released", &format!("moved to @{worktree}"))
+            .await;
+    }
+
+    // Idempotency guard + reserve in one call. A card already sent to this lane (and
+    // not yet claimed) is `AlreadyDispatched` with NO write, so a re-drop no-ops.
+    // Refusals (blocked / terminal / assigned elsewhere) bubble up from the reserve,
+    // BEFORE any write.
+    match backend
         .dispatch_reserve(task_id, "keitora", &worktree)
         .await
         .map_err(|e| e.to_string())?
@@ -359,122 +550,180 @@ async fn apply(
         ReserveOutcome::AlreadyDispatched => {
             return Ok(DispatchOutcome {
                 dispatched: true,
-                reason: Some("already dispatched".into()),
+                state: "already_sent",
+                reason: Some(format!(
+                    "already sent to @{worktree}; waiting for it to claim the task"
+                )),
+                worktree,
             });
         }
-        ReserveOutcome::Reserved(task) => task,
-    };
-
-    // Why an inject sent nothing, for a request's refusal reason.
-    let mut inject_detail = String::new();
-    let mut outcome = match decide(&state, has_live_pty) {
-        Decision::Dispatched => {
-            let ctx = DispatchContext {
-                task: &task,
-                worktree: &worktree,
-            };
-            // Resolve the target worktree's CLI so the injected ritual matches it:
-            // worktree entry `cli` → user `default_cli` →
-            // `CliKind::Claude`. Dispatching INTO a Codex worktree is safe here
-            // specifically because `decide` above already gated this branch on
-            // idle + live state, and stage 030 landed Codex's own liveness signal
-            // (`.codex/hooks.json`) — before 030, a Codex worktree's reconciled
-            // state was always Claude-hook-derived (never meaningfully idle+live),
-            // so this injection path was effectively unreachable for Codex until
-            // that liveness signal landed.
-            let user = keitora_tasks::UserConfig::load().unwrap_or_default();
-            let entry = config
-                .worktree_entries()
-                .into_iter()
-                .find(|e| e.name == worktree);
-            let resolved_cli = keitora_tasks::resolve_cli(entry.as_ref(), &user);
-            let steps = render_steps(select_ritual_steps(&config.dispatch, resolved_cli), &ctx);
-            let key = SessionKey {
-                project: project.clone(),
-                worktree: worktree.clone(),
-            };
-            // Inject each step as its own submitted line via a single atomic daemon
-            // `WriteLine` RPC: the daemon writes the text, pauses `SUBMIT_DELAY` ms,
-            // then writes the `\r`. Folding the old two-step client-side
-            // text→sleep→`\r` split into one server-side RPC removes the window where
-            // a concurrent keystroke could land between a step's text and its Enter.
-            // The `write_line` RESULT is AUTHORITATIVE for liveness (D6):
-            //   * Ok            → Dispatched (text + `\r` reached the PTY).
-            //   * Queued        → NoSuchSession / NotConnected: leave reserved, retry
-            //                     later. NOT an Err (a retry would re-inject).
-            //   * Error (other) → a real write failure; still NEVER an Err after
-            //                     reserve — the partial/queued reporting preserves the
-            //                     never-Err-after-reserve invariant.
-            // The inter-step delay still runs on this thread so the TUI finishes one
-            // submitted line before the next arrives — bounded and small for the
-            // handful of steps a ritual holds.
-            let (result, sent_any) = inject_steps(
-                client.as_ref(),
-                &key,
-                &steps,
-                SUBMIT_DELAY.as_millis() as u32,
-                INTER_STEP_DELAY,
-            );
-            // The task is already reserved. NEVER return Err after reserving (a retry
-            // would re-inject). Map the authoritative final outcome to a (never-Err)
-            // result + audit decision via the pure `injection_outcome` helper.
-            let terminated = client.terminated_keys(&project).contains(&worktree);
-            let detail = injection_detail(&result, terminated);
-            let (decision, outcome) =
-                injection_outcome(map_write_line_result(&result), sent_any, &worktree, &detail);
-            // Best-effort audit: a failed log must not flip us to Err (which would
-            // prompt a re-inject of an already-dispatched task).
-            let _ = backend
-                .dispatch_log_add(task_id, &worktree, decision, &detail)
-                .await;
-            inject_detail = detail;
-            outcome
-        }
-        Decision::Queued => {
-            // Best-effort audit, matching the Dispatched branch: the task is already
-            // reserved, so a failed log must NOT flip us to Err (a retried
-            // dispatch_apply would re-reserve / re-inject). never-Err-after-reserve.
-            let _ = backend
-                .dispatch_log_add(task_id, &worktree, "queued", "")
-                .await;
-            let terminated = client.terminated_keys(&project).contains(&worktree);
-            DispatchOutcome {
-                dispatched: false,
-                reason: Some(queued_reason(&worktree, terminated)),
-            }
-        }
-    };
-
-    // A request that sent nothing leaves nothing behind: undo the reserve it made
-    // (a partial inject reports `dispatched` and is kept, since the agent has input).
-    // Best-effort, like the audit writes; the outcome stays not-dispatched either way.
-    if mode == ApplyMode::Request && !outcome.dispatched {
-        if !reserved_before {
-            let _ = backend.release(task_id, "keitora").await;
-            let _ = backend
-                .dispatch_log_add(task_id, &worktree, "released", "nothing was sent")
-                .await;
-        }
-        outcome.reason = Some(request_miss_reason(
-            &worktree,
-            &inject_detail,
-            reserved_before,
-        ));
+        ReserveOutcome::Reserved(task) => lanes.upsert(TaskWithDeps { task, ..twd }),
     }
+
+    // From here on NEVER return Err: the task is reserved, and a retry would re-send.
+    let user = keitora_tasks::UserConfig::load().unwrap_or_default();
+    let front = send_front(
+        backend, &config, &mut lanes, &worktree, client, &mut memo, &user, false,
+    )
+    .await;
+    let outcome = match front {
+        FrontSend::Sent {
+            task_id: id,
+            reason,
+        } if id == task_id => DispatchOutcome {
+            dispatched: true,
+            state: "sent",
+            worktree,
+            reason,
+        },
+        FrontSend::Failed {
+            task_id: id,
+            reason,
+        } if id == task_id => DispatchOutcome {
+            dispatched: false,
+            state: "failed",
+            worktree,
+            reason: Some(reason),
+        },
+        other => {
+            let queue = lanes.queue(&worktree);
+            let ahead = queue
+                .iter()
+                .position(|&id| id == task_id)
+                .unwrap_or(queue.len());
+            let hold = lanes.hold(&worktree);
+            let mut reason = pending_reason(&worktree, hold.as_ref(), ahead);
+            if hold == Some(LaneHold::Offline)
+                && client.terminated_keys(&project).contains(&worktree)
+            {
+                reason.push_str(" (its session is terminated; launch it to dispatch)");
+            }
+            let _ = backend
+                .dispatch_log_add(task_id, &worktree, "queued", &reason)
+                .await;
+            pending_outcome(worktree, reason, &other)
+        }
+    };
     Ok(outcome)
 }
 
-/// Pure: why a CLI dispatch request for `task_id` onto `worktree` (whose reconciled
-/// session is in `state`) must be refused before anything is reserved, or `None` to
-/// go ahead. `configured` is the project's worktree list; an empty list doesn't
-/// restrict, matching how `reconciled_sessions` scopes. Task-side, these are the
-/// board's lane checks; session-side, only an idle session passes.
+/// Pure: the outcome for a card left pending on `worktree`. If the lane's front card
+/// (ahead of it) failed to send just now, that is reported as a failure too.
+fn pending_outcome(worktree: String, reason: String, front: &FrontSend) -> DispatchOutcome {
+    match front {
+        FrontSend::Failed {
+            task_id,
+            reason: why,
+        } => DispatchOutcome {
+            dispatched: false,
+            state: "failed",
+            worktree,
+            reason: Some(format!("{reason}; sending #{task_id} failed: {why}")),
+        },
+        _ => DispatchOutcome {
+            dispatched: false,
+            state: "pending",
+            worktree,
+            reason: Some(reason),
+        },
+    }
+}
+
+/// Auto-pick a pool worktree for `task_id` ([`pick_worktree`]). A card already pending
+/// on a pool lane stays there (Dispatch on it retries that lane). Worktrees mid-
+/// transfer are skipped.
+async fn auto_pick(
+    backend: &dyn TaskBackend,
+    config: &ProjectConfig,
+    lanes: &Lanes,
+    registry: &TransferRegistry,
+    task_id: i64,
+) -> Result<String, String> {
+    let project = &config.project.name;
+    let pool: Vec<String> = config
+        .dispatch_pool()
+        .into_iter()
+        .filter(|w| transfer_refusal(registry, project, w).is_none())
+        .collect();
+    if pool.is_empty() {
+        return Err(
+            "no worktree is in the dispatch pool; add one from its worktree menu".to_string(),
+        );
+    }
+    if let Some(here) = lanes
+        .tasks
+        .iter()
+        .find(|t| t.task.id == task_id && t.task.status == "open")
+        .and_then(|t| t.task.assigned_to.clone())
+        .filter(|a| pool.contains(a))
+    {
+        return Ok(here);
+    }
+    let log = backend.dispatch_log_list(500).await.unwrap_or_default();
+    let candidates: Vec<PoolLane> = pool
+        .iter()
+        .map(|w| PoolLane {
+            worktree: w.clone(),
+            free: lanes.hold(w).is_none(),
+            queue_len: lanes.queue(w).len(),
+            last_dispatched: log
+                .iter()
+                .filter(|e| e.worktree == *w && e.decision == "dispatched")
+                .map(|e| e.created_at.clone())
+                .max(),
+        })
+        .collect();
+    pick_worktree(&candidates)
+        .map(|l| l.worktree.clone())
+        .ok_or_else(|| "no worktree is in the dispatch pool".to_string())
+}
+
+/// The refusal for a worktree outside the dispatch pool.
+fn pool_refusal(worktree: &str) -> String {
+    format!(
+        "@{worktree} is not in the dispatch pool, so it takes no tasks; add it from its worktree menu"
+    )
+}
+
+/// Pure: why a board dispatch of `task_id` onto `worktree` must be refused before
+/// anything is reserved, or `None` to go ahead. As [`request_refusal`]'s task checks,
+/// except that a card pending (assigned, not yet sent) on another lane may move.
+fn board_refusal(
+    task: Option<&TaskWithDeps>,
+    task_id: i64,
+    worktree: &str,
+    sent: &HashSet<i64>,
+) -> Option<String> {
+    let Some(task) = task else {
+        return Some(format!("task #{task_id} not found"));
+    };
+    let t = &task.task;
+    match t.assigned_to.as_deref() {
+        Some(other) if other != worktree && t.status == "open" => {
+            if sent.contains(&task_id) {
+                return Some(format!(
+                    "task #{task_id} was already sent to @{other}; release it first"
+                ));
+            }
+            // Movable: judge the rest as if unassigned.
+            let mut probe = task.clone();
+            probe.task.assigned_to = None;
+            keitora_tasks::dispatch::task_refusal(&probe, worktree)
+        }
+        _ => keitora_tasks::dispatch::task_refusal(task, worktree),
+    }
+}
+
+/// Pure: why a CLI dispatch request for `task_id` onto `worktree` must be refused
+/// before anything is reserved, or `None` to go ahead. `configured` is the project's
+/// worktree list; an empty list doesn't restrict, matching how `reconciled_sessions`
+/// scopes. The session state is not checked: like a board drop, a request assigns the
+/// card at once and it waits on the lane as pending.
 fn request_refusal(
-    task: Option<&keitora_tasks::TaskWithDeps>,
+    task: Option<&TaskWithDeps>,
     task_id: i64,
     worktree: &str,
     configured: &[String],
-    state: &str,
 ) -> Option<String> {
     if !configured.is_empty() && !configured.iter().any(|w| w == worktree) {
         return Some(format!(
@@ -486,24 +735,6 @@ fn request_refusal(
         return Some(format!("task #{task_id} not found"));
     };
     keitora_tasks::dispatch::task_refusal(task, worktree)
-        .or_else(|| keitora_tasks::dispatch::session_refusal(state, worktree))
-}
-
-/// Pure: the refusal reason for a request whose inject sent nothing. `detail` is the
-/// write error (may be empty); `reserved_before` says the card was already queued on
-/// that lane, so it stays there rather than being released.
-fn request_miss_reason(worktree: &str, detail: &str, reserved_before: bool) -> String {
-    let why = if detail.is_empty() {
-        String::new()
-    } else {
-        format!(" ({detail})")
-    };
-    let left = if reserved_before {
-        "it stays queued on the board as before"
-    } else {
-        "nothing is left reserved"
-    };
-    format!("could not send to @{worktree}{why}; {left}")
 }
 
 /// How old a pending dispatch request may be before the app refuses it rather than
@@ -512,25 +743,19 @@ fn request_miss_reason(worktree: &str, detail: &str, reserved_before: bool) -> S
 const REQUEST_MAX_AGE_SECS: i64 = 600;
 
 /// Pure: the `(status, reason)` a dispatch request resolves to, from its apply
-/// result. An inject (or an idempotent re-apply) is `applied`; anything else is
-/// `refused`: an `Err` (nothing was reserved) or an inject that sent nothing (its
-/// reserve was undone).
+/// result. Any `Ok` is `applied` (the task is on the lane: sent, pending, or pending
+/// after a failed send, said in the reason); an `Err` is `refused` (nothing changed).
 fn request_outcome(result: &Result<DispatchOutcome, String>) -> (&'static str, String) {
     match result {
-        Ok(o) if o.dispatched => ("applied", o.reason.clone().unwrap_or_default()),
-        Ok(o) => (
-            "refused",
-            o.reason
-                .clone()
-                .unwrap_or_else(|| "nothing was sent".to_string()),
-        ),
+        Ok(o) => ("applied", o.reason.clone().unwrap_or_default()),
         Err(e) => ("refused", e.clone()),
     }
 }
 
-/// If `local` (the DB of registered project `project`) holds pending CLI dispatch
-/// requests, start [`run_dispatch_requests`] for it. Called from the tasks-DB
-/// watchers on each debounced write; a cheap indexed read when there are none.
+/// Called from the tasks-DB watchers on each debounced write of registered project
+/// `project`'s DB (`local`): start [`run_dispatch_requests`] if CLI dispatch requests
+/// are pending, else [`pump_lanes`] if any card is reserved to a lane. Both checks
+/// are cheap indexed reads.
 pub(crate) fn spawn_pending_requests<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     local: &keitora_tasks::LocalStore,
@@ -540,15 +765,75 @@ pub(crate) fn spawn_pending_requests<R: tauri::Runtime>(
         .dispatch_requests_pending()
         .is_ok_and(|p| !p.is_empty());
     if has_pending {
+        // Each request's apply sends what it can; the writes it makes wake the
+        // watcher again, which then pumps the rest.
         tauri::async_runtime::spawn(run_dispatch_requests(app.clone(), project.to_string()));
+    } else if local.has_reserved_tasks() {
+        tauri::async_runtime::spawn(pump_lanes(app.clone(), project.to_string()));
+    }
+}
+
+/// The automatic send: for each pool worktree of registered project `project`, send
+/// the lane's front pending card if the lane is free. This is what makes a pending
+/// card go out when its session turns idle, its active task finishes, or the card
+/// ahead of it is claimed.
+pub(crate) async fn pump_lanes<R: tauri::Runtime>(app: tauri::AppHandle<R>, project: String) {
+    use tauri::Manager;
+
+    let (Some(client), Some(gate), Some(registry)) = (
+        app.try_state::<SharedBackend>(),
+        app.try_state::<DispatchGate>(),
+        app.try_state::<TransferRegistry>(),
+    ) else {
+        return; // still starting up; the next DB event retries
+    };
+    let Some(config) = keitora_tasks::UserConfig::load()
+        .ok()
+        .and_then(|u| u.project_config_by_name(&project))
+    else {
+        return;
+    };
+    let mut memo = gate.0.lock().await;
+    let backend = match keitora_tasks::open_backend(&config) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("auto-send: cannot open {project}'s tasks: {e}");
+            return;
+        }
+    };
+    let mut lanes = match Lanes::load(backend.as_ref(), &config, client.inner()).await {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!("auto-send: cannot read {project}'s lanes: {e}");
+            return;
+        }
+    };
+    let user = keitora_tasks::UserConfig::load().unwrap_or_default();
+    for worktree in config.dispatch_pool() {
+        if transfer_refusal(&registry, &project, &worktree).is_some() {
+            continue;
+        }
+        let sent = send_front(
+            backend.as_ref(),
+            &config,
+            &mut lanes,
+            &worktree,
+            client.inner(),
+            &mut memo,
+            &user,
+            true,
+        )
+        .await;
+        if let FrontSend::Sent { task_id, .. } = sent {
+            log::info!("auto-send: #{task_id} → {project}/{worktree}");
+        }
     }
 }
 
 /// Execute `project`'s pending CLI dispatch requests (`keitora task dispatch`),
 /// oldest first, each through [`apply`] in request mode, and record each outcome on
-/// its row. `project` is a resolved `[project].name` from the app's registry; the
-/// tasks-DB watchers call this when they see a pending row in that project's DB (the
-/// active project's watcher, and each registered project's background watcher).
+/// its row. A request with no worktree is auto-picked, and its row is pointed at the
+/// picked worktree. `project` is a resolved `[project].name` from the app's registry.
 ///
 /// Safe to run concurrently with itself and with board dispatches: each request is
 /// taken with a compare-and-set (`dispatch_request_begin`), so it executes once,
@@ -603,7 +888,7 @@ pub(crate) async fn run_dispatch_requests<R: tauri::Runtime>(
             }
         }
         let result = apply(
-            &req.worktree,
+            Some(&req.worktree),
             req.task_id,
             ApplyMode::Request,
             Some(config.clone()),
@@ -612,12 +897,19 @@ pub(crate) async fn run_dispatch_requests<R: tauri::Runtime>(
             &registry,
         )
         .await;
+        let target = match &result {
+            Ok(o) => o.worktree.clone(),
+            Err(_) => req.worktree.clone(),
+        };
+        if target != req.worktree {
+            let _ = local.dispatch_request_retarget(req.id, &target);
+        }
         let (status, reason) = request_outcome(&result);
         log::info!(
             "dispatch request {} ({project}: task #{} → {}, by {}): {status} {reason}",
             req.id,
             req.task_id,
-            req.worktree,
+            if target.is_empty() { "(auto)" } else { &target },
             req.requested_by
         );
         if let Err(e) = local.dispatch_request_resolve(req.id, status, &reason) {
@@ -693,40 +985,311 @@ mod tests {
     }
 
     #[test]
-    fn request_refusal_follows_the_lane_rule() {
+    fn request_refusal_checks_the_task_not_the_session() {
         let wts = vec!["alpha".to_string(), "bravo".to_string()];
         let card = open_card(None, vec![]);
-        // Only an idle session takes a request.
-        assert_eq!(request_refusal(Some(&card), 5, "alpha", &wts, "idle"), None);
-        // Busy, waiting and offline are refused, not queued: the board is the queue.
-        for state in ["busy", "waiting", "offline"] {
-            let msg = request_refusal(Some(&card), 5, "alpha", &wts, state).expect(state);
-            assert!(msg.starts_with(&format!("@alpha is {state}")), "{msg}");
-        }
-        // A blocked task is refused whatever the session state.
+        // Any session state goes ahead: the card is assigned and waits as pending.
+        assert_eq!(request_refusal(Some(&card), 5, "alpha", &wts), None);
+        // A blocked task is refused.
         assert_eq!(
-            request_refusal(Some(&open_card(None, vec![2])), 5, "alpha", &wts, "idle"),
+            request_refusal(Some(&open_card(None, vec![2])), 5, "alpha", &wts),
             Some("task #5 is blocked by #2".to_string())
         );
-        // Reserved elsewhere is refused; reserved here goes ahead (sends a queued task).
-        assert!(request_refusal(
-            Some(&open_card(Some("bravo"), vec![])),
-            5,
-            "alpha",
-            &wts,
-            "idle"
-        )
-        .is_some());
+        // Reserved elsewhere is refused; reserved here goes ahead (retries a pending one).
+        assert!(
+            request_refusal(Some(&open_card(Some("bravo"), vec![])), 5, "alpha", &wts).is_some()
+        );
         assert_eq!(
-            request_refusal(
-                Some(&open_card(Some("alpha"), vec![])),
-                5,
-                "alpha",
-                &wts,
-                "idle"
-            ),
+            request_refusal(Some(&open_card(Some("alpha"), vec![])), 5, "alpha", &wts),
             None
         );
+        // Backlog is refused with how to bring it back.
+        let mut backlog = open_card(None, vec![]);
+        backlog.task.status = "backlog".to_string();
+        let msg = request_refusal(Some(&backlog), 5, "alpha", &wts).unwrap();
+        assert!(msg.contains("backlog"), "{msg}");
+    }
+
+    #[test]
+    fn board_refusal_lets_a_pending_card_move_but_not_a_sent_one() {
+        let none = HashSet::new();
+        let pending_elsewhere = open_card(Some("bravo"), vec![]);
+        assert_eq!(
+            board_refusal(Some(&pending_elsewhere), 5, "alpha", &none),
+            None
+        );
+        let sent: HashSet<i64> = [5].into();
+        assert_eq!(
+            board_refusal(Some(&pending_elsewhere), 5, "alpha", &sent).as_deref(),
+            Some("task #5 was already sent to @bravo; release it first")
+        );
+        // A blocked card can't move either.
+        assert!(
+            board_refusal(Some(&open_card(Some("bravo"), vec![3])), 5, "alpha", &none).is_some()
+        );
+        // Same lane: a retry.
+        assert_eq!(
+            board_refusal(Some(&open_card(Some("alpha"), vec![])), 5, "alpha", &none),
+            None
+        );
+        assert_eq!(
+            board_refusal(None, 5, "alpha", &none).as_deref(),
+            Some("task #5 not found")
+        );
+        let mut active = open_card(Some("bravo"), vec![]);
+        active.task.status = "active".to_string();
+        assert_eq!(
+            board_refusal(Some(&active), 5, "alpha", &none).as_deref(),
+            Some("task #5 is already active on @bravo")
+        );
+    }
+
+    #[test]
+    fn pool_refusal_names_the_worktree_and_the_fix() {
+        let msg = pool_refusal("fellowship");
+        assert!(
+            msg.starts_with("@fellowship is not in the dispatch pool"),
+            "{msg}"
+        );
+        assert!(msg.contains("worktree menu"), "{msg}");
+    }
+
+    #[test]
+    fn pending_outcome_reports_a_failed_front_card() {
+        let o = pending_outcome(
+            "alpha".into(),
+            "pending: behind 1 card on @alpha".into(),
+            &FrontSend::Nothing,
+        );
+        assert_eq!(o.state, "pending");
+        assert!(!o.dispatched);
+        let o = pending_outcome(
+            "alpha".into(),
+            "pending: behind 1 card on @alpha".into(),
+            &FrontSend::Failed {
+                task_id: 3,
+                reason: "herdr unreachable".into(),
+            },
+        );
+        assert_eq!(o.state, "failed");
+        assert_eq!(
+            o.reason.as_deref(),
+            Some("pending: behind 1 card on @alpha; sending #3 failed: herdr unreachable")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // send_front — the send-on-idle path against a real SQLite DB + FakeBackend.
+    // -----------------------------------------------------------------------
+
+    struct SendFixture {
+        _dir: tempfile::TempDir,
+        backend: keitora_tasks::SqliteBackend,
+        config: ProjectConfig,
+        fake: std::sync::Arc<crate::backend::fake::FakeBackend>,
+        client: SharedBackend,
+    }
+
+    fn send_fixture() -> SendFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("tasks.db");
+        let backend = keitora_tasks::SqliteBackend::open(&db.to_string_lossy()).unwrap();
+        let mut config = ProjectConfig::scaffold(&dir.path().join("proj"));
+        config.project.name = "proj".to_string();
+        let fake = std::sync::Arc::new(crate::backend::fake::FakeBackend::new());
+        let client: SharedBackend = fake.clone();
+        SendFixture {
+            _dir: dir,
+            backend,
+            config,
+            fake,
+            client,
+        }
+    }
+
+    fn session(worktree: &str, state: &str, heartbeat: &str) -> WorktreeSession {
+        WorktreeSession {
+            project: String::new(),
+            worktree: worktree.to_string(),
+            state: state.to_string(),
+            current_task_id: None,
+            pid: None,
+            last_heartbeat: heartbeat.to_string(),
+        }
+    }
+
+    async fn reserve(f: &SendFixture, title: &str, priority: &str, wt: &str) -> i64 {
+        let t = f
+            .backend
+            .create("me", title, "d", priority, &[], None)
+            .await
+            .unwrap();
+        f.backend.assign(t.id, "keitora", wt).await.unwrap();
+        t.id
+    }
+
+    async fn lanes_for(f: &SendFixture, sessions: Vec<WorktreeSession>) -> Lanes {
+        let tasks = f.backend.list(&ListFilter::default()).await.unwrap();
+        let sent = f
+            .backend
+            .dispatched_reservations()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.task_id)
+            .collect();
+        Lanes {
+            tasks,
+            sent,
+            sessions,
+        }
+    }
+
+    async fn front(
+        f: &SendFixture,
+        lanes: &mut Lanes,
+        memo: &mut SendMemo,
+        auto: bool,
+    ) -> FrontSend {
+        send_front(
+            &f.backend,
+            &f.config,
+            lanes,
+            "alpha",
+            &f.client,
+            memo,
+            &keitora_tasks::UserConfig::default(),
+            auto,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_idle_lane_sends_its_front_card_once() {
+        let f = send_fixture();
+        let low = reserve(&f, "low one", "low", "alpha").await;
+        let urgent = reserve(&f, "urgent one", "urgent", "alpha").await;
+        let mut memo = SendMemo::default();
+        let mut lanes = lanes_for(&f, vec![session("alpha", "idle", "t1")]).await;
+        // The urgent card is the front of the lane, so it goes first.
+        assert_eq!(
+            front(&f, &mut lanes, &mut memo, true).await,
+            FrontSend::Sent {
+                task_id: urgent,
+                reason: None
+            }
+        );
+        let writes = write_line_calls(&f.fake);
+        assert_eq!(writes.len(), 1);
+        assert!(
+            writes[0].1.contains(&format!("task #{urgent}")),
+            "{:?}",
+            writes[0]
+        );
+        // Logged as dispatched: the board shows it sent.
+        let sent = f.backend.dispatched_reservations().await.unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].task_id, urgent);
+        // The lane now waits for the claim: nothing more is typed, even on a re-read.
+        let mut lanes = lanes_for(&f, vec![session("alpha", "idle", "t2")]).await;
+        assert_eq!(lanes.hold("alpha"), Some(LaneHold::AwaitingClaim(urgent)));
+        assert_eq!(
+            front(&f, &mut lanes, &mut memo, true).await,
+            FrontSend::Nothing
+        );
+        assert_eq!(write_line_calls(&f.fake).len(), 1);
+        // Claimed: the agent is working, so the idle lane still holds.
+        f.backend.claim(urgent, "alpha").await.unwrap();
+        let mut lanes = lanes_for(&f, vec![session("alpha", "idle", "t3")]).await;
+        assert_eq!(lanes.hold("alpha"), Some(LaneHold::Working(urgent)));
+        assert_eq!(
+            front(&f, &mut lanes, &mut memo, true).await,
+            FrontSend::Nothing
+        );
+        // Done → the next card (the low one) goes out.
+        f.backend.set_done(urgent, "alpha").await.unwrap();
+        let mut lanes = lanes_for(&f, vec![session("alpha", "idle", "t4")]).await;
+        assert_eq!(
+            front(&f, &mut lanes, &mut memo, true).await,
+            FrontSend::Sent {
+                task_id: low,
+                reason: None
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_busy_or_offline_lane_sends_nothing() {
+        let f = send_fixture();
+        reserve(&f, "t", "normal", "alpha").await;
+        let mut memo = SendMemo::default();
+        for sessions in [vec![session("alpha", "busy", "t1")], vec![]] {
+            let mut lanes = lanes_for(&f, sessions).await;
+            assert_eq!(
+                front(&f, &mut lanes, &mut memo, false).await,
+                FrontSend::Nothing
+            );
+        }
+        assert!(write_line_calls(&f.fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_stays_pending_and_auto_retries_on_the_next_report() {
+        let f = send_fixture();
+        let id = reserve(&f, "t", "normal", "alpha").await;
+        let mut memo = SendMemo::default();
+        f.fake.push_write_line(Err(PtyBackendError::NotConnected));
+        let mut lanes = lanes_for(&f, vec![session("alpha", "idle", "t1")]).await;
+        match front(&f, &mut lanes, &mut memo, true).await {
+            FrontSend::Failed { task_id, reason } => {
+                assert_eq!(task_id, id);
+                assert!(reason.contains("herdr unreachable"), "{reason}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        // Logged as failed (the board shows it), and still reserved, not sent.
+        let log = f.backend.dispatch_log_for(id).await.unwrap();
+        assert_eq!(log[0].decision, "failed");
+        assert!(f
+            .backend
+            .dispatched_reservations()
+            .await
+            .unwrap()
+            .is_empty());
+        // Same heartbeat: the auto-send leaves it alone (no write loop)...
+        let mut lanes = lanes_for(&f, vec![session("alpha", "idle", "t1")]).await;
+        assert_eq!(
+            front(&f, &mut lanes, &mut memo, true).await,
+            FrontSend::Nothing
+        );
+        assert_eq!(write_line_calls(&f.fake).len(), 1);
+        // ...a manual retry doesn't wait...
+        f.fake.push_write_line(Err(PtyBackendError::NotConnected));
+        assert!(matches!(
+            front(&f, &mut lanes, &mut memo, false).await,
+            FrontSend::Failed { .. }
+        ));
+        assert_eq!(write_line_calls(&f.fake).len(), 2);
+        // ...and a new session report lets the auto-send try again.
+        let mut lanes = lanes_for(&f, vec![session("alpha", "idle", "t2")]).await;
+        assert!(matches!(
+            front(&f, &mut lanes, &mut memo, true).await,
+            FrontSend::Sent { task_id, .. } if task_id == id
+        ));
+        assert_eq!(write_line_calls(&f.fake).len(), 3);
+    }
+
+    #[test]
+    fn auto_send_skips_a_failed_card_until_the_session_reports_again() {
+        let mut memo = SendMemo::default();
+        let key = ("p".to_string(), "alpha".to_string());
+        assert!(!skip_failed(&memo, &key, 5, "t1"));
+        memo.failed.insert(key.clone(), (5, "t1".to_string()));
+        assert!(skip_failed(&memo, &key, 5, "t1"), "same heartbeat: wait");
+        assert!(!skip_failed(&memo, &key, 5, "t2"), "new heartbeat: retry");
+        assert!(!skip_failed(&memo, &key, 6, "t1"), "another card: try it");
+        let other = ("p".to_string(), "bravo".to_string());
+        assert!(!skip_failed(&memo, &other, 5, "t1"));
     }
 
     #[test]
@@ -734,50 +1297,39 @@ mod tests {
         let wts = vec!["alpha".to_string()];
         let card = open_card(None, vec![]);
         assert_eq!(
-            request_refusal(Some(&card), 5, "zulu", &wts, "idle"),
+            request_refusal(Some(&card), 5, "zulu", &wts),
             Some("unknown worktree `zulu`; expected one of: alpha".to_string())
         );
         assert_eq!(
-            request_refusal(None, 9, "alpha", &wts, "idle"),
+            request_refusal(None, 9, "alpha", &wts),
             Some("task #9 not found".to_string())
         );
         // No configured worktrees: no restriction, as in `reconciled_sessions`.
-        assert_eq!(request_refusal(Some(&card), 5, "zulu", &[], "idle"), None);
-    }
-
-    #[test]
-    fn request_miss_reason_says_what_was_left() {
-        assert_eq!(
-            request_miss_reason("alpha", "no live session", false),
-            "could not send to @alpha (no live session); nothing is left reserved"
-        );
-        assert_eq!(
-            request_miss_reason("alpha", "", true),
-            "could not send to @alpha; it stays queued on the board as before"
-        );
+        assert_eq!(request_refusal(Some(&card), 5, "zulu", &[]), None);
     }
 
     #[test]
     fn request_outcome_maps_apply_results() {
-        let ok = |dispatched: bool, reason: Option<&str>| {
+        let ok = |dispatched: bool, state: &'static str, reason: Option<&str>| {
             Ok(DispatchOutcome {
                 dispatched,
+                state,
+                worktree: "alpha".to_string(),
                 reason: reason.map(str::to_string),
             })
         };
-        assert_eq!(request_outcome(&ok(true, None)), ("applied", String::new()));
         assert_eq!(
-            request_outcome(&ok(true, Some("already dispatched"))),
-            ("applied", "already dispatched".to_string())
+            request_outcome(&ok(true, "sent", None)),
+            ("applied", String::new())
         );
-        // An inject that sent nothing is refused (its reserve was undone).
+        // Pending (and pending after a failed send) is still applied: the card is on the lane.
         assert_eq!(
-            request_outcome(&ok(false, Some("alpha: could not inject (gone)"))),
-            ("refused", "alpha: could not inject (gone)".to_string())
+            request_outcome(&ok(false, "pending", Some("pending: @alpha is busy"))),
+            ("applied", "pending: @alpha is busy".to_string())
         );
         assert_eq!(
-            request_outcome(&ok(false, None)),
-            ("refused", "nothing was sent".to_string())
+            request_outcome(&ok(false, "failed", Some("could not send"))),
+            ("applied", "could not send".to_string())
         );
         assert_eq!(
             request_outcome(&Err("task #5 is done".to_string())),
@@ -785,20 +1337,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decide_truth_table() {
-        // Only idle + live PTY dispatches; everything else queues.
-        assert_eq!(decide("idle", true), Decision::Dispatched);
-        assert_eq!(decide("idle", false), Decision::Queued);
-        assert_eq!(decide("busy", true), Decision::Queued);
-        assert_eq!(decide("waiting", true), Decision::Queued);
-        assert_eq!(decide("offline", true), Decision::Queued);
-        assert_eq!(decide("offline", false), Decision::Queued);
-    }
-
     /// Gate test: a session that is `idle` per the DB but present in the background
-    /// set reconciles to `busy`, and `decide("busy", true)` returns `Queued` — so
-    /// the dispatcher never injects into a session running background work.
+    /// set reconciles to `busy`, and a busy lane holds — so the dispatcher never
+    /// injects into a session running background work.
     #[test]
     fn idle_with_background_task_gates_dispatch() {
         use crate::backend::{apply_reconcile, SessionKey};
@@ -835,11 +1376,11 @@ mod tests {
             "idle+bg session must reconcile to busy"
         );
 
-        // Stage-004 gate: busy → Queued, so the dispatcher never injects.
+        // The lane rule: busy holds the lane, so the dispatcher never injects.
         assert_eq!(
-            decide("busy", true),
-            Decision::Queued,
-            "decide must queue a busy session even with a live PTY"
+            lane_hold(&[], "sayo", &reconciled[0].state, &HashSet::new()),
+            Some(LaneHold::Busy("busy".to_string())),
+            "a busy session must hold its lane even with a live PTY"
         );
     }
 
@@ -1141,12 +1682,6 @@ mod tests {
     }
 
     #[test]
-    fn a_terminated_worktree_is_named_in_the_queued_reason() {
-        assert_eq!(queued_reason("sayo", false), "sayo busy — reserved");
-        assert_eq!(queued_reason("sayo", true), "sayo is terminated — reserved");
-    }
-
-    #[test]
     fn a_missing_session_of_a_terminated_worktree_says_so() {
         use crate::backend::fake::FakeBackend;
         let fake = FakeBackend::new();
@@ -1159,7 +1694,8 @@ mod tests {
         assert_eq!(detail, "session is terminated; launch it to dispatch");
         let (decision, outcome) =
             injection_outcome(map_write_line_result(&result), sent_any, "sayo", &detail);
-        assert_eq!(decision, "queued");
+        assert_eq!(decision, "failed");
+        assert_eq!(outcome.state, "failed");
         assert!(!outcome.dispatched);
         assert!(outcome.reason.unwrap().contains("terminated"));
         // Not terminated, or another error: the error's own text.

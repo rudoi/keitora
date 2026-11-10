@@ -251,6 +251,8 @@ pub fn create_worktree(pc: &ProjectConfig, name: &str) -> Result<ResolvedWorktre
         path: path.clone(),
         status: classify_worktree(&path),
         cli: crate::config::resolve_cli(None, &user),
+        // A freshly created linked worktree is never the main checkout.
+        dispatch: true,
     })
 }
 

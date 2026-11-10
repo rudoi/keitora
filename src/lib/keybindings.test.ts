@@ -164,6 +164,7 @@ function makeCtx(overrides: Partial<KeyCtx> = {}): KeyCtx {
     setView: vi.fn(),
     setSelected: vi.fn(),
     openCardMenu: vi.fn(),
+    toggleCardBacklog: vi.fn(),
     adjustFontSize: vi.fn(),
     resetFontSize: vi.fn(),
     projectNames: [],

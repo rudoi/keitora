@@ -10,14 +10,34 @@ function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 }
 
 export interface DispatchOutcome {
+  /** The prompt reached the session (fresh, partial, or sent earlier). */
   dispatched: boolean;
+  /** sent | already_sent | pending (assigned, waiting on its lane) | failed (assigned,
+   *  but the send errored; it stays pending). */
+  state: "sent" | "already_sent" | "pending" | "failed";
+  /** The lane the task is on (the picked one, for an auto-pick). */
+  worktree: string;
   reason: string | null;
 }
 
-/** Reserve and (if the worktree is idle + live) inject the task into its PTY.
- *  The backend is authoritative on the idle-vs-queue decision. */
+/** Assign the task to `worktree`'s lane at once, and send the lane's front card if
+ *  the lane is free. The backend is authoritative on send-vs-pending. */
 export function dispatchApply(worktree: string, taskId: number): Promise<DispatchOutcome> {
   return invoke<DispatchOutcome>("dispatch_apply", { worktree, taskId });
+}
+
+/** One-click Dispatch: the backend auto-picks a pool worktree (an idle one first,
+ *  least recently dispatched; else the shortest queue) and applies as above. */
+export function dispatchAuto(taskId: number): Promise<DispatchOutcome> {
+  return invoke<DispatchOutcome>("dispatch_auto", { taskId });
+}
+
+/** A pending card whose latest send to its lane failed (from `board_snapshot`). */
+export interface DispatchFailure {
+  task_id: number;
+  worktree: string;
+  reason: string;
+  at: string;
 }
 
 /** A task already dispatched and still reserved to a worktree. Serialized from the

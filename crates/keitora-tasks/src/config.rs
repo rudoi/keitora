@@ -500,6 +500,11 @@ pub struct WorktreeEntry {
     /// ([`ProjectMeta::diff_base`]), then [`DiffBase::Auto`].
     /// Registry-only — never written to the committed `[tasks].worktrees` file.
     pub diff_base: Option<DiffBase>,
+    /// Whether this worktree is in the project's dispatch pool (may receive board /
+    /// CLI dispatches). `None` ⇒ the default: in the pool, except the project's main
+    /// checkout (the worktree whose path is the project root). See
+    /// [`ProjectConfig::in_dispatch_pool`]. Registry-only.
+    pub dispatch: Option<bool>,
 }
 
 /// What a writer should do with one optional registry field: leave it, set it, or clear it.
@@ -532,6 +537,7 @@ impl WorktreeEntry {
             codex_thread_id: None,
             claude_session_id: None,
             diff_base: None,
+            dispatch: None,
         }
     }
 
@@ -544,6 +550,7 @@ impl WorktreeEntry {
             codex_thread_id: None,
             claude_session_id: None,
             diff_base: None,
+            dispatch: None,
         }
     }
 }
@@ -570,6 +577,8 @@ enum WorktreeEntryRepr {
         claude_session_id: Option<String>,
         #[serde(default)]
         diff_base: Option<DiffBase>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatch: Option<bool>,
     },
     /// Bare string: `"delta"` → legacy, path-less.
     Name(String),
@@ -586,6 +595,7 @@ impl Serialize for WorktreeEntry {
             || self.codex_thread_id.is_some()
             || self.claude_session_id.is_some()
             || self.diff_base.is_some()
+            || self.dispatch.is_some()
         {
             WorktreeEntryRepr::Table {
                 name: self.name.clone(),
@@ -594,6 +604,7 @@ impl Serialize for WorktreeEntry {
                 codex_thread_id: self.codex_thread_id.clone(),
                 claude_session_id: self.claude_session_id.clone(),
                 diff_base: self.diff_base.clone(),
+                dispatch: self.dispatch,
             }
             .serialize(serializer)
         } else {
@@ -615,6 +626,7 @@ impl<'de> Deserialize<'de> for WorktreeEntry {
                 codex_thread_id: None,
                 claude_session_id: None,
                 diff_base: None,
+                dispatch: None,
             },
             WorktreeEntryRepr::Table {
                 name,
@@ -623,6 +635,7 @@ impl<'de> Deserialize<'de> for WorktreeEntry {
                 codex_thread_id,
                 claude_session_id,
                 diff_base,
+                dispatch,
             } => WorktreeEntry {
                 name,
                 path,
@@ -630,9 +643,16 @@ impl<'de> Deserialize<'de> for WorktreeEntry {
                 codex_thread_id,
                 claude_session_id,
                 diff_base,
+                dispatch,
             },
         })
     }
+}
+
+/// Pure: the dispatch-pool rule for one worktree. An explicit `flag` wins; otherwise
+/// every worktree is in the pool except the project's main checkout.
+pub fn dispatch_pool_default(flag: Option<bool>, is_main_checkout: bool) -> bool {
+    flag.unwrap_or(!is_main_checkout)
 }
 
 /// Merge registry-only fields from existing entries by name (hazard I2).
@@ -650,6 +670,7 @@ fn merge_worktree_registry_fields(
                 || merged.codex_thread_id.is_none()
                 || merged.claude_session_id.is_none()
                 || merged.diff_base.is_none()
+                || merged.dispatch.is_none()
             {
                 if let Some(old) =
                     existing.and_then(|list| list.iter().find(|e| e.name == inc.name))
@@ -665,6 +686,9 @@ fn merge_worktree_registry_fields(
                     }
                     if merged.diff_base.is_none() {
                         merged.diff_base = old.diff_base.clone();
+                    }
+                    if merged.dispatch.is_none() {
+                        merged.dispatch = old.dispatch;
                     }
                 }
             }
@@ -926,6 +950,45 @@ impl UserConfig {
                             .cloned()
                             .unwrap_or_else(|| WorktreeEntry::name_only(worktree));
                         entry.diff_base = base.clone();
+                        list.push(entry);
+                    }
+                }
+                pref.worktrees = Some(list);
+                matched = true;
+            }
+        }
+        if matched {
+            self.save()?;
+        }
+        Ok(matched)
+    }
+
+    /// Set one worktree's dispatch-pool flag (`dispatch = true|false` on its registry
+    /// entry) for the registered project(s) whose root matches `root`. Like
+    /// [`Self::set_worktree_diff_base_by_root`] it bypasses the carry-forward merge and
+    /// materializes the entry from `current` when the registry list is unset. Returns
+    /// `true` if a project matched and the registry was saved.
+    pub fn set_worktree_dispatch_by_root(
+        &mut self,
+        root: &Path,
+        worktree: &str,
+        dispatch: bool,
+        current: &[WorktreeEntry],
+    ) -> Result<bool, ResolveError> {
+        let target = canonical_key(root);
+        let mut matched = false;
+        for pref in self.projects.values_mut() {
+            if canonical_key(&pref.path) == target {
+                let mut list = pref.worktrees.clone().unwrap_or_else(|| current.to_vec());
+                match list.iter_mut().find(|e| e.name == worktree) {
+                    Some(e) => e.dispatch = Some(dispatch),
+                    None => {
+                        let mut entry = current
+                            .iter()
+                            .find(|e| e.name == worktree)
+                            .cloned()
+                            .unwrap_or_else(|| WorktreeEntry::name_only(worktree));
+                        entry.dispatch = Some(dispatch);
                         list.push(entry);
                     }
                 }
@@ -1247,6 +1310,30 @@ impl ProjectConfig {
         self.effective_worktrees
             .clone()
             .unwrap_or_else(|| self.tasks.worktrees.clone())
+    }
+
+    /// Whether `worktree_name` is in the dispatch pool: may receive board and CLI
+    /// dispatches and be auto-picked. The entry's `dispatch` flag wins; a missing
+    /// flag means `true`, except for the project's main checkout (the worktree whose
+    /// path is the project root), which defaults to `false`. A name with no entry is
+    /// judged by the same default.
+    pub fn in_dispatch_pool(&self, worktree_name: &str) -> bool {
+        let flag = self
+            .worktree_entries()
+            .into_iter()
+            .find(|e| e.name == worktree_name)
+            .and_then(|e| e.dispatch);
+        let is_main =
+            canonical_key(&self.worktree_path(worktree_name)) == canonical_key(&self.root);
+        dispatch_pool_default(flag, is_main)
+    }
+
+    /// The effective worktree names that are in the dispatch pool, in config order.
+    pub fn dispatch_pool(&self) -> Vec<String> {
+        self.worktrees()
+            .into_iter()
+            .filter(|w| self.in_dispatch_pool(w))
+            .collect()
     }
 
     /// The effective diff-view base for `worktree_name`: the per-worktree override
@@ -2681,11 +2768,13 @@ impl Config {
             let path = self.worktree_path(&entry.name)?;
             let status = classify_worktree(&path);
             let cli = resolve_cli(Some(&entry), user);
+            let dispatch = self.project.in_dispatch_pool(&entry.name);
             out.push(ResolvedWorktree {
                 name: entry.name,
                 path,
                 status,
                 cli,
+                dispatch,
             });
         }
         Ok(out)
@@ -2846,6 +2935,58 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_pool_default_excludes_only_the_main_checkout() {
+        assert!(dispatch_pool_default(None, false));
+        assert!(!dispatch_pool_default(None, true));
+        assert!(dispatch_pool_default(Some(true), true));
+        assert!(!dispatch_pool_default(Some(false), false));
+    }
+
+    #[test]
+    fn in_dispatch_pool_reads_the_entry_flag_and_defaults_main_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("acme");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut pc = ProjectConfig::scaffold(&root);
+        let mut off = WorktreeEntry::new("off", tmp.path().join("off"));
+        off.dispatch = Some(false);
+        let mut main_on = WorktreeEntry::new("acme", root.clone());
+        main_on.dispatch = None;
+        pc.effective_worktrees = Some(vec![
+            main_on,
+            WorktreeEntry::new("feat", tmp.path().join("feat")),
+            off,
+        ]);
+        assert!(!pc.in_dispatch_pool("acme"), "main checkout defaults out");
+        assert!(pc.in_dispatch_pool("feat"), "missing flag means in");
+        assert!(!pc.in_dispatch_pool("off"));
+        assert_eq!(pc.dispatch_pool(), vec!["feat".to_string()]);
+        // An explicit flag puts the main checkout back in.
+        pc.effective_worktrees.as_mut().unwrap()[0].dispatch = Some(true);
+        assert!(pc.in_dispatch_pool("acme"));
+    }
+
+    #[test]
+    fn worktree_entry_dispatch_flag_roundtrips_as_table() {
+        #[derive(Serialize, Deserialize)]
+        struct Wrap {
+            list: Vec<WorktreeEntry>,
+        }
+        let mut e = WorktreeEntry::name_only("fellowship");
+        e.dispatch = Some(false);
+        let text = toml::to_string(&Wrap {
+            list: vec![e.clone()],
+        })
+        .unwrap();
+        assert!(text.contains("dispatch = false"), "{text}");
+        let back: Wrap = toml::from_str(&text).unwrap();
+        assert_eq!(back.list[0], e);
+        // A table without the key parses to None.
+        let back: Wrap = toml::from_str("list = [{ name = \"x\", path = \"/x\" }]").unwrap();
+        assert_eq!(back.list[0].dispatch, None);
+    }
+
+    #[test]
     fn diff_base_toml_roundtrip_all_variants() {
         for base in [
             DiffBase::Auto,
@@ -2981,6 +3122,42 @@ mod tests {
         }
         .apply_to(&mut pref);
         assert_eq!(pref.diff_base, None);
+    }
+
+    #[test]
+    fn set_worktree_dispatch_sets_and_materializes() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("KEITORA_CONFIG_HOME", tmp.path());
+        let root = PathBuf::from("/code/acme");
+        let mut reg = UserConfig::default();
+        reg.register("acme", root.clone());
+        let current = vec![
+            WorktreeEntry::new("acme", "/code/acme"),
+            WorktreeEntry::new("feat", "/code/acme-wt/feat"),
+        ];
+        assert!(reg
+            .set_worktree_dispatch_by_root(&root, "feat", false, &current)
+            .unwrap());
+        let find = |reg: &UserConfig, n: &str| {
+            reg.projects["acme"]
+                .worktrees
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|e| e.name == n)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(find(&reg, "feat").dispatch, Some(false));
+        assert_eq!(find(&reg, "acme").dispatch, None);
+        reg.set_worktree_dispatch_by_root(&root, "acme", true, &current)
+            .unwrap();
+        assert_eq!(find(&reg, "acme").dispatch, Some(true));
+        // A later plain worktree-list write carries the flag forward.
+        reg.set_project_worktrees_by_root(&root, &current).unwrap();
+        assert_eq!(find(&reg, "feat").dispatch, Some(false));
+        std::env::remove_var("KEITORA_CONFIG_HOME");
     }
 
     #[test]
@@ -6168,6 +6345,7 @@ owner = "acme-corp"
             codex_thread_id: Some("thread-abc".to_string()),
             claude_session_id: None,
             diff_base: None,
+            dispatch: None,
         };
         let serialized = toml::to_string(&Wrap {
             list: vec![entry.clone()],
@@ -6239,6 +6417,7 @@ owner = "acme-corp"
             codex_thread_id: Some("keep-me".to_string()),
             claude_session_id: Some("sid-keep".to_string()),
             diff_base: None,
+            dispatch: None,
         }]);
 
         // Incoming edit carries only {name, path} — as the Settings UI would send.
@@ -6279,6 +6458,7 @@ owner = "acme-corp"
             codex_thread_id: None,
             claude_session_id: None,
             diff_base: None,
+            dispatch: None,
         }]);
 
         let incoming = vec![WorktreeEntry {
@@ -6288,6 +6468,7 @@ owner = "acme-corp"
             codex_thread_id: None,
             claude_session_id: None,
             diff_base: None,
+            dispatch: None,
         }];
         reg.set_project_worktrees_by_root(&root, &incoming).unwrap();
 

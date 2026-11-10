@@ -5,9 +5,9 @@
 // Rows are separated by hairlines; empty+offline rows are dimmed.
 
 import { useDroppable } from "@dnd-kit/core";
-import type { WorktreeSession } from "../../lib/sessions";
 import type { Decision } from "../../lib/useDispatchTargets";
-import { cardDecorators, decisionClasses } from "./cardHelpers";
+import { type CardEnv, decisionClasses, stateOf } from "./cardHelpers";
+import { laneStatusText } from "./LaneHeader";
 import { TaskCard } from "./TaskCard";
 import type { Lane as LaneData } from "./useBoardLanes";
 
@@ -17,19 +17,7 @@ interface WorktreeRowProps {
   lane: LaneData;
   dragging: boolean;
   decision: Decision | undefined;
-  sessions: Map<string, WorktreeSession>;
-  actor: string | null;
-  selectedId: number | null;
-  worktreeNames: string[];
-  dispatchedSet: Set<string>;
-  frontReserved: Map<string, number>;
-  flyIn: { id: number; worktree: string } | null;
-  menuTaskId: number | null;
-  onMenuOpenChange: (taskId: number, open: boolean) => void;
-  onSelect: (id: number) => void;
-  onAction: (fn: () => Promise<unknown>) => void;
-  onDispatch: (worktree: string, taskId: number) => void;
-  onRelease: (taskId: number) => void;
+  env: CardEnv;
   /** One-shot flash on the name column after a successful dispatch to this worktree. */
   headerFlash?: boolean;
 }
@@ -40,19 +28,7 @@ export function WorktreeRow({
   lane,
   dragging,
   decision,
-  sessions,
-  actor,
-  selectedId,
-  worktreeNames,
-  dispatchedSet,
-  frontReserved,
-  flyIn,
-  menuTaskId,
-  onMenuOpenChange,
-  onSelect,
-  onAction,
-  onDispatch,
-  onRelease,
+  env,
   headerFlash = false,
 }: WorktreeRowProps) {
   const { setNodeRef, isOver } = useDroppable({ id: lane.key });
@@ -67,34 +43,16 @@ export function WorktreeRow({
     ? `rounded-chip border ${decisionClasses(decision, isOver)}`
     : "border-b border-line last:border-b-0";
 
-  function renderCard(t: LaneData["tasks"][0], fill = false) {
-    const { isFrontReserved, alreadyDispatched } = cardDecorators(
-      t,
-      lane,
-      frontReserved,
-      sessions,
-      dispatchedSet,
-    );
+  const inPool = env.pool.has(lane.key);
 
+  function renderCard(t: LaneData["tasks"][0], fill = false) {
     return (
       <TaskCard
         key={t.id}
         t={t}
         column={lane.key}
-        isWorktreeColumn={true}
-        actor={actor}
-        selected={t.id === selectedId}
-        worktreeNames={worktreeNames}
-        sessions={sessions}
-        isFrontReserved={isFrontReserved}
-        alreadyDispatched={alreadyDispatched}
-        flyIn={flyIn?.id === t.id ? flyIn.worktree : null}
-        menuOpen={menuTaskId === t.id}
-        onMenuOpenChange={(open) => onMenuOpenChange(t.id, open)}
-        onSelect={() => onSelect(t.id)}
-        onAction={onAction}
-        onDispatch={(wt) => onDispatch(wt, t.id)}
-        onRelease={() => onRelease(t.id)}
+        state={stateOf(env, t)}
+        env={env}
         compact={true}
         fill={fill}
       />
@@ -116,6 +74,16 @@ export function WorktreeRow({
       >
         <span className="block text-[8px] uppercase tracking-[0.14em] text-tx-3">WORKTREE</span>
         <span className="block truncate text-[15px] font-semibold text-tx-1">{lane.label}</span>
+        <span
+          className="block truncate text-[9.5px] text-tx-3"
+          title={
+            inPool
+              ? undefined
+              : "Not in the dispatch pool: it takes no tasks (worktree menu → Accept dispatched tasks)"
+          }
+        >
+          {inPool ? laneStatusText(lane) : "no dispatch"}
+        </span>
       </div>
 
       {/* Right: compact cards wrap within the fixed-height row; if they overflow the

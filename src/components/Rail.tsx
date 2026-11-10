@@ -12,7 +12,7 @@ import { Activity, HelpCircle, Settings } from "lucide-react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatBytes, formatCpu, formatUptime } from "../lib/format";
 import type { CliKind, DaemonInfo } from "../lib/ipc";
-import { daemonRestart, daemonStatus } from "../lib/ipc";
+import { daemonRestart, daemonStatus, setWorktreeDispatch } from "../lib/ipc";
 import {
   laneMenuAction,
   sessionItemDisabledReason,
@@ -276,6 +276,8 @@ type WorktreeMenuState = {
   y: number;
   cli: CliKind;
   terminated: boolean;
+  /** In the dispatch pool (may receive dispatched tasks). */
+  dispatch: boolean;
 };
 
 const WORKTREE_ITEM_LABEL: Record<Exclude<WorktreeMenuItem, "transfer">, string> = {
@@ -291,12 +293,15 @@ function WorktreeMenu({
   state,
   onOpenChange,
   onPick,
+  onToggleDispatch,
   codexAvailable,
   transferBusy,
 }: {
   state: WorktreeMenuState | null;
   onOpenChange: (open: boolean) => void;
   onPick: (state: WorktreeMenuState, item: WorktreeMenuItem, targetCli: CliKind) => void;
+  /** Put the worktree in or out of the dispatch pool (active project only). */
+  onToggleDispatch: (state: WorktreeMenuState) => void;
   codexAvailable: boolean;
   /** A transfer is already in flight for the menu's worktree. */
   transferBusy: boolean;
@@ -345,6 +350,19 @@ function WorktreeMenu({
             </DropdownMenu.Label>
           )}
           {items.map(item)}
+          {state && !state.inactive && (
+            <>
+              <DropdownMenu.Separator className={menuSepCls} />
+              <DropdownMenu.CheckboxItem
+                checked={state.dispatch}
+                onSelect={() => onToggleDispatch(state)}
+                title="Whether the board and `keitora task dispatch` may send tasks here"
+                className={`${menuItemCls} text-tx-2`}
+              >
+                {state.dispatch ? "✓ " : ""}Accept dispatched tasks
+              </DropdownMenu.CheckboxItem>
+            </>
+          )}
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>
@@ -658,8 +676,26 @@ export function Rail({
       y,
       cli: lane.cli,
       terminated: lane.terminated,
+      dispatch: lane.dispatch,
     });
   }, []);
+  // The worktree list refreshes on project://changed, which the command emits.
+  const toggleDispatch = useCallback(
+    (m: WorktreeMenuState) => {
+      setMenu(null);
+      const next = !m.dispatch;
+      setWorktreeDispatch(m.name, next)
+        .then(() =>
+          showToast(
+            next
+              ? `@${m.name} now accepts dispatched tasks`
+              : `@${m.name} no longer accepts dispatched tasks`,
+          ),
+        )
+        .catch((e) => showToast(String(e)));
+    },
+    [showToast],
+  );
   const openProjectMenu = useCallback(
     (g: GroupModel, x: number, y: number, from: HTMLElement | null) => {
       projectMenuReturn.current = from;
@@ -732,6 +768,7 @@ export function Rail({
           if (!open) setMenu(null);
         }}
         onPick={pickLaneItem}
+        onToggleDispatch={toggleDispatch}
         codexAvailable={codexAvailable}
         transferBusy={menuBusy}
       />

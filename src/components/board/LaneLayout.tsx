@@ -3,8 +3,8 @@
 // Open (unassigned) full-height left column | center flex-1 scrollable
 // column of WorktreeRows | Done full-height right column (only when showDone).
 
-import type { WorktreeSession } from "../../lib/sessions";
 import type { Decision } from "../../lib/useDispatchTargets";
+import type { CardEnv } from "./cardHelpers";
 import { Lane } from "./Lane";
 import type { Lane as LaneData } from "./useBoardLanes";
 import { WorktreeRow } from "./WorktreeRow";
@@ -13,63 +13,28 @@ interface LaneLayoutProps {
   lanes: LaneData[];
   decisions: Map<string, Decision>;
   dragging: boolean;
-  flyIn: { id: number; worktree: string } | null;
-  sessions: Map<string, WorktreeSession>;
-  actor: string | null;
-  selectedId: number | null;
-  worktreeNames: string[];
-  dispatchedSet: Set<string>;
-  frontReserved: Map<string, number>;
-  menuTaskId: number | null;
-  onMenuOpenChange: (taskId: number, open: boolean) => void;
-  onSelect: (id: number) => void;
-  onAction: (fn: () => Promise<unknown>) => void;
-  onDispatch: (worktree: string, taskId: number) => void;
-  onRelease: (taskId: number) => void;
+  env: CardEnv;
   /** When false (default), the Done column is not rendered. */
   showDone: boolean;
+  /** The Open lane's backlog toggle. */
+  backlog: { shown: boolean; count: number; onToggle: () => void };
 }
 
 export function LaneLayout({
   lanes,
   decisions,
   dragging,
-  flyIn,
-  sessions,
-  actor,
-  selectedId,
-  worktreeNames,
-  dispatchedSet,
-  frontReserved,
-  menuTaskId,
-  onMenuOpenChange,
-  onSelect,
-  onAction,
-  onDispatch,
-  onRelease,
+  env,
   showDone,
+  backlog,
 }: LaneLayoutProps) {
+  const flyIn = env.flyIn;
   const unassignedLane = lanes.find((l) => l.kind === "unassigned");
   const worktreeLanes = lanes.filter((l) => l.kind === "worktree");
   const doneLane = lanes.find((l) => l.kind === "done");
 
   // Shared props for Lane (side columns) and WorktreeRow.
-  const sharedProps = {
-    dragging,
-    flyIn,
-    sessions,
-    actor,
-    selectedId,
-    worktreeNames,
-    dispatchedSet,
-    frontReserved,
-    menuTaskId,
-    onMenuOpenChange,
-    onSelect,
-    onAction,
-    onDispatch,
-    onRelease,
-  };
+  const sharedProps = { dragging, env };
 
   // Three full-height regions.
   return (
@@ -81,6 +46,7 @@ export function LaneLayout({
             lane={unassignedLane}
             decision={decisions.get(unassignedLane.key)}
             headerFlash={flyIn?.worktree === unassignedLane.key}
+            backlog={backlog}
             {...sharedProps}
           />
         </div>

@@ -1,12 +1,16 @@
-//! Pure rendering for custom dispatch steps, plus the pure dispatch preconditions
-//! ([`task_refusal`], [`session_refusal`]) that a CLI dispatch request is checked
-//! against.
+//! Pure rendering for custom dispatch steps, the pure dispatch precondition
+//! ([`task_refusal`]) a CLI dispatch request is checked against, and the lane rules
+//! shared by the board and the app's auto-send: [`lane_queue`] (send order),
+//! [`lane_hold`] (what keeps a lane from taking a send), [`pending_reason`] and
+//! [`pick_worktree`] (one-click Dispatch).
 //!
 //! A dispatched task's prompt lines (configured in `[dispatch].steps`, see
 //! [`crate::DispatchConfig`]) are templates with a fixed placeholder set. This
 //! module turns a template + a [`DispatchContext`] into the final text. It is
 //! deliberately Tauri-free and fully unit-tested; the orchestration (writing the
 //! lines into a PTY, the submit byte, inter-step delays) lives in the app crate.
+
+use std::collections::HashSet;
 
 use crate::{Task, TaskWithDeps};
 
@@ -103,7 +107,11 @@ pub fn task_refusal(task: &TaskWithDeps, worktree: &str) -> Option<String> {
     let id = t.id;
     match t.status.as_str() {
         "done" | "cancelled" => return Some(format!("task #{id} is {}", t.status)),
-        "backlog" => return Some(format!("task #{id} is in the backlog; reopen it first")),
+        "backlog" => {
+            return Some(format!(
+                "task #{id} is in the backlog; reopen it first (`keitora task reopen {id}`)"
+            ))
+        }
         "active" => {
             let who = t.assigned_to.as_deref().unwrap_or("someone");
             return Some(format!("task #{id} is already active on @{who}"));
@@ -127,21 +135,146 @@ pub fn task_refusal(task: &TaskWithDeps, worktree: &str) -> Option<String> {
     }
 }
 
-/// Pure: why a session in `state` can't take a CLI dispatch, or `None` when it can.
-/// Only an `idle` session takes one. A `busy` or `waiting` session is refused rather
-/// than queued: the board's lanes are the queue, and a CLI request is a "send it now"
-/// that either lands or doesn't. `offline` is refused too, since dispatch only types
-/// into a live session and never starts one.
-pub fn session_refusal(state: &str, worktree: &str) -> Option<String> {
-    match state {
-        "idle" => None,
-        "busy" | "waiting" => Some(format!(
-            "@{worktree} is {state}; dispatch only sends to an idle session (queue it on the board instead)"
-        )),
-        other => Some(format!(
-            "@{worktree} is {other}; start its session first (dispatch never launches an agent)"
-        )),
+/// Send order within a lane: priority rank (urgent first). Unknown priorities sort
+/// with `normal`.
+pub fn priority_rank(priority: &str) -> u8 {
+    match priority {
+        "urgent" => 0,
+        "high" => 1,
+        "low" => 3,
+        _ => 2,
     }
+}
+
+/// Pure: a worktree lane's queue of *pending* cards, in the order they are sent:
+/// open cards reserved to `worktree` that have not been sent yet (`sent` holds the
+/// ids of cards already typed into a session) and are not blocked, highest priority
+/// first, then lowest id. The board mirrors this order (`laneQueue` in the frontend).
+pub fn lane_queue<'a>(
+    tasks: &'a [TaskWithDeps],
+    worktree: &str,
+    sent: &HashSet<i64>,
+) -> Vec<&'a TaskWithDeps> {
+    let mut q: Vec<&TaskWithDeps> = tasks
+        .iter()
+        .filter(|t| {
+            t.task.status == "open"
+                && t.task.assigned_to.as_deref() == Some(worktree)
+                && !sent.contains(&t.task.id)
+                && t.blocked_by.is_empty()
+        })
+        .collect();
+    q.sort_by_key(|t| (priority_rank(&t.task.priority), t.task.id));
+    q
+}
+
+/// Why a lane can't take a send right now. A lane is *free* (its front pending card
+/// may be typed in) only when none of these hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaneHold {
+    /// No live session: dispatch never starts one.
+    Offline,
+    /// The worktree's agent has an active (claimed) task. Its session may be idle
+    /// between workflow stages; typing a new task in would break into that work.
+    Working(i64),
+    /// A card was sent and the agent has not claimed it yet.
+    AwaitingClaim(i64),
+    /// The session is `busy` or `waiting`.
+    Busy(String),
+}
+
+impl LaneHold {
+    /// A short reason, e.g. "@alpha is busy".
+    pub fn describe(&self, worktree: &str) -> String {
+        match self {
+            LaneHold::Offline => format!("@{worktree} is offline"),
+            LaneHold::Working(id) => format!("@{worktree} is working on #{id}"),
+            LaneHold::AwaitingClaim(id) => {
+                format!("@{worktree} was sent #{id} and has not claimed it yet")
+            }
+            LaneHold::Busy(state) => format!("@{worktree} is {state}"),
+        }
+    }
+}
+
+/// Pure: what holds `worktree`'s lane (session in `state`), or `None` when it is
+/// free. Offline is checked first, then an active task, then a sent-but-unclaimed
+/// card, then a non-idle session.
+pub fn lane_hold(
+    tasks: &[TaskWithDeps],
+    worktree: &str,
+    state: &str,
+    sent: &HashSet<i64>,
+) -> Option<LaneHold> {
+    if state == "offline" || state.is_empty() {
+        return Some(LaneHold::Offline);
+    }
+    let here = |t: &&TaskWithDeps| t.task.assigned_to.as_deref() == Some(worktree);
+    if let Some(t) = tasks
+        .iter()
+        .filter(here)
+        .find(|t| t.task.status == "active")
+    {
+        return Some(LaneHold::Working(t.task.id));
+    }
+    if let Some(t) = tasks
+        .iter()
+        .filter(here)
+        .find(|t| t.task.status == "open" && sent.contains(&t.task.id))
+    {
+        return Some(LaneHold::AwaitingClaim(t.task.id));
+    }
+    if state != "idle" {
+        return Some(LaneHold::Busy(state.to_string()));
+    }
+    None
+}
+
+/// Pure: the reason shown for a pending card on `worktree`: what holds the lane (if
+/// anything) and how many pending cards are ahead of it.
+pub fn pending_reason(worktree: &str, hold: Option<&LaneHold>, ahead: usize) -> String {
+    let behind = match ahead {
+        0 => String::new(),
+        1 => "behind 1 card".to_string(),
+        n => format!("behind {n} cards"),
+    };
+    match (hold, behind.is_empty()) {
+        (Some(h), true) => format!("pending: {}", h.describe(worktree)),
+        (Some(h), false) => format!("pending: {}, {behind}", h.describe(worktree)),
+        (None, false) => format!("pending: {behind} on @{worktree}"),
+        (None, true) => format!("pending: next on @{worktree}"),
+    }
+}
+
+/// One pool worktree as auto-pick sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolLane {
+    pub worktree: String,
+    /// The lane is free (live, idle, nothing active or awaiting a claim).
+    pub free: bool,
+    /// Pending cards already queued on the lane.
+    pub queue_len: usize,
+    /// When the lane was last sent a card (dispatch-log `created_at`), if ever.
+    pub last_dispatched: Option<String>,
+}
+
+/// Pure: auto-pick a worktree for a one-click Dispatch from the pool `lanes` (in
+/// config order). A free lane with an empty queue wins, least recently dispatched
+/// first (never-dispatched before any); otherwise the lane with the shortest queue,
+/// then least recently dispatched, so the card waits there as pending. Ties keep
+/// config order. `None` when the pool is empty.
+pub fn pick_worktree(lanes: &[PoolLane]) -> Option<&PoolLane> {
+    // `None` (never dispatched) sorts before any timestamp; `min_by_key` keeps the
+    // first of equal keys, so ties fall back to config order.
+    let free = lanes
+        .iter()
+        .filter(|l| l.free && l.queue_len == 0)
+        .min_by_key(|l| l.last_dispatched.clone());
+    free.or_else(|| {
+        lanes
+            .iter()
+            .min_by_key(|l| (l.queue_len, l.last_dispatched.clone()))
+    })
 }
 
 #[cfg(test)]
@@ -340,7 +473,7 @@ mod tests {
         );
         assert_eq!(
             refuse(card("backlog", None, vec![])),
-            "task #19 is in the backlog; reopen it first"
+            "task #19 is in the backlog; reopen it first (`keitora task reopen 19`)"
         );
         assert_eq!(
             refuse(card("active", Some("bravo"), vec![])),
@@ -358,17 +491,129 @@ mod tests {
         assert_eq!(refuse(card("done", None, vec![3])), "task #19 is done");
     }
 
+    fn lane_card(id: i64, status: &str, wt: Option<&str>, priority: &str) -> TaskWithDeps {
+        let mut c = card(status, wt, vec![]);
+        c.task.id = id;
+        c.task.priority = priority.to_string();
+        c
+    }
+
     #[test]
-    fn session_refusal_truth_table() {
-        assert_eq!(session_refusal("idle", "alpha"), None);
-        // Busy and waiting are refused, not queued: the board is the queue.
+    fn lane_queue_orders_by_priority_then_id_and_skips_sent_blocked_and_others() {
+        let mut blocked = lane_card(1, "open", Some("alpha"), "urgent");
+        blocked.blocked_by = vec![9];
+        let tasks = vec![
+            blocked,
+            lane_card(7, "open", Some("alpha"), "normal"),
+            lane_card(3, "open", Some("alpha"), "normal"),
+            lane_card(9, "open", Some("alpha"), "high"),
+            lane_card(4, "open", Some("alpha"), "urgent"), // sent
+            lane_card(5, "open", Some("bravo"), "urgent"), // another lane
+            lane_card(6, "active", Some("alpha"), "urgent"),
+            lane_card(8, "open", None, "urgent"),
+        ];
+        let sent: HashSet<i64> = [4].into();
+        let ids: Vec<i64> = lane_queue(&tasks, "alpha", &sent)
+            .iter()
+            .map(|t| t.task.id)
+            .collect();
+        assert_eq!(ids, vec![9, 3, 7]);
+    }
+
+    #[test]
+    fn lane_hold_checks_offline_then_active_then_sent_then_state() {
+        let none = HashSet::new();
+        let idle_lane = vec![lane_card(3, "open", Some("alpha"), "normal")];
+        assert_eq!(lane_hold(&idle_lane, "alpha", "idle", &none), None);
+        assert_eq!(
+            lane_hold(&idle_lane, "alpha", "offline", &none),
+            Some(LaneHold::Offline)
+        );
         for state in ["busy", "waiting"] {
-            let msg = session_refusal(state, "alpha").expect("refused");
-            assert!(msg.starts_with(&format!("@alpha is {state}")), "{msg}");
-            assert!(msg.contains("only sends to an idle session"), "{msg}");
+            assert_eq!(
+                lane_hold(&idle_lane, "alpha", state, &none),
+                Some(LaneHold::Busy(state.to_string()))
+            );
         }
-        let msg = session_refusal("offline", "alpha").expect("refused");
-        assert!(msg.starts_with("@alpha is offline"), "{msg}");
-        assert!(session_refusal("", "alpha").is_some());
+        // An active task holds an idle lane (an agent idle between workflow stages).
+        let working = vec![
+            lane_card(3, "open", Some("alpha"), "normal"),
+            lane_card(6, "active", Some("alpha"), "normal"),
+        ];
+        assert_eq!(
+            lane_hold(&working, "alpha", "idle", &none),
+            Some(LaneHold::Working(6))
+        );
+        // A sent, unclaimed card holds it too.
+        let sent: HashSet<i64> = [3].into();
+        assert_eq!(
+            lane_hold(&idle_lane, "alpha", "idle", &sent),
+            Some(LaneHold::AwaitingClaim(3))
+        );
+        // Another lane's active task doesn't hold this one.
+        let other = vec![lane_card(6, "active", Some("bravo"), "normal")];
+        assert_eq!(lane_hold(&other, "alpha", "idle", &none), None);
+    }
+
+    #[test]
+    fn pending_reason_names_the_hold_and_the_position() {
+        assert_eq!(
+            pending_reason("alpha", Some(&LaneHold::Busy("busy".into())), 0),
+            "pending: @alpha is busy"
+        );
+        assert_eq!(
+            pending_reason("alpha", Some(&LaneHold::Offline), 2),
+            "pending: @alpha is offline, behind 2 cards"
+        );
+        assert_eq!(
+            pending_reason("alpha", None, 1),
+            "pending: behind 1 card on @alpha"
+        );
+        assert_eq!(
+            pending_reason("alpha", Some(&LaneHold::Working(6)), 0),
+            "pending: @alpha is working on #6"
+        );
+    }
+
+    fn pool(name: &str, free: bool, queue_len: usize, last: Option<&str>) -> PoolLane {
+        PoolLane {
+            worktree: name.to_string(),
+            free,
+            queue_len,
+            last_dispatched: last.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn pick_prefers_a_free_lane_least_recently_dispatched() {
+        let lanes = vec![
+            pool("a", true, 0, Some("2026-11-10 10:00:00")),
+            pool("b", false, 0, None),
+            pool("c", true, 0, Some("2026-11-10 09:00:00")),
+            pool("d", true, 0, Some("2026-11-10 11:00:00")),
+        ];
+        assert_eq!(pick_worktree(&lanes).unwrap().worktree, "c");
+        // Never dispatched beats any timestamp.
+        let lanes = vec![
+            pool("a", true, 0, Some("2026-11-10 09:00:00")),
+            pool("b", true, 0, None),
+        ];
+        assert_eq!(pick_worktree(&lanes).unwrap().worktree, "b");
+    }
+
+    #[test]
+    fn pick_falls_back_to_the_shortest_queue() {
+        let lanes = vec![
+            pool("a", false, 2, None),
+            pool("b", false, 1, Some("2026-11-10 10:00:00")),
+            pool("c", false, 1, Some("2026-11-10 09:00:00")),
+            // Free, but already has a queue: not "idle first".
+            pool("d", true, 3, None),
+        ];
+        assert_eq!(pick_worktree(&lanes).unwrap().worktree, "c");
+        // Ties keep config order.
+        let lanes = vec![pool("x", false, 0, None), pool("y", false, 0, None)];
+        assert_eq!(pick_worktree(&lanes).unwrap().worktree, "x");
+        assert_eq!(pick_worktree(&[]), None);
     }
 }

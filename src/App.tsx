@@ -222,6 +222,11 @@ function AppInner() {
   const registerOpenCardMenu = useCallback((fn: () => void) => {
     openCardMenuRef.current = fn;
   }, []);
+  // Same for `b`: backlog / reopen the selected card.
+  const toggleBacklogRef = useRef<() => void>(() => {});
+  const registerToggleBacklog = useCallback((fn: () => void) => {
+    toggleBacklogRef.current = fn;
+  }, []);
 
   // Per-worktree restart signal: the Rail's "Restart session" context-menu item
   // (and a completed CLI transfer) bumps the entry keyed
@@ -345,6 +350,8 @@ function AppInner() {
   const {
     tasks,
     reservations: dispatched,
+    backlog: backlogTasks,
+    failures: dispatchFailures,
     reload: reloadTasks,
   } = useTasks(activeProjectName, activeBackend);
   // Bumps whenever the task list reloads, so the open inspector refetches in step.
@@ -944,6 +951,7 @@ function AppInner() {
       setView,
       setSelected,
       openCardMenu: () => openCardMenuRef.current(),
+      toggleCardBacklog: () => toggleBacklogRef.current(),
       adjustFontSize,
       resetFontSize,
       projectNames,
@@ -1156,6 +1164,9 @@ function AppInner() {
   const actor = selected;
 
   const worktreeNames = activeWorktrees.map((w) => w.name);
+  // The dispatch pool: worktrees that may receive tasks (the main checkout is out by
+  // default). A missing flag (an older backend) counts as in.
+  const dispatchPool = activeWorktrees.filter((w) => w.dispatch !== false).map((w) => w.name);
 
   return (
     <div className="keitora">
@@ -1215,13 +1226,17 @@ function AppInner() {
             <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-bg-0">
               <Board
                 tasks={tasks ?? []}
+                backlog={backlogTasks}
+                failures={dispatchFailures}
                 worktreeNames={worktreeNames}
+                pool={dispatchPool}
                 sessions={sessions}
                 actor={actor}
                 selectedId={selectedTaskId}
                 onSelect={setSelectedTaskId}
                 reload={reloadTasks}
                 registerOpenCardMenu={registerOpenCardMenu}
+                registerToggleBacklog={registerToggleBacklog}
                 dispatched={dispatched ?? []}
               />
             </div>

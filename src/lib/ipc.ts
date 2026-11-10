@@ -566,6 +566,9 @@ export interface WorktreeInfo {
   /** The user terminated this worktree's session: it stays down (no resume,
    *  no respawn) until launched again. */
   terminated: boolean;
+  /** In the project's dispatch pool: may receive dispatched tasks (missing = true). Defaults to true
+   *  except for the project's main checkout. */
+  dispatch?: boolean;
 }
 
 /** List configured worktrees, each resolved to a path + filesystem status. */
@@ -801,6 +804,11 @@ export function worktreeDiffBase(worktree: string): Promise<DiffBaseInfo> {
 
 /** Set (or clear, with `base: null`) the per-worktree diff-base override. Emits
  *  `project://changed`; the backend invalidates its base cache so the next fetch reflects it. */
+/** Put a worktree of the active project in or out of the dispatch pool. */
+export function setWorktreeDispatch(worktree: string, dispatch: boolean): Promise<void> {
+  return invoke("set_worktree_dispatch", { worktree, dispatch });
+}
+
 export function setWorktreeDiffBase(worktree: string, base: DiffBase | null): Promise<void> {
   return invoke("set_worktree_diff_base", { worktree, base });
 }

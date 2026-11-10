@@ -522,6 +522,29 @@ impl LocalStore {
         Ok(n == 1)
     }
 
+    /// Point an auto-pick request (one made with no worktree) at the worktree the app
+    /// picked for it, so the requester can see where its task went.
+    pub fn dispatch_request_retarget(&self, id: i64, worktree: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE dispatch_requests SET worktree = ?2 WHERE id = ?1",
+            params![id, worktree],
+        )?;
+        Ok(())
+    }
+
+    /// Whether any task is pending on a worktree lane (open and reserved to one), i.e.
+    /// whether the app's auto-send has anything to look at. Cheap; `true` when the
+    /// `tasks` table isn't in this DB (another backend), so callers err on looking.
+    pub fn has_reserved_tasks(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM tasks                  WHERE status = 'open' AND assigned_to IS NOT NULL)",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(true)
+    }
+
     /// Refuse every `pending` request older than `max_age_secs`, so an app that starts
     /// long after a request was made doesn't act on it. Returns how many expired.
     pub fn dispatch_requests_expire(&self, max_age_secs: i64) -> Result<usize> {
@@ -1257,6 +1280,49 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no dispatch request 999"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_request_retarget_records_the_picked_worktree() {
+        let db = TempDb::new();
+        let ls = db.open();
+        let r = ls.dispatch_request_add(4, "", "me").unwrap();
+        assert_eq!(r.worktree, "");
+        ls.dispatch_request_retarget(r.id, "bravo").unwrap();
+        assert_eq!(
+            ls.dispatch_request_get(r.id).unwrap().unwrap().worktree,
+            "bravo"
+        );
+    }
+
+    #[test]
+    fn has_reserved_tasks_sees_open_assigned_rows_only() {
+        let db = TempDb::new();
+        let ls = db.open();
+        let has_table = ls
+            .conn
+            .execute("INSERT INTO tasks (title, status) VALUES ('a', 'open')", [])
+            .is_ok();
+        if !has_table {
+            // Another backend's DB: err on looking.
+            assert!(ls.has_reserved_tasks());
+            return;
+        }
+        assert!(!ls.has_reserved_tasks());
+        ls.conn
+            .execute(
+                "INSERT INTO tasks (title, status, assigned_to) VALUES ('b', 'active', 'alpha')",
+                [],
+            )
+            .unwrap();
+        assert!(!ls.has_reserved_tasks());
+        ls.conn
+            .execute(
+                "INSERT INTO tasks (title, status, assigned_to) VALUES ('c', 'open', 'alpha')",
+                [],
+            )
+            .unwrap();
+        assert!(ls.has_reserved_tasks());
     }
 
     #[test]
