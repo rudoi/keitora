@@ -121,6 +121,10 @@ enum TaskCmd {
         /// Wait up to this many seconds for the app's outcome (0: don't wait)
         #[arg(long, default_value_t = 0)]
         wait: u64,
+        /// After the prompt is sent, keep waiting (within --wait) until the worktree's
+        /// agent claims the task; exit non-zero if it doesn't
+        #[arg(long)]
+        until_claimed: bool,
     },
     /// Stream session-state changes, dispatch-log entries and dispatch requests
     /// (one line per change; JSON lines with --json) until interrupted
@@ -617,8 +621,24 @@ async fn run_task(
             backend.delete(id).await?;
             emit_ok(json, &format!("  Deleted task #{id}"))?;
         }
-        TaskCmd::Dispatch { id, worktree, wait } => {
-            cmd_task_dispatch(backend, local, config, &me, id, &worktree, wait, json).await?
+        TaskCmd::Dispatch {
+            id,
+            worktree,
+            wait,
+            until_claimed,
+        } => {
+            cmd_task_dispatch(
+                backend,
+                local,
+                config,
+                &me,
+                id,
+                &worktree,
+                wait,
+                until_claimed,
+                json,
+            )
+            .await?
         }
         TaskCmd::Watch {
             worktree,
@@ -659,8 +679,12 @@ async fn cmd_task_dispatch(
     id: i64,
     worktree: &str,
     wait: u64,
+    until_claimed: bool,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
+    if until_claimed && wait == 0 {
+        return Err("--until-claimed needs --wait <secs> to bound how long it waits".into());
+    }
     // The app only reads requests from the DBs of projects in its registry; anywhere
     // else a request would sit unread until it expired.
     let root = &config.project_config().root;
@@ -684,8 +708,10 @@ async fn cmd_task_dispatch(
     }
 
     let mut req = local.dispatch_request_add(id, worktree, me)?;
+    // One budget for the whole wait: the app's outcome, then (with --until-claimed)
+    // the agent's claim.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
     if wait > 0 {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
         while !req.is_resolved() && std::time::Instant::now() < deadline {
             std::thread::sleep(DISPATCH_WAIT_POLL);
             req = local
@@ -703,10 +729,34 @@ async fn cmd_task_dispatch(
         }
     }
 
+    // `applied` means the prompt was typed; --until-claimed waits on until the agent
+    // in that worktree has actually taken the task.
+    let mut claim = None;
+    if until_claimed && req.status == "applied" {
+        let mut progress = ClaimProgress::Waiting;
+        loop {
+            if let Some(twd) = backend.get(id).await? {
+                progress = claim_progress(&twd.task, worktree);
+            }
+            if progress != ClaimProgress::Waiting || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(DISPATCH_WAIT_POLL);
+        }
+        claim = Some(progress);
+    }
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&req)?);
+        let mut v = serde_json::to_value(&req)?;
+        if let (Some(p), Some(obj)) = (&claim, v.as_object_mut()) {
+            obj.insert("claimed".into(), json!(*p == ClaimProgress::Claimed));
+        }
+        println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
         println!("{}", dispatch_request_message(&req, wait > 0));
+        if claim == Some(ClaimProgress::Claimed) {
+            println!("  Claimed by @{worktree}");
+        }
     }
     match req.status.as_str() {
         "refused" => {
@@ -715,7 +765,42 @@ async fn cmd_task_dispatch(
         "running" => {
             Err(format!("dispatch of #{id} to @{worktree} still running after {wait}s").into())
         }
-        _ => Ok(()),
+        _ => match claim {
+            Some(ClaimProgress::Waiting) => Err(format!(
+                "dispatch of #{id} to @{worktree} applied, but not claimed within {wait}s"
+            )
+            .into()),
+            Some(ClaimProgress::Lost(why)) => {
+                Err(format!("dispatch of #{id} to @{worktree} applied, but {why}").into())
+            }
+            _ => Ok(()),
+        },
+    }
+}
+
+/// Where a dispatched task stands, for `--until-claimed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClaimProgress {
+    /// Still reserved to the worktree, not yet claimed.
+    Waiting,
+    /// The worktree's agent claimed it (it is active there, or already done there).
+    Claimed,
+    /// It went somewhere else; waiting longer won't make it claimed here.
+    Lost(String),
+}
+
+/// Pure: classify `task` after a dispatch onto `worktree`.
+fn claim_progress(task: &Task, worktree: &str) -> ClaimProgress {
+    let here = task.assigned_to.as_deref() == Some(worktree);
+    match (task.status.as_str(), here) {
+        ("active" | "done", true) => ClaimProgress::Claimed,
+        ("open", true) => ClaimProgress::Waiting,
+        ("active", false) => ClaimProgress::Lost(format!(
+            "it was claimed by @{}",
+            task.assigned_to.as_deref().unwrap_or("someone else")
+        )),
+        ("open", false) => ClaimProgress::Lost("it was released".to_string()),
+        (status, _) => ClaimProgress::Lost(format!("it is now {status}")),
     }
 }
 
@@ -1153,8 +1238,16 @@ mod tests {
             .unwrap()
             .cmd
         {
-            Cmd::Task(TaskCmd::Dispatch { id, worktree, wait }) => {
-                assert_eq!((id, worktree.as_str(), wait), (7, "alpha", 0));
+            Cmd::Task(TaskCmd::Dispatch {
+                id,
+                worktree,
+                wait,
+                until_claimed,
+            }) => {
+                assert_eq!(
+                    (id, worktree.as_str(), wait, until_claimed),
+                    (7, "alpha", 0, false)
+                );
             }
             _ => panic!("expected `task dispatch`"),
         }
@@ -1402,5 +1495,78 @@ mod tests {
         let msg = unregistered_message(std::path::Path::new("D:/repos/proj"));
         assert!(msg.contains("D:/repos/proj"), "{msg}");
         assert!(msg.contains("isn't registered with Keitora"), "{msg}");
+    }
+
+    #[test]
+    fn parses_until_claimed() {
+        match Cli::try_parse_from([
+            "keitora",
+            "task",
+            "dispatch",
+            "7",
+            "--worktree",
+            "alpha",
+            "--wait",
+            "60",
+            "--until-claimed",
+        ])
+        .unwrap()
+        .cmd
+        {
+            Cmd::Task(TaskCmd::Dispatch {
+                wait,
+                until_claimed,
+                ..
+            }) => assert!(until_claimed && wait == 60),
+            _ => panic!("expected `task dispatch`"),
+        }
+    }
+
+    fn task_in(status: &str, assigned_to: Option<&str>) -> Task {
+        Task {
+            id: 5,
+            title: "t".into(),
+            description: String::new(),
+            status: status.into(),
+            priority: "normal".into(),
+            assigned_to: assigned_to.map(str::to_string),
+            created_by: None,
+            tags: vec![],
+            branch: None,
+            pr_url: None,
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-01 00:00:00".into(),
+        }
+    }
+
+    #[test]
+    fn claim_progress_waits_for_the_worktree_to_claim() {
+        // Reserved here, not yet claimed: keep waiting.
+        assert_eq!(
+            claim_progress(&task_in("open", Some("alpha")), "alpha"),
+            ClaimProgress::Waiting
+        );
+        // Claimed here (or already finished here): done.
+        assert_eq!(
+            claim_progress(&task_in("active", Some("alpha")), "alpha"),
+            ClaimProgress::Claimed
+        );
+        assert_eq!(
+            claim_progress(&task_in("done", Some("alpha")), "alpha"),
+            ClaimProgress::Claimed
+        );
+        // Anything else won't turn into a claim here: stop with the reason.
+        assert_eq!(
+            claim_progress(&task_in("active", Some("bravo")), "alpha"),
+            ClaimProgress::Lost("it was claimed by @bravo".into())
+        );
+        assert_eq!(
+            claim_progress(&task_in("open", None), "alpha"),
+            ClaimProgress::Lost("it was released".into())
+        );
+        assert_eq!(
+            claim_progress(&task_in("cancelled", Some("alpha")), "alpha"),
+            ClaimProgress::Lost("it is now cancelled".into())
+        );
     }
 }
