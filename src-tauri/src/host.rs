@@ -2088,8 +2088,8 @@ fn start_tasks_watcher(app: AppHandle) {
     let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(0);
     drop(replace_stop(&TASKS_WATCHER_STOP, stop_tx));
 
-    let db_path = match keitora_tasks::resolve_active() {
-        Ok(pc) => pc.tasks.db_path.clone(),
+    let (db_path, project) = match keitora_tasks::resolve_active() {
+        Ok(pc) => (pc.tasks.db_path.clone(), pc.project.name.clone()),
         Err(_) => return, // no active project → previous watcher stopped above
     };
     let dir = match db_path.parent() {
@@ -2140,16 +2140,9 @@ fn start_tasks_watcher(app: AppHandle) {
                     .unwrap_or_default();
                 emit_if_changed("sessions://changed", srev, &mut last_session_revision);
                 // CLI dispatch requests (`keitora task dispatch`) arrive as rows in
-                // this DB; run them through the app's own dispatch path. The executor
-                // takes each row with a compare-and-set, so an overlapping run is harmless.
-                let has_pending = local
-                    .as_ref()
-                    .and_then(|l| l.dispatch_requests_pending().ok())
-                    .is_some_and(|p| !p.is_empty());
-                if has_pending {
-                    tauri::async_runtime::spawn(crate::dispatch::run_dispatch_requests(
-                        app_for_requests.clone(),
-                    ));
+                // this DB; run them through the app's own dispatch path.
+                if let Some(l) = local.as_ref() {
+                    crate::dispatch::spawn_pending_requests(&app_for_requests, l, &project);
                 }
             },
         );

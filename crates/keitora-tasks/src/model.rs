@@ -131,33 +131,34 @@ pub struct DispatchLogEntry {
     pub created_at: String,
 }
 
-/// Every `dispatch_requests.status`. `pending` → `running` → one of the three terminal
+/// Every `dispatch_requests.status`. `pending` → `running` → one of the two terminal
 /// outcomes; see [`DispatchRequest`].
-pub const DISPATCH_REQUEST_STATUSES: [&str; 5] =
-    ["pending", "running", "applied", "queued", "refused"];
+pub const DISPATCH_REQUEST_STATUSES: [&str; 4] = ["pending", "running", "applied", "refused"];
 
 /// The terminal subset of [`DISPATCH_REQUEST_STATUSES`]: what the app resolves a
 /// request to once it has acted on it.
-pub const DISPATCH_REQUEST_OUTCOMES: [&str; 3] = ["applied", "queued", "refused"];
+pub const DISPATCH_REQUEST_OUTCOMES: [&str; 2] = ["applied", "refused"];
 
 /// A request, written by another process (the CLI's `task dispatch`), for the running
-/// app to dispatch `task_id` onto `worktree`. The app executes it through the same path
-/// as a board drag and records the outcome here, so the requester can wait for it.
+/// app to send `task_id` to the session on `worktree` now. The app executes it through
+/// the same path as a board drag and records the outcome here, so the requester can
+/// wait for it.
+///
+/// This is a mailbox, not a queue: a request either reaches an idle session at once
+/// or is refused. Queuing work on a busy session is what the board's lanes are for.
 ///
 /// `status` is `pending` until the app picks it up, `running` while it executes, then
-/// `applied` (injected into an idle session, or already dispatched there), `queued`
-/// (reserved on a busy/waiting session, or on request), or `refused` (with `reason`).
+/// `applied` (typed into the idle session, or already dispatched there) or `refused`
+/// (with `reason`; nothing is left reserved).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DispatchRequest {
     pub id: i64,
     pub task_id: i64,
     pub worktree: String,
-    /// Reserve only: never inject, even into an idle session.
-    pub queue_only: bool,
     /// Who asked (the requesting worktree / actor), for the audit trail.
     pub requested_by: String,
     pub status: String,
-    /// Why the request was queued or refused; empty when applied cleanly.
+    /// Why the request was refused (or a note on how it applied); empty otherwise.
     pub reason: String,
     pub created_at: String,
     /// When the app resolved it to a terminal status; `None` while pending/running.
