@@ -2088,8 +2088,8 @@ fn start_tasks_watcher(app: AppHandle) {
     let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(0);
     drop(replace_stop(&TASKS_WATCHER_STOP, stop_tx));
 
-    let db_path = match keitora_tasks::resolve_active() {
-        Ok(pc) => pc.tasks.db_path.clone(),
+    let (db_path, project) = match keitora_tasks::resolve_active() {
+        Ok(pc) => (pc.tasks.db_path.clone(), pc.project.name.clone()),
         Err(_) => return, // no active project → previous watcher stopped above
     };
     let dir = match db_path.parent() {
@@ -2112,6 +2112,7 @@ fn start_tasks_watcher(app: AppHandle) {
         let local = keitora_tasks::LocalStore::open(&db_path_str).ok();
         let mut last_revision = String::new();
         let mut last_session_revision = String::new();
+        let app_for_requests = app.clone();
         // Emit `event` only when `rev` differs from the last value we sent.
         let emit_if_changed = |event: &str, rev: String, last: &mut String| {
             if rev != *last {
@@ -2138,6 +2139,11 @@ fn start_tasks_watcher(app: AppHandle) {
                     .and_then(|l| l.session_revision().ok())
                     .unwrap_or_default();
                 emit_if_changed("sessions://changed", srev, &mut last_session_revision);
+                // CLI dispatch requests (`keitora task dispatch`) arrive as rows in
+                // this DB; run them through the app's own dispatch path.
+                if let Some(l) = local.as_ref() {
+                    crate::dispatch::spawn_pending_requests(&app_for_requests, l, &project);
+                }
             },
         );
     });
