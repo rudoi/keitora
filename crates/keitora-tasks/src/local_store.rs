@@ -13,7 +13,7 @@
 use rusqlite::{params, OptionalExtension};
 
 use crate::config::CliKind;
-use crate::model::{self, ActiveTask, WorktreeSession};
+use crate::model::{self, ActiveTask, DispatchRequest, WorktreeSession};
 use crate::sqlite_backend::{init_schema, open_conn};
 use crate::{Error, Result};
 
@@ -408,6 +408,140 @@ impl LocalStore {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(names)
     }
+
+    // ---- Dispatch requests ----
+
+    /// Queue a request for the running app to dispatch `task_id` onto `worktree`.
+    /// Returns the new `pending` row. The app's tasks-DB watcher picks it up.
+    pub fn dispatch_request_add(
+        &self,
+        task_id: i64,
+        worktree: &str,
+        queue_only: bool,
+        requested_by: &str,
+    ) -> Result<DispatchRequest> {
+        self.conn.execute(
+            "INSERT INTO dispatch_requests (task_id, worktree, queue_only, requested_by)              VALUES (?1, ?2, ?3, ?4)",
+            params![task_id, worktree, queue_only, requested_by],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.dispatch_request_get(id)?
+            .ok_or_else(|| Error::Conflict(format!("dispatch request {id} vanished")))
+    }
+
+    /// One request by id, or `None`.
+    pub fn dispatch_request_get(&self, id: i64) -> Result<Option<DispatchRequest>> {
+        let row = self
+            .conn
+            .query_row(
+                &format!("SELECT {DISPATCH_REQUEST_COLS} FROM dispatch_requests WHERE id = ?1"),
+                params![id],
+                row_to_dispatch_request,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Every `pending` request, oldest first (the order the app executes them in).
+    pub fn dispatch_requests_pending(&self) -> Result<Vec<DispatchRequest>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {DISPATCH_REQUEST_COLS} FROM dispatch_requests              WHERE status = 'pending' ORDER BY id"
+        ))?;
+        let rows = stmt
+            .query_map([], row_to_dispatch_request)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The most recent `limit` requests, newest first.
+    pub fn dispatch_requests_list(&self, limit: i64) -> Result<Vec<DispatchRequest>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {DISPATCH_REQUEST_COLS} FROM dispatch_requests ORDER BY id DESC LIMIT ?1"
+        ))?;
+        let rows = stmt
+            .query_map(params![limit], row_to_dispatch_request)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Take ownership of a `pending` request by moving it to `running`. `true` when
+    /// this call won; `false` when it was not pending (another app instance, or an
+    /// earlier pass, already took it). This compare-and-set is what keeps a request
+    /// from executing twice.
+    pub fn dispatch_request_begin(&self, id: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE dispatch_requests SET status = 'running'              WHERE id = ?1 AND status = 'pending'",
+            params![id],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Record a request's outcome: `status` must be one of
+    /// [`DISPATCH_REQUEST_OUTCOMES`](crate::DISPATCH_REQUEST_OUTCOMES). Stamps
+    /// `resolved_at`. Resolving an already-resolved request is a `Conflict`, so an
+    /// outcome is written once.
+    pub fn dispatch_request_resolve(&self, id: i64, status: &str, reason: &str) -> Result<()> {
+        if !model::DISPATCH_REQUEST_OUTCOMES.contains(&status) {
+            return Err(Error::Conflict(format!(
+                "invalid dispatch request outcome: {status}"
+            )));
+        }
+        let n = self.conn.execute(
+            "UPDATE dispatch_requests SET status = ?2, reason = ?3, resolved_at = datetime('now')              WHERE id = ?1 AND status IN ('pending', 'running')",
+            params![id, status, reason],
+        )?;
+        if n == 1 {
+            return Ok(());
+        }
+        match self.dispatch_request_get(id)? {
+            None => Err(Error::Conflict(format!("no dispatch request {id}"))),
+            Some(r) => Err(Error::Conflict(format!(
+                "dispatch request {id} is already {}",
+                r.status
+            ))),
+        }
+    }
+
+    /// Withdraw a request the app hasn't picked up yet (the requester stopped waiting):
+    /// a `pending` row becomes `refused` with `reason`. `true` when it was withdrawn;
+    /// `false` when the app had already begun or resolved it, which is left alone.
+    pub fn dispatch_request_cancel(&self, id: i64, reason: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE dispatch_requests SET status = 'refused', reason = ?2, resolved_at = datetime('now') \
+             WHERE id = ?1 AND status = 'pending'",
+            params![id, reason],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Refuse every `pending` request older than `max_age_secs`, so an app that starts
+    /// long after a request was made doesn't act on it. Returns how many expired.
+    pub fn dispatch_requests_expire(&self, max_age_secs: i64) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE dispatch_requests              SET status = 'refused', resolved_at = datetime('now'),                  reason = 'expired: no running Keitora app picked it up in time'              WHERE status = 'pending' AND created_at < datetime('now', ?1)",
+            params![format!("-{max_age_secs} seconds")],
+        )?;
+        Ok(n)
+    }
+}
+
+/// Column list shared by every `dispatch_requests` read, in
+/// [`row_to_dispatch_request`] order.
+const DISPATCH_REQUEST_COLS: &str =
+    "id, task_id, worktree, queue_only, requested_by, status, reason, created_at, resolved_at";
+
+fn row_to_dispatch_request(r: &rusqlite::Row) -> rusqlite::Result<DispatchRequest> {
+    Ok(DispatchRequest {
+        id: r.get(0)?,
+        task_id: r.get(1)?,
+        worktree: r.get(2)?,
+        queue_only: r.get(3)?,
+        requested_by: r.get(4)?,
+        status: r.get(5)?,
+        reason: r.get(6)?,
+        created_at: r.get(7)?,
+        resolved_at: r.get(8)?,
+    })
 }
 
 fn row_to_resume_row(r: &rusqlite::Row) -> rusqlite::Result<ResumeRow> {
@@ -1008,6 +1142,193 @@ mod tests {
         ls.set_terminated("p", "w", false).unwrap();
         ls.set_terminated("p", "w", false).unwrap();
         assert!(!ls.is_terminated("p", "w").unwrap());
+    }
+
+    #[test]
+    fn dispatch_request_add_starts_pending() {
+        let db = TempDb::new();
+        let ls = db.open();
+        let r = ls.dispatch_request_add(7, "alpha", false, "main").unwrap();
+        assert_eq!(r.task_id, 7);
+        assert_eq!(r.worktree, "alpha");
+        assert!(!r.queue_only);
+        assert_eq!(r.requested_by, "main");
+        assert_eq!(r.status, "pending");
+        assert_eq!(r.reason, "");
+        assert_eq!(r.resolved_at, None);
+        assert!(!r.is_resolved());
+        assert_eq!(ls.dispatch_request_get(r.id).unwrap(), Some(r));
+        assert_eq!(ls.dispatch_request_get(999).unwrap(), None);
+    }
+
+    #[test]
+    fn dispatch_requests_pending_is_oldest_first_and_excludes_taken() {
+        let db = TempDb::new();
+        let ls = db.open();
+        let a = ls.dispatch_request_add(1, "alpha", false, "me").unwrap();
+        let b = ls.dispatch_request_add(2, "bravo", true, "me").unwrap();
+        let c = ls.dispatch_request_add(3, "alpha", false, "me").unwrap();
+        assert!(ls.dispatch_request_begin(b.id).unwrap());
+        let pending: Vec<i64> = ls
+            .dispatch_requests_pending()
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(pending, vec![a.id, c.id]);
+        // Newest first, every status.
+        let all: Vec<i64> = ls
+            .dispatch_requests_list(10)
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(all, vec![c.id, b.id, a.id]);
+        assert_eq!(ls.dispatch_requests_list(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dispatch_request_begin_wins_once() {
+        let db = TempDb::new();
+        let ls = db.open();
+        // A second handle on the same file stands in for a second app instance.
+        let other = db.open();
+        let r = ls.dispatch_request_add(1, "alpha", false, "me").unwrap();
+        assert!(ls.dispatch_request_begin(r.id).unwrap());
+        assert!(!other.dispatch_request_begin(r.id).unwrap());
+        assert_eq!(
+            ls.dispatch_request_get(r.id).unwrap().unwrap().status,
+            "running"
+        );
+        assert!(!ls.dispatch_request_begin(999).unwrap());
+    }
+
+    #[test]
+    fn dispatch_request_resolve_records_outcome_once() {
+        let db = TempDb::new();
+        let ls = db.open();
+        let r = ls.dispatch_request_add(1, "alpha", false, "me").unwrap();
+        assert!(ls.dispatch_request_begin(r.id).unwrap());
+        ls.dispatch_request_resolve(r.id, "queued", "alpha busy — reserved")
+            .unwrap();
+        let got = ls.dispatch_request_get(r.id).unwrap().unwrap();
+        assert_eq!(got.status, "queued");
+        assert_eq!(got.reason, "alpha busy — reserved");
+        assert!(got.resolved_at.is_some());
+        assert!(got.is_resolved());
+        // Written once: a second outcome is a conflict naming the current status.
+        let err = ls
+            .dispatch_request_resolve(r.id, "applied", "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already queued"), "{err}");
+        assert_eq!(
+            ls.dispatch_request_get(r.id).unwrap().unwrap().status,
+            "queued"
+        );
+    }
+
+    #[test]
+    fn dispatch_request_resolve_rejects_non_outcomes_and_unknown_ids() {
+        let db = TempDb::new();
+        let ls = db.open();
+        let r = ls.dispatch_request_add(1, "alpha", false, "me").unwrap();
+        for bad in ["pending", "running", "dispatched", ""] {
+            assert!(ls.dispatch_request_resolve(r.id, bad, "").is_err(), "{bad}");
+        }
+        assert_eq!(
+            ls.dispatch_request_get(r.id).unwrap().unwrap().status,
+            "pending"
+        );
+        // A pending request can be resolved without being begun (e.g. refused early).
+        ls.dispatch_request_resolve(r.id, "refused", "task #1 not found")
+            .unwrap();
+        let err = ls
+            .dispatch_request_resolve(999, "refused", "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no dispatch request 999"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_request_cancel_only_withdraws_pending() {
+        let db = TempDb::new();
+        let ls = db.open();
+        let pending = ls.dispatch_request_add(1, "alpha", false, "me").unwrap();
+        let running = ls.dispatch_request_add(2, "alpha", false, "me").unwrap();
+        assert!(ls.dispatch_request_begin(running.id).unwrap());
+        assert!(ls
+            .dispatch_request_cancel(pending.id, "requester gave up")
+            .unwrap());
+        let got = ls.dispatch_request_get(pending.id).unwrap().unwrap();
+        assert_eq!(got.status, "refused");
+        assert_eq!(got.reason, "requester gave up");
+        assert!(got.resolved_at.is_some());
+        // Already taken by the app, already resolved, or unknown: left alone.
+        assert!(!ls.dispatch_request_cancel(running.id, "x").unwrap());
+        assert!(!ls.dispatch_request_cancel(pending.id, "x").unwrap());
+        assert!(!ls.dispatch_request_cancel(999, "x").unwrap());
+        assert_eq!(
+            ls.dispatch_request_get(running.id).unwrap().unwrap().status,
+            "running"
+        );
+    }
+
+    #[test]
+    fn dispatch_requests_expire_refuses_only_old_pending_rows() {
+        let db = TempDb::new();
+        let ls = db.open();
+        let old = ls.dispatch_request_add(1, "alpha", false, "me").unwrap();
+        let old_running = ls.dispatch_request_add(2, "alpha", false, "me").unwrap();
+        let fresh = ls.dispatch_request_add(3, "alpha", false, "me").unwrap();
+        assert!(ls.dispatch_request_begin(old_running.id).unwrap());
+        ls.conn
+            .execute(
+                "UPDATE dispatch_requests SET created_at = datetime('now', '-1 hour') \
+                 WHERE id IN (?1, ?2)",
+                params![old.id, old_running.id],
+            )
+            .unwrap();
+        assert_eq!(ls.dispatch_requests_expire(600).unwrap(), 1);
+        let got = ls.dispatch_request_get(old.id).unwrap().unwrap();
+        assert_eq!(got.status, "refused");
+        assert!(got.reason.starts_with("expired"), "{}", got.reason);
+        // A running request belongs to whoever began it; a fresh one stays pending.
+        assert_eq!(
+            ls.dispatch_request_get(old_running.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
+        assert_eq!(
+            ls.dispatch_request_get(fresh.id).unwrap().unwrap().status,
+            "pending"
+        );
+        assert_eq!(ls.dispatch_requests_expire(600).unwrap(), 0);
+    }
+
+    #[test]
+    fn init_schema_adds_dispatch_requests_to_existing_db() {
+        let db = TempDb::new();
+        {
+            // A DB from before the dispatch_requests table existed.
+            let conn = rusqlite::Connection::open(&db.path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE worktree_sessions (
+                   worktree TEXT PRIMARY KEY,
+                   state TEXT NOT NULL DEFAULT 'idle',
+                   current_task_id INTEGER,
+                   pid INTEGER,
+                   last_heartbeat TEXT NOT NULL DEFAULT (datetime('now'))
+                 );",
+            )
+            .unwrap();
+        }
+        let ls = db.open();
+        assert!(ls.dispatch_requests_pending().unwrap().is_empty());
+        ls.dispatch_request_add(1, "alpha", false, "me").unwrap();
+        assert_eq!(ls.dispatch_requests_pending().unwrap().len(), 1);
     }
 
     #[test]
