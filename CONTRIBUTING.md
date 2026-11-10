@@ -128,9 +128,8 @@ prints what it would do without doing it.
 
 ### Signed macOS builds
 
-`scripts/build-dmg.sh` produces a signed, notarized `.dmg` in
-`src-tauri/target/release/bundle/dmg/`. Set `APPLE_SIGNING_IDENTITY`, plus one of these two sets of
-notarization variables:
+`scripts/build-dmg.sh` produces a signed, notarized `.dmg` in `target/release/bundle/dmg/`. Set
+`APPLE_SIGNING_IDENTITY`, plus one of these two sets of notarization variables:
 
 **Apple ID** (simplest for one developer)
 
@@ -151,5 +150,51 @@ notarization variables:
 `APPLE_SIGNING_IDENTITY` is the full certificate name, e.g.
 `Developer ID Application: Jane Smith (AB12CD34EF)`. List yours with
 `security find-identity -v -p codesigning`. Never commit any of these values.
+
+Without notarization credentials, `bash scripts/build-dmg.sh --sign-only` signs the app with
+`APPLE_SIGNING_IDENTITY` and skips notarization. `yarn release` on macOS picks the mode for you:
+
+- **Notarized:** used when one set of notarization variables is complete.
+- **Signed only:** used when no notarization variables are set. It warns that downloaders must
+  allow the app once under System Settings → Privacy & Security → **Open Anyway**.
+- **Stops with an error:** when the variables are only partly set, or when
+  `APPLE_SIGNING_IDENTITY` is missing or `-`.
+
+### macOS permissions (Screen Recording)
+
+Agents take screenshots with `screencapture`. macOS doesn't check that tool's own permission.
+It checks the **responsible app**: the Keitora instance that started the `herdr server` your
+panes run in. So the entry to allow under System Settings → Privacy & Security →
+Screen & System Audio Recording is **Keitora**. Entries for herdr or your terminal don't matter
+for agent sessions.
+
+macOS saves that permission against the app's code signature. A plain `yarn tauri:bundle` with
+no signing identity gives an ad-hoc signature, which is tied to that exact build. Every rebuild
+looks like a new app: System Settings still shows Keitora as allowed, but each capture prompts
+again and fails. To fix that, build with a stable identity:
+
+```sh
+security find-identity -v -p codesigning          # any Apple Development / Developer ID works
+export APPLE_SIGNING_IDENTITY="Apple Development: Jane Smith (AB12CD34EF)"
+yarn tauri:bundle
+```
+
+If you have no Apple certificate, `scripts/macos-local-signing-cert.sh` creates a self-signed
+"Keitora Local Signing" identity in your login keychain. macOS may ask you to authorize trusting
+it. The certificate only works on your own machine. `tauri:bundle` prints a warning on macOS
+whenever it builds without a stable identity.
+
+After you first install a signed build, grant the permission once:
+
+1. Quit Keitora and run `herdr server stop`. The server outlives Keitora, and panes stay charged
+   to whichever build started it. Stopping it ends live panes; Keitora resumes them on its next
+   launch.
+2. `tccutil reset ScreenCapture com.keitora.dispatch` clears the stale entry.
+3. Launch Keitora and allow it when asked, or switch it on in System Settings.
+
+`bash scripts/macos-capture-doctor.sh` checks all of this without changing anything. It reports
+how the installed app is signed, which signing identities you have, and whether the running
+herdr server is older than the installed build. Development builds (`yarn tauri dev`) are always
+ad-hoc signed, so screenshots from agents in a dev build won't keep their permission.
 
 Windows installers are unsigned for now, so SmartScreen warns on first install.
