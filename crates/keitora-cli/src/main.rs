@@ -110,17 +110,14 @@ enum TaskCmd {
     /// Permanently delete a task.
     #[command(visible_alias = "rm")]
     Delete { id: i64 },
-    /// Ask the running Keitora app to dispatch a task onto a worktree, as a board drag
-    /// would: an idle session gets it now, a busy or waiting one gets it queued, and an
-    /// offline one is refused. Needs the app running with this project active.
+    /// Ask the running Keitora app to send a task to a worktree's idle session now, as
+    /// a board drag would. A busy, waiting or offline session is refused (queue work on
+    /// the board instead). Needs the app running, with this project registered in it.
     Dispatch {
         id: i64,
         /// The worktree to dispatch onto
         #[arg(long)]
         worktree: String,
-        /// Reserve the task on the worktree without sending it, even if it is idle
-        #[arg(long)]
-        queue: bool,
         /// Wait up to this many seconds for the app's outcome (0: don't wait)
         #[arg(long, default_value_t = 0)]
         wait: u64,
@@ -620,16 +617,8 @@ async fn run_task(
             backend.delete(id).await?;
             emit_ok(json, &format!("  Deleted task #{id}"))?;
         }
-        TaskCmd::Dispatch {
-            id,
-            worktree,
-            queue,
-            wait,
-        } => {
-            cmd_task_dispatch(
-                backend, local, config, &me, id, &worktree, queue, wait, json,
-            )
-            .await?
+        TaskCmd::Dispatch { id, worktree, wait } => {
+            cmd_task_dispatch(backend, local, config, &me, id, &worktree, wait, json).await?
         }
         TaskCmd::Watch {
             worktree,
@@ -657,8 +646,10 @@ const DISPATCH_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis
 
 /// `keitora task dispatch`: write a dispatch request into the project's `tasks.db`
 /// for the running app to execute through its own dispatch path (the CLI never types
-/// into a pane itself, so it can't race the app's writer). Checks what it can up front
-/// (the task, the worktree name), then optionally waits for the app's outcome.
+/// into a pane itself, so it can't race the app's writer). The request is a
+/// short-lived "send it now" message, not a queue entry: the app sends the task to an
+/// idle session or refuses it. Checks what it can up front (the project is registered
+/// with the app, the worktree name, the task), then optionally waits for the outcome.
 #[allow(clippy::too_many_arguments)]
 async fn cmd_task_dispatch(
     backend: &dyn TaskBackend,
@@ -667,10 +658,16 @@ async fn cmd_task_dispatch(
     me: &str,
     id: i64,
     worktree: &str,
-    queue: bool,
     wait: u64,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
+    // The app only reads requests from the DBs of projects in its registry; anywhere
+    // else a request would sit unread until it expired.
+    let root = &config.project_config().root;
+    let registry = UserConfig::load().map_err(|e| e.to_string())?;
+    if registry.project_ref_by_root(root).is_none() {
+        return Err(unregistered_message(root).into());
+    }
     if !config.worktrees.is_empty() && !config.worktrees.iter().any(|w| w == worktree) {
         return Err(format!(
             "unknown worktree \"{worktree}\" — must be one of: {}",
@@ -686,7 +683,7 @@ async fn cmd_task_dispatch(
         return Err(reason.into());
     }
 
-    let mut req = local.dispatch_request_add(id, worktree, queue, me)?;
+    let mut req = local.dispatch_request_add(id, worktree, me)?;
     if wait > 0 {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
         while !req.is_resolved() && std::time::Instant::now() < deadline {
@@ -722,6 +719,15 @@ async fn cmd_task_dispatch(
     }
 }
 
+/// The error for a `task dispatch` from a project the app hasn't registered.
+fn unregistered_message(root: &std::path::Path) -> String {
+    format!(
+        "the project at {} isn't registered with Keitora, so the app would never pick up \
+         the request — add it in the app first (or run from a registered project)",
+        root.display()
+    )
+}
+
 /// The human-readable line for a dispatch request's current state. `waited` is
 /// whether the caller waited for the outcome (a bare `pending` is expected otherwise).
 fn dispatch_request_message(req: &DispatchRequest, waited: bool) -> String {
@@ -733,7 +739,6 @@ fn dispatch_request_message(req: &DispatchRequest, waited: bool) -> String {
     };
     match req.status.as_str() {
         "applied" => format!("  Dispatched #{id} to @{wt}{suffix}"),
-        "queued" => format!("  Queued #{id} on @{wt}{suffix}"),
         "refused" => format!("  Refused #{id} → @{wt}{suffix}"),
         "pending" if !waited => format!(
             "  Requested dispatch of #{id} to @{wt} (request {}); the running Keitora app applies it",
@@ -1148,13 +1153,8 @@ mod tests {
             .unwrap()
             .cmd
         {
-            Cmd::Task(TaskCmd::Dispatch {
-                id,
-                worktree,
-                queue,
-                wait,
-            }) => {
-                assert_eq!((id, worktree.as_str(), queue, wait), (7, "alpha", false, 0));
+            Cmd::Task(TaskCmd::Dispatch { id, worktree, wait }) => {
+                assert_eq!((id, worktree.as_str(), wait), (7, "alpha", 0));
             }
             _ => panic!("expected `task dispatch`"),
         }
@@ -1165,7 +1165,6 @@ mod tests {
             "7",
             "--worktree",
             "alpha",
-            "--queue",
             "--wait",
             "30",
             "--json",
@@ -1173,9 +1172,20 @@ mod tests {
         .unwrap()
         .cmd
         {
-            Cmd::Task(TaskCmd::Dispatch { queue, wait, .. }) => assert!(queue && wait == 30),
+            Cmd::Task(TaskCmd::Dispatch { wait, .. }) => assert_eq!(wait, 30),
             _ => panic!("expected `task dispatch`"),
         }
+        // There is no `--queue`: the board is the queue.
+        assert!(Cli::try_parse_from([
+            "keitora",
+            "task",
+            "dispatch",
+            "7",
+            "--worktree",
+            "alpha",
+            "--queue"
+        ])
+        .is_err());
         // The worktree is required.
         assert!(Cli::try_parse_from(["keitora", "task", "dispatch", "7"]).is_err());
 
@@ -1227,7 +1237,6 @@ mod tests {
             id,
             task_id: 5,
             worktree: worktree.into(),
-            queue_only: false,
             requested_by: "me".into(),
             status: status.into(),
             reason: String::new(),
@@ -1316,9 +1325,9 @@ mod tests {
             None,
         );
         assert!(again.is_empty());
-        let moved = w.step(&[], &[], &[request(2, "alpha", "queued")], None);
+        let moved = w.step(&[], &[], &[request(2, "alpha", "refused")], None);
         assert_eq!(kinds(&moved), vec!["request"]);
-        assert_eq!(moved[0]["status"], "queued");
+        assert_eq!(moved[0]["status"], "refused");
     }
 
     #[test]
@@ -1380,11 +1389,18 @@ mod tests {
             dispatch_request_message(&r, true),
             "  Dispatched #5 to @alpha"
         );
-        r.status = "queued".into();
-        r.reason = "alpha busy — reserved".into();
+        r.status = "refused".into();
+        r.reason = "@alpha is busy".into();
         assert_eq!(
             dispatch_request_message(&r, true),
-            "  Queued #5 on @alpha (alpha busy — reserved)"
+            "  Refused #5 → @alpha (@alpha is busy)"
         );
+    }
+
+    #[test]
+    fn unregistered_message_names_the_project_root() {
+        let msg = unregistered_message(std::path::Path::new("D:/repos/proj"));
+        assert!(msg.contains("D:/repos/proj"), "{msg}");
+        assert!(msg.contains("isn't registered with Keitora"), "{msg}");
     }
 }

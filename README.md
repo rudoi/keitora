@@ -122,14 +122,15 @@ keitora task done <id>             # finish it, and see what it unblocked
 With the app running, a script can also dispatch and monitor work without the board:
 
 ```sh
-keitora task dispatch <id> --worktree alpha --wait 30  # like dragging the card onto alpha
+keitora task dispatch <id> --worktree alpha --wait 30  # send it to alpha's idle session now
 keitora task watch --json                              # stream session and dispatch changes
 ```
 
-`task dispatch` asks the app to dispatch the task, and the app does it the same way as a drag: an
-idle session gets the task now, a busy one gets it queued, and an offline one is refused (it never
-starts an agent). `--queue` reserves the task without sending it. The app only picks up requests for
-the project it has open, and refuses any it hasn't picked up within ten minutes.
+`task dispatch` asks the app to send the task to that worktree's session right away, the same way a
+drag onto an idle lane does. It only works on an idle session: a busy, waiting or offline one is
+refused and nothing is reserved (the board is the queue, and dispatch never starts an agent). The
+app picks up requests for any project in its registry, active or not, and refuses any it hasn't
+picked up within ten minutes.
 
 If `keitora` isn't on your `PATH`, the app offers to install it for you.
 

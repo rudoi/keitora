@@ -96,8 +96,8 @@ pub fn already_dispatched(
 /// or `None` when it can. The task-side half of the board's lane rule (`decideLane`):
 /// terminal and blocked cards are refused, and so is anything `assign` would reject
 /// (backlog, active, reserved to another worktree), worded so a CLI caller knows what
-/// to do. A task already reserved to `worktree` passes: re-dispatching it there is how
-/// a queued task gets sent once the session is idle, and an already-sent one no-ops.
+/// to do. A task already reserved to `worktree` passes: re-dispatching it there sends
+/// a card queued on that lane once the session is idle, and an already-sent one no-ops.
 pub fn task_refusal(task: &TaskWithDeps, worktree: &str) -> Option<String> {
     let t = &task.task;
     let id = t.id;
@@ -127,13 +127,17 @@ pub fn task_refusal(task: &TaskWithDeps, worktree: &str) -> Option<String> {
     }
 }
 
-/// Pure: why a session in `state` can't take a dispatch, or `None` when it can. The
-/// session-side half of the board's lane rule: `idle` takes it now, `busy` and
-/// `waiting` queue it, and anything else (`offline`) is refused, since dispatch only
-/// types into a live session and never starts one.
+/// Pure: why a session in `state` can't take a CLI dispatch, or `None` when it can.
+/// Only an `idle` session takes one. A `busy` or `waiting` session is refused rather
+/// than queued: the board's lanes are the queue, and a CLI request is a "send it now"
+/// that either lands or doesn't. `offline` is refused too, since dispatch only types
+/// into a live session and never starts one.
 pub fn session_refusal(state: &str, worktree: &str) -> Option<String> {
     match state {
-        "idle" | "busy" | "waiting" => None,
+        "idle" => None,
+        "busy" | "waiting" => Some(format!(
+            "@{worktree} is {state}; dispatch only sends to an idle session (queue it on the board instead)"
+        )),
         other => Some(format!(
             "@{worktree} is {other}; start its session first (dispatch never launches an agent)"
         )),
@@ -357,8 +361,12 @@ mod tests {
     #[test]
     fn session_refusal_truth_table() {
         assert_eq!(session_refusal("idle", "alpha"), None);
-        assert_eq!(session_refusal("busy", "alpha"), None);
-        assert_eq!(session_refusal("waiting", "alpha"), None);
+        // Busy and waiting are refused, not queued: the board is the queue.
+        for state in ["busy", "waiting"] {
+            let msg = session_refusal(state, "alpha").expect("refused");
+            assert!(msg.starts_with(&format!("@alpha is {state}")), "{msg}");
+            assert!(msg.contains("only sends to an idle session"), "{msg}");
+        }
         let msg = session_refusal("offline", "alpha").expect("refused");
         assert!(msg.starts_with("@alpha is offline"), "{msg}");
         assert!(session_refusal("", "alpha").is_some());

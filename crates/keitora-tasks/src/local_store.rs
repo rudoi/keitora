@@ -410,19 +410,22 @@ impl LocalStore {
     }
 
     // ---- Dispatch requests ----
+    //
+    // A short-lived mailbox from the CLI to the running app, not a queue: each row
+    // asks the app to send one task to one idle session now, and is resolved
+    // `applied` or `refused` within moments (or expires). The board is the queue.
 
-    /// Queue a request for the running app to dispatch `task_id` onto `worktree`.
-    /// Returns the new `pending` row. The app's tasks-DB watcher picks it up.
+    /// Ask the running app to dispatch `task_id` onto `worktree` now. Returns the new
+    /// `pending` row; the app's tasks-DB watcher picks it up.
     pub fn dispatch_request_add(
         &self,
         task_id: i64,
         worktree: &str,
-        queue_only: bool,
         requested_by: &str,
     ) -> Result<DispatchRequest> {
         self.conn.execute(
-            "INSERT INTO dispatch_requests (task_id, worktree, queue_only, requested_by)              VALUES (?1, ?2, ?3, ?4)",
-            params![task_id, worktree, queue_only, requested_by],
+            "INSERT INTO dispatch_requests (task_id, worktree, requested_by) VALUES (?1, ?2, ?3)",
+            params![task_id, worktree, requested_by],
         )?;
         let id = self.conn.last_insert_rowid();
         self.dispatch_request_get(id)?
@@ -445,7 +448,8 @@ impl LocalStore {
     /// Every `pending` request, oldest first (the order the app executes them in).
     pub fn dispatch_requests_pending(&self) -> Result<Vec<DispatchRequest>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {DISPATCH_REQUEST_COLS} FROM dispatch_requests              WHERE status = 'pending' ORDER BY id"
+            "SELECT {DISPATCH_REQUEST_COLS} FROM dispatch_requests \
+             WHERE status = 'pending' ORDER BY id"
         ))?;
         let rows = stmt
             .query_map([], row_to_dispatch_request)?
@@ -470,7 +474,8 @@ impl LocalStore {
     /// from executing twice.
     pub fn dispatch_request_begin(&self, id: i64) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE dispatch_requests SET status = 'running'              WHERE id = ?1 AND status = 'pending'",
+            "UPDATE dispatch_requests SET status = 'running' \
+             WHERE id = ?1 AND status = 'pending'",
             params![id],
         )?;
         Ok(n == 1)
@@ -487,7 +492,9 @@ impl LocalStore {
             )));
         }
         let n = self.conn.execute(
-            "UPDATE dispatch_requests SET status = ?2, reason = ?3, resolved_at = datetime('now')              WHERE id = ?1 AND status IN ('pending', 'running')",
+            "UPDATE dispatch_requests \
+             SET status = ?2, reason = ?3, resolved_at = datetime('now') \
+             WHERE id = ?1 AND status IN ('pending', 'running')",
             params![id, status, reason],
         )?;
         if n == 1 {
@@ -507,7 +514,8 @@ impl LocalStore {
     /// `false` when the app had already begun or resolved it, which is left alone.
     pub fn dispatch_request_cancel(&self, id: i64, reason: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE dispatch_requests SET status = 'refused', reason = ?2, resolved_at = datetime('now') \
+            "UPDATE dispatch_requests \
+             SET status = 'refused', reason = ?2, resolved_at = datetime('now') \
              WHERE id = ?1 AND status = 'pending'",
             params![id, reason],
         )?;
@@ -518,7 +526,10 @@ impl LocalStore {
     /// long after a request was made doesn't act on it. Returns how many expired.
     pub fn dispatch_requests_expire(&self, max_age_secs: i64) -> Result<usize> {
         let n = self.conn.execute(
-            "UPDATE dispatch_requests              SET status = 'refused', resolved_at = datetime('now'),                  reason = 'expired: no running Keitora app picked it up in time'              WHERE status = 'pending' AND created_at < datetime('now', ?1)",
+            "UPDATE dispatch_requests \
+             SET status = 'refused', resolved_at = datetime('now'), \
+                 reason = 'expired: no running Keitora app picked it up in time' \
+             WHERE status = 'pending' AND created_at < datetime('now', ?1)",
             params![format!("-{max_age_secs} seconds")],
         )?;
         Ok(n)
@@ -528,19 +539,18 @@ impl LocalStore {
 /// Column list shared by every `dispatch_requests` read, in
 /// [`row_to_dispatch_request`] order.
 const DISPATCH_REQUEST_COLS: &str =
-    "id, task_id, worktree, queue_only, requested_by, status, reason, created_at, resolved_at";
+    "id, task_id, worktree, requested_by, status, reason, created_at, resolved_at";
 
 fn row_to_dispatch_request(r: &rusqlite::Row) -> rusqlite::Result<DispatchRequest> {
     Ok(DispatchRequest {
         id: r.get(0)?,
         task_id: r.get(1)?,
         worktree: r.get(2)?,
-        queue_only: r.get(3)?,
-        requested_by: r.get(4)?,
-        status: r.get(5)?,
-        reason: r.get(6)?,
-        created_at: r.get(7)?,
-        resolved_at: r.get(8)?,
+        requested_by: r.get(3)?,
+        status: r.get(4)?,
+        reason: r.get(5)?,
+        created_at: r.get(6)?,
+        resolved_at: r.get(7)?,
     })
 }
 
@@ -1148,10 +1158,9 @@ mod tests {
     fn dispatch_request_add_starts_pending() {
         let db = TempDb::new();
         let ls = db.open();
-        let r = ls.dispatch_request_add(7, "alpha", false, "main").unwrap();
+        let r = ls.dispatch_request_add(7, "alpha", "main").unwrap();
         assert_eq!(r.task_id, 7);
         assert_eq!(r.worktree, "alpha");
-        assert!(!r.queue_only);
         assert_eq!(r.requested_by, "main");
         assert_eq!(r.status, "pending");
         assert_eq!(r.reason, "");
@@ -1165,9 +1174,9 @@ mod tests {
     fn dispatch_requests_pending_is_oldest_first_and_excludes_taken() {
         let db = TempDb::new();
         let ls = db.open();
-        let a = ls.dispatch_request_add(1, "alpha", false, "me").unwrap();
-        let b = ls.dispatch_request_add(2, "bravo", true, "me").unwrap();
-        let c = ls.dispatch_request_add(3, "alpha", false, "me").unwrap();
+        let a = ls.dispatch_request_add(1, "alpha", "me").unwrap();
+        let b = ls.dispatch_request_add(2, "bravo", "me").unwrap();
+        let c = ls.dispatch_request_add(3, "alpha", "me").unwrap();
         assert!(ls.dispatch_request_begin(b.id).unwrap());
         let pending: Vec<i64> = ls
             .dispatch_requests_pending()
@@ -1193,7 +1202,7 @@ mod tests {
         let ls = db.open();
         // A second handle on the same file stands in for a second app instance.
         let other = db.open();
-        let r = ls.dispatch_request_add(1, "alpha", false, "me").unwrap();
+        let r = ls.dispatch_request_add(1, "alpha", "me").unwrap();
         assert!(ls.dispatch_request_begin(r.id).unwrap());
         assert!(!other.dispatch_request_begin(r.id).unwrap());
         assert_eq!(
@@ -1207,13 +1216,13 @@ mod tests {
     fn dispatch_request_resolve_records_outcome_once() {
         let db = TempDb::new();
         let ls = db.open();
-        let r = ls.dispatch_request_add(1, "alpha", false, "me").unwrap();
+        let r = ls.dispatch_request_add(1, "alpha", "me").unwrap();
         assert!(ls.dispatch_request_begin(r.id).unwrap());
-        ls.dispatch_request_resolve(r.id, "queued", "alpha busy — reserved")
+        ls.dispatch_request_resolve(r.id, "refused", "@alpha is busy")
             .unwrap();
         let got = ls.dispatch_request_get(r.id).unwrap().unwrap();
-        assert_eq!(got.status, "queued");
-        assert_eq!(got.reason, "alpha busy — reserved");
+        assert_eq!(got.status, "refused");
+        assert_eq!(got.reason, "@alpha is busy");
         assert!(got.resolved_at.is_some());
         assert!(got.is_resolved());
         // Written once: a second outcome is a conflict naming the current status.
@@ -1221,10 +1230,10 @@ mod tests {
             .dispatch_request_resolve(r.id, "applied", "")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("already queued"), "{err}");
+        assert!(err.contains("already refused"), "{err}");
         assert_eq!(
             ls.dispatch_request_get(r.id).unwrap().unwrap().status,
-            "queued"
+            "refused"
         );
     }
 
@@ -1232,8 +1241,8 @@ mod tests {
     fn dispatch_request_resolve_rejects_non_outcomes_and_unknown_ids() {
         let db = TempDb::new();
         let ls = db.open();
-        let r = ls.dispatch_request_add(1, "alpha", false, "me").unwrap();
-        for bad in ["pending", "running", "dispatched", ""] {
+        let r = ls.dispatch_request_add(1, "alpha", "me").unwrap();
+        for bad in ["pending", "running", "queued", "dispatched", ""] {
             assert!(ls.dispatch_request_resolve(r.id, bad, "").is_err(), "{bad}");
         }
         assert_eq!(
@@ -1254,8 +1263,8 @@ mod tests {
     fn dispatch_request_cancel_only_withdraws_pending() {
         let db = TempDb::new();
         let ls = db.open();
-        let pending = ls.dispatch_request_add(1, "alpha", false, "me").unwrap();
-        let running = ls.dispatch_request_add(2, "alpha", false, "me").unwrap();
+        let pending = ls.dispatch_request_add(1, "alpha", "me").unwrap();
+        let running = ls.dispatch_request_add(2, "alpha", "me").unwrap();
         assert!(ls.dispatch_request_begin(running.id).unwrap());
         assert!(ls
             .dispatch_request_cancel(pending.id, "requester gave up")
@@ -1278,9 +1287,9 @@ mod tests {
     fn dispatch_requests_expire_refuses_only_old_pending_rows() {
         let db = TempDb::new();
         let ls = db.open();
-        let old = ls.dispatch_request_add(1, "alpha", false, "me").unwrap();
-        let old_running = ls.dispatch_request_add(2, "alpha", false, "me").unwrap();
-        let fresh = ls.dispatch_request_add(3, "alpha", false, "me").unwrap();
+        let old = ls.dispatch_request_add(1, "alpha", "me").unwrap();
+        let old_running = ls.dispatch_request_add(2, "alpha", "me").unwrap();
+        let fresh = ls.dispatch_request_add(3, "alpha", "me").unwrap();
         assert!(ls.dispatch_request_begin(old_running.id).unwrap());
         ls.conn
             .execute(
@@ -1327,7 +1336,7 @@ mod tests {
         }
         let ls = db.open();
         assert!(ls.dispatch_requests_pending().unwrap().is_empty());
-        ls.dispatch_request_add(1, "alpha", false, "me").unwrap();
+        ls.dispatch_request_add(1, "alpha", "me").unwrap();
         assert_eq!(ls.dispatch_requests_pending().unwrap().len(), 1);
     }
 

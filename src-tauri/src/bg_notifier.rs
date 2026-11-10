@@ -144,6 +144,7 @@ pub fn start_bg_notifier<R: Runtime + 'static>(app: AppHandle<R>) {
         spawn_project_watcher(
             app.clone(),
             project_name.clone(),
+            pc.project.name.clone(),
             pc.tasks.db_path.clone(),
             stop_rx,
         );
@@ -155,13 +156,18 @@ pub fn start_bg_notifier<R: Runtime + 'static>(app: AppHandle<R>) {
 }
 
 /// Watch a single project's DB dir and fire OS notifications for that project's
-/// background sessions on the `false → true` edge of needs-input.
+/// background sessions on the `false → true` edge of needs-input. The same watcher
+/// also hands the project's pending CLI dispatch requests to the dispatcher, so a
+/// request for a registered project runs whether or not it is the active one.
 ///
 /// Modelled on `host::start_tasks_watcher`: same `notify` recommended watcher,
 /// 300 ms debounce, and `session_revision()` skip for heartbeat-only writes.
+/// `project_name` is the registry key (shown in notifications); `resolved_name` is
+/// the project's `[project].name`, which the dispatcher looks it up by.
 fn spawn_project_watcher<R: Runtime + 'static>(
     app: AppHandle<R>,
     project_name: String,
+    resolved_name: String,
     db_path: std::path::PathBuf,
     stop_rx: mpsc::Receiver<()>,
 ) {
@@ -198,6 +204,10 @@ fn spawn_project_watcher<R: Runtime + 'static>(
             Duration::from_millis(300),
             stop_rx,
             move || {
+                // CLI dispatch requests don't change session state, so check them
+                // before the heartbeat skip below.
+                crate::dispatch::spawn_pending_requests(&app, &local, &resolved_name);
+
                 // Skip if session states haven't changed (heartbeat-only write).
                 let srev = match local.session_revision() {
                     Ok(r) => r,
