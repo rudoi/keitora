@@ -28,6 +28,7 @@ import { judgeLane, type LaneContext, useDispatchTargets } from "../lib/useDispa
 import { useLocalStorageState } from "../lib/useLocalStorageState";
 import type { CardEnv } from "./board/cardHelpers";
 import { LaneLayout } from "./board/LaneLayout";
+import { availableTags } from "./board/tagFilter";
 import { useBoardLanes } from "./board/useBoardLanes";
 import { TaskFormDialog } from "./TaskFormDialog";
 import { useToast } from "./Toast";
@@ -102,6 +103,9 @@ export function Board({
     () => new Map([...tasks, ...backlog].map((t) => [t.id, t])),
     [tasks, backlog],
   );
+  // Every tag in use on the project's tasks, backlog included, suggested by the New
+  // task form.
+  const projectTags = useMemo(() => availableTags([...tasks, ...backlog]), [tasks, backlog]);
   const poolSet = useMemo(() => new Set(pool), [pool]);
   const states = useMemo(
     () => cardStates(tasks, backlog, worktreeNames, sessions, dispatched, failures, poolSet),
@@ -355,6 +359,7 @@ export function Board({
         open={newOpen}
         onOpenChange={setNewOpen}
         mode="new"
+        tagOptions={projectTags}
         onSubmit={async (v) => {
           await newTask(v.title, v.description, v.priority, v.tags);
           await reload();
