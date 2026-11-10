@@ -924,7 +924,7 @@ function AppInner() {
   );
 
   // ── Central keymap ──────────────────────────────────────────────────────────
-  // Ordered list of available worktree names; drives Cmd+Left/Right cycling.
+  // Ordered list of available worktree names; drives Cmd+Up/Down cycling.
   const availableWorktrees = useMemo(
     () => activeWorktrees.filter((w) => w.status === "available").map((w) => w.name),
     [activeWorktrees],
