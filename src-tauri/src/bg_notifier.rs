@@ -29,7 +29,6 @@ use std::{
 };
 
 use tauri::{AppHandle, Runtime};
-use tauri_plugin_notification::NotificationExt;
 
 // ── Live watcher registry (idempotent restart) ──────────────────────────────────
 
@@ -144,6 +143,7 @@ pub fn start_bg_notifier<R: Runtime + 'static>(app: AppHandle<R>) {
         spawn_project_watcher(
             app.clone(),
             project_name.clone(),
+            pc.project.name.clone(),
             pc.tasks.db_path.clone(),
             stop_rx,
         );
@@ -159,9 +159,12 @@ pub fn start_bg_notifier<R: Runtime + 'static>(app: AppHandle<R>) {
 ///
 /// Modelled on `host::start_tasks_watcher`: same `notify` recommended watcher,
 /// 300 ms debounce, and `session_revision()` skip for heartbeat-only writes.
+/// `project_name` is the registry key (shown in notifications); `resolved_name` is
+/// the project's `[project].name`, which a clicked toast switches to.
 fn spawn_project_watcher<R: Runtime + 'static>(
     app: AppHandle<R>,
     project_name: String,
+    resolved_name: String,
     db_path: std::path::PathBuf,
     stop_rx: mpsc::Receiver<()>,
 ) {
@@ -261,12 +264,15 @@ fn spawn_project_watcher<R: Runtime + 'static>(
                             })
                             .unwrap_or_else(|| "needs attention".to_string());
 
-                        let _ = app
-                            .notification()
-                            .builder()
-                            .title(format!("Keitora \u{2014} {project_name}/{wt}"))
-                            .body(task_title)
-                            .show();
+                        crate::session_toast::show_session_toast(
+                            &app,
+                            format!("Keitora \u{2014} {project_name}/{wt}"),
+                            task_title,
+                            crate::session_toast::ToastTarget {
+                                project: resolved_name.clone(),
+                                worktree: wt.clone(),
+                            },
+                        );
                     }
                 }
 
