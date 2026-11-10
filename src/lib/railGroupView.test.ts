@@ -30,6 +30,7 @@ function lane(name: string, status: LaneModel["status"] = "available"): LaneMode
     cli: "claude",
     status,
     terminated: false,
+    dispatch: true,
     sessionState: undefined,
     attn: undefined,
     task: undefined,

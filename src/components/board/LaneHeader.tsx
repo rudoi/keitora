@@ -7,7 +7,7 @@ import type { Lane } from "./useBoardLanes";
 
 // ── Status-line helpers ───────────────────────────────────────────────────────
 
-/** Queue depth for a worktree: reserved (open+assigned) tasks. */
+/** Queue depth for a worktree: assigned, not-yet-claimed (pending or sent) tasks. */
 function queuedCount(lane: Lane): number {
   return lane.tasks.filter((t) => t.status === "open" && t.assigned_to === lane.key).length;
 }
@@ -27,13 +27,13 @@ export function laneStatusText(lane: Lane): string {
   const q = queuedCount(lane);
   switch (state) {
     case "idle":
-      return "idle · ready";
+      return q > 0 ? `idle · ${q} queued` : "idle · ready";
     case "busy":
       return q > 0 ? `busy · ${q} queued` : "busy";
     case "waiting":
       return q > 0 ? `waiting · ${q} queued` : "waiting";
     default:
-      return "offline";
+      return q > 0 ? `offline · ${q} pending` : "offline";
   }
 }
 
@@ -50,7 +50,7 @@ function DecisionChip({ decision }: { decision: Decision | undefined }) {
     case "queue":
       return (
         <span className="rounded-full border border-accent/30 px-1.5 py-px text-[9.5px] text-accent-text/70">
-          Queue
+          Pending
         </span>
       );
     case "release":

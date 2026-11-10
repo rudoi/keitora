@@ -803,6 +803,35 @@ fn set_worktree_diff_base(
     Ok(())
 }
 
+/// Put `worktree` of the active project in or out of the dispatch pool (`dispatch =
+/// true|false` on its registry entry). An excluded worktree accepts no drops, is never
+/// auto-picked and is refused by the CLI. Registry-only. The rail and board refresh at
+/// once, and a worktree just put in the pool sends its front pending card right away.
+#[tauri::command(async)]
+fn set_worktree_dispatch(app: AppHandle, worktree: String, dispatch: bool) -> Result<(), String> {
+    let pc = keitora_tasks::resolve_active().map_err(|e| e.to_string())?;
+    let current = pc.worktree_entries();
+    {
+        let _registry = keitora_tasks::UserConfig::write_lock();
+        let mut user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
+        let matched = user_cfg
+            .set_worktree_dispatch_by_root(&pc.root, &worktree, dispatch, &current)
+            .map_err(|e| e.to_string())?;
+        if !matched {
+            return Err("this project isn't registered, so there is nowhere to save it".into());
+        }
+    }
+    let _ = app.emit("worktrees://changed", ());
+    let _ = app.emit("project://changed", ());
+    if dispatch {
+        tauri::async_runtime::spawn(crate::dispatch::pump_lanes(
+            app.clone(),
+            pc.project.name.clone(),
+        ));
+    }
+    Ok(())
+}
+
 /// Commit the active project's effective settings to a committed `<root>/keitora.toml`
 /// so they can be version-controlled. Seeds a fresh scaffold (relative/tilde
 /// paths) when no file exists, then writes the effective retention/worktrees-dir/
@@ -2198,6 +2227,9 @@ pub fn run() {
             // constructed, `UnavailableBackend` reports why so the app still starts.
             let backend: SharedBackend = select_pty_backend(app.handle().clone());
             backend.start();
+            // Lane auto-send on a slow tick too: a pane coming up or an agent dialog
+            // closing writes nothing to tasks.db, so the DB watchers can't see it.
+            tauri::async_runtime::spawn(crate::dispatch::pump_tick(app.handle().clone()));
             app.manage(backend);
             // Shared sysinfo System for the rail daemon card's 2s stats poll.
             // Per-worktree activity caches (workflow slots, branch cache, UBT engine).
@@ -2302,6 +2334,7 @@ pub fn run() {
             get_settings,
             save_project_settings,
             set_worktree_diff_base,
+            set_worktree_dispatch,
             commit_settings_to_project,
             save_user_settings,
             set_skip_permissions,
@@ -2316,10 +2349,13 @@ pub fn run() {
             tasks::task_done,
             tasks::task_unclaim,
             tasks::task_update,
+            tasks::task_backlog,
+            tasks::task_reopen,
             tasks::task_new,
             tasks::task_release,
             tasks::task_delete,
             dispatch::dispatch_apply,
+            dispatch::dispatch_auto,
             crate::transfer::preview_claude_transfer,
             crate::transfer::transfer_worktree,
             crate::transfer::inject_handoff_summary,
@@ -2602,6 +2638,7 @@ mod tests {
                         codex_thread_id: None,
                         claude_session_id: None,
                         diff_base: None,
+                        dispatch: None,
                     })
                     .collect(),
             );
@@ -2664,6 +2701,7 @@ mod tests {
                 codex_thread_id: None,
                 claude_session_id: None,
                 diff_base: None,
+                dispatch: None,
             }
         }
 

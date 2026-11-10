@@ -58,6 +58,9 @@ pub struct ResolvedWorktree {
     /// `cli`, else the user default, else `claude` (via `resolve_cli`). Lets the
     /// rail render the provider glyph before any session exists.
     pub cli: crate::config::CliKind,
+    /// In the project's dispatch pool (may receive dispatches; see
+    /// `ProjectConfig::in_dispatch_pool`).
+    pub dispatch: bool,
 }
 
 /// A git worktree discovered under a project (via `git worktree list`), offered

@@ -5,9 +5,8 @@
 
 import { useDroppable } from "@dnd-kit/core";
 import { useEffect, useMemo, useState } from "react";
-import type { WorktreeSession } from "../../lib/sessions";
 import type { Decision } from "../../lib/useDispatchTargets";
-import { cardDecorators, decisionClasses } from "./cardHelpers";
+import { type CardEnv, decisionClasses, stateOf } from "./cardHelpers";
 import { LaneHeader } from "./LaneHeader";
 import { LaneTagFilter } from "./LaneTagFilter";
 import { TaskCard } from "./TaskCard";
@@ -21,42 +20,14 @@ interface LaneProps {
   dragging: boolean;
   decision: Decision | undefined;
   headerFlash: boolean;
-  sessions: Map<string, WorktreeSession>;
-  actor: string | null;
-  selectedId: number | null;
-  worktreeNames: string[];
-  dispatchedSet: Set<string>;
-  frontReserved: Map<string, number>;
-  flyIn: { id: number; worktree: string } | null;
-  menuTaskId: number | null;
-  onMenuOpenChange: (taskId: number, open: boolean) => void;
-  onSelect: (id: number) => void;
-  onAction: (fn: () => Promise<unknown>) => void;
-  onDispatch: (worktree: string, taskId: number) => void;
-  onRelease: (taskId: number) => void;
+  env: CardEnv;
+  /** Open lane only: the backlog toggle (show/hide backlog cards in this lane). */
+  backlog?: { shown: boolean; count: number; onToggle: () => void };
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export function Lane({
-  lane,
-  dragging,
-  decision,
-  headerFlash,
-  sessions,
-  actor,
-  selectedId,
-  worktreeNames,
-  dispatchedSet,
-  frontReserved,
-  flyIn,
-  menuTaskId,
-  onMenuOpenChange,
-  onSelect,
-  onAction,
-  onDispatch,
-  onRelease,
-}: LaneProps) {
+export function Lane({ lane, dragging, decision, headerFlash, env, backlog }: LaneProps) {
   const [collapsed, setCollapsed] = useState(false);
 
   // Tag filter — Open (unassigned) lane only. Ephemeral (resets on reload).
@@ -129,12 +100,33 @@ export function Lane({
         onToggleCollapse={lane.kind === "done" ? () => setCollapsed((c) => !c) : undefined}
         filterSlot={
           isOpenLane ? (
-            <LaneTagFilter
-              tags={tagOptions}
-              selected={activeTags}
-              onToggle={toggleTag}
-              onClear={() => setSelectedTags([])}
-            />
+            <>
+              {backlog && (
+                <button
+                  type="button"
+                  onClick={backlog.onToggle}
+                  aria-pressed={backlog.shown}
+                  title={
+                    backlog.shown
+                      ? "Hide backlog cards"
+                      : `Show backlog cards (${backlog.count}) in Open`
+                  }
+                  className={`rounded-full border px-1.5 py-px text-[9.5px] transition-colors ${
+                    backlog.shown
+                      ? "border-accent/40 bg-accent-dim text-accent-text"
+                      : "border-line text-tx-3 hover:text-tx-1"
+                  }`}
+                >
+                  backlog{backlog.count > 0 ? ` ${backlog.count}` : ""}
+                </button>
+              )}
+              <LaneTagFilter
+                tags={tagOptions}
+                selected={activeTags}
+                onToggle={toggleTag}
+                onClear={() => setSelectedTags([])}
+              />
+            </>
           ) : undefined
         }
         filteredCount={filterActive ? visibleTasks.length : undefined}
@@ -147,38 +139,9 @@ export function Lane({
             showAffordance ? decisionClasses(decision, isOver) : "border-transparent"
           } ${showAffordance && decision !== "invalid" ? "p-1" : ""}`}
         >
-          {visibleTasks.map((t) => {
-            const isWorktreeColumn = lane.kind === "worktree";
-            const { isFrontReserved, alreadyDispatched } = cardDecorators(
-              t,
-              lane,
-              frontReserved,
-              sessions,
-              dispatchedSet,
-            );
-
-            return (
-              <TaskCard
-                key={t.id}
-                t={t}
-                column={lane.key}
-                isWorktreeColumn={isWorktreeColumn}
-                actor={actor}
-                selected={t.id === selectedId}
-                worktreeNames={worktreeNames}
-                sessions={sessions}
-                isFrontReserved={isFrontReserved}
-                alreadyDispatched={alreadyDispatched}
-                flyIn={flyIn?.id === t.id ? flyIn.worktree : null}
-                menuOpen={menuTaskId === t.id}
-                onMenuOpenChange={(open) => onMenuOpenChange(t.id, open)}
-                onSelect={() => onSelect(t.id)}
-                onAction={onAction}
-                onDispatch={(wt) => onDispatch(wt, t.id)}
-                onRelease={() => onRelease(t.id)}
-              />
-            );
-          })}
+          {visibleTasks.map((t) => (
+            <TaskCard key={t.id} t={t} column={lane.key} state={stateOf(env, t)} env={env} />
+          ))}
           {visibleTasks.length === 0 && (
             <div className="rounded-chip border border-dashed border-line/60 px-2.5 py-3 text-center text-[11px] text-tx-3">
               {filterActive ? "no tasks match" : "—"}

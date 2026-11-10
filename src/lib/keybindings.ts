@@ -29,6 +29,10 @@ export interface KeyCtx {
   setSelected: (name: string) => void;
   /** Toggle the per-card DispatchMenu for the selected card (Board → App wired). */
   openCardMenu: () => void;
+  /** Move the selected board card to the backlog, or reopen it from there. */
+  toggleCardBacklog: () => void;
+  /** Auto-dispatch the selected board card (as its Dispatch button does). */
+  autoDispatchCard: () => void;
   /** Step the terminal font size by `delta` px (clamped), and flash the size HUD. */
   adjustFontSize: (delta: number) => void;
   /** Reset the terminal font size to the default, and flash the size HUD. */
@@ -311,10 +315,26 @@ export const DEFAULT_BINDINGS: Keybinding[] = [
   {
     id: "board.dispatch",
     keys: "d",
-    label: "Dispatch selected card",
+    label: "Dispatch selected card to… (menu)",
     group: "Board",
     when: (ctx) => ctx.view === "board" && ctx.hasSelectedCard,
     run: (ctx) => ctx.openCardMenu(),
+  },
+  {
+    id: "board.autoDispatch",
+    keys: "Shift+D",
+    label: "Dispatch selected card (auto-pick worktree)",
+    group: "Board",
+    when: (ctx) => ctx.view === "board" && ctx.hasSelectedCard,
+    run: (ctx) => ctx.autoDispatchCard(),
+  },
+  {
+    id: "board.backlog",
+    keys: "b",
+    label: "Backlog / reopen selected card",
+    group: "Board",
+    when: (ctx) => ctx.view === "board" && ctx.hasSelectedCard,
+    run: (ctx) => ctx.toggleCardBacklog(),
   },
   // Worktree number jumps: Cmd+1..9 selects the Nth available worktree → Focus view.
   ...[1, 2, 3, 4, 5, 6, 7, 8, 9].map((N) => ({

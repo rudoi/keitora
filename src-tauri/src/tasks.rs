@@ -5,8 +5,8 @@
 // so we don't hold a non-Send connection in Tauri state.
 
 use keitora_tasks::{
-    BackendError, ClaimOutcome, DepNode, ListFilter, LocalStore, LogEntry, ProjectConfig,
-    Reservation, Task, TaskBackend, TaskUpdate, TaskWithDeps, WorktreeSession,
+    BackendError, ClaimOutcome, DepNode, DispatchLogEntry, ListFilter, LocalStore, LogEntry,
+    ProjectConfig, Reservation, Task, TaskBackend, TaskUpdate, TaskWithDeps, WorktreeSession,
 };
 use serde::Serialize;
 
@@ -227,6 +227,49 @@ pub struct BoardSnapshotResponse {
     pub project: String,
     pub tasks: Vec<TaskWithDeps>,
     pub reservations: Vec<Reservation>,
+    /// Backlog tasks, kept apart from `tasks` so nothing that reads the board model
+    /// sees them by accident; the board shows them in the Open lane when its backlog
+    /// toggle is on.
+    pub backlog: Vec<TaskWithDeps>,
+    /// Pending cards whose last send to their lane failed, with the reason.
+    pub failures: Vec<DispatchFailure>,
+}
+
+/// A pending card whose latest dispatch-log entry for its lane is a failed send.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DispatchFailure {
+    pub task_id: i64,
+    pub worktree: String,
+    pub reason: String,
+    pub at: String,
+}
+
+/// How many recent dispatch-log entries the snapshot scans for failed sends.
+const FAILURE_SCAN: i64 = 300;
+
+/// Pure: the failed sends still standing. For each open card reserved to a lane, its
+/// newest log entry for that lane (`log` is newest first) decides: `failed` is a
+/// standing failure; anything later (a send, a queue, a release) clears it.
+pub(crate) fn dispatch_failures(
+    tasks: &[TaskWithDeps],
+    log: &[DispatchLogEntry],
+) -> Vec<DispatchFailure> {
+    tasks
+        .iter()
+        .filter(|t| t.task.status == "open")
+        .filter_map(|t| {
+            let wt = t.task.assigned_to.as_deref()?;
+            let latest = log
+                .iter()
+                .find(|e| e.task_id == t.task.id && e.worktree == wt)?;
+            (latest.decision == "failed").then(|| DispatchFailure {
+                task_id: t.task.id,
+                worktree: wt.to_string(),
+                reason: latest.rationale.clone(),
+                at: latest.created_at.clone(),
+            })
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -237,10 +280,29 @@ pub async fn board_snapshot(filter: Option<ListFilter>) -> Result<BoardSnapshotR
         .board_snapshot(&filter)
         .await
         .map_err(|e| to_ipc_error(&e))?;
+    let backlog_filter = ListFilter {
+        include_backlog: true,
+        ..filter.clone()
+    };
+    let backlog = backend
+        .list(&backlog_filter)
+        .await
+        .map_err(|e| to_ipc_error(&e))?
+        .into_iter()
+        .filter(|t| t.task.status == "backlog")
+        .collect();
+    // Best-effort: a log read failure just shows no failures.
+    let log = backend
+        .dispatch_log_list(FAILURE_SCAN)
+        .await
+        .unwrap_or_default();
+    let failures = dispatch_failures(&snapshot.tasks, &log);
     Ok(BoardSnapshotResponse {
         project: config.project.name,
         tasks: snapshot.tasks,
         reservations: snapshot.reservations,
+        backlog,
+        failures,
     })
 }
 
@@ -348,6 +410,31 @@ pub async fn task_release(id: i64) -> Result<(), IpcError> {
         .map_err(|e| to_ipc_error(&e))
 }
 
+/// Move a task to the backlog: hidden from the board (unless its backlog toggle is
+/// on) and never dispatched. Clears any lane assignment.
+#[tauri::command]
+pub async fn task_backlog(id: i64) -> Result<(), IpcError> {
+    let (backend, _) = open_backend().map_err(IpcError::internal)?;
+    backend
+        .backlog(id, &keitora_tasks::current_worktree())
+        .await
+        .map_err(|e| to_ipc_error(&e))
+}
+
+/// Bring a backlog task back to `open`.
+#[tauri::command]
+pub async fn task_reopen(id: i64) -> Result<(), IpcError> {
+    let (backend, _) = open_backend().map_err(IpcError::internal)?;
+    let upd = TaskUpdate {
+        status: Some("open".to_string()),
+        ..TaskUpdate::default()
+    };
+    backend
+        .update(id, &keitora_tasks::current_worktree(), &upd)
+        .await
+        .map_err(|e| to_ipc_error(&e))
+}
+
 #[tauri::command]
 pub async fn task_update(id: i64, patch: TaskUpdate) -> Result<(), IpcError> {
     let (backend, _) = open_backend().map_err(IpcError::internal)?;
@@ -376,4 +463,69 @@ pub async fn task_new(
         )
         .await
         .map_err(|e| to_ipc_error(&e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log_entry(id: i64, task_id: i64, wt: &str, decision: &str) -> DispatchLogEntry {
+        DispatchLogEntry {
+            id,
+            task_id,
+            worktree: wt.to_string(),
+            decision: decision.to_string(),
+            rationale: format!("why {id}"),
+            created_at: format!("t{id}"),
+        }
+    }
+
+    fn card(id: i64, status: &str, wt: Option<&str>) -> TaskWithDeps {
+        TaskWithDeps {
+            task: Task {
+                id,
+                title: "t".into(),
+                description: String::new(),
+                status: status.into(),
+                priority: "normal".into(),
+                assigned_to: wt.map(str::to_string),
+                created_by: None,
+                tags: vec![],
+                branch: None,
+                pr_url: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+            blocked_by: vec![],
+            blocks: vec![],
+        }
+    }
+
+    #[test]
+    fn dispatch_failures_keep_only_standing_failures_on_the_current_lane() {
+        let tasks = vec![
+            card(1, "open", Some("alpha")),   // failed last → standing
+            card(2, "open", Some("alpha")),   // failed, then sent → cleared
+            card(3, "open", Some("bravo")),   // failed on alpha, moved to bravo → not here
+            card(4, "active", Some("alpha")), // claimed → not a failure
+            card(5, "open", None),
+        ];
+        // Newest first.
+        let log = vec![
+            log_entry(9, 2, "alpha", "dispatched"),
+            log_entry(8, 1, "alpha", "failed"),
+            log_entry(7, 3, "alpha", "failed"),
+            log_entry(6, 2, "alpha", "failed"),
+            log_entry(5, 4, "alpha", "failed"),
+        ];
+        assert_eq!(
+            dispatch_failures(&tasks, &log),
+            vec![DispatchFailure {
+                task_id: 1,
+                worktree: "alpha".into(),
+                reason: "why 8".into(),
+                at: "t8".into(),
+            }]
+        );
+    }
 }

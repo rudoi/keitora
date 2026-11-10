@@ -165,6 +165,8 @@ function makeCtx(overrides: Partial<KeyCtx> = {}): KeyCtx {
     setView: vi.fn(),
     setSelected: vi.fn(),
     openCardMenu: vi.fn(),
+    toggleCardBacklog: vi.fn(),
+    autoDispatchCard: vi.fn(),
     adjustFontSize: vi.fn(),
     resetFontSize: vi.fn(),
     projectNames: [],
@@ -335,6 +337,34 @@ describe("isFindChord", () => {
 
   it("is the search.open binding's chord", () => {
     expect(DEFAULT_BINDINGS.find((b) => b.id === "search.open")?.keys).toBe("Cmd+F");
+  });
+});
+
+describe("board dispatch bindings", () => {
+  const menu = DEFAULT_BINDINGS.find((b) => b.id === "board.dispatch");
+  const auto = DEFAULT_BINDINGS.find((b) => b.id === "board.autoDispatch");
+
+  it("d opens the menu and Shift+D auto-dispatches, without overlap", () => {
+    const d = ev({ key: "d" });
+    const shiftD = ev({ key: "D", shiftKey: true });
+    expect(matchesKey(d, menu?.keys ?? "")).toBe(true);
+    expect(matchesKey(shiftD, menu?.keys ?? "")).toBe(false);
+    expect(matchesKey(shiftD, auto?.keys ?? "")).toBe(true);
+    expect(matchesKey(d, auto?.keys ?? "")).toBe(false);
+    // Ctrl+Shift+D is a different (global) chord.
+    expect(matchesKey(ev({ key: "D", shiftKey: true, ctrlKey: true }), auto?.keys ?? "")).toBe(
+      false,
+    );
+  });
+
+  it("Shift+D runs the auto-dispatch on the board with a selected card only", () => {
+    const ctx = makeCtx({ view: "board", hasSelectedCard: true });
+    expect(auto?.when(ctx)).toBe(true);
+    auto?.run(ctx);
+    expect(ctx.autoDispatchCard).toHaveBeenCalledTimes(1);
+    expect(ctx.openCardMenu).not.toHaveBeenCalled();
+    expect(auto?.when(makeCtx({ view: "board", hasSelectedCard: false }))).toBe(false);
+    expect(auto?.when(makeCtx({ view: "focus", hasSelectedCard: true }))).toBe(false);
   });
 });
 

@@ -28,6 +28,8 @@ export interface LaneModel {
   status: WorktreeStatus;
   /** The user terminated the session (only ever set on an available worktree). */
   terminated: boolean;
+  /** In the project's dispatch pool (may receive dispatched tasks). */
+  dispatch: boolean;
   sessionState: SessionState | undefined;
   /** Active group: from `attention`. Other groups: `waiting` iff the session is waiting. */
   attn: AttentionKind | undefined;
@@ -114,6 +116,7 @@ export function buildLane(
     cli: w.cli,
     status: w.status,
     terminated,
+    dispatch: w.dispatch !== false,
     sessionState: session?.state,
     attn,
     task,

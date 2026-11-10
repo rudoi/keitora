@@ -82,6 +82,14 @@ describe("buildLanes", () => {
     }
   });
 
+  it("shows backlog tasks in the Open lane, after open ones, when asked", () => {
+    const tasks = [task(1, "backlog"), task(2, "open")];
+    const lanes = buildLanes(tasks, ["wt-a"], new Map(), true);
+    const open = lanes.find((l) => l.kind === "unassigned");
+    expect(open?.tasks.map((t) => t.id)).toEqual([2, 1]);
+    expect(lanes.find((l) => l.key === "wt-a")?.tasks).toEqual([]);
+  });
+
   it("routes done tasks to the Done lane", () => {
     const tasks = [task(1, "done")];
     const lanes = buildLanes(tasks, ["wt-a"], noSessions);

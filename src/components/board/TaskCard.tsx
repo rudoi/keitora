@@ -1,59 +1,57 @@
-// TaskCard — extracted verbatim from Board.tsx's `Card` component (≈L112–362).
-// Props, useDraggable wiring, reserved/ready/sent/terminal logic, claim/done/release
-// buttons, and usePrefersReducedMotion gating are unchanged. Only imports are fixed up
-// for the new location under src/components/board/.
+// TaskCard — one board card. Shows exactly one state (Open, Backlog, Pending with its
+// reason, Sent, Active, Blocked, Done), any failed send with its reason, and the
+// actions that state allows: Dispatch (auto-pick) on an open card, Retry on a
+// pending card whose send failed, Release on an assigned card, Reopen on a backlog
+// card, Claim for the focused worktree.
 
 import { useDraggable } from "@dnd-kit/core";
 import { motion } from "motion/react";
-import type { WorktreeSession } from "../../lib/sessions";
+import type { CardState } from "../../lib/cardState";
 import { PRIORITY_BAR } from "../../lib/taskStyles";
 import { claimTask, type TaskWithDeps } from "../../lib/tasks";
 import { usePrefersReducedMotion } from "../../lib/usePrefersReducedMotion";
 import { DispatchMenu } from "../DispatchMenu";
+import type { CardEnv } from "./cardHelpers";
 
 // Tags render on a single (non-wrapping) line; beyond this many we collapse the rest
 // into a "+N more" chip so the card grows in width predictably instead of wrapping.
 const MAX_VISIBLE_TAGS = 3;
 
+/** Pure: the state chip's text and tooltip for a card. Exported for tests. */
+export function stateChip(state: CardState): { text: string; title: string } | null {
+  switch (state.kind) {
+    case "pending": {
+      const why = state.reason.replace(/^pending: /, "");
+      return state.failure
+        ? { text: "send failed", title: state.failure }
+        : { text: "pending", title: why };
+    }
+    case "sent":
+      return { text: "sent ✓", title: `typed into @${state.worktree}; waiting for its claim` };
+    case "active":
+      return {
+        text: "active",
+        title: state.worktree ? `claimed by @${state.worktree}` : "claimed",
+      };
+    case "backlog":
+      return { text: "backlog", title: "hidden from dispatch; reopen it to work on it" };
+    default:
+      return null;
+  }
+}
+
 export function TaskCard({
   t,
   column,
-  isWorktreeColumn,
-  actor,
-  selected,
-  worktreeNames,
-  sessions,
-  isFrontReserved,
-  alreadyDispatched,
-  flyIn,
-  menuOpen,
-  onMenuOpenChange,
-  onSelect,
-  onAction,
-  onDispatch,
-  onRelease,
+  state,
+  env,
   compact = false,
   fill = false,
 }: {
   t: TaskWithDeps;
   column: string;
-  isWorktreeColumn: boolean;
-  actor: string | null;
-  selected: boolean;
-  worktreeNames: string[];
-  sessions: Map<string, WorktreeSession>;
-  /** This is the front reserved card AND its worktree is now idle → ready. */
-  isFrontReserved: boolean;
-  /** This reserved card has already been injected into its worktree's PTY. */
-  alreadyDispatched: boolean;
-  /** Worktree this card just dispatched to (inline "dispatched → @wt" line). */
-  flyIn: string | null;
-  menuOpen: boolean;
-  onMenuOpenChange: (open: boolean) => void;
-  onSelect: () => void;
-  onAction: (fn: () => Promise<unknown>) => void;
-  onDispatch: (worktree: string) => void;
-  onRelease: () => void;
+  state: CardState;
+  env: CardEnv;
   /** Compact variant: tighter padding, smaller text, suited to ~w-[188px] cards in rows. */
   compact?: boolean;
   /** Stretch the card body to fill its parent's height (desktop worktree-row cards). */
@@ -62,60 +60,68 @@ export function TaskCard({
   const task = t;
   const blocked_by = t.blocked_by;
   const terminal = task.status === "done" || task.status === "cancelled";
+  const backlog = state.kind === "backlog";
   const reducedMotion = usePrefersReducedMotion();
+  const selected = t.id === env.selectedId;
+  const flyIn = env.flyIn?.id === t.id ? env.flyIn.worktree : null;
 
-  // A reserved card = open + assigned to *this* worktree column.
-  const reserved = isWorktreeColumn && task.status === "open" && task.assigned_to === column;
-  // Ready-to-dispatch = the front reserved card whose worktree is now idle,
-  // and has not yet been dispatched (injected into the PTY).
-  const ready = reserved && isFrontReserved && !alreadyDispatched;
+  // An assigned, not-yet-claimed card on this worktree lane (pending or sent).
+  const reserved = (state.kind === "pending" || state.kind === "sent") && state.worktree === column;
+  const failed = state.kind === "pending" && state.failure !== null;
 
-  // Whole-card drag on non-terminal cards. Terminal → no drag (cursor-default).
+  // Whole-card drag on non-terminal, non-backlog cards.
   const draggable = useDraggable({
     id: task.id,
     data: { task },
-    disabled: terminal,
+    disabled: terminal || backlog,
   });
   const { attributes, listeners, setNodeRef, isDragging } = draggable;
   // The lifted visual is the DragOverlay; the origin slot stays put (opacity-40),
   // so we deliberately do NOT apply `draggable.transform` here.
 
-  // One 600ms pulse when a card becomes ready-to-dispatch (gated on reduced motion).
-  const pulse = ready && !reducedMotion ? "animate-[pulse_600ms_ease-in-out_1]" : "";
+  // A sent card gets the brighter accent; pending cards stay dashed and dim.
+  const emphasized = state.kind === "sent";
 
-  // A reserved card is "emphasized" when it's the live dispatch target (ready) or
-  // already sent — both get the brighter accent border/rail; plain queued cards stay dim.
-  const emphasized = ready || (reserved && alreadyDispatched);
-
-  // Card chrome: reserved swaps the solid bar for a dashed accent rail + border.
-  const borderCls = emphasized
-    ? "border-accent/60"
-    : reserved
-      ? "border-dashed border-accent/30"
-      : selected
-        ? "border-accent/55 shadow-[0_0_0_1px_color-mix(in_srgb,var(--color-accent)_25%,transparent)]"
-        : "border-line";
+  const borderCls = failed
+    ? "border-urgent/60"
+    : emphasized
+      ? "border-accent/60"
+      : reserved
+        ? "border-dashed border-accent/30"
+        : selected
+          ? "border-accent/55 shadow-[0_0_0_1px_color-mix(in_srgb,var(--color-accent)_25%,transparent)]"
+          : "border-line";
 
   // Compact variant sizing tokens.
   const padCls = compact ? "px-2 py-2.5" : "px-2.5 py-2.5";
   const railInsetCls = "top-2.5 bottom-2.5";
   const idTextCls = compact ? "text-[10px]" : "text-[11px]";
   const titleTextCls = compact
-    ? `mt-1 text-[11px] leading-snug line-clamp-2 ${reserved ? "text-tx-2" : "text-tx-1"}`
-    : `mt-1.5 max-w-[200px] text-[12.5px] leading-snug ${reserved ? "text-tx-2" : "text-tx-1"}`;
+    ? `mt-1 text-[11px] leading-snug line-clamp-2 ${reserved || backlog ? "text-tx-2" : "text-tx-1"}`
+    : `mt-1.5 max-w-[200px] text-[12.5px] leading-snug ${reserved || backlog ? "text-tx-2" : "text-tx-1"}`;
   const badgeTextCls = compact ? "text-[9px]" : "text-[10px]";
   const tagTextCls = compact ? "text-[9px]" : "text-[10px]";
   const actionMtCls = compact ? "mt-1.5" : "mt-2.5";
+  const chip = stateChip(state);
+  const pendingNote =
+    state.kind === "pending" ? (state.failure ?? state.reason.replace(/^pending: /, "")) : null;
+  const canDispatch =
+    state.kind === "open" && task.status === "open" && blocked_by.length === 0 && env.pool.size > 0;
+
+  const stop = {
+    onPointerDown: (e: React.PointerEvent) => e.stopPropagation(),
+  };
 
   const cardBody = (
     <div
       ref={setNodeRef}
-      onClick={onSelect}
-      {...(terminal ? {} : listeners)}
+      onClick={() => env.onSelect(t.id)}
+      {...(terminal || backlog ? {} : listeners)}
       {...attributes}
+      data-card-state={state.kind}
       className={`group relative rounded-chip border bg-bg-2 ${padCls} ${fill ? "flex h-full flex-col" : ""} ${
         terminal ? "cursor-default" : "cursor-pointer"
-      } ${borderCls} ${terminal ? "opacity-60" : ""} ${isDragging ? "opacity-40" : ""} ${pulse}`}
+      } ${borderCls} ${terminal || backlog ? "opacity-60" : ""} ${isDragging ? "opacity-40" : ""}`}
     >
       {/* Left rail: dashed accent for reserved, solid priority bar otherwise. */}
       {reserved ? (
@@ -143,46 +149,38 @@ export function TaskCard({
         {!terminal && (
           <DispatchMenu
             card={task}
-            worktreeNames={worktreeNames}
-            sessions={sessions}
-            open={menuOpen}
-            onOpenChange={onMenuOpenChange}
-            onDispatch={onDispatch}
-            onRelease={onRelease}
+            state={state}
+            worktreeNames={env.worktreeNames}
+            pool={env.pool}
+            laneCtx={env.laneCtx}
+            open={env.menuTaskId === t.id}
+            onOpenChange={(open) => env.onMenuOpenChange(t.id, open)}
+            onDispatch={(wt) => env.onDispatch(wt, t.id)}
+            onAutoDispatch={() => env.onAutoDispatch(t.id)}
+            onRelease={() => env.onRelease(t.id)}
+            onBacklog={() => env.onBacklog(t.id)}
+            onReopen={() => env.onReopen(t.id)}
           />
         )}
 
-        {/* Right-side badge slot: queued chip / dispatch button. */}
-        {ready && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onDispatch(column);
-            }}
-            onPointerDown={(e) => e.stopPropagation()}
-            className={`ml-auto rounded-chip border border-accent bg-accent px-2 py-px ${badgeTextCls} font-semibold text-[var(--color-on-accent)]`}
-          >
-            Dispatch ↵
-          </button>
-        )}
-        {reserved && alreadyDispatched && (
+        {/* Right-side badge slot: one state chip. */}
+        {chip && (
           <span
-            className={`ml-auto rounded-full border border-accent/40 bg-accent-dim px-2 py-px ${badgeTextCls} text-accent-text`}
+            title={chip.title}
+            className={`ml-auto whitespace-nowrap rounded-full border px-2 py-px ${badgeTextCls} ${
+              failed
+                ? "border-urgent/40 bg-urgent/10 text-urgent"
+                : backlog
+                  ? "border-line bg-bg-3 text-tx-3"
+                  : "border-accent/40 bg-accent-dim text-accent-text"
+            }`}
           >
-            sent ✓
-          </span>
-        )}
-        {reserved && !ready && !alreadyDispatched && (
-          <span
-            className={`ml-auto rounded-full border border-accent/40 bg-accent-dim px-2 py-px ${badgeTextCls} text-accent-text`}
-          >
-            queued
+            {chip.text}
           </span>
         )}
         {terminal && <span className="ml-auto text-idle">✓</span>}
 
-        {/* Blocked indicator: top-right of the header, in line with the #id. Pushed
-            right with ml-auto; if a reserved badge is also present they sit adjacent. */}
+        {/* Blocked indicator: top-right of the header, in line with the #id. */}
         {blocked_by.length > 0 && (
           <span
             className={`ml-auto whitespace-nowrap rounded-full bg-urgent/10 px-2 py-px ${badgeTextCls} text-urgent`}
@@ -194,10 +192,22 @@ export function TaskCard({
 
       <div className={`pl-2 ${titleTextCls}`}>{task.title}</div>
 
+      {/* Why a pending card waits, or why its send failed. */}
+      {pendingNote && (
+        <div
+          title={pendingNote}
+          className={`${compact ? "mt-1" : "mt-1.5"} truncate pl-2 text-[10px] ${
+            failed ? "text-urgent" : "text-tx-3"
+          }`}
+        >
+          {pendingNote}
+        </div>
+      )}
+
       {/* Inline dispatch fly-in line (until the worktree flips it to active). */}
       {flyIn && task.status === "open" && (
         <div className={`${compact ? "mt-1" : "mt-1.5"} pl-2 text-[10.5px] text-accent-text`}>
-          dispatched → @{flyIn}
+          sent → @{flyIn}
         </div>
       )}
 
@@ -223,37 +233,81 @@ export function TaskCard({
         </div>
       )}
       {/* Reserved cards hide Claim (a human must not self-claim an agent's reserved
-          task); they expose a subtle hover Release instead. */}
+          task); a failed one offers Retry, every one a subtle hover Release. */}
       {reserved ? (
         <div
-          className={`${actionMtCls} pl-2 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100`}
+          className={`${actionMtCls} flex gap-1.5 pl-2 ${
+            failed
+              ? ""
+              : "opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100"
+          }`}
         >
+          {failed && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                env.onDispatch(column, t.id);
+              }}
+              {...stop}
+              className="rounded-chip border border-accent bg-accent px-2.5 py-1 text-[11px] font-semibold text-[var(--color-on-accent)]"
+            >
+              Retry
+            </button>
+          )}
           <button
             onClick={(e) => {
               e.stopPropagation();
-              onRelease();
+              env.onRelease(t.id);
             }}
-            onPointerDown={(e) => e.stopPropagation()}
+            {...stop}
             className="rounded-chip border border-line bg-bg-3 px-2.5 py-1 text-[11px] text-tx-1"
           >
             Release
           </button>
         </div>
+      ) : backlog ? (
+        <div className={`${actionMtCls} pl-2`}>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              env.onReopen(t.id);
+            }}
+            {...stop}
+            className="rounded-chip border border-line bg-bg-3 px-2.5 py-1 text-[11px] text-tx-1"
+          >
+            Reopen
+          </button>
+        </div>
       ) : (
         task.status === "open" &&
-        blocked_by.length === 0 &&
-        actor !== null && (
-          <div className={`${actionMtCls} pl-2`}>
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onAction(() => claimTask(task.id, actor));
-              }}
-              onPointerDown={(e) => e.stopPropagation()}
-              className="rounded-chip border border-accent bg-accent px-2.5 py-1 text-[11px] font-semibold text-[var(--color-on-accent)]"
-            >
-              Claim
-            </button>
+        blocked_by.length === 0 && (
+          <div className={`${actionMtCls} flex gap-1.5 pl-2`}>
+            {canDispatch && (
+              <button
+                title="Send to a worktree from the dispatch pool (an idle one first)"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  env.onAutoDispatch(t.id);
+                }}
+                {...stop}
+                className="rounded-chip border border-accent bg-accent px-2.5 py-1 text-[11px] font-semibold text-[var(--color-on-accent)]"
+              >
+                Dispatch
+              </button>
+            )}
+            {env.actor !== null && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  // biome-ignore lint/style/noNonNullAssertion: guarded by the actor check above
+                  env.onAction(() => claimTask(task.id, env.actor!));
+                }}
+                {...stop}
+                className="rounded-chip border border-line bg-bg-3 px-2.5 py-1 text-[11px] text-tx-1"
+              >
+                Claim
+              </button>
+            )}
           </div>
         )
       )}

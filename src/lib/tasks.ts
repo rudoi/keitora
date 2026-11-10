@@ -4,7 +4,7 @@
 
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef } from "react";
-import type { Reservation } from "./dispatch";
+import type { DispatchFailure, Reservation } from "./dispatch";
 import { shouldSeedFromCache } from "./projectScope";
 import { getTransport, liveListen } from "./transport";
 import { useLiveResource } from "./useLiveResource";
@@ -137,6 +137,10 @@ export function listTasks(): Promise<TaskBoardResponse> {
  *  stamped with the active project (superset of {@link TaskBoardResponse}). */
 export interface BoardSnapshotResponse extends TaskBoardResponse {
   reservations: Reservation[];
+  /** Backlog tasks (kept out of `tasks`); the Open lane shows them on its toggle. */
+  backlog?: TaskWithDeps[];
+  /** Pending cards whose latest send failed, with the reason. */
+  failures?: DispatchFailure[];
 }
 
 /** Fetch the whole board — tasks + `sent ✓` reservations — in **one** backend call
@@ -194,6 +198,16 @@ export function unclaimTask(id: number, actor: string): Promise<void> {
   return invoke("task_unclaim", { id, actor });
 }
 
+/** Move a task to the backlog (hidden from the board by default, never dispatched). */
+export function backlogTask(id: number): Promise<void> {
+  return invoke("task_backlog", { id });
+}
+
+/** Bring a backlog task back to open. */
+export function reopenTask(id: number): Promise<void> {
+  return invoke("task_reopen", { id });
+}
+
 export function updateTask(id: number, patch: TaskUpdatePatch): Promise<void> {
   return invoke("task_update", { id, patch });
 }
@@ -241,6 +255,10 @@ export interface UseTasks {
    *  `sent ✓`. Fetched in the same `board_snapshot` call as `tasks`, so a board
    *  refresh is one backend call. Scoped to the active project like `tasks`. */
   reservations: Reservation[];
+  /** Backlog tasks of the active project (empty until a matching response lands). */
+  backlog: TaskWithDeps[];
+  /** Standing failed sends of the active project. */
+  failures: DispatchFailure[];
   error: string | null;
   reload: () => Promise<void>;
 }
@@ -335,5 +353,10 @@ export function useTasks(activeProject: string | null, backend?: string | null):
     return liveReservations ?? [];
   }, [activeProject, liveReservations]);
 
-  return { tasks, reservations, error, reload };
+  // Backlog + failures ride the same response; shown only for a matching project.
+  const matching = data && activeProject && data.project === activeProject ? data : null;
+  const backlog = useMemo(() => matching?.backlog ?? [], [matching]);
+  const failures = useMemo(() => matching?.failures ?? [], [matching]);
+
+  return { tasks, reservations, backlog, failures, error, reload };
 }
