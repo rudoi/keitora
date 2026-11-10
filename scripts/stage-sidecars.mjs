@@ -13,10 +13,15 @@
 // everyday builds don't require the staged sidecar. Any failure exits non-zero so the
 // `tauri:bundle` `&&` chain aborts — a release bundle can never silently proceed
 // without sidecars.
+//
+// On macOS it also warns (without failing) when no stable signing identity is set: an
+// ad-hoc bundle loses its privacy grants, such as Screen Recording, on every rebuild.
 import { execFileSync } from "node:child_process";
 import { copyFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { unsignedBundleWarning } from "./signing.mjs";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const isWindows = process.platform === "win32";
@@ -24,6 +29,9 @@ const EXE = isWindows ? ".exe" : "";
 // Node's execFile does no PATHEXT resolution on Windows, so name the real executables.
 const CARGO = isWindows ? "cargo.exe" : "cargo";
 const RUSTC = isWindows ? "rustc.exe" : "rustc";
+
+const signingWarning = unsignedBundleWarning(process.platform, process.env);
+if (signingWarning) console.warn(signingWarning);
 
 // Host target triple — Tauri's externalBin requires the sidecar filename to carry it
 // (it strips the suffix at bundle time, placing plain `keitora-cli`

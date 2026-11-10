@@ -29,6 +29,7 @@ import {
   type ReleaseOptions,
   tauriArchToken,
 } from "./release.lib.ts";
+import { API_KEY_VARS, APPLE_ID_VARS, macBuildMode } from "./signing.mjs";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -178,12 +179,42 @@ function cleanBundleDir(platform: string, dryRun: boolean): void {
   console.log(`+ cleaned ${dir}`);
 }
 
-function build(platform: string, dryRun: boolean): void {
+/**
+ * Decide how the macOS dmg is built, before anything is bumped, tagged or pushed: a
+ * signing problem must stop the release while nothing has changed. Returns the extra
+ * `build-dmg.sh` arguments. In a dry run, problems are reported instead of thrown.
+ */
+function macBuildFlags(dryRun: boolean): string[] {
+  const mode = macBuildMode(process.env);
+  const problem =
+    mode === "no-identity"
+      ? "APPLE_SIGNING_IDENTITY must name a code-signing identity (not '-'). " +
+        'See CONTRIBUTING.md, "Signed macOS builds".'
+      : mode === "partial-notarization"
+        ? `Notarization variables are only partly set. Set all of ${APPLE_ID_VARS.join(", ")}, ` +
+          `or all of ${API_KEY_VARS.join(", ")}, or none of them for a sign-only build.`
+        : null;
+  if (problem) {
+    if (!dryRun) throw new Error(problem);
+    console.warn(`[dry-run] a real release would stop here: ${problem}`);
+  }
+  if (mode === "signed-only") {
+    console.warn(
+      "\n*** WARNING: no notarization credentials. The DMG will be signed but NOT notarized.\n" +
+        "*** Downloaders must allow it once under System Settings > Privacy & Security > Open Anyway.\n",
+    );
+    return ["--sign-only"];
+  }
+  return [];
+}
+
+function build(platform: string, macFlags: string[], dryRun: boolean): void {
   if (platform === "win32") {
     runMutating("yarn", ["tauri:bundle"], dryRun);
   } else {
-    // macOS: signed + notarized, overlay-aware (see scripts/build-dmg.sh).
-    runMutating("bash", ["scripts/build-dmg.sh"], dryRun);
+    // macOS: always signed with a stable identity (so privacy grants survive upgrades),
+    // notarized when credentials are present. Overlay-aware (see scripts/build-dmg.sh).
+    runMutating("bash", ["scripts/build-dmg.sh", ...macFlags], dryRun);
   }
 }
 
@@ -266,7 +297,11 @@ Builds this platform's Tauri bundle and uploads it to the GitHub release v{versi
 
 Version bumps are propagated to package.json, src-tauri/tauri.conf.json, and
 src-tauri/Cargo.toml. Run on each platform to fill that platform's artifact into
-the same release (e.g. Windows NSIS, then macOS dmg).`);
+the same release (e.g. Windows NSIS, then macOS dmg).
+
+macOS needs APPLE_SIGNING_IDENTITY. With a complete set of notarization variables
+the dmg is notarized; with none it is signed only (downloaders must allow it once
+under System Settings > Privacy & Security > Open Anyway). See CONTRIBUTING.md, "Signed macOS builds".`);
 }
 
 async function main(): Promise<void> {
@@ -289,6 +324,7 @@ async function main(): Promise<void> {
   }
   const archToken = tauriArchToken(process.arch);
   const current = readCurrentVersion();
+  const macFlags = platform === "darwin" ? macBuildFlags(opts.dryRun) : [];
 
   // ── 1. optional version rev ──
   let targetVersion = current;
@@ -322,7 +358,7 @@ async function main(): Promise<void> {
   // ── 2. build + discover ──
   console.log(`==> Building ${platform} (${archToken}) bundle for ${tag}`);
   cleanBundleDir(platform, opts.dryRun);
-  build(platform, opts.dryRun);
+  build(platform, macFlags, opts.dryRun);
   const artifact = discoverArtifact(platform, targetVersion, archToken, opts.dryRun);
   console.log(`==> Artifact: ${artifact}`);
 
