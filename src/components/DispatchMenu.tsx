@@ -1,7 +1,7 @@
 // Per-card "Dispatch to…" menu — the keyboard-first parity path for drag-to-
 // dispatch (proposal §4.3). A Radix DropdownMenu opened by a caret on the card
 // header (hover/focus-visible) or by `D` when the card is selected (the parent
-// drives `open`). Order: Dispatch (auto-pick) first, so `D` then Enter dispatches;
+// drives `open`). Order: Dispatch (auto-pick) first (also Shift+D, without the menu);
 // then the pool worktrees (→ send now, accent; → pending, dim) — worktrees outside
 // the dispatch pool never appear; then Release, and Move to backlog / Reopen.
 
@@ -12,6 +12,16 @@ import type { SessionState } from "../lib/sessions";
 import { STATE_ORDER, sessionDotCls } from "../lib/taskStyles";
 import type { TaskWithDeps } from "../lib/tasks";
 import { judgeLane, type LaneContext } from "../lib/useDispatchTargets";
+
+/** Handlers that keep the menu's key and pointer events from reaching the card.
+ *  React bubbles events through the component tree even out of a portal, so without
+ *  this an Enter on a menu item also lands on the card's drag listeners. Exported
+ *  for tests. */
+export const isolateFromCard = {
+  onKeyDown: (e: { stopPropagation: () => void }) => e.stopPropagation(),
+  onPointerDown: (e: { stopPropagation: () => void }) => e.stopPropagation(),
+  onClick: (e: { stopPropagation: () => void }) => e.stopPropagation(),
+};
 
 export function DispatchMenu({
   card,
@@ -67,8 +77,7 @@ export function DispatchMenu({
         <button
           type="button"
           aria-label="Dispatch to…"
-          onClick={(e) => e.stopPropagation()}
-          onPointerDown={(e) => e.stopPropagation()}
+          {...isolateFromCard}
           className="ml-1 flex-none rounded text-tx-3 opacity-0 outline-none transition-opacity hover:text-tx-1 focus-visible:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100"
         >
           <ChevronDown size={13} />
@@ -78,7 +87,7 @@ export function DispatchMenu({
         <DropdownMenu.Content
           align="end"
           sideOffset={4}
-          onClick={(e) => e.stopPropagation()}
+          {...isolateFromCard}
           className="z-50 min-w-[200px] rounded-card border border-line bg-bg-2 p-1 shadow-[0_8px_24px_rgba(0,0,0,.45)]"
         >
           <DropdownMenu.Label className="px-2 py-1 text-[10px] uppercase tracking-wide text-tx-3">
@@ -101,7 +110,7 @@ export function DispatchMenu({
             >
               <span className="h-1.5 w-1.5 flex-none rounded-full bg-accent" />
               <span>Dispatch</span>
-              <span className="ml-auto text-[10px] font-normal text-tx-3">auto-pick</span>
+              <span className="ml-auto text-[10px] font-normal text-tx-3">auto-pick · ⇧D</span>
             </DropdownMenu.Item>
           )}
 

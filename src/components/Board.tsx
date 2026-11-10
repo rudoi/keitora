@@ -13,7 +13,6 @@ import {
   type DragEndEvent,
   DragOverlay,
   type DragStartEvent,
-  KeyboardSensor,
   PointerSensor,
   useSensor,
   useSensors,
@@ -54,6 +53,7 @@ export function Board({
   reload,
   registerOpenCardMenu,
   registerToggleBacklog,
+  registerAutoDispatch,
   dispatched,
 }: {
   tasks: TaskWithDeps[];
@@ -75,6 +75,9 @@ export function Board({
   /** Hand App a stable callback that backlogs / reopens the selected card
    *  (`board.backlog`). */
   registerToggleBacklog?: (fn: () => void) => void;
+  /** Hand App a stable callback that auto-dispatches the selected card
+   *  (`board.autoDispatch`, Shift+D) — the card's Dispatch button. */
+  registerAutoDispatch?: (fn: () => void) => void;
   /** Reservations already sent — cards in this set show `sent ✓`. */
   dispatched: Reservation[];
 }) {
@@ -123,10 +126,12 @@ export function Board({
   const draggedCard = activeId !== null ? (byId.get(activeId) ?? null) : null;
   const decisions = useDispatchTargets(draggedCard, lanesForTargets, laneCtx);
 
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
-    useSensor(KeyboardSensor),
-  );
+  // Pointer only. dnd-kit's KeyboardSensor started a drag on Enter/Space on a focused
+  // card — including an Enter pressed in the card's "Dispatch to…" menu, which
+  // reaches the card through the React tree despite the portal — and the drag then
+  // sat mid-animation with no lane to move to. The keyboard path to dispatch is the
+  // menu (`d`) and Shift+D, not keyboard dragging.
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
 
   // Run a mutation, surface any store error (inline + toast), then refetch
   // immediately (the tasks://changed watcher will also fire, but this keeps the UI
@@ -228,6 +233,19 @@ export function Board({
   useEffect(() => {
     registerToggleBacklog?.(toggleBacklog);
   }, [registerToggleBacklog, toggleBacklog]);
+  const autoDispatchSelected = useCallback(() => {
+    const id = selectedIdRef.current;
+    if (id === null) return;
+    const card = byIdRef.current.get(id);
+    if (!card) return;
+    setMenuTaskId(null);
+    // The backend refuses what can't go (blocked, backlog, active, …) and the hook
+    // toasts the outcome either way.
+    runAutoDispatch(id);
+  }, [runAutoDispatch]);
+  useEffect(() => {
+    registerAutoDispatch?.(autoDispatchSelected);
+  }, [registerAutoDispatch, autoDispatchSelected]);
 
   const handleDragStart = (e: DragStartEvent) => {
     setActiveId(Number(e.active.id));
