@@ -113,8 +113,8 @@ fn step_session(
 // ── Watcher orchestration ───────────────────────────────────────────────────────
 
 /// Enumerate every registered project (`UserConfig.projects` →
-/// `ProjectConfig::load` → `tasks.db_path`, the same pattern as
-/// `host::list_projects`) and spawn one watcher thread per project DB.
+/// `effective_config` → `tasks.db_path`, so projects without a `keitora.toml`
+/// count too) and spawn one watcher thread per project DB.
 ///
 /// Idempotent: each call snapshots `UserConfig`, stops the previous watcher set,
 /// and spawns a fresh watcher per project found. Re-calling after onboard/remove
@@ -133,17 +133,13 @@ pub fn start_bg_notifier<R: Runtime + 'static>(app: AppHandle<R>) {
         }
     };
     let mut new_senders = Vec::new();
-    for (project_name, project_ref) in &user_cfg.projects {
-        let pc = match keitora_tasks::ProjectConfig::load(&project_ref.path) {
-            Ok(pc) => pc,
-            Err(_) => continue, // stale/unloadable registry entry — skip
-        };
+    for (project_name, pc) in watched_projects(&user_cfg) {
         // Rendezvous channel (cap 0): we only care about connect/disconnect, the
         // watcher thread observes its receiver to know when it is superseded.
         let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(0);
         spawn_project_watcher(
             app.clone(),
-            project_name.clone(),
+            project_name,
             pc.project.name.clone(),
             pc.tasks.db_path.clone(),
             stop_rx,
@@ -153,6 +149,27 @@ pub fn start_bg_notifier<R: Runtime + 'static>(app: AppHandle<R>) {
     // Install the fresh set and drop the previous senders → the old watcher
     // threads observe their receivers disconnect and exit on their next loop.
     drop(replace_bg_watchers(new_senders));
+}
+
+/// The registered projects to watch, as `(registry key, effective config)`.
+/// Uses `effective_config`, not `ProjectConfig::load`, so a project registered
+/// without a committed `keitora.toml` is watched too (its DB is the scaffold
+/// default): it gets background notifications, and its CLI dispatch requests run
+/// while it isn't the active project. An entry whose root is gone is stale and
+/// skipped, as is one whose config can't be resolved.
+fn watched_projects(
+    user_cfg: &keitora_tasks::UserConfig,
+) -> Vec<(String, keitora_tasks::ProjectConfig)> {
+    user_cfg
+        .projects
+        .iter()
+        .filter(|(_, pref)| pref.path.is_dir())
+        .filter_map(|(name, pref)| {
+            keitora_tasks::effective_config(pref)
+                .ok()
+                .map(|pc| (name.clone(), pc))
+        })
+        .collect()
 }
 
 /// Watch a single project's DB dir and fire OS notifications for that project's
@@ -488,6 +505,47 @@ mod tests {
         let prev = (st.0.as_str(), st.1, st.2);
         let (_n, fire) = step_session(Some(prev), "waiting", false);
         assert!(fire, "armed waiting edge fires on background handoff");
+    }
+
+    // ── which projects are watched ──────────────────────────────────────────────
+
+    #[test]
+    fn watched_projects_include_toml_less_projects_and_skip_stale_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A registered project with no keitora.toml: watched, at its scaffold DB.
+        let bare = tmp.path().join("proj");
+        std::fs::create_dir_all(&bare).unwrap();
+        // A registered project with a keitora.toml pinning its DB.
+        let pinned = tmp.path().join("other-proj");
+        std::fs::create_dir_all(&pinned).unwrap();
+        std::fs::write(
+            pinned.join("keitora.toml"),
+            "[project]\nname = \"other-proj\"\n\n[tasks]\ndb_path = \"shared/tasks.db\"\n",
+        )
+        .unwrap();
+        let mut cfg = keitora_tasks::UserConfig::default();
+        cfg.register("proj", bare);
+        cfg.register("other-proj", pinned);
+        cfg.register("gone", tmp.path().join("gone")); // root no longer exists
+
+        let watched = watched_projects(&cfg);
+        let names: Vec<(&str, &str)> = watched
+            .iter()
+            .map(|(k, pc)| (k.as_str(), pc.project.name.as_str()))
+            .collect();
+        assert_eq!(names, vec![("other-proj", "other-proj"), ("proj", "proj")]);
+        // The committed db_path wins where there is one; the bare project gets one too.
+        let other_db = watched[0]
+            .1
+            .tasks
+            .db_path
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            other_db.ends_with("other-proj/shared/tasks.db"),
+            "{other_db}"
+        );
+        assert!(watched[1].1.tasks.db_path.ends_with("tasks.db"));
     }
 
     // ── idempotent restart: the live-watcher registry swap ──────────────────────
