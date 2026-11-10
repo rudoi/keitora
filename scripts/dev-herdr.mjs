@@ -21,7 +21,15 @@
 // relocates a shebang off byte 0, where it is no longer valid syntax.
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, posix, resolve, win32 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -177,6 +185,53 @@ export function seedProjectToml(name, dbPath, cliPath) {
     `path = '${fwd(cliPath)}'`,
     "",
   ].join("\n");
+}
+
+/**
+ * The Claude Code config the dev agents run under, or null to leave them on your
+ * real one.
+ *
+ * Claude Code remembers "I trust this folder" only in its config file
+ * (`.claude.json`, `projects[<repo root>].hasTrustDialogAccepted`); there is no
+ * flag or env var to skip the prompt. Pre-trusting the throwaway repos therefore
+ * needs a config of our own: `CLAUDE_CONFIG_DIR` under the dev home, which this run
+ * may write freely. Your real `~/.claude.json` is never touched.
+ *
+ * A separate config dir also has its own login, so this is only used when the
+ * environment already carries a credential Claude Code reads without one
+ * (`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`, or `ANTHROPIC_API_KEY`).
+ * Without one, null: the agents use your real config, and the first run in a new
+ * dev repo asks to trust it once. Pure.
+ */
+export function claudeDevConfig(env, devHome) {
+  const hasCredential = Boolean(env.CLAUDE_CODE_OAUTH_TOKEN || env.ANTHROPIC_API_KEY);
+  if (!hasCredential) return null;
+  const configDir = join(devHome, "claude");
+  return {
+    configDir,
+    configFile: join(configDir, ".claude.json"),
+    env: { CLAUDE_CONFIG_DIR: configDir },
+  };
+}
+
+/**
+ * `existing` (a parsed `.claude.json`, or null) with every path in `repoPaths`
+ * marked trusted, and the first-run onboarding marked done so a fresh config dir
+ * doesn't stop at the theme picker either. Each path is keyed both native and
+ * forward-slashed, since the Windows key form is undocumented. Everything else in
+ * `existing` is kept. Pure (returns a new object).
+ */
+export function trustedClaudeConfig(existing, repoPaths) {
+  const cfg = { ...(existing ?? {}) };
+  cfg.hasCompletedOnboarding = true;
+  const projects = { ...(cfg.projects ?? {}) };
+  for (const repo of repoPaths) {
+    for (const key of new Set([repo, repo.replace(/\\/g, "/")])) {
+      projects[key] = { ...(projects[key] ?? {}), hasTrustDialogAccepted: true };
+    }
+  }
+  cfg.projects = projects;
+  return cfg;
 }
 
 /**
@@ -506,6 +561,8 @@ function main() {
       seedProjectToml(name, join(p.tasksDir, name, "tasks.db"), cliBin),
     );
   let appCwd = p.repoPath;
+  // Every directory an agent will start in, for the Claude trust seed below.
+  let agentDirs = [p.repoPath];
   if (projectCount > 1) {
     const projects = demoProjects(devHome, projectCount);
     for (const project of projects) {
@@ -513,11 +570,28 @@ function main() {
       writeProjectToml(project.name, project.root);
     }
     appCwd = projects[0].root;
+    agentDirs = projects.flatMap((project) => project.worktrees.map((w) => w.path));
     writeFileSync(join(p.configHome, "keitora", "keitora.toml"), seedDemoRegistryToml(projects));
   } else {
     ensureTestRepo(p.repoPath);
     writeProjectToml("herdr-test-repo", p.repoPath);
     writeFileSync(join(p.configHome, "keitora", "keitora.toml"), seedRegistryToml(p.repoPath));
+  }
+
+  // Pre-trust the throwaway repos in a dev-home Claude config, when one can be used.
+  const claude = claudeDevConfig(process.env, devHome);
+  if (claude) {
+    mkdirSync(claude.configDir, { recursive: true });
+    let existing = null;
+    try {
+      existing = JSON.parse(readFileSync(claude.configFile, "utf8"));
+    } catch {
+      /* first run, or unreadable: start fresh */
+    }
+    writeFileSync(
+      claude.configFile,
+      `${JSON.stringify(trustedClaudeConfig(existing, agentDirs), null, 2)}\n`,
+    );
   }
 
   // Build the app and the CLI its session hooks call (tauri dev would build the app,
@@ -554,12 +628,21 @@ function main() {
   console.log(`[dev:herdr] app cwd             ${appCwd} (throwaway repo)`);
   console.log(`[dev:herdr] task DBs            ${p.tasksDir}`);
   if (projectCount > 1) console.log(`[dev:herdr] seeded ${projectCount} throwaway projects`);
+  if (claude) {
+    console.log(`[dev:herdr] CLAUDE_CONFIG_DIR   ${claude.configDir} (throwaway repos pre-trusted)`);
+  } else {
+    console.log(
+      "[dev:herdr] Claude uses your real config: a new dev repo asks once to be trusted. " +
+        "Set CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`) to use an isolated, pre-trusted one.",
+    );
+  }
   console.log("[dev:herdr] ISOLATED: no real project registered, herdr state purged.");
 
+  // The agents inherit the app's environment (through the herdr server it starts).
   const app = spawn(appBin, [], {
     cwd: appCwd,
     stdio: "inherit",
-    env: isolatedEnv,
+    env: { ...isolatedEnv, ...(claude?.env ?? {}) },
   });
 
   const shutdown = () => {
