@@ -166,6 +166,15 @@ fn pane_process_info_args(pane_id: &str) -> [&str; 4] {
     ["pane", "process-info", "--pane", pane_id]
 }
 
+/// The argv of `herdr agent prompt` sending `text` to `pane_id`. herdr takes the
+/// text as the positional right after the target, verbatim even when it starts
+/// with `-` (`--wait`, `-x` and a bare `--` all arrive as text), and parses options
+/// only after it. So there is no `--` separator: herdr would take the `--` itself
+/// as the text and reject the real text as an unknown option.
+fn agent_prompt_args<'a>(pane_id: &'a str, text: &'a str) -> [&'a str; 4] {
+    ["agent", "prompt", pane_id, text]
+}
+
 /// The API error in a finished herdr command's output, if any (see [`error_body`]).
 fn output_error(output: &Output) -> Option<HerdrError> {
     error_body(
@@ -394,11 +403,12 @@ impl HerdrOps for RealHerdr {
         }
     }
 
-    /// `herdr agent prompt <pane_id> -- <text>` — fire-and-forget (no `--wait`).
+    /// `herdr agent prompt <pane_id> <text>` — fire-and-forget (no `--wait`); see
+    /// [`agent_prompt_args`] for why there is no `--`.
     /// `agent_blocked` / `agent_not_ready` come back as [`HerdrError::Api`]; the
     /// backend maps them to "queue the line" via [`super::cli::agent_prompt_error_from`].
     fn agent_prompt(&self, pane_id: &str, text: &str) -> Result<(), HerdrError> {
-        self.run(CallClass::Quick, &["agent", "prompt", pane_id, "--", text])
+        self.run(CallClass::Quick, &agent_prompt_args(pane_id, text))
             .map(|_| ())
     }
 
@@ -750,6 +760,23 @@ mod tests {
         assert_eq!(
             subcommand(&pane_process_info_args("w1:p2")),
             "pane process-info"
+        );
+    }
+
+    #[test]
+    fn agent_prompt_passes_the_text_right_after_the_target() {
+        assert_eq!(
+            agent_prompt_args("w1:p1", "do the thing"),
+            ["agent", "prompt", "w1:p1", "do the thing"]
+        );
+        // No `--`: herdr reads it as the text and rejects the real text as an option.
+        // Text that looks like an option is still the text, verbatim.
+        for text in ["--wait", "-x", "--", "-- leading"] {
+            assert_eq!(agent_prompt_args("w1:p1", text)[3], text);
+        }
+        assert_eq!(
+            subcommand(&agent_prompt_args("w1:p1", "secret")),
+            "agent prompt"
         );
     }
 
