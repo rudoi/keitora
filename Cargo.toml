@@ -11,4 +11,7 @@ members = ["crates/keitora-tasks", "crates/keitora-cli", "src-tauri"]
 warnings = "deny"
 
 [workspace.lints.clippy]
-all = "deny"
+all = { level = "deny", priority = -1 }
+# `#[async_trait]` puts a bare `#[must_use]` on every generated method, whose boxed
+# future is already must-use; newer Clippy flags that on code we don't write.
+double_must_use = "allow"
