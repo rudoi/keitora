@@ -64,9 +64,9 @@ pub use factory::open_backend;
 pub use local_store::{LocalStore, ResumeRow};
 pub use migration::{find_legacy_config, migrate_legacy};
 pub use model::{
-    ActiveTask, DepNode, DispatchLogEntry, ListFilter, LogEntry, ResolvedWorktree, Task,
-    TaskUpdate, TaskWithDeps, WorktreeCandidate, WorktreeSession, WorktreeStatus, PRIORITIES,
-    SESSION_STATES, STATUSES,
+    ActiveTask, DepNode, DispatchLogEntry, DispatchRequest, ListFilter, LogEntry, ResolvedWorktree,
+    Task, TaskUpdate, TaskWithDeps, WorktreeCandidate, WorktreeSession, WorktreeStatus,
+    DISPATCH_REQUEST_OUTCOMES, DISPATCH_REQUEST_STATUSES, PRIORITIES, SESSION_STATES, STATUSES,
 };
 pub use sqlite_backend::SqliteBackend;
 

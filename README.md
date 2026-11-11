@@ -121,6 +121,20 @@ keitora task claim <id>            # take a task for this worktree
 keitora task done <id>             # finish it, and see what it unblocked
 ```
 
+With the app running, a script can also dispatch and monitor work without the board:
+
+```sh
+keitora task dispatch <id> --worktree alpha --wait 30  # send it to alpha's idle session now
+keitora task watch --json                              # stream session and dispatch changes
+```
+
+`task dispatch` asks the app to send the task to that worktree's session right away, the same way a
+drag onto an idle lane does. It only works on an idle session: a busy, waiting or offline one is
+refused and nothing is reserved (the board is the queue, and dispatch never starts an agent). The
+app picks up requests for any project in its registry, active or not, and refuses any it hasn't
+picked up within ten minutes. Add `--until-claimed` to keep waiting, within `--wait`, until the
+agent in that worktree has claimed the task.
+
 If `keitora` isn't on your `PATH`, the app offers to install it for you.
 
 ## Configuration
