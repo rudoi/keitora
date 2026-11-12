@@ -2809,6 +2809,19 @@ pub fn current_worktree() -> String {
     "unknown".to_string()
 }
 
+/// Set to `1` in the environment of every agent pane Keitora starts, so the CLI can
+/// tell an agent's commands from a human's.
+pub const AGENT_ENV: &str = "KEITORA_AGENT";
+
+/// Whether `lookup` (an env lookup) says the process runs inside a coding agent's
+/// session: a pane Keitora started for an agent ([`AGENT_ENV`]), or a Claude Code
+/// tool call anywhere (`CLAUDECODE`). An empty or `0` value doesn't count.
+pub fn in_agent_session(lookup: impl Fn(&str) -> Option<String>) -> bool {
+    [AGENT_ENV, "CLAUDECODE"]
+        .iter()
+        .any(|k| lookup(k).is_some_and(|v| !v.is_empty() && v != "0"))
+}
+
 /// `git rev-parse --show-toplevel`, run in the current process cwd. Exported so
 /// the CLI can resolve its own project root without re-implementing it.
 pub fn git_toplevel() -> Option<PathBuf> {
@@ -2860,6 +2873,25 @@ mod tests {
     use super::*;
     use crate::TEST_ENV_LOCK;
     use tempfile::TempDir;
+
+    #[test]
+    fn agent_session_is_a_keitora_agent_pane_or_a_claude_code_tool_call() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert!(in_agent_session(env(&[("KEITORA_AGENT", "1")])));
+        assert!(in_agent_session(env(&[("CLAUDECODE", "1")])));
+        assert!(!in_agent_session(env(&[])));
+        assert!(!in_agent_session(env(&[
+            ("KEITORA_AGENT", "0"),
+            ("CLAUDECODE", "")
+        ])));
+    }
 
     #[cfg(unix)]
     #[test]

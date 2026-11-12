@@ -455,7 +455,8 @@ impl Spawner {
         }
         let kind = agent::herdr_kind(STRICT_CLI);
         let name = agent::agent_name(kind, key);
-        let extra = crate::codex_env::strict_pane_extra_env(codex_home);
+        let mut extra = crate::codex_env::strict_pane_extra_env(codex_home);
+        extra.push(env::agent_marker());
         let pane_env = env::pane_env_with(
             &launch.path,
             &self.ops.env().original_xdg,

@@ -248,6 +248,15 @@ export function Inspector({
               Claim
             </button>
           )}
+          {task.status === "review" && actor !== null && (
+            <button
+              title="Reviewed: move it to Done"
+              onClick={() => act(() => doneTask(task.id, actor))}
+              className="flex-1 rounded-chip border border-accent bg-accent py-1.5 text-center text-[11.5px] font-semibold text-[var(--color-on-accent)]"
+            >
+              Mark done
+            </button>
+          )}
           {mine && actor !== null && (
             <>
               <button

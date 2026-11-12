@@ -947,11 +947,13 @@ impl Spawner {
         let name = agent::agent_name(kind, key);
         // A PATH that resolves the configured exe (on unix always built on herdr's
         // own PATH; on Windows a bare `claude`/`codex` adds none and the pane
-        // inherits herdr's), plus the user's own XDG dirs.
-        let pane_env = env::pane_env(
+        // inherits herdr's), plus the user's own XDG dirs, plus the agent marker the
+        // `keitora` CLI reads to keep agents from marking tasks done.
+        let pane_env = env::pane_env_with(
             &launch.path,
             &self.ops.env().original_xdg,
             self.ops.env().path(),
+            &[env::agent_marker()],
         );
         // One `agent_name_taken` per launch is recovered from by closing the
         // unmapped holders in this cwd and starting over in a fresh pane.
@@ -3569,6 +3571,48 @@ mod tests {
                 load_related: false,
             })
         );
+    }
+
+    /// An agent pane carries the agent marker the `keitora` CLI reads; a plain shell
+    /// pane (the user's) does not.
+    #[test]
+    fn only_agent_panes_carry_the_agent_marker() {
+        let env_of = |fake: &fake::FakeHerdr| {
+            fake.calls()
+                .into_iter()
+                .find(|c| c.op == ops::Op::WorkspaceCreate)
+                .expect("a workspace")
+                .args
+        };
+        let marker = "(\"KEITORA_AGENT\", \"1\")";
+
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend_with(&fake, Some(launch_everything()));
+        backend
+            .spawn_agent(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                claude_launch(),
+            )
+            .unwrap();
+        let env = env_of(&fake);
+        assert!(env.contains(marker), "{env}");
+
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        backend
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
+            .unwrap();
+        let env = env_of(&fake);
+        assert!(!env.contains("KEITORA_AGENT"), "{env}");
     }
 
     #[test]
@@ -9502,6 +9546,27 @@ mod tests {
                 .find(|c| c.op == ops::Op::WorkspaceCreate)
                 .expect("a workspace")
                 .args
+        }
+
+        #[test]
+        fn strict_marks_the_pane_as_an_agent_pane() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            let cwd = worktree_dir(&fake, "wt", None);
+            backend
+                .spawner()
+                .spawn_agent_transfer_strict_with(
+                    &skey("wt"),
+                    cwd,
+                    80,
+                    24,
+                    &strict(),
+                    &StrictTiming::fast(),
+                    None,
+                )
+                .unwrap();
+            let env = workspace_env(&fake);
+            assert!(env.contains("(\"KEITORA_AGENT\", \"1\")"), "{env}");
         }
 
         #[test]

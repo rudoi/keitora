@@ -72,8 +72,16 @@ enum TaskCmd {
     Claim { id: i64 },
     /// Release a claim
     Unclaim { id: i64 },
-    /// Mark a task done
-    Done { id: i64 },
+    /// Mark a task done: a human's step, after review. An agent finishes with `review`
+    Done {
+        id: i64,
+        /// Mark it done from inside an agent session anyway
+        #[arg(long)]
+        force: bool,
+    },
+    /// Hand a finished task over for review; it stays in this worktree's lane until a
+    /// human marks it done
+    Review { id: i64 },
     /// Mark a task cancelled
     Cancel { id: i64 },
     /// Punt a task to the backlog (hidden from the board and from dispatch)
@@ -173,6 +181,7 @@ fn status_label(s: &str) -> String {
     let c = match s {
         "open" => "\x1b[37mopen\x1b[0m",
         "active" => "\x1b[32mactive\x1b[0m",
+        "review" => "\x1b[33mreview\x1b[0m",
         "backlog" => "\x1b[35mbacklog\x1b[0m",
         "done" => "\x1b[90mdone\x1b[0m",
         "cancelled" => "\x1b[90mcancelled\x1b[0m",
@@ -435,7 +444,10 @@ async fn run_task(
             backend.unclaim(id, &me).await?;
             emit_ok(json, &format!("  Released task #{id}"))?;
         }
-        TaskCmd::Done { id } => {
+        TaskCmd::Done { id, force } => {
+            if !force && keitora_tasks::in_agent_session(|k| std::env::var(k).ok()) {
+                return Err(agent_done_refusal(id).into());
+            }
             let outcome = backend.set_done(id, &me).await?;
             if json {
                 println!(
@@ -456,6 +468,14 @@ async fn run_task(
                     println!("  Unblocked: {ids}");
                 }
             }
+        }
+        TaskCmd::Review { id } => {
+            let task = backend.set_review(id, &me).await?;
+            emit_task_msg(
+                json,
+                &task,
+                &format!("  Task #{id} is ready for review; a human marks it done"),
+            )?;
         }
         TaskCmd::Cancel { id } => {
             backend.cancel(id, &me).await?;
@@ -850,7 +870,8 @@ fn pool_refusal_message(worktree: &str) -> String {
 enum ClaimProgress {
     /// Still reserved to the worktree, not yet claimed.
     Waiting,
-    /// The worktree's agent claimed it (it is active there, or already done there).
+    /// The worktree's agent claimed it (it is active there, or already in review or
+    /// done there).
     Claimed,
     /// It went somewhere else; waiting longer won't make it claimed here.
     Lost(String),
@@ -860,7 +881,7 @@ enum ClaimProgress {
 fn claim_progress(task: &Task, worktree: &str) -> ClaimProgress {
     let here = task.assigned_to.as_deref() == Some(worktree);
     match (task.status.as_str(), here) {
-        ("active" | "done", true) => ClaimProgress::Claimed,
+        ("active" | "review" | "done", true) => ClaimProgress::Claimed,
         ("open", true) => ClaimProgress::Waiting,
         ("active", false) => ClaimProgress::Lost(format!(
             "it was claimed by @{}",
@@ -869,6 +890,16 @@ fn claim_progress(task: &Task, worktree: &str) -> ClaimProgress {
         ("open", false) => ClaimProgress::Lost("it was released".to_string()),
         (status, _) => ClaimProgress::Lost(format!("it is now {status}")),
     }
+}
+
+/// Why `task done` refuses inside an agent session: the agent's work goes to review,
+/// and a human marks it done.
+fn agent_done_refusal(id: i64) -> String {
+    format!(
+        "this looks like an agent session, and agents don't mark tasks done: run \
+         `./keitora task review {id}` and stop. A human marks it done after review \
+         (a human running this from an agent session can pass --force)"
+    )
 }
 
 /// The error for a `task dispatch` from a project the app hasn't registered.
@@ -1293,6 +1324,27 @@ mod tests {
             Cmd::Task(TaskCmd::Claim { id }) => assert_eq!(id, 7),
             _ => panic!("expected `task claim`"),
         }
+        assert!(matches!(
+            Cli::try_parse_from(["keitora", "task", "review", "7"])
+                .unwrap()
+                .cmd,
+            Cmd::Task(TaskCmd::Review { id: 7 })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["keitora", "task", "done", "7"])
+                .unwrap()
+                .cmd,
+            Cmd::Task(TaskCmd::Done {
+                id: 7,
+                force: false
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["keitora", "task", "done", "7", "--force"])
+                .unwrap()
+                .cmd,
+            Cmd::Task(TaskCmd::Done { id: 7, force: true })
+        ));
         match Cli::try_parse_from(["keitora", "session", "idle"])
             .unwrap()
             .cmd
@@ -1642,6 +1694,13 @@ mod tests {
     }
 
     #[test]
+    fn agent_done_refusal_points_at_review() {
+        let msg = agent_done_refusal(7);
+        assert!(msg.contains("./keitora task review 7"), "{msg}");
+        assert!(msg.contains("--force"), "{msg}");
+    }
+
+    #[test]
     fn claim_progress_waits_for_the_worktree_to_claim() {
         // Reserved here, not yet claimed: keep waiting.
         assert_eq!(
@@ -1651,6 +1710,10 @@ mod tests {
         // Claimed here (or already finished here): done.
         assert_eq!(
             claim_progress(&task_in("active", Some("alpha")), "alpha"),
+            ClaimProgress::Claimed
+        );
+        assert_eq!(
+            claim_progress(&task_in("review", Some("alpha")), "alpha"),
             ClaimProgress::Claimed
         );
         assert_eq!(

@@ -1,14 +1,16 @@
 // TaskCard — one board card. Shows exactly one state (Open, Backlog, Pending with its
-// reason, Sent, Active, Blocked, Done), any failed send with its reason, and the
+// reason, Sent, Active, Review, Blocked, Done), any failed send with its reason, and the
 // actions that state allows: Dispatch (auto-pick) on an open card, Retry on a
 // pending card whose send failed, Release on an assigned card, Reopen on a backlog
-// card, Claim for the focused worktree.
+// card, Claim for the focused worktree, Mark done on a card in review (with its branch
+// and PR, so the reviewer knows what to look at).
 
 import { useDraggable } from "@dnd-kit/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { motion } from "motion/react";
 import type { CardState } from "../../lib/cardState";
 import { PRIORITY_BAR } from "../../lib/taskStyles";
-import { claimTask, type TaskWithDeps } from "../../lib/tasks";
+import { claimTask, doneTask, type TaskWithDeps } from "../../lib/tasks";
 import { usePrefersReducedMotion } from "../../lib/usePrefersReducedMotion";
 import { DispatchMenu } from "../DispatchMenu";
 import type { CardEnv } from "./cardHelpers";
@@ -32,6 +34,11 @@ export function stateChip(state: CardState): { text: string; title: string } | n
       return {
         text: "active",
         title: state.worktree ? `claimed by @${state.worktree}` : "claimed",
+      };
+    case "review":
+      return {
+        text: "review",
+        title: `${state.worktree ? `@${state.worktree}` : "The agent"} finished; mark it done once reviewed`,
       };
     case "backlog":
       return { text: "backlog", title: "hidden from dispatch; reopen it to work on it" };
@@ -61,6 +68,9 @@ export function TaskCard({
   const blocked_by = t.blocked_by;
   const terminal = task.status === "done" || task.status === "cancelled";
   const backlog = state.kind === "backlog";
+  const inReview = state.kind === "review";
+  // Terminal, backlog and review cards stay put: none of them can be dispatched.
+  const fixed = terminal || backlog || inReview;
   const reducedMotion = usePrefersReducedMotion();
   const selected = t.id === env.selectedId;
   const flyIn = env.flyIn?.id === t.id ? env.flyIn.worktree : null;
@@ -69,11 +79,11 @@ export function TaskCard({
   const reserved = (state.kind === "pending" || state.kind === "sent") && state.worktree === column;
   const failed = state.kind === "pending" && state.failure !== null;
 
-  // Whole-card drag on non-terminal, non-backlog cards.
+  // Whole-card drag on cards that can still be dispatched or released.
   const draggable = useDraggable({
     id: task.id,
     data: { task },
-    disabled: terminal || backlog,
+    disabled: fixed,
   });
   const { attributes, listeners, setNodeRef, isDragging } = draggable;
   // The lifted visual is the DragOverlay; the origin slot stays put (opacity-40),
@@ -116,7 +126,7 @@ export function TaskCard({
     <div
       ref={setNodeRef}
       onClick={() => env.onSelect(t.id)}
-      {...(terminal || backlog ? {} : listeners)}
+      {...(fixed ? {} : listeners)}
       {...attributes}
       data-card-state={state.kind}
       className={`group relative rounded-chip border bg-bg-2 ${padCls} ${fill ? "flex h-full flex-col" : ""} ${
@@ -232,9 +242,54 @@ export function TaskCard({
           )}
         </div>
       )}
-      {/* Reserved cards hide Claim (a human must not self-claim an agent's reserved
-          task); a failed one offers Retry, every one a subtle hover Release. */}
-      {reserved ? (
+      {/* What a card in review is about: its branch and PR. */}
+      {inReview && (task.branch || task.pr_url) && (
+        <div
+          className={`${compact ? "mt-1" : "mt-1.5"} flex min-w-0 items-center gap-2 pl-2 text-[10px] text-tx-3`}
+        >
+          {task.branch && (
+            <span className="truncate font-mono" title={task.branch}>
+              {task.branch}
+            </span>
+          )}
+          {task.pr_url && (
+            <button
+              type="button"
+              title={task.pr_url}
+              onClick={(e) => {
+                e.stopPropagation();
+                // biome-ignore lint/style/noNonNullAssertion: guarded by the pr_url check above
+                env.onAction(() => openUrl(task.pr_url!));
+              }}
+              {...stop}
+              className="flex-none text-accent-text underline-offset-2 hover:underline"
+            >
+              PR ↗
+            </button>
+          )}
+        </div>
+      )}
+      {/* A card in review offers Mark done, the human's step. Reserved cards hide Claim
+          (a human must not self-claim an agent's reserved task); a failed one offers
+          Retry, every one a subtle hover Release. */}
+      {inReview ? (
+        env.actor !== null && (
+          <div className={`${actionMtCls} pl-2`}>
+            <button
+              title="Reviewed: move it to Done"
+              onClick={(e) => {
+                e.stopPropagation();
+                // biome-ignore lint/style/noNonNullAssertion: guarded by the actor check above
+                env.onAction(() => doneTask(task.id, env.actor!));
+              }}
+              {...stop}
+              className="rounded-chip border border-accent bg-accent px-2.5 py-1 text-[11px] font-semibold text-[var(--color-on-accent)]"
+            >
+              Mark done
+            </button>
+          </div>
+        )
+      ) : reserved ? (
         <div
           className={`${actionMtCls} flex gap-1.5 pl-2 ${
             failed

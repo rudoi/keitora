@@ -95,6 +95,9 @@ describe("judgeLane refusals carry a reason", () => {
     expect(reason(task(5, "done")).reason).toBe("#5 is done");
     expect(reason(task(5, "active", "a")).reason).toBe("#5 is already active on @a");
     expect(reason(task(5, "active", "b")).reason).toBe("#5 is active on @b; release it first");
+    expect(reason(task(5, "review", "a")).reason).toBe(
+      "#5 is in review on @a; mark it done once reviewed",
+    );
     const sent = task(5, "open", "a");
     expect(reason(sent, wt("a"), ctx({ a: "idle" }, [sent], [5])).reason).toBe(
       "#5 was already sent to @a; waiting for its claim",

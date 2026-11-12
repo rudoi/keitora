@@ -4,7 +4,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const STATUSES: [&str; 5] = ["open", "active", "backlog", "done", "cancelled"];
+/// Every task status. `review`: the assignee finished and the work awaits a human,
+/// who marks it done; the task keeps its assignee (and its board lane) meanwhile.
+pub const STATUSES: [&str; 6] = ["open", "active", "review", "backlog", "done", "cancelled"];
 pub const PRIORITIES: [&str; 4] = ["low", "normal", "high", "urgent"];
 pub const SESSION_STATES: [&str; 4] = ["idle", "busy", "waiting", "offline"];
 

@@ -51,6 +51,8 @@ export function DispatchMenu({
   onReopen: () => void;
 }) {
   const backlog = state.kind === "backlog";
+  // Active and review cards belong to their worktree's lane; the backlog isn't offered.
+  const inLane = card.status === "active" || card.status === "review";
   const blocked = card.blocked_by.length > 0;
   const dispatchable = !backlog && !blocked && (state.kind === "open" || state.kind === "pending");
 
@@ -139,7 +141,7 @@ export function DispatchMenu({
             );
           })}
 
-          {(card.assigned_to || card.status !== "active") && (
+          {(card.assigned_to || !inLane) && (
             <DropdownMenu.Separator className="my-1 h-px bg-line" />
           )}
           {card.assigned_to && (
@@ -155,7 +157,7 @@ export function DispatchMenu({
               <span className="ml-auto text-[10px] text-tx-3">b</span>
             </DropdownMenu.Item>
           ) : (
-            card.status !== "active" && (
+            !inLane && (
               <DropdownMenu.Item onSelect={() => onBacklog()} className={`${itemCls} text-tx-2`}>
                 <span className="h-1.5 w-1.5 flex-none rounded-full bg-tx-3" />
                 <span>Move to backlog</span>

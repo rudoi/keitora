@@ -43,6 +43,7 @@ pub async fn run_universal<B: TaskBackend>(b: &B) {
     test_unclaim_returns_to_open(b).await;
     test_update_persists_and_logs(b).await;
     test_set_done_reports_unblocked(b).await;
+    test_set_review_keeps_the_assignee(b).await;
     test_newly_unblocked_by(b).await;
     test_claim_outcome_variants(b).await;
     test_add_dep_self_dep_rejected(b).await;
@@ -880,6 +881,35 @@ async fn test_set_done_idempotent<B: TaskBackend>(b: &B) {
         "second set_done must return Ok (idempotent), got {:?}",
         result
     );
+}
+
+/// The assignee hands a task to review and keeps it (its lane); nobody else can. A
+/// backend with no review column (GitHub) leaves it `active`, so either reads back.
+async fn test_set_review_keeps_the_assignee<B: TaskBackend>(b: &B) {
+    let task = b
+        .create("alice", "review-me", "", "normal", &[], None)
+        .await
+        .expect("create");
+    assert_conflict(
+        b.set_review(task.id, "alice").await,
+        "set_review on open task",
+    );
+    b.claim(task.id, "alice").await.expect("claim");
+    assert_conflict(
+        b.set_review(task.id, "bob").await,
+        "set_review by non-owner",
+    );
+
+    let reviewed = b.set_review(task.id, "alice").await.expect("set_review");
+    assert_eq!(reviewed.assigned_to.as_deref(), Some("alice"));
+    assert!(
+        matches!(reviewed.status.as_str(), "review" | "active"),
+        "status after set_review: {}",
+        reviewed.status
+    );
+    b.set_review(task.id, "alice")
+        .await
+        .expect("set_review is idempotent");
 }
 
 async fn test_set_done_non_owner_conflict<B: TaskBackend>(b: &B) {

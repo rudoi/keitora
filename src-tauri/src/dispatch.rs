@@ -194,11 +194,13 @@ fn collapse(s: &str) -> String {
 }
 
 /// Pure: Keitora's built-in dispatch prompt, used when no custom `[dispatch].steps`
-/// are configured. The submit byte is appended separately at injection time.
+/// are configured. The agent ends in `review`, not `done`: the task keeps its lane
+/// until a human has reviewed the work and marks it done. The submit byte is appended
+/// separately at injection time.
 fn default_line(ctx: &DispatchContext) -> String {
     let id = ctx.task.id;
     format!(
-        "Please pick up Keitora task #{id}. Run `./keitora task claim {id}` to claim it, then implement it: {title}. {desc}. When finished, run `./keitora task done {id}`.",
+        "Please pick up Keitora task #{id}. Run `./keitora task claim {id}` to claim it, then implement it: {title}. {desc}. When your work is ready for review, run `./keitora task review {id}` and stop. Don't run `task done`; a human does that after review.",
         title = ctx.task.title,
         desc = ctx.task.description,
     )
@@ -1454,9 +1456,10 @@ mod tests {
             line.contains("It crashes on empty input"),
             "desc not collapsed: {line}"
         );
-        // Built-in claim/done guidance preserved.
+        // Built-in claim/review guidance: the agent stops at review, never done.
         assert!(line.contains("./keitora task claim 42"));
-        assert!(line.contains("./keitora task done 42"));
+        assert!(line.contains("./keitora task review 42"));
+        assert!(!line.contains("./keitora task done"));
         // The submit byte is NOT carried in-band any more — it is written separately.
         assert!(
             !line.ends_with('\r'),

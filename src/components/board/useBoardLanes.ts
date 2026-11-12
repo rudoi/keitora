@@ -20,6 +20,11 @@ export interface Lane {
   isEmptyOffline: boolean;
 }
 
+/** A worktree lane's card order: the active card, then cards in review, then the rest. */
+function laneRank(t: TaskWithDeps): number {
+  return t.status === "active" ? 0 : t.status === "review" ? 1 : 2;
+}
+
 /**
  * Derive ordered lanes from tasks + worktrees + sessions.
  *
@@ -27,7 +32,8 @@ export interface Lane {
  *  - backlog → excluded, unless `includeBacklog` (the Open lane's backlog toggle):
  *    then shown in the Open lane, after the open cards.
  *  - done / cancelled → Done lane.
- *  - assigned to a known worktree → that worktree lane.
+ *  - assigned to a known worktree → that worktree lane (a card in review included:
+ *    it keeps its lane until a human marks it done). Active cards lead, then review.
  *  - else (open/active with no known assignee) → Unassigned.
  *
  * Lane order: Unassigned, worktrees in `worktreeNames` order, Done.
@@ -68,11 +74,7 @@ export function buildLanes(
 
   const worktreeLanes: Lane[] = worktreeNames.map((n) => {
     // biome-ignore lint/style/noNonNullAssertion: key n is guaranteed in byWt: populated from worktreeNames in the forEach above
-    const wtTasks = [...byWt.get(n)!].sort((a, b) => {
-      const aActive = a.status === "active" ? 0 : 1;
-      const bActive = b.status === "active" ? 0 : 1;
-      return aActive - bActive;
-    });
+    const wtTasks = [...byWt.get(n)!].sort((a, b) => laneRank(a) - laneRank(b));
     const session = sessions.get(n);
     const state = session?.state ?? "offline";
     const isEmptyOffline = wtTasks.length === 0 && state === "offline";

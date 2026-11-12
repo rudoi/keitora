@@ -24,6 +24,10 @@ describe("stateChip", () => {
     expect(stateChip({ kind: "sent", worktree: "a" })?.text).toBe("sent ✓");
     expect(stateChip({ kind: "active", worktree: "a" })?.text).toBe("active");
     expect(stateChip({ kind: "backlog" })?.text).toBe("backlog");
+    expect(stateChip({ kind: "review", worktree: "a" })).toEqual({
+      text: "review",
+      title: "@a finished; mark it done once reviewed",
+    });
     expect(stateChip({ kind: "open" })).toBeNull();
   });
 });

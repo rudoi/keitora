@@ -45,6 +45,7 @@ export const PRIORITY_PILL: Record<Priority, string> = {
 export const STATUS_DOT: Record<TaskStatus, string> = {
   open: "bg-tx-3",
   active: "bg-accent",
+  review: "bg-waiting",
   backlog: "bg-offline",
   done: "bg-idle",
   cancelled: "bg-offline",

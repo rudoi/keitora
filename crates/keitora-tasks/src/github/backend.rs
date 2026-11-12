@@ -765,6 +765,27 @@ impl<A: GhApi> TaskBackend for GitHubBackend<A> {
         })
     }
 
+    /// The board columns have no review column, so a reviewed task stays "In
+    /// progress" and claimed by its worktree (still in that lane); only the `review`
+    /// log entry records the hand-off. A human closes it with `set_done`.
+    async fn set_review(&self, id: i64, actor: &str) -> BackendResult<Task> {
+        let issue = self.require_issue(id).await?;
+        let assignee = assignee_from_labels(&issue.labels);
+        if assignee.as_deref() != Some(actor) {
+            return Err(BackendError::Conflict(format!(
+                "task #{id} is not assigned to {actor}"
+            )));
+        }
+        let status = self.derive_status(&issue, assignee.as_deref());
+        if status != "active" {
+            return Err(BackendError::Conflict(format!(
+                "task #{id} is {status}, not active"
+            )));
+        }
+        self.append_log(&issue, actor, "review", "").await?;
+        Ok(self.issue_to_task(&issue))
+    }
+
     /// Dependents newly unblocked once `id` is done, computed from a **single**
     /// board fetch (the trait default does `blocks(id)` + a `get(dep)` per
     /// dependent, each a full `issue_list_all` → O(N²) `gh` calls).
