@@ -3,6 +3,7 @@ import {
   blockAnimates,
   blockStateCls,
   laneMenuAction,
+  openItemDisabledReason,
   sessionItemDisabledReason,
   transferDisabledReason,
   worktreeMenuItems,
@@ -174,5 +175,17 @@ describe("sessionItemDisabledReason", () => {
     for (const item of ["focus", "transfer", "launch", "launch-fresh"] as const) {
       expect(sessionItemDisabledReason(item, true)).toBeNull();
     }
+  });
+});
+
+describe("openItemDisabledReason", () => {
+  it("enables the open items whenever the directory exists", () => {
+    expect(openItemDisabledReason("available")).toBeNull();
+    expect(openItemDisabledReason("not_git")).toBeNull();
+  });
+
+  it("disables them when the path is gone or not a directory", () => {
+    expect(openItemDisabledReason("missing")).toMatch(/not found/);
+    expect(openItemDisabledReason("not_dir")).toMatch(/not a directory/);
   });
 });
