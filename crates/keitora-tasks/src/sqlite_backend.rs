@@ -910,6 +910,15 @@ impl SqliteBackend {
             &mut vals,
             &mut fields,
         );
+        let tags_json = upd.tags.as_ref().map(serde_json::to_string).transpose()?;
+        push(
+            "tags",
+            "tags = ?",
+            &tags_json,
+            &mut sets,
+            &mut vals,
+            &mut fields,
+        );
 
         let sql = format!("UPDATE tasks SET {} WHERE id = ?", sets.join(", "));
         let mut p: Vec<&dyn ToSql> = vals.iter().map(|s| s as &dyn ToSql).collect();

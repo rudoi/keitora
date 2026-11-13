@@ -3,7 +3,7 @@
 // them without depending on a component module.
 
 import type { AttentionKind } from "./attention";
-import type { CliKind } from "./ipc";
+import type { CliKind, WorktreeStatus } from "./ipc";
 import type { PendingAction } from "./pendingIntent";
 import type { WorktreeSession } from "./sessions";
 
@@ -113,4 +113,15 @@ export function sessionItemDisabledReason(
 ): string | null {
   const kills = item === "restart" || item === "fresh" || item === "terminate";
   return kills && transferBusy ? "A transfer is in progress" : null;
+}
+
+/**
+ * Why the worktree menu's "Open folder" and "Open terminal here" are disabled, or `null`
+ * when they are enabled: both need the worktree's directory to exist. A directory that
+ * isn't a git worktree can still be opened.
+ */
+export function openItemDisabledReason(status: WorktreeStatus): string | null {
+  if (status === "missing") return "The worktree's path was not found";
+  if (status === "not_dir") return "The worktree's path is not a directory";
+  return null;
 }

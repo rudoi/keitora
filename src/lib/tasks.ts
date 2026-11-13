@@ -110,6 +110,65 @@ export interface TaskUpdatePatch {
   status?: TaskStatus;
   branch?: string;
   pr_url?: string;
+  /** Replaces the whole tag set; `[]` clears it. */
+  tags?: string[];
+}
+
+// ---- Tag + dependency editing (pure) ----
+
+/** Split a comma-separated tag field: trimmed, empties and repeats dropped. */
+export function parseTags(raw: string): string[] {
+  const out: string[] = [];
+  for (const t of raw.split(",").map((s) => s.trim())) {
+    if (t && !out.includes(t)) out.push(t);
+  }
+  return out;
+}
+
+/** Whether two tag lists hold the same tags, ignoring order. */
+export function sameTags(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const set = new Set(a);
+  return b.every((t) => set.has(t));
+}
+
+/**
+ * Parse a comma/space-separated list of task ids (`#3, 5`). `invalid` holds the tokens
+ * that are not positive integers, so the form can name them instead of dropping them.
+ */
+export function parseTaskIds(raw: string): { ids: number[]; invalid: string[] } {
+  const ids: number[] = [];
+  const invalid: string[] = [];
+  for (const token of raw.split(/[\s,]+/).filter(Boolean)) {
+    const m = /^#?(\d+)$/.exec(token);
+    const id = m ? Number(m[1]) : 0;
+    if (id > 0) {
+      if (!ids.includes(id)) ids.push(id);
+    } else {
+      invalid.push(token);
+    }
+  }
+  return { ids, invalid };
+}
+
+/** A task's direct dependencies (any status), from its inspector dependency tree. */
+export function directDeps(deps: readonly DepNode[]): number[] {
+  const ids: number[] = [];
+  for (const d of deps) {
+    if (d.depth === 1 && !ids.includes(d.id)) ids.push(d.id);
+  }
+  return ids;
+}
+
+/** The dependency edges to add and remove to turn `current` into `next`. */
+export function depChanges(
+  current: readonly number[],
+  next: readonly number[],
+): { add: number[]; remove: number[] } {
+  return {
+    add: next.filter((id) => !current.includes(id)),
+    remove: current.filter((id) => !next.includes(id)),
+  };
 }
 
 // ---- Commands ----
@@ -226,6 +285,16 @@ export function markTaskDone(id: number): Promise<DoneResult> {
 
 export function updateTask(id: number, patch: TaskUpdatePatch): Promise<void> {
   return invoke("task_update", { id, patch });
+}
+
+/** Make task `id` blocked by `dependsOn`. Rejects self-deps, cycles and duplicates. */
+export function addTaskDep(id: number, dependsOn: number): Promise<void> {
+  return invoke("task_add_dep", { id, dependsOn });
+}
+
+/** Remove the edge that makes task `id` blocked by `dependsOn`. */
+export function removeTaskDep(id: number, dependsOn: number): Promise<void> {
+  return invoke("task_remove_dep", { id, dependsOn });
 }
 
 /// Permanently delete a task (hard-delete on SQLite, tombstone on GitHub). Rejects

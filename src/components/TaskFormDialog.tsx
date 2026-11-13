@@ -1,13 +1,12 @@
 // Reusable task form in a Radix dialog — used for "New task" (Board) and "Edit"
-// (Inspector). Tags are editable only when creating: the store's TaskUpdate has
-// no tags field, so edit covers title/priority/description.
+// (Inspector). Edit also covers the task's dependencies ("Blocked by"), which only
+// exist once the task does.
 
 import * as Dialog from "@radix-ui/react-dialog";
 import { useEffect, useId, useState } from "react";
 import { LAYER_MODAL, MODAL_OVERLAY_CLS } from "../lib/layers";
-import type { Priority } from "../lib/tasks";
+import { errorMessage, type Priority, parseTags, parseTaskIds } from "../lib/tasks";
 import { TagInput } from "./TagInput";
-import { parseTags } from "./tagEntry";
 
 const PRIORITIES: Priority[] = ["low", "normal", "high", "urgent"];
 
@@ -16,7 +15,11 @@ export interface TaskFormValues {
   priority: Priority;
   description: string;
   tags: string[];
+  /** Ids of the tasks this one depends on (edit mode only). */
+  blockedBy: number[];
 }
+
+const formatIds = (ids: readonly number[]) => ids.map((id) => `#${id}`).join(", ");
 
 export function TaskFormDialog({
   open,
@@ -39,6 +42,7 @@ export function TaskFormDialog({
   const [description, setDescription] = useState(initial?.description ?? "");
   const [tags, setTags] = useState((initial?.tags ?? []).join(", "));
   const tagsId = useId();
+  const [blockedBy, setBlockedBy] = useState(formatIds(initial?.blockedBy ?? []));
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -52,6 +56,7 @@ export function TaskFormDialog({
     setPriority(initial?.priority ?? "normal");
     setDescription(initial?.description ?? "");
     setTags((initial?.tags ?? []).join(", "));
+    setBlockedBy(formatIds(initial?.blockedBy ?? []));
     setErr(null);
     // Re-seed only on open/close transitions, not on every parent re-render
     // (which recreates the inline `initial` object).
@@ -62,6 +67,11 @@ export function TaskFormDialog({
       setErr("Title is required.");
       return;
     }
+    const deps = parseTaskIds(blockedBy);
+    if (deps.invalid.length > 0) {
+      setErr(`Not a task id: ${deps.invalid.join(", ")}`);
+      return;
+    }
     setBusy(true);
     setErr(null);
     try {
@@ -70,10 +80,11 @@ export function TaskFormDialog({
         priority,
         description: description.trim(),
         tags: parseTags(tags),
+        blockedBy: deps.ids,
       });
       onOpenChange(false);
     } catch (e) {
-      setErr(String(e));
+      setErr(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -112,18 +123,30 @@ export function TaskFormDialog({
         </select>
       </label>
 
-      {mode === "new" && (
-        <label className="flex flex-col gap-1.5" htmlFor={tagsId}>
+      <label className="flex flex-col gap-1.5" htmlFor={tagsId}>
+        <span className={labelText}>
+          Tags <span className="normal-case text-tx-3/70">(comma-separated)</span>
+        </span>
+        <TagInput
+          id={tagsId}
+          className={field}
+          value={tags}
+          onChange={setTags}
+          tags={tagOptions}
+          placeholder="ui, backend"
+        />
+      </label>
+
+      {mode === "edit" && (
+        <label className="flex flex-col gap-1.5">
           <span className={labelText}>
-            Tags <span className="normal-case text-tx-3/70">(comma-separated)</span>
+            Blocked by <span className="normal-case text-tx-3/70">(task ids)</span>
           </span>
-          <TagInput
-            id={tagsId}
-            className={field}
-            value={tags}
-            onChange={setTags}
-            tags={tagOptions}
-            placeholder="ui, backend"
+          <input
+            className={`${field} font-mono`}
+            value={blockedBy}
+            onChange={(e) => setBlockedBy(e.target.value)}
+            placeholder="#12, #15"
           />
         </label>
       )}
@@ -146,7 +169,7 @@ export function TaskFormDialog({
   const desc_ =
     mode === "new"
       ? "Create a task in the shared board."
-      : "Update this task. (Tags are set at creation.)";
+      : "Update this task's details, tags and dependencies.";
 
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>

@@ -9,6 +9,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AddProjectDialog } from "./components/AddProjectDialog";
 import { AttentionBannersProvider, useAttentionBanners } from "./components/AttentionBanners";
 import { Board } from "./components/Board";
+import { availableTags } from "./components/board/tagFilter";
 import { ConfirmDialogProvider, useConfirmDialog } from "./components/ConfirmDialog";
 import { CreateWorktreeDialog } from "./components/CreateWorktreeDialog";
 import { DiffView } from "./components/DiffView";
@@ -360,6 +361,12 @@ function AppInner() {
     failures: dispatchFailures,
     reload: reloadTasks,
   } = useTasks(activeProjectName, activeBackend);
+  // Every tag in use on the project's tasks, backlog included, suggested by the
+  // Inspector's Edit form.
+  const projectTags = useMemo(
+    () => availableTags([...(tasks ?? []), ...backlogTasks]),
+    [tasks, backlogTasks],
+  );
   // Bumps whenever the task list reloads, so the open inspector refetches in step.
   const [taskRev, setTaskRev] = useState(0);
   // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only increment; stable setter intentionally omitted
@@ -1270,6 +1277,7 @@ function AppInner() {
               revision={taskRev}
               actor={actor}
               reload={reloadTasks}
+              tagOptions={projectTags}
               onClose={() => setSelectedTaskId(null)}
               collapsed={inspectorCollapsed}
               onToggleCollapsed={() => {

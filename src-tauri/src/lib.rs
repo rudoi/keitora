@@ -28,6 +28,7 @@ mod tasks;
 mod terminal_links;
 mod transfer;
 mod transfer_registry;
+mod worktree_open;
 
 /// Desktop entry: the full host app (PTY backend, board, dispatch, watchers).
 pub fn run() {

@@ -2,15 +2,8 @@
 // list. Kept free of React so the editing rules are unit-testable; TagInput.tsx
 // is the thin component over them.
 
+import { parseTags } from "../lib/tasks";
 import { filterTags } from "./board/tagFilter";
-
-/** The tags in a comma-separated field value, trimmed, blanks dropped. */
-export function parseTags(value: string): string[] {
-  return value
-    .split(",")
-    .map((t) => t.trim())
-    .filter(Boolean);
-}
 
 /** The tag being typed: the text after the last comma, trimmed. */
 export function currentToken(value: string): string {

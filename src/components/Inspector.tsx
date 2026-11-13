@@ -6,13 +6,18 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 import { useEffect, useState } from "react";
 import { PRIORITY_PILL, STATUS_DOT, shortTime } from "../lib/taskStyles";
 import {
+  addTaskDep,
   claimTask,
   deleteTask,
+  depChanges,
+  directDeps,
   errorMessage,
   finishActions,
   getTask,
   markTaskDone,
+  removeTaskDep,
   reopenTask,
+  sameTags,
   type TaskDetail,
   unclaimTask,
   updateTask,
@@ -24,6 +29,7 @@ export function Inspector({
   revision,
   actor,
   reload,
+  tagOptions,
   onClose,
   collapsed,
   onToggleCollapsed,
@@ -33,6 +39,8 @@ export function Inspector({
   revision: number;
   actor: string | null;
   reload: () => Promise<void>;
+  /** The project's tags, suggested by the Edit form's Tags field. */
+  tagOptions: string[];
   /** Clear the parent's task selection (e.g. after a successful delete). */
   onClose: () => void;
   /** When true, the panel folds into a skinny rail with an expand affordance. */
@@ -311,14 +319,31 @@ export function Inspector({
           open={editOpen}
           onOpenChange={setEditOpen}
           mode="edit"
-          initial={{ title: task.title, priority: task.priority, description: task.description }}
+          tagOptions={tagOptions}
+          initial={{
+            title: task.title,
+            priority: task.priority,
+            description: task.description,
+            tags: task.tags,
+            blockedBy: directDeps(detail.deps),
+          }}
           onSubmit={async (v) => {
-            await updateTask(task.id, {
-              title: v.title,
-              priority: v.priority,
-              description: v.description,
-            });
-            await reload();
+            try {
+              await updateTask(task.id, {
+                title: v.title,
+                priority: v.priority,
+                description: v.description,
+                ...(sameTags(task.tags, v.tags) ? {} : { tags: v.tags }),
+              });
+              // Removals first, so swapping one blocker for another never trips the
+              // cycle check on an edge that is about to go.
+              const deps = depChanges(directDeps(detail.deps), v.blockedBy);
+              for (const id of deps.remove) await removeTaskDep(task.id, id);
+              for (const id of deps.add) await addTaskDep(task.id, id);
+            } finally {
+              // Show whatever did apply, even when a later step was rejected.
+              await reload();
+            }
           }}
         />
       </div>

@@ -1,14 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { applyTag, currentToken, parseTags, tagSuggestions } from "./tagEntry";
+import { applyTag, currentToken, tagSuggestions } from "./tagEntry";
 
 const TAGS = ["backend", "Bug", "docs", "ui"];
-
-describe("parseTags", () => {
-  it("splits on commas, trims and drops blanks", () => {
-    expect(parseTags(" ui ,backend,, ")).toEqual(["ui", "backend"]);
-    expect(parseTags("")).toEqual([]);
-  });
-});
 
 describe("currentToken", () => {
   it("is the trimmed text after the last comma", () => {
