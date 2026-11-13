@@ -2293,6 +2293,8 @@ pub fn run() {
             save_clipboard_image,
             crate::terminal_links::open_terminal_file,
             crate::session_toast::notify_session,
+            crate::worktree_open::open_worktree_folder,
+            crate::worktree_open::open_worktree_terminal,
             pty_resize,
             pty_scroll,
             pty_scroll_offset,

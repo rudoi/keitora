@@ -704,6 +704,16 @@ export function openTerminalFile(project: string, worktree: string, path: string
   return invoke("open_terminal_file", { project, worktree, path });
 }
 
+/** Open a worktree's directory in the OS file manager. `project` is the registry key. */
+export function openWorktreeFolder(project: string, worktree: string): Promise<void> {
+  return invoke("open_worktree_folder", { project, worktree });
+}
+
+/** Start a system terminal window in a worktree's directory. `project` is the registry key. */
+export function openWorktreeTerminal(project: string, worktree: string): Promise<void> {
+  return invoke("open_worktree_terminal", { project, worktree });
+}
+
 // ── Diff view ────────────────────────────────────────────────────────────────
 // Read-only worktree diff (merge-base of main → working tree). The backend emits
 // camelCase (serde rename_all), so these need no normalization. Diff base, caching,
