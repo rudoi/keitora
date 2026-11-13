@@ -1,12 +1,13 @@
 // First-run nudge: when the `keitora` CLI isn't on PATH but a binary is available to
 // link, offer (once per launch, via a native dialog) to install it into ~/.local/bin
 // so session hooks resolve `keitora` in every project. Fully declinable and non-fatal —
-// it never blocks app use.
+// it never blocks app use. Also warns, once per launch, when the CLI agents run is an
+// older build than this app's (e.g. an upgrade couldn't replace a copy in use).
 
 import { ask, message } from "@tauri-apps/plugin-dialog";
 import { useEffect, useRef } from "react";
 
-import { installKeitoraCli, keitoraCliStatus } from "./ipc";
+import { installKeitoraCli, keitoraCliStaleness, keitoraCliStatus } from "./ipc";
 
 export function useKeitoraCliInstall() {
   const asked = useRef(false);
@@ -17,7 +18,12 @@ export function useKeitoraCliInstall() {
     void (async () => {
       try {
         const status = await keitoraCliStatus();
-        if (status.state !== "installable") return; // on_path / missing → no prompt
+        if (status.state === "on_path") {
+          const stale = await keitoraCliStaleness();
+          if (stale) await message(stale, { title: "Outdated keitora CLI", kind: "warning" });
+          return;
+        }
+        if (status.state !== "installable") return; // missing → no prompt
 
         const accept = await ask(
           "The `keitora` CLI isn't on your PATH. Install it to ~/.local/bin so worktree " +

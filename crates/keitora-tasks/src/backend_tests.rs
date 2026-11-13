@@ -45,6 +45,7 @@ pub async fn run_universal<B: TaskBackend>(b: &B) {
     test_update_replaces_tags(b).await;
     test_set_done_reports_unblocked(b).await;
     test_set_review_keeps_the_assignee(b).await;
+    test_force_done_and_reopen(b).await;
     test_newly_unblocked_by(b).await;
     test_claim_outcome_variants(b).await;
     test_add_dep_self_dep_rejected(b).await;
@@ -945,6 +946,39 @@ async fn test_set_review_keeps_the_assignee<B: TaskBackend>(b: &B) {
     b.set_review(task.id, "alice")
         .await
         .expect("set_review is idempotent");
+}
+
+/// A human closes a task whoever holds it, and reopens a finished one to `open`,
+/// unassigned. Active tasks are released, not reopened.
+async fn test_force_done_and_reopen<B: TaskBackend>(b: &B) {
+    let task = b
+        .create("alice", "close-me", "", "normal", &[], None)
+        .await
+        .expect("create");
+    b.claim(task.id, "alpha").await.expect("claim");
+    assert_conflict(b.reopen(task.id, "main").await, "reopen an active task");
+
+    let done = b.force_done(task.id, "main").await.expect("force_done");
+    assert_eq!(done.task.status, "done");
+    assert_eq!(done.task.assigned_to.as_deref(), Some("alpha"));
+    b.force_done(task.id, "main")
+        .await
+        .expect("force_done is idempotent");
+
+    let open = b.reopen(task.id, "main").await.expect("reopen");
+    assert_eq!(open.status, "open");
+    assert_eq!(open.assigned_to, None);
+    b.reopen(task.id, "main")
+        .await
+        .expect("reopen is idempotent");
+
+    b.cancel(task.id, "main").await.expect("cancel");
+    assert_conflict(
+        b.force_done(task.id, "main").await,
+        "force_done a cancelled task",
+    );
+    let reopened = b.reopen(task.id, "main").await.expect("reopen cancelled");
+    assert_eq!(reopened.status, "open");
 }
 
 async fn test_set_done_non_owner_conflict<B: TaskBackend>(b: &B) {

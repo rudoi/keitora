@@ -800,6 +800,61 @@ impl<A: GhApi> TaskBackend for GitHubBackend<A> {
         Ok(self.issue_to_task(&issue))
     }
 
+    async fn force_done(&self, id: i64, actor: &str) -> BackendResult<DoneOutcome> {
+        let issue = self.require_issue(id).await?;
+        let assignee = assignee_from_labels(&issue.labels);
+        match self.derive_status(&issue, assignee.as_deref()).as_str() {
+            "done" => {
+                let unblocked = self.newly_unblocked_by(id).await?;
+                return Ok(DoneOutcome {
+                    task: self.issue_to_task(&issue),
+                    unblocked,
+                });
+            }
+            "cancelled" => {
+                return Err(BackendError::Conflict(format!(
+                    "task #{id} is cancelled; reopen it first"
+                )))
+            }
+            _ => {}
+        }
+        self.set_status(id, "done").await?;
+        self.api.close_issue(&self.project, id, false).await?;
+        self.append_log(&issue, actor, "done", "").await?;
+        let fresh = self.require_issue(id).await?;
+        let unblocked = self.newly_unblocked_by(id).await?;
+        Ok(DoneOutcome {
+            task: self.issue_to_task(&fresh),
+            unblocked,
+        })
+    }
+
+    async fn reopen(&self, id: i64, actor: &str) -> BackendResult<Task> {
+        let issue = self.require_issue(id).await?;
+        let assignee = assignee_from_labels(&issue.labels);
+        let status = self.derive_status(&issue, assignee.as_deref());
+        if !matches!(status.as_str(), "done" | "cancelled" | "backlog") {
+            if status == "open" && assignee.is_none() {
+                return Ok(self.issue_to_task(&issue));
+            }
+            return Err(BackendError::Conflict(format!(
+                "task #{id} is {status}; release it instead"
+            )));
+        }
+        if let Some(holder) = assignee {
+            self.api
+                .remove_label(&self.project, id, &worktree_label(&holder))
+                .await?;
+        }
+        if !matches!(issue.state, IssueState::Open) {
+            self.api.reopen_issue(&self.project, id).await?;
+        }
+        self.set_status(id, "open").await?;
+        self.append_log(&issue, actor, "reopened", "").await?;
+        let fresh = self.require_issue(id).await?;
+        Ok(self.issue_to_task(&fresh))
+    }
+
     /// Dependents newly unblocked once `id` is done, computed from a **single**
     /// board fetch (the trait default does `blocks(id)` + a `get(dep)` per
     /// dependent, each a full `issue_list_all` → O(N²) `gh` calls).

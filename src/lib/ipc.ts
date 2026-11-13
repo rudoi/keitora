@@ -1211,6 +1211,12 @@ export function keitoraCliStatus(): Promise<CliStatus> {
   return invoke<CliStatus>("keitora_cli_status");
 }
 
+/** A warning when the `keitora` CLI agents run is an older build than this app's
+ *  bundled one (on PATH, or Windows' per-user copy); `null` when it's current. */
+export function keitoraCliStaleness(): Promise<string | null> {
+  return invoke<string | null>("keitora_cli_staleness");
+}
+
 /** Symlink a located `keitora` binary onto PATH (~/.local/bin). Idempotent. */
 export function installKeitoraCli(): Promise<CliStatus> {
   return invoke<CliStatus>("install_keitora_cli");

@@ -692,6 +692,62 @@ impl SqliteBackend {
         Self::require_locked(&conn, id)
     }
 
+    pub(crate) fn force_done_blocking(&self, id: i64, actor: &str) -> BackendResult<DoneOutcome> {
+        let conn = self.lock()?;
+        let task = Self::require_locked(&conn, id)?;
+        match task.status.as_str() {
+            "done" => {
+                return Ok(DoneOutcome {
+                    task,
+                    unblocked: vec![],
+                })
+            }
+            "cancelled" => {
+                return Err(BackendError::Conflict(format!(
+                    "task #{id} is cancelled; reopen it first"
+                )))
+            }
+            _ => {}
+        }
+        conn.execute(
+            "UPDATE tasks SET status = 'done' WHERE id = ?1",
+            params![id],
+        )
+        .map_err(map_sqlite)?;
+        Self::log_locked(&conn, id, actor, "status_changed", "done")?;
+        let unblocked = Self::newly_unblocked_by_locked(&conn, id)?;
+        let task = Self::require_locked(&conn, id)?;
+        Ok(DoneOutcome { task, unblocked })
+    }
+
+    pub(crate) fn reopen_blocking(&self, id: i64, actor: &str) -> BackendResult<Task> {
+        let conn = self.lock()?;
+        let changed = conn
+            .execute(
+                "UPDATE tasks SET status = 'open', assigned_to = NULL \
+                 WHERE id = ?1 AND status IN ('done', 'cancelled', 'backlog')",
+                params![id],
+            )
+            .map_err(map_sqlite)?;
+        if changed == 0 {
+            let task = Self::require_locked(&conn, id)?;
+            if task.status == "open" && task.assigned_to.is_none() {
+                return Ok(task);
+            }
+            let on = task
+                .assigned_to
+                .as_deref()
+                .map(|w| format!(" on @{w}"))
+                .unwrap_or_default();
+            return Err(BackendError::Conflict(format!(
+                "task #{id} is {}{on}; release it instead",
+                task.status
+            )));
+        }
+        Self::log_locked(&conn, id, actor, "status_changed", "open")?;
+        Self::require_locked(&conn, id)
+    }
+
     /// IDs of tasks newly unblocked by `id` becoming done: dependents that are still
     /// `'open'` and whose every *other* dep is done. The single indexed unblock query
     /// shared by `set_done_blocking` and `newly_unblocked_by_blocking`.
@@ -1204,6 +1260,14 @@ impl TaskBackend for SqliteBackend {
 
     async fn set_review(&self, id: i64, actor: &str) -> BackendResult<Task> {
         self.set_review_blocking(id, actor)
+    }
+
+    async fn force_done(&self, id: i64, actor: &str) -> BackendResult<DoneOutcome> {
+        self.force_done_blocking(id, actor)
+    }
+
+    async fn reopen(&self, id: i64, actor: &str) -> BackendResult<Task> {
+        self.reopen_blocking(id, actor)
     }
 
     // Override the default (read-derived) impl with the targeted indexed query.

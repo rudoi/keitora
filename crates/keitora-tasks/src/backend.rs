@@ -383,6 +383,22 @@ pub trait TaskBackend: Send + Sync {
     /// Returns `NotFound` if no task with `id` exists.
     async fn set_review(&self, id: i64, actor: &str) -> BackendResult<Task>;
 
+    /// Mark `id` done on a human's say-so, whoever holds it: the board's and the
+    /// Inspector's Mark done. Unlike [`TaskBackend::set_done`], `actor` needn't be the
+    /// assignee; the assignee is kept as the record of who did the work.
+    ///
+    /// Idempotent: already `'done'` → success. Returns `Conflict` if `id` is
+    /// `'cancelled'` (reopen it first), `NotFound` if no task with `id` exists.
+    async fn force_done(&self, id: i64, actor: &str) -> BackendResult<DoneOutcome>;
+
+    /// Put a `'done'`, `'cancelled'` or `'backlog'` task back to `'open'`, unassigned,
+    /// so it can be dispatched again.
+    ///
+    /// Idempotent: already open and unassigned → success. Returns `Conflict` for an
+    /// assigned or `'active'`/`'review'` task (release it instead), `NotFound` if no
+    /// task with `id` exists.
+    async fn reopen(&self, id: i64, actor: &str) -> BackendResult<Task>;
+
     /// IDs of tasks that became newly unblocked because `id` is now done: tasks that
     /// depend on `id`, are still `'open'`, and whose every *other* dependency is also
     /// done. Idempotent and side-effect-free — callers may invoke it after a

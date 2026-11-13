@@ -1011,6 +1011,42 @@ fn keitora_cli_status() -> crate::cli_install::CliStatus {
     }
 }
 
+/// Warn when the `keitora` agents run is an older build than this app's: the CLI on
+/// PATH and, on Windows, the per-user copy put first on agent panes' PATH (refreshed
+/// here first, so a copy that is about to be replaced isn't reported). `None` when
+/// they're current or there is no bundled CLI to compare against.
+#[tauri::command(async)]
+fn keitora_cli_staleness() -> Option<String> {
+    let bundled = locate_keitora_binary()?;
+    let mut found: Vec<std::path::PathBuf> = Vec::new();
+    #[cfg(windows)]
+    {
+        let _ = keitora_tasks::windows_keitora_bin_dir();
+        if let Some(alias) = keitora_tasks::windows_keitora_alias_path() {
+            if alias.is_file() {
+                found.push(alias);
+            }
+        }
+    }
+    if let Some(p) = keitora_tasks::keitora_on_path() {
+        found.push(p.into());
+    }
+    // The PATH entry is often the Windows copy itself, spelled differently.
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    let mut stale: Vec<String> = Vec::new();
+    for f in found {
+        let key = std::fs::canonicalize(&f).unwrap_or_else(|_| f.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        if crate::cli_install::is_older_build(&f, &bundled) {
+            stale.push(f.display().to_string());
+        }
+    }
+    (!stale.is_empty()).then(|| crate::cli_install::stale_cli_message(&stale))
+}
+
 /// Symlink a located `keitora` binary into `~/.local/bin` so it (and session hooks in
 /// any project) can resolve it on PATH. No-op-safe: if `keitora` is already on PATH it
 /// reports `on_path` without touching anything. Returns the resulting status.
@@ -2332,6 +2368,7 @@ pub fn run() {
             set_worktrees,
             worktree_create,
             keitora_cli_status,
+            keitora_cli_staleness,
             install_keitora_cli,
             get_settings,
             save_project_settings,
@@ -2357,6 +2394,7 @@ pub fn run() {
             tasks::task_remove_dep,
             tasks::task_new,
             tasks::task_release,
+            tasks::task_mark_done,
             tasks::task_delete,
             dispatch::dispatch_apply,
             dispatch::dispatch_auto,

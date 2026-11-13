@@ -22,7 +22,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cardStates, sentIds } from "../lib/cardState";
 import type { DispatchFailure, Reservation } from "../lib/dispatch";
 import type { WorktreeSession } from "../lib/sessions";
-import { backlogTask, errorMessage, newTask, reopenTask, type TaskWithDeps } from "../lib/tasks";
+import {
+  backlogTask,
+  errorMessage,
+  markTaskDone,
+  newTask,
+  reopenTask,
+  type TaskWithDeps,
+} from "../lib/tasks";
 import { useDispatchActions } from "../lib/useDispatchActions";
 import { judgeLane, type LaneContext, useDispatchTargets } from "../lib/useDispatchTargets";
 import { useLocalStorageState } from "../lib/useLocalStorageState";
@@ -182,6 +189,19 @@ export function Board({
     },
     [act, showToast],
   );
+  const runMarkDone = useCallback(
+    (taskId: number) => {
+      act(() =>
+        markTaskDone(taskId).then((r) => {
+          const freed = r.unblocked.length
+            ? `; unblocked ${r.unblocked.map((u) => `#${u}`).join(", ")}`
+            : "";
+          showToast(`Marked #${taskId} done${freed}`);
+        }),
+      );
+    },
+    [act, showToast],
+  );
 
   // Toast each failed send once, including those the backend's auto-send hit while
   // nobody was dragging. Failures already standing when the board mounts are shown on
@@ -293,6 +313,7 @@ export function Board({
     onRelease: runRelease,
     onBacklog: runBacklog,
     onReopen: runReopen,
+    onMarkDone: runMarkDone,
   };
 
   const board = (

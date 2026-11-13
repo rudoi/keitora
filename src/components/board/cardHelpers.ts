@@ -45,6 +45,8 @@ export interface CardEnv {
   onRelease: (taskId: number) => void;
   onBacklog: (taskId: number) => void;
   onReopen: (taskId: number) => void;
+  /** A human's Mark done, whoever holds the card. */
+  onMarkDone: (taskId: number) => void;
 }
 
 /** A card's state, falling back to `open` for a card the board hasn't judged. */
