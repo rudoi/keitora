@@ -3,14 +3,15 @@
 // header (hover/focus-visible) or by `D` when the card is selected (the parent
 // drives `open`). Order: Dispatch (auto-pick) first (also Shift+D, without the menu);
 // then the pool worktrees (→ send now, accent; → pending, dim) — worktrees outside
-// the dispatch pool never appear; then Release, and Move to backlog / Reopen.
+// the dispatch pool never appear; then Mark done (active and review cards), Release,
+// and Move to backlog / Reopen. A done or cancelled card's menu offers only Reopen.
 
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { ChevronDown } from "lucide-react";
 import type { CardState } from "../lib/cardState";
 import type { SessionState } from "../lib/sessions";
 import { STATE_ORDER, sessionDotCls } from "../lib/taskStyles";
-import type { TaskWithDeps } from "../lib/tasks";
+import { finishActions, type TaskWithDeps } from "../lib/tasks";
 import { judgeLane, type LaneContext } from "../lib/useDispatchTargets";
 
 /** Handlers that keep the menu's key and pointer events from reaching the card.
@@ -36,6 +37,7 @@ export function DispatchMenu({
   onRelease,
   onBacklog,
   onReopen,
+  onMarkDone,
 }: {
   card: TaskWithDeps;
   state: CardState;
@@ -49,10 +51,12 @@ export function DispatchMenu({
   onRelease: () => void;
   onBacklog: () => void;
   onReopen: () => void;
+  onMarkDone: () => void;
 }) {
   const backlog = state.kind === "backlog";
-  // Active and review cards belong to their worktree's lane; the backlog isn't offered.
-  const inLane = card.status === "active" || card.status === "review";
+  // Active and review cards belong to their worktree's lane: they offer Mark done, not
+  // the backlog. Finished cards offer only Reopen.
+  const { markDone: inLane, reopen: finished } = finishActions(card.status);
   const blocked = card.blocked_by.length > 0;
   const dispatchable = !backlog && !blocked && (state.kind === "open" || state.kind === "pending");
 
@@ -92,78 +96,101 @@ export function DispatchMenu({
           {...isolateFromCard}
           className="z-50 min-w-[200px] rounded-card border border-line bg-bg-2 p-1 shadow-[0_8px_24px_rgba(0,0,0,.45)]"
         >
-          <DropdownMenu.Label className="px-2 py-1 text-[10px] uppercase tracking-wide text-tx-3">
-            Dispatch to…
-          </DropdownMenu.Label>
-
-          {blocked && (
-            <div className="px-2 py-1.5 text-[11px] text-urgent">Blocked — resolve deps first</div>
-          )}
-          {dispatchable && pool.size === 0 && (
-            <div className="px-2 py-1.5 text-[11px] text-tx-3">
-              No worktree is in the dispatch pool
-            </div>
-          )}
-
-          {dispatchable && pool.size > 0 && (
-            <DropdownMenu.Item
-              onSelect={() => onAutoDispatch()}
-              className={`${itemCls} font-semibold text-accent-text`}
-            >
-              <span className="h-1.5 w-1.5 flex-none rounded-full bg-accent" />
-              <span>Dispatch</span>
-              <span className="ml-auto text-[10px] font-normal text-tx-3">auto-pick · ⇧D</span>
-            </DropdownMenu.Item>
-          )}
-
-          {targets.map((tgt, i) => {
-            const prev = targets[i - 1]?.state;
-            // Separator between the action tiers (idle | busy/waiting | offline).
-            const tier = (s: SessionState) => (s === "idle" ? 0 : s === "offline" ? 2 : 1);
-            const sep = i === 0 || (prev !== undefined && tier(prev) !== tier(tgt.state));
-            const now = tgt.judged.decision === "dispatch";
-            const here = card.assigned_to === tgt.wt;
-            const verb = here ? "→ retry" : now ? "→ send now" : `→ pending (${tgt.state})`;
-            return (
-              <div key={tgt.wt}>
-                {sep && <DropdownMenu.Separator className="my-1 h-px bg-line" />}
-                <DropdownMenu.Item
-                  onSelect={() => onDispatch(tgt.wt)}
-                  className={`${itemCls} ${now ? "text-accent-text" : "text-tx-2"}`}
-                >
-                  <span
-                    className={`h-1.5 w-1.5 flex-none rounded-full ${sessionDotCls(tgt.state)}`}
-                  />
-                  <span className="font-mono">@{tgt.wt}</span>
-                  <span className="ml-auto text-[10px] text-tx-3">{verb}</span>
-                </DropdownMenu.Item>
-              </div>
-            );
-          })}
-
-          {(card.assigned_to || !inLane) && (
-            <DropdownMenu.Separator className="my-1 h-px bg-line" />
-          )}
-          {card.assigned_to && (
-            <DropdownMenu.Item onSelect={() => onRelease()} className={`${itemCls} text-tx-2`}>
-              <span className="h-1.5 w-1.5 flex-none rounded-full bg-tx-3" />
-              <span>Release to Open</span>
-            </DropdownMenu.Item>
-          )}
-          {backlog ? (
+          {finished ? (
             <DropdownMenu.Item onSelect={() => onReopen()} className={`${itemCls} text-tx-2`}>
               <span className="h-1.5 w-1.5 flex-none rounded-full bg-tx-3" />
-              <span>Reopen from backlog</span>
-              <span className="ml-auto text-[10px] text-tx-3">b</span>
+              <span>Reopen</span>
             </DropdownMenu.Item>
           ) : (
-            !inLane && (
-              <DropdownMenu.Item onSelect={() => onBacklog()} className={`${itemCls} text-tx-2`}>
-                <span className="h-1.5 w-1.5 flex-none rounded-full bg-tx-3" />
-                <span>Move to backlog</span>
-                <span className="ml-auto text-[10px] text-tx-3">b</span>
-              </DropdownMenu.Item>
-            )
+            <>
+              <DropdownMenu.Label className="px-2 py-1 text-[10px] uppercase tracking-wide text-tx-3">
+                Dispatch to…
+              </DropdownMenu.Label>
+
+              {blocked && (
+                <div className="px-2 py-1.5 text-[11px] text-urgent">
+                  Blocked — resolve deps first
+                </div>
+              )}
+              {dispatchable && pool.size === 0 && (
+                <div className="px-2 py-1.5 text-[11px] text-tx-3">
+                  No worktree is in the dispatch pool
+                </div>
+              )}
+
+              {dispatchable && pool.size > 0 && (
+                <DropdownMenu.Item
+                  onSelect={() => onAutoDispatch()}
+                  className={`${itemCls} font-semibold text-accent-text`}
+                >
+                  <span className="h-1.5 w-1.5 flex-none rounded-full bg-accent" />
+                  <span>Dispatch</span>
+                  <span className="ml-auto text-[10px] font-normal text-tx-3">auto-pick · ⇧D</span>
+                </DropdownMenu.Item>
+              )}
+
+              {targets.map((tgt, i) => {
+                const prev = targets[i - 1]?.state;
+                // Separator between the action tiers (idle | busy/waiting | offline).
+                const tier = (s: SessionState) => (s === "idle" ? 0 : s === "offline" ? 2 : 1);
+                const sep = i === 0 || (prev !== undefined && tier(prev) !== tier(tgt.state));
+                const now = tgt.judged.decision === "dispatch";
+                const here = card.assigned_to === tgt.wt;
+                const verb = here ? "→ retry" : now ? "→ send now" : `→ pending (${tgt.state})`;
+                return (
+                  <div key={tgt.wt}>
+                    {sep && <DropdownMenu.Separator className="my-1 h-px bg-line" />}
+                    <DropdownMenu.Item
+                      onSelect={() => onDispatch(tgt.wt)}
+                      className={`${itemCls} ${now ? "text-accent-text" : "text-tx-2"}`}
+                    >
+                      <span
+                        className={`h-1.5 w-1.5 flex-none rounded-full ${sessionDotCls(tgt.state)}`}
+                      />
+                      <span className="font-mono">@{tgt.wt}</span>
+                      <span className="ml-auto text-[10px] text-tx-3">{verb}</span>
+                    </DropdownMenu.Item>
+                  </div>
+                );
+              })}
+
+              {(card.assigned_to || !inLane) && (
+                <DropdownMenu.Separator className="my-1 h-px bg-line" />
+              )}
+              {inLane && (
+                <DropdownMenu.Item
+                  onSelect={() => onMarkDone()}
+                  className={`${itemCls} text-accent-text`}
+                >
+                  <span className="h-1.5 w-1.5 flex-none rounded-full bg-idle" />
+                  <span>Mark done</span>
+                </DropdownMenu.Item>
+              )}
+              {card.assigned_to && (
+                <DropdownMenu.Item onSelect={() => onRelease()} className={`${itemCls} text-tx-2`}>
+                  <span className="h-1.5 w-1.5 flex-none rounded-full bg-tx-3" />
+                  <span>Release to Open</span>
+                </DropdownMenu.Item>
+              )}
+              {backlog ? (
+                <DropdownMenu.Item onSelect={() => onReopen()} className={`${itemCls} text-tx-2`}>
+                  <span className="h-1.5 w-1.5 flex-none rounded-full bg-tx-3" />
+                  <span>Reopen from backlog</span>
+                  <span className="ml-auto text-[10px] text-tx-3">b</span>
+                </DropdownMenu.Item>
+              ) : (
+                !inLane && (
+                  <DropdownMenu.Item
+                    onSelect={() => onBacklog()}
+                    className={`${itemCls} text-tx-2`}
+                  >
+                    <span className="h-1.5 w-1.5 flex-none rounded-full bg-tx-3" />
+                    <span>Move to backlog</span>
+                    <span className="ml-auto text-[10px] text-tx-3">b</span>
+                  </DropdownMenu.Item>
+                )
+              )}
+            </>
           )}
         </DropdownMenu.Content>
       </DropdownMenu.Portal>

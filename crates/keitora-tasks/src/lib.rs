@@ -49,6 +49,8 @@ pub use config::{
 #[cfg(unix)]
 pub use config::unix_spawn_path;
 #[cfg(windows)]
+pub use config::windows_keitora_alias_path;
+#[cfg(windows)]
 pub use config::{prepend_path, windows_keitora_bin_dir};
 pub use config_edit::{
     check_days, clean_dispatch_steps, normalize_worktrees_dir, remove_project_from_registry,

@@ -421,18 +421,31 @@ pub async fn task_backlog(id: i64) -> Result<(), IpcError> {
         .map_err(|e| to_ipc_error(&e))
 }
 
-/// Bring a backlog task back to `open`.
+/// Bring a backlog, done or cancelled task back to `open`, unassigned.
 #[tauri::command]
 pub async fn task_reopen(id: i64) -> Result<(), IpcError> {
     let (backend, _) = open_backend().map_err(IpcError::internal)?;
-    let upd = TaskUpdate {
-        status: Some("open".to_string()),
-        ..TaskUpdate::default()
-    };
     backend
-        .update(id, &keitora_tasks::current_worktree(), &upd)
+        .reopen(id, &keitora_tasks::current_worktree())
         .await
+        .map(|_| ())
         .map_err(|e| to_ipc_error(&e))
+}
+
+/// A human's Mark done from the board or the Inspector: closes the task whoever holds
+/// it (the app acts as `keitora`, not the assignee). Never goes through the CLI, so the
+/// agent-session refusal doesn't apply.
+#[tauri::command]
+pub async fn task_mark_done(id: i64) -> Result<DoneResult, IpcError> {
+    let (backend, _) = open_backend().map_err(IpcError::internal)?;
+    let outcome = backend
+        .force_done(id, &keitora_tasks::current_worktree())
+        .await
+        .map_err(|e| to_ipc_error(&e))?;
+    Ok(DoneResult {
+        task: outcome.task,
+        unblocked: outcome.unblocked,
+    })
 }
 
 #[tauri::command]

@@ -203,9 +203,25 @@ export function backlogTask(id: number): Promise<void> {
   return invoke("task_backlog", { id });
 }
 
-/** Bring a backlog task back to open. */
+/** Bring a backlog, done or cancelled task back to open, unassigned. */
 export function reopenTask(id: number): Promise<void> {
   return invoke("task_reopen", { id });
+}
+
+/**
+ * The finishing actions a human gets on a task: Mark done while it sits in a worktree
+ * lane (active or in review), Reopen once it is finished (done or cancelled).
+ */
+export function finishActions(status: TaskStatus): { markDone: boolean; reopen: boolean } {
+  return {
+    markDone: status === "active" || status === "review",
+    reopen: status === "done" || status === "cancelled",
+  };
+}
+
+/** A human's Mark done: closes the task whoever holds it (active, review or open). */
+export function markTaskDone(id: number): Promise<DoneResult> {
+  return invoke("task_mark_done", { id });
 }
 
 export function updateTask(id: number, patch: TaskUpdatePatch): Promise<void> {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   type BoardSnapshotResponse,
+  finishActions,
   loadBoard,
   resyncIntervalForBackend,
   type TaskBoardResponse,
@@ -140,5 +141,17 @@ describe("TaskCache", () => {
     cache.set("projA", source);
     source.push(makeTask(2)); // mutate after caching
     expect(cache.get("projA")?.map((t) => t.id)).toEqual([1]);
+  });
+});
+
+describe("finishActions", () => {
+  it("offers Mark done in a lane and Reopen once finished", () => {
+    expect(finishActions("active")).toEqual({ markDone: true, reopen: false });
+    expect(finishActions("review")).toEqual({ markDone: true, reopen: false });
+    expect(finishActions("done")).toEqual({ markDone: false, reopen: true });
+    expect(finishActions("cancelled")).toEqual({ markDone: false, reopen: true });
+    for (const s of ["open", "backlog"] as const) {
+      expect(finishActions(s)).toEqual({ markDone: false, reopen: false });
+    }
   });
 });

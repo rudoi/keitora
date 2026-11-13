@@ -3,14 +3,15 @@
 // actions that state allows: Dispatch (auto-pick) on an open card, Retry on a
 // pending card whose send failed, Release on an assigned card, Reopen on a backlog
 // card, Claim for the focused worktree, Mark done on a card in review (with its branch
-// and PR, so the reviewer knows what to look at).
+// and PR, so the reviewer knows what to look at). The card menu adds Mark done on an
+// active card and Reopen on a done one.
 
 import { useDraggable } from "@dnd-kit/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { motion } from "motion/react";
 import type { CardState } from "../../lib/cardState";
 import { PRIORITY_BAR } from "../../lib/taskStyles";
-import { claimTask, doneTask, type TaskWithDeps } from "../../lib/tasks";
+import { claimTask, type TaskWithDeps } from "../../lib/tasks";
 import { usePrefersReducedMotion } from "../../lib/usePrefersReducedMotion";
 import { DispatchMenu } from "../DispatchMenu";
 import type { CardEnv } from "./cardHelpers";
@@ -156,22 +157,21 @@ export function TaskCard({
           />
         )}
 
-        {!terminal && (
-          <DispatchMenu
-            card={task}
-            state={state}
-            worktreeNames={env.worktreeNames}
-            pool={env.pool}
-            laneCtx={env.laneCtx}
-            open={env.menuTaskId === t.id}
-            onOpenChange={(open) => env.onMenuOpenChange(t.id, open)}
-            onDispatch={(wt) => env.onDispatch(wt, t.id)}
-            onAutoDispatch={() => env.onAutoDispatch(t.id)}
-            onRelease={() => env.onRelease(t.id)}
-            onBacklog={() => env.onBacklog(t.id)}
-            onReopen={() => env.onReopen(t.id)}
-          />
-        )}
+        <DispatchMenu
+          card={task}
+          state={state}
+          worktreeNames={env.worktreeNames}
+          pool={env.pool}
+          laneCtx={env.laneCtx}
+          open={env.menuTaskId === t.id}
+          onOpenChange={(open) => env.onMenuOpenChange(t.id, open)}
+          onDispatch={(wt) => env.onDispatch(wt, t.id)}
+          onAutoDispatch={() => env.onAutoDispatch(t.id)}
+          onRelease={() => env.onRelease(t.id)}
+          onBacklog={() => env.onBacklog(t.id)}
+          onReopen={() => env.onReopen(t.id)}
+          onMarkDone={() => env.onMarkDone(t.id)}
+        />
 
         {/* Right-side badge slot: one state chip. */}
         {chip && (
@@ -279,8 +279,7 @@ export function TaskCard({
               title="Reviewed: move it to Done"
               onClick={(e) => {
                 e.stopPropagation();
-                // biome-ignore lint/style/noNonNullAssertion: guarded by the actor check above
-                env.onAction(() => doneTask(task.id, env.actor!));
+                env.onMarkDone(task.id);
               }}
               {...stop}
               className="rounded-chip border border-accent bg-accent px-2.5 py-1 text-[11px] font-semibold text-[var(--color-on-accent)]"

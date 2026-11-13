@@ -80,13 +80,18 @@ enum TaskCmd {
         force: bool,
     },
     /// Hand a finished task over for review; it stays in this worktree's lane until a
-    /// human marks it done
-    Review { id: i64 },
+    /// human marks it done. Records the current git branch if the task has none
+    Review {
+        id: i64,
+        /// The pull request with the work, shown on the board card
+        #[arg(long = "pr")]
+        pr: Option<String>,
+    },
     /// Mark a task cancelled
     Cancel { id: i64 },
     /// Punt a task to the backlog (hidden from the board and from dispatch)
     Backlog { id: i64 },
-    /// Bring a backlog task back to open
+    /// Bring a backlog, done or cancelled task back to open, unassigned
     #[command(visible_alias = "unbacklog")]
     Reopen { id: i64 },
     /// Update task fields
@@ -469,8 +474,13 @@ async fn run_task(
                 }
             }
         }
-        TaskCmd::Review { id } => {
-            let task = backend.set_review(id, &me).await?;
+        TaskCmd::Review { id, pr } => {
+            let mut task = backend.set_review(id, &me).await?;
+            let upd = review_update(task.branch.as_deref(), current_branch().as_deref(), pr);
+            if !upd.is_empty() {
+                backend.update(id, &me, &upd).await?;
+                task = backend.require(id).await?;
+            }
             emit_task_msg(
                 json,
                 &task,
@@ -486,21 +496,8 @@ async fn run_task(
             emit_ok(json, &format!("  Moved task #{id} to backlog"))?;
         }
         TaskCmd::Reopen { id } => {
-            let twd = backend
-                .get(id)
-                .await?
-                .ok_or_else(|| format!("task #{id} not found"))?;
-            if twd.task.status != "backlog" {
-                return Err(
-                    format!("task #{id} is {}, not in the backlog", twd.task.status).into(),
-                );
-            }
-            let upd = TaskUpdate {
-                status: Some("open".to_string()),
-                ..TaskUpdate::default()
-            };
-            backend.update(id, &me, &upd).await?;
-            emit_ok(json, &format!("  Reopened task #{id} from the backlog"))?;
+            let task = backend.reopen(id, &me).await?;
+            emit_task_msg(json, &task, &format!("  Reopened task #{id}"))?;
         }
 
         TaskCmd::Update {
@@ -890,6 +887,34 @@ fn claim_progress(task: &Task, worktree: &str) -> ClaimProgress {
         ("open", false) => ClaimProgress::Lost("it was released".to_string()),
         (status, _) => ClaimProgress::Lost(format!("it is now {status}")),
     }
+}
+
+/// The fields `task review` records with the hand-off: the PR, when given, and the
+/// current git branch when the task has none yet (a detached HEAD has no branch).
+fn review_update(
+    task_branch: Option<&str>,
+    head_branch: Option<&str>,
+    pr: Option<String>,
+) -> TaskUpdate {
+    let branch = match (task_branch, head_branch) {
+        (None, Some(b)) if !b.is_empty() => Some(b.to_string()),
+        _ => None,
+    };
+    TaskUpdate {
+        branch,
+        pr_url: pr.filter(|p| !p.trim().is_empty()),
+        ..TaskUpdate::default()
+    }
+}
+
+/// The branch checked out in the current directory, or `None` (detached, or not a repo).
+fn current_branch() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["branch", "--show-current"])
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !name.is_empty()).then_some(name)
 }
 
 /// Why `task done` refuses inside an agent session: the agent's work goes to review,
@@ -1328,8 +1353,25 @@ mod tests {
             Cli::try_parse_from(["keitora", "task", "review", "7"])
                 .unwrap()
                 .cmd,
-            Cmd::Task(TaskCmd::Review { id: 7 })
+            Cmd::Task(TaskCmd::Review { id: 7, pr: None })
         ));
+        match Cli::try_parse_from([
+            "keitora",
+            "task",
+            "review",
+            "7",
+            "--pr",
+            "https://example.com/pr/1",
+        ])
+        .unwrap()
+        .cmd
+        {
+            Cmd::Task(TaskCmd::Review { id, pr }) => {
+                assert_eq!(id, 7);
+                assert_eq!(pr.as_deref(), Some("https://example.com/pr/1"));
+            }
+            _ => panic!("expected `task review --pr`"),
+        }
         assert!(matches!(
             Cli::try_parse_from(["keitora", "task", "done", "7"])
                 .unwrap()
@@ -1691,6 +1733,21 @@ mod tests {
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-01 00:00:00".into(),
         }
+    }
+
+    #[test]
+    fn review_records_the_pr_and_a_missing_branch() {
+        let upd = review_update(
+            None,
+            Some("feat/x"),
+            Some("https://example.com/pr/1".into()),
+        );
+        assert_eq!(upd.branch.as_deref(), Some("feat/x"));
+        assert_eq!(upd.pr_url.as_deref(), Some("https://example.com/pr/1"));
+        // A branch already on the task is kept; a blank --pr and a detached HEAD add nothing.
+        let upd = review_update(Some("feat/old"), Some("feat/x"), Some("  ".into()));
+        assert!(upd.is_empty(), "{upd:?}");
+        assert!(review_update(None, None, None).is_empty());
     }
 
     #[test]

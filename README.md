@@ -113,11 +113,11 @@ The command-line tool works with the same task list as the app, so you, or Claud
 from inside any worktree:
 
 ```sh
-keitora task list                  # open and in-progress tasks
-keitora task new "Fix pause menu"  # add a task
-keitora task claim <id>            # take a task for this worktree
-keitora task review <id>           # hand finished work over for review
-keitora task done <id>             # mark it done after review, and see what it unblocked
+keitora task list                   # open and in-progress tasks
+keitora task new "Fix pause menu"   # add a task
+keitora task claim <id>             # take a task for this worktree
+keitora task review <id> --pr <url> # hand finished work over for review
+keitora task done <id>              # mark it done after review, and see what it unblocked
 ```
 
 With the app running, a script can also dispatch and monitor work without the board:
@@ -134,8 +134,10 @@ app picks up requests for any project in its registry, active or not, and refuse
 picked up within ten minutes. Add `--until-claimed` to keep waiting, within `--wait`, until the
 agent in that worktree has claimed the task.
 
-An agent finishes with `task review`: the task keeps its worktree's lane on the board, showing its
-branch and PR, until a human marks it done there or with `task done`. Inside an agent session
+An agent finishes by pushing its branch, opening a PR and running `task review` with the PR's URL
+(the current branch is recorded too): the task keeps its worktree's lane on the board, showing its
+branch and PR, until a human marks it done there (card menu or Inspector) or with `task done`.
+`task reopen` brings a done task back to open. Inside an agent session
 `task done` refuses without `--force`, so a habit or an old prompt can't skip the review.
 
 If `keitora` isn't on your `PATH`, the app offers to install it for you.
@@ -155,8 +157,9 @@ worktrees = ["alpha", "bravo", "charlie"]
 
 [dispatch]
 # typed into a worktree's session when you hand it a task. Without steps, Keitora sends
-# a prompt that ends with `./keitora task review <id>`; custom steps should too
-# (e.g. "... then run ./keitora task review {task_id} and stop").
+# a prompt that has the agent push a branch, open a PR and end with
+# `./keitora task review <id> --pr <url>`; custom steps should too
+# (e.g. "... then run ./keitora task review {task_id} --pr <url> and stop").
 # Placeholders: {task_number} {task_id} {task_title} {task_description} {branch} {worktree}
 steps = ["/clear", "/workflow {task_number}"]
 ```

@@ -8,9 +8,11 @@ import { PRIORITY_PILL, STATUS_DOT, shortTime } from "../lib/taskStyles";
 import {
   claimTask,
   deleteTask,
-  doneTask,
   errorMessage,
+  finishActions,
   getTask,
+  markTaskDone,
+  reopenTask,
   type TaskDetail,
   unclaimTask,
   updateTask,
@@ -248,30 +250,31 @@ export function Inspector({
               Claim
             </button>
           )}
-          {task.status === "review" && actor !== null && (
+          {finishActions(task.status).markDone && (
             <button
-              title="Reviewed: move it to Done"
-              onClick={() => act(() => doneTask(task.id, actor))}
+              title="Move it to Done, whoever holds it"
+              onClick={() => act(() => markTaskDone(task.id))}
               className="flex-1 rounded-chip border border-accent bg-accent py-1.5 text-center text-[11.5px] font-semibold text-[var(--color-on-accent)]"
             >
               Mark done
             </button>
           )}
+          {finishActions(task.status).reopen && (
+            <button
+              title="Back to open, unassigned"
+              onClick={() => act(() => reopenTask(task.id))}
+              className="flex-1 rounded-chip border border-line bg-bg-3 py-1.5 text-center text-[11.5px] text-tx-1"
+            >
+              Reopen
+            </button>
+          )}
           {mine && actor !== null && (
-            <>
-              <button
-                onClick={() => act(() => doneTask(task.id, actor))}
-                className="flex-1 rounded-chip border border-accent bg-accent py-1.5 text-center text-[11.5px] font-semibold text-[var(--color-on-accent)]"
-              >
-                Done
-              </button>
-              <button
-                onClick={() => act(() => unclaimTask(task.id, actor))}
-                className="flex-1 rounded-chip border border-line bg-bg-3 py-1.5 text-center text-[11.5px] text-tx-1"
-              >
-                Unclaim
-              </button>
-            </>
+            <button
+              onClick={() => act(() => unclaimTask(task.id, actor))}
+              className="flex-1 rounded-chip border border-line bg-bg-3 py-1.5 text-center text-[11.5px] text-tx-1"
+            >
+              Unclaim
+            </button>
           )}
           <button
             onClick={() => setEditOpen(true)}

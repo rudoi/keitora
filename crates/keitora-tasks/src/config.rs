@@ -2619,21 +2619,24 @@ fn refresh_alias(src: &Path, bin_dir: &Path, dst: &Path) -> std::io::Result<()> 
         // A pre-existing `dst` is still usable even if we can't (re)create the dir.
         return if dst.is_file() { Ok(()) } else { Err(e) };
     }
+    sweep_set_aside_aliases(bin_dir);
     if !alias_needs_refresh(src, dst) {
         return Ok(());
     }
-    // Copy to a temp sibling then rename over `dst`, so a concurrent reader never sees a
+    // Copy to a temp sibling then swap it in, so a concurrent reader never sees a
     // half-written exe and a locked `dst` (a running `keitora.exe`) can't be corrupted.
     let tmp = bin_dir.join("keitora.exe.new");
-    match std::fs::copy(src, &tmp).and_then(|_| std::fs::rename(&tmp, dst)) {
-        Ok(_) => Ok(()),
+    match std::fs::copy(src, &tmp).and_then(|_| swap_in_alias(&tmp, dst, bin_dir)) {
+        Ok(()) => Ok(()),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
-            // Best-effort fallback: if a `dst` already exists we keep it
-            // rather than fail. Note this means an app UPGRADE while a `keitora.exe` is running
-            // (rename blocked) leaves the OLD copy in place until the next app restart
-            // refreshes it — acceptable for a CLI shim.
+            // Keep a present `dst` rather than fail, but say so: agents keep running
+            // the old build until it is replaced.
             if dst.is_file() {
+                log::warn!(
+                    "keitora CLI at {} was not updated and stays at an older build: {e}",
+                    dst.display()
+                );
                 Ok(())
             } else {
                 Err(e)
@@ -2642,14 +2645,82 @@ fn refresh_alias(src: &Path, bin_dir: &Path, dst: &Path) -> std::io::Result<()> 
     }
 }
 
+/// Prefix of a replaced `keitora.exe` moved aside by [`swap_in_alias`].
+#[cfg(windows)]
+const SET_ASIDE_ALIAS: &str = "keitora.exe.old-";
+
+/// Move `tmp` over `dst`. Windows can't replace or delete a running `keitora.exe` (a
+/// session hook, `task watch`), but it can rename one: after a few quick retries the
+/// locked file is moved aside (deleted by a later [`sweep_set_aside_aliases`], once it
+/// has exited) and `tmp` takes its place. On failure the old `dst` is put back.
+#[cfg(windows)]
+fn swap_in_alias(tmp: &Path, dst: &Path, bin_dir: &Path) -> std::io::Result<()> {
+    const TRIES: u32 = 3;
+    let mut last = None;
+    for attempt in 0..TRIES {
+        match std::fs::rename(tmp, dst) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+        if attempt + 1 < TRIES {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    let err = last.expect("at least one try");
+    if !dst.exists() {
+        return Err(err);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let aside = bin_dir.join(format!("{SET_ASIDE_ALIAS}{}-{stamp}", std::process::id()));
+    std::fs::rename(dst, &aside)?;
+    if let Err(e) = std::fs::rename(tmp, dst) {
+        let _ = std::fs::rename(&aside, dst);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Delete the `keitora.exe` copies [`swap_in_alias`] moved aside. One still running
+/// can't be deleted yet; it is left for a later start.
+#[cfg(windows)]
+fn sweep_set_aside_aliases(bin_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(bin_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(SET_ASIDE_ALIAS)
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Windows: the per-user `keitora.exe` copy the app puts first on agent panes' `PATH`
+/// (see [`windows_keitora_bin_dir`]), whether or not it exists yet.
+#[cfg(windows)]
+pub fn windows_keitora_alias_path() -> Option<PathBuf> {
+    Some(
+        dirs::data_local_dir()?
+            .join("keitora")
+            .join("bin")
+            .join("keitora.exe"),
+    )
+}
+
 /// The uncached body of [`windows_keitora_bin_dir`] — resolves the env-derived paths, then
 /// delegates the file work to [`refresh_alias`].
 #[cfg(windows)]
 fn ensure_windows_keitora_alias() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let src = pick_cli_source(exe.parent()?)?;
-    let bin_dir = dirs::data_local_dir()?.join("keitora").join("bin");
-    let dst = bin_dir.join("keitora.exe");
+    let dst = windows_keitora_alias_path()?;
+    let bin_dir = dst.parent()?.to_path_buf();
     match refresh_alias(&src, &bin_dir, &dst) {
         Ok(()) => Some(bin_dir),
         Err(e) => {
@@ -5598,6 +5669,46 @@ idle_shutdown_secs = 60
     }
 
     // The copy/refresh/fallback branches of the alias install.
+    /// The failure behind an upgrade leaving an old CLI: a running `keitora.exe` can't
+    /// be replaced. A running copy of a system exe stands in for it here.
+    #[cfg(windows)]
+    #[test]
+    fn refresh_alias_replaces_a_running_dst_and_sweeps_it_later() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let dst = bin.join("keitora.exe");
+        let system = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap();
+        std::fs::copy(system.join("System32").join("PING.EXE"), &dst).unwrap();
+        let mut running = std::process::Command::new(&dst)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let src = tmp.path().join("src.exe");
+        std::fs::write(&src, b"NEW BUILD").unwrap();
+
+        let result = refresh_alias(&src, &bin, &dst);
+        let aside = |bin: &Path| {
+            std::fs::read_dir(bin)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(SET_ASIDE_ALIAS))
+                .count()
+        };
+        let set_aside = aside(&bin);
+        let _ = running.kill();
+        let _ = running.wait();
+
+        result.unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"NEW BUILD");
+        assert_eq!(set_aside, 1, "the running copy was moved aside");
+        assert!(!bin.join("keitora.exe.new").exists());
+        // Once it has exited, the next refresh deletes it.
+        refresh_alias(&src, &bin, &dst).unwrap();
+        assert_eq!(aside(&bin), 0);
+    }
+
     #[cfg(windows)]
     #[test]
     fn refresh_alias_copies_when_missing_then_skips_when_fresh() {

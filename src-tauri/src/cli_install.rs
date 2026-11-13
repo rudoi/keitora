@@ -160,6 +160,86 @@ pub fn install_symlink(src: &Path, link: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Whether the `keitora` at `found` is an older build than the app's own CLI at
+/// `bundled`: a different file, modified earlier, whose bytes differ. The same file (a
+/// link to it), an identical copy or a newer build is fine. Unreadable files aren't
+/// judged stale. Compares builds rather than version strings, which dev builds share.
+pub fn is_older_build(found: &Path, bundled: &Path) -> bool {
+    if let (Ok(a), Ok(b)) = (std::fs::canonicalize(found), std::fs::canonicalize(bundled)) {
+        if a == b {
+            return false;
+        }
+    }
+    let (Ok(f), Ok(b)) = (std::fs::metadata(found), std::fs::metadata(bundled)) else {
+        return false;
+    };
+    let older = match (f.modified(), b.modified()) {
+        (Ok(fm), Ok(bm)) => fm < bm,
+        _ => false,
+    };
+    if !older {
+        return false;
+    }
+    let same = f.len() == b.len()
+        && matches!(
+            (std::fs::read(found), std::fs::read(bundled)),
+            (Ok(x), Ok(y)) if x == y
+        );
+    !same
+}
+
+/// The app's warning for `keitora` copies older than its own build.
+pub fn stale_cli_message(paths: &[String]) -> String {
+    format!(
+        "The keitora CLI at {} is an older build than this app, so agents and session \
+         hooks still run the old one. If a session is using it, close that session and \
+         restart Keitora to update it; otherwise replace or remove the old copy.",
+        paths.join(" and ")
+    )
+}
+
+#[cfg(test)]
+mod staleness_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn write_at(p: &Path, bytes: &[u8], age: Duration) {
+        std::fs::write(p, bytes).unwrap();
+        let f = std::fs::File::options().write(true).open(p).unwrap();
+        f.set_modified(SystemTime::now() - age).unwrap();
+    }
+
+    #[test]
+    fn an_older_different_build_is_stale_and_nothing_else_is() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bundled = tmp.path().join("bundled");
+        let found = tmp.path().join("found");
+        write_at(&bundled, b"new build", Duration::from_secs(10));
+
+        write_at(&found, b"old build", Duration::from_secs(3600));
+        assert!(is_older_build(&found, &bundled));
+        // Same bytes (a copy that kept an older timestamp): current.
+        write_at(&found, b"new build", Duration::from_secs(3600));
+        assert!(!is_older_build(&found, &bundled));
+        // A newer, different build (a local dev build): not older.
+        write_at(&found, b"dev build", Duration::from_secs(1));
+        assert!(!is_older_build(&found, &bundled));
+        // The bundled file itself, and a missing one, are never stale.
+        assert!(!is_older_build(&bundled, &bundled));
+        assert!(!is_older_build(&tmp.path().join("missing"), &bundled));
+    }
+
+    #[test]
+    fn stale_message_names_every_copy() {
+        let msg = stale_cli_message(&["C:/a/keitora.exe".into(), "C:/b/keitora.exe".into()]);
+        assert!(
+            msg.contains("C:/a/keitora.exe and C:/b/keitora.exe"),
+            "{msg}"
+        );
+        assert!(msg.contains("restart Keitora"), "{msg}");
+    }
+}
+
 // These exercise unix symlink install + exec-bit semantics (`0o755`, `:`-PATH);
 // the windows CLI-install path (D3) is cfg-stubbed and gets its own tests in
 // stage 050.
