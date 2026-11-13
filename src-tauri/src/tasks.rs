@@ -444,6 +444,26 @@ pub async fn task_update(id: i64, patch: TaskUpdate) -> Result<(), IpcError> {
         .map_err(|e| to_ipc_error(&e))
 }
 
+/// Make `id` blocked by `depends_on`. Rejects self-deps, cycles and duplicates.
+#[tauri::command]
+pub async fn task_add_dep(id: i64, depends_on: i64) -> Result<(), IpcError> {
+    let (backend, _) = open_backend().map_err(IpcError::internal)?;
+    backend
+        .add_dep(id, depends_on, &keitora_tasks::current_worktree())
+        .await
+        .map_err(|e| to_ipc_error(&e))
+}
+
+/// Drop the edge that makes `id` blocked by `depends_on`.
+#[tauri::command]
+pub async fn task_remove_dep(id: i64, depends_on: i64) -> Result<(), IpcError> {
+    let (backend, _) = open_backend().map_err(IpcError::internal)?;
+    backend
+        .remove_dep(id, depends_on, &keitora_tasks::current_worktree())
+        .await
+        .map_err(|e| to_ipc_error(&e))
+}
+
 #[tauri::command]
 pub async fn task_new(
     title: String,

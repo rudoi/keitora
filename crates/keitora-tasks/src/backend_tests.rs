@@ -42,6 +42,7 @@ pub async fn run_universal<B: TaskBackend>(b: &B) {
     test_claim_blocked_by_dep(b).await;
     test_unclaim_returns_to_open(b).await;
     test_update_persists_and_logs(b).await;
+    test_update_replaces_tags(b).await;
     test_set_done_reports_unblocked(b).await;
     test_set_review_keeps_the_assignee(b).await;
     test_newly_unblocked_by(b).await;
@@ -271,6 +272,40 @@ async fn test_update_persists_and_logs<B: TaskBackend>(b: &B) {
         logs.iter().any(|l| l.action == "updated"),
         "logs must contain an 'updated' entry after update"
     );
+}
+
+async fn test_update_replaces_tags<B: TaskBackend>(b: &B) {
+    let tags = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let task = b
+        .create("alice", "tagged", "", "high", &tags(&["x", "y"]), None)
+        .await
+        .expect("create");
+
+    let set_tags = |new: Vec<String>| TaskUpdate {
+        tags: Some(new),
+        ..Default::default()
+    };
+    b.update(task.id, "tester", &set_tags(tags(&["y", "z"])))
+        .await
+        .expect("update tags");
+    let got = b.get(task.id).await.expect("get").expect("Some");
+    let mut got_tags = got.task.tags.clone();
+    got_tags.sort();
+    assert_eq!(
+        got_tags,
+        tags(&["y", "z"]),
+        "update must replace the tag set"
+    );
+    assert_eq!(
+        got.task.priority, "high",
+        "a tags-only update leaves priority alone"
+    );
+
+    b.update(task.id, "tester", &set_tags(Vec::new()))
+        .await
+        .expect("clear tags");
+    let got = b.get(task.id).await.expect("get").expect("Some");
+    assert!(got.task.tags.is_empty(), "an empty tag set clears the tags");
 }
 
 async fn test_set_done_reports_unblocked<B: TaskBackend>(b: &B) {
