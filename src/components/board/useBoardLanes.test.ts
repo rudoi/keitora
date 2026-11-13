@@ -53,6 +53,16 @@ describe("buildLanes", () => {
     expect(wta.tasks[0].id).toBe(1);
   });
 
+  it("keeps a task in review in its worktree lane, after the active one", () => {
+    const tasks = [task(3, "open", "wt-a"), task(2, "review", "wt-a"), task(1, "active", "wt-a")];
+    const lanes = buildLanes(tasks, ["wt-a"], noSessions);
+    // biome-ignore lint/style/noNonNullAssertion: test asserts presence of expected lane; find result guaranteed non-null by test setup
+    const wta = lanes.find((l) => l.key === "wt-a")!;
+    expect(wta.tasks.map((t) => t.id)).toEqual([1, 2, 3]);
+    // biome-ignore lint/style/noNonNullAssertion: test asserts presence of expected lane; find result guaranteed non-null by test setup
+    expect(lanes.find((l) => l.key === "done")!.tasks).toHaveLength(0);
+  });
+
   it("routes a task assigned to an unknown worktree to Unassigned", () => {
     const tasks = [task(1, "open", "wt-unknown")];
     const lanes = buildLanes(tasks, ["wt-a"], noSessions);

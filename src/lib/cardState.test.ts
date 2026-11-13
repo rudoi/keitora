@@ -74,6 +74,20 @@ describe("laneHold", () => {
       taskId: 3,
     });
   });
+
+  it("lets a card in review sit on the lane without holding it", () => {
+    expect(laneHold([task(6, "review", "a")], "a", "idle", new Set())).toBeNull();
+  });
+});
+
+describe("cardStates in review", () => {
+  it("shows a card in review as review on its worktree, not active or pending", () => {
+    const tasks = [task(6, "review", "a"), task(7, "open", "a")];
+    const states = cardStates(tasks, [], ["a"], sessions({ a: "idle" }), [], []);
+    expect(states.get(6)).toEqual({ kind: "review", worktree: "a" });
+    // The lane is free, so the next card is up next rather than held behind it.
+    expect(states.get(7)).toMatchObject({ kind: "pending", reason: "pending: next on @a" });
+  });
 });
 
 describe("pendingReason", () => {

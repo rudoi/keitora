@@ -361,16 +361,27 @@ pub trait TaskBackend: Send + Sync {
     /// Returns `NotFound` if no task with `id` exists.
     async fn unclaim(&self, id: i64, actor: &str) -> BackendResult<()>;
 
-    /// Mark `id` done. `actor` must be the current assignee.
+    /// Mark `id` done. `actor` must be the current assignee, unless the task is in
+    /// `'review'`: then anyone may (the human who reviewed it is usually elsewhere).
     ///
     /// Idempotent: already `'done'` → **success, not `Conflict`** (safe to retry).
     ///
     /// Returns `DoneOutcome { task, unblocked }` where `unblocked` is the (best-effort,
     /// observational) list of task IDs that became unblocked by this completion.
     ///
-    /// Returns `Conflict` if `id` is not assigned to `actor`.
+    /// Returns `Conflict` if `id` is not in review and not assigned to `actor`.
     /// Returns `NotFound` if no task with `id` exists.
     async fn set_done(&self, id: i64, actor: &str) -> BackendResult<DoneOutcome>;
+
+    /// Hand `id` over for review: its assignee finished, and a human marks it done.
+    /// `actor` must be the current assignee; the task keeps its assignee, so it stays
+    /// in that worktree's lane. Re-claiming it makes it `'active'` again.
+    ///
+    /// Idempotent: already `'review'` → success.
+    ///
+    /// Returns `Conflict` if `id` is not assigned to `actor` or is not `'active'`.
+    /// Returns `NotFound` if no task with `id` exists.
+    async fn set_review(&self, id: i64, actor: &str) -> BackendResult<Task>;
 
     /// IDs of tasks that became newly unblocked because `id` is now done: tasks that
     /// depend on `id`, are still `'open'`, and whose every *other* dependency is also

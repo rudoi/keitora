@@ -60,19 +60,14 @@ pub(crate) fn open_conn(db_path: &str) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// Create the full schema if absent. Shared by both [`SqliteBackend::open`] and
-/// `LocalStore::open` so each handle sees every table when pointed at the same DB
-/// file (WAL-safe concurrent opens). The DDL is `CREATE … IF NOT EXISTS`, so
-/// running it from both opens is idempotent.
-pub(crate) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS tasks (
+/// The `tasks` table's columns, shared by its create and by
+/// [`upgrade_tasks_status_check`]'s rebuild.
+const TASKS_COLUMNS: &str = "
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           title TEXT NOT NULL,
           description TEXT NOT NULL DEFAULT '',
           status TEXT NOT NULL DEFAULT 'open'
-            CHECK(status IN ('open', 'active', 'backlog', 'done', 'cancelled')),
+            CHECK(status IN ('open', 'active', 'review', 'backlog', 'done', 'cancelled')),
           priority TEXT NOT NULL DEFAULT 'normal'
             CHECK(priority IN ('low', 'normal', 'high', 'urgent')),
           assigned_to TEXT DEFAULT NULL,
@@ -82,7 +77,80 @@ pub(crate) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
           pr_url TEXT DEFAULT NULL,
           created_at TEXT NOT NULL DEFAULT (datetime('now')),
           updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
+";
+
+/// The columns [`upgrade_tasks_status_check`] copies.
+const TASKS_COLUMN_NAMES: &str = "id, title, description, status, priority, assigned_to, \
+     created_by, tags, branch, pr_url, created_at, updated_at";
+
+/// Rebuild a `tasks` table created before the `review` status existed: its
+/// `CHECK(status IN …)` rejects `review`, and SQLite can't alter a CHECK. The rows are
+/// copied into a table with the current columns, which replaces the old one; the
+/// indexes and the `updated_at` trigger dropped with it are recreated by the
+/// `IF NOT EXISTS` DDL that follows in [`init_schema`]. Foreign keys are off for the
+/// swap so dropping the old table doesn't cascade into `task_deps` / `task_log`, and
+/// the AUTOINCREMENT counter is carried over so a deleted task's id is never reused.
+/// Several processes open the same DB, so the check is repeated under the write lock.
+fn upgrade_tasks_status_check(conn: &Connection) -> rusqlite::Result<()> {
+    fn needed(conn: &Connection) -> rusqlite::Result<bool> {
+        let sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(sql.is_some_and(|s| !s.contains("'review'")))
+    }
+    if !needed(conn)? {
+        return Ok(());
+    }
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let rebuild = || -> rusqlite::Result<()> {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        if !needed(conn)? {
+            return conn.execute_batch("COMMIT;");
+        }
+        let seq: Option<i64> = conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'tasks'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        conn.execute_batch(&format!(
+            "CREATE TABLE tasks_new ({TASKS_COLUMNS});
+             INSERT INTO tasks_new ({TASKS_COLUMN_NAMES}) SELECT {TASKS_COLUMN_NAMES} FROM tasks;
+             DROP TABLE tasks;
+             ALTER TABLE tasks_new RENAME TO tasks;"
+        ))?;
+        if let Some(seq) = seq {
+            conn.execute(
+                "UPDATE sqlite_sequence SET seq = MAX(seq, ?1) WHERE name = 'tasks'",
+                params![seq],
+            )?;
+        }
+        conn.execute_batch("COMMIT;")
+    };
+    let result = rebuild();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    result
+}
+
+/// Create the full schema if absent. Shared by both [`SqliteBackend::open`] and
+/// `LocalStore::open` so each handle sees every table when pointed at the same DB
+/// file (WAL-safe concurrent opens). The DDL is `CREATE … IF NOT EXISTS`, so
+/// running it from both opens is idempotent.
+pub(crate) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS tasks ({TASKS_COLUMNS});"
+    ))?;
+    upgrade_tasks_status_check(conn)?;
+    conn.execute_batch(
+        r#"
         CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
         CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(assigned_to);
         CREATE INDEX IF NOT EXISTS idx_tasks_status_assigned ON tasks(status, assigned_to);
@@ -569,7 +637,7 @@ impl SqliteBackend {
         let conn = self.lock()?;
         let changed = conn
             .execute(
-                "UPDATE tasks SET status = 'done' WHERE id = ?1 AND assigned_to = ?2",
+                "UPDATE tasks SET status = 'done'                  WHERE id = ?1 AND (assigned_to = ?2 OR status = 'review')",
                 params![id, actor],
             )
             .map_err(map_sqlite)?;
@@ -594,6 +662,34 @@ impl SqliteBackend {
 
         let task = Self::require_locked(&conn, id)?;
         Ok(DoneOutcome { task, unblocked })
+    }
+
+    pub(crate) fn set_review_blocking(&self, id: i64, actor: &str) -> BackendResult<Task> {
+        let conn = self.lock()?;
+        let changed = conn
+            .execute(
+                "UPDATE tasks SET status = 'review'                  WHERE id = ?1 AND assigned_to = ?2 AND status = 'active'",
+                params![id, actor],
+            )
+            .map_err(map_sqlite)?;
+        if changed == 0 {
+            let task = Self::require_locked(&conn, id)?;
+            if task.assigned_to.as_deref() != Some(actor) {
+                let owner = task.assigned_to.as_deref().unwrap_or("nobody");
+                return Err(BackendError::Conflict(format!(
+                    "task #{id} is not assigned to @{actor} (assigned to @{owner})"
+                )));
+            }
+            if task.status == "review" {
+                return Ok(task);
+            }
+            return Err(BackendError::Conflict(format!(
+                "task #{id} is {}, not active",
+                task.status
+            )));
+        }
+        Self::log_locked(&conn, id, actor, "status_changed", "review")?;
+        Self::require_locked(&conn, id)
     }
 
     /// IDs of tasks newly unblocked by `id` becoming done: dependents that are still
@@ -1097,6 +1193,10 @@ impl TaskBackend for SqliteBackend {
         self.set_done_blocking(id, actor)
     }
 
+    async fn set_review(&self, id: i64, actor: &str) -> BackendResult<Task> {
+        self.set_review_blocking(id, actor)
+    }
+
     // Override the default (read-derived) impl with the targeted indexed query.
     async fn newly_unblocked_by(&self, id: i64) -> BackendResult<Vec<i64>> {
         self.newly_unblocked_by_blocking(id)
@@ -1337,6 +1437,138 @@ mod tests {
         let outcome = b.set_done(task.id, "alice").await.unwrap();
         assert_eq!(outcome.task.status, "done");
         assert!(outcome.unblocked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_keeps_the_assignee_and_only_then_lets_anyone_finish() {
+        let db = TempDb::new();
+        let b = db.open();
+        let task = b
+            .create("alice", "work", "", "normal", &[], None)
+            .await
+            .unwrap();
+        // Only an active task can go to review.
+        assert!(matches!(
+            b.set_review(task.id, "alpha").await,
+            Err(BackendError::Conflict(_))
+        ));
+        b.claim(task.id, "alpha").await.unwrap();
+        // Not the assignee: refused, and so is finishing it from elsewhere while active.
+        assert!(matches!(
+            b.set_review(task.id, "bravo").await,
+            Err(BackendError::Conflict(_))
+        ));
+        assert!(matches!(
+            b.set_done(task.id, "main").await,
+            Err(BackendError::Conflict(_))
+        ));
+
+        let reviewed = b.set_review(task.id, "alpha").await.unwrap();
+        assert_eq!(reviewed.status, "review");
+        assert_eq!(reviewed.assigned_to.as_deref(), Some("alpha"));
+        // Idempotent.
+        assert_eq!(
+            b.set_review(task.id, "alpha").await.unwrap().status,
+            "review"
+        );
+        let logs = b.logs(task.id, 10).await.unwrap();
+        assert!(logs
+            .iter()
+            .any(|l| l.action == "status_changed" && l.detail == "review"));
+
+        // In review, a human anywhere can mark it done.
+        let done = b.set_done(task.id, "main").await.unwrap();
+        assert_eq!(done.task.status, "done");
+        assert_eq!(done.task.assigned_to.as_deref(), Some("alpha"));
+    }
+
+    #[tokio::test]
+    async fn reclaiming_a_task_in_review_makes_it_active_again() {
+        let db = TempDb::new();
+        let b = db.open();
+        let task = b
+            .create("alice", "work", "", "normal", &[], None)
+            .await
+            .unwrap();
+        b.claim(task.id, "alpha").await.unwrap();
+        b.set_review(task.id, "alpha").await.unwrap();
+        assert!(matches!(
+            b.claim(task.id, "bravo").await,
+            Err(BackendError::Conflict(_))
+        ));
+        let again = b.claim(task.id, "alpha").await.unwrap().task();
+        assert_eq!(again.status, "active");
+    }
+
+    /// A DB created before `review` existed is rebuilt on open: rows, ids, deps, logs
+    /// and the id counter survive, and `review` is then accepted.
+    #[tokio::test]
+    async fn opening_an_old_db_upgrades_its_status_check() {
+        let db = TempDb::new();
+        {
+            let conn = Connection::open(&db.path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tasks (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   title TEXT NOT NULL,
+                   description TEXT NOT NULL DEFAULT '',
+                   status TEXT NOT NULL DEFAULT 'open'
+                     CHECK(status IN ('open', 'active', 'backlog', 'done', 'cancelled')),
+                   priority TEXT NOT NULL DEFAULT 'normal'
+                     CHECK(priority IN ('low', 'normal', 'high', 'urgent')),
+                   assigned_to TEXT DEFAULT NULL,
+                   created_by TEXT DEFAULT NULL,
+                   tags TEXT NOT NULL DEFAULT '[]',
+                   branch TEXT DEFAULT NULL,
+                   pr_url TEXT DEFAULT NULL,
+                   created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 CREATE TABLE task_deps (
+                   task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                   depends_on INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                   PRIMARY KEY (task_id, depends_on)
+                 );
+                 CREATE TABLE task_log (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                   worktree TEXT NOT NULL,
+                   action TEXT NOT NULL,
+                   detail TEXT NOT NULL DEFAULT '',
+                   created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 INSERT INTO tasks (title, status, assigned_to, branch) VALUES
+                   ('a', 'active', 'alpha', 'feat/a'), ('b', 'open', NULL, NULL),
+                   ('gone', 'open', NULL, NULL);
+                 DELETE FROM tasks WHERE id = 3;
+                 INSERT INTO task_deps (task_id, depends_on) VALUES (2, 1);
+                 INSERT INTO task_log (task_id, worktree, action) VALUES (1, 'alpha', 'claimed');",
+            )
+            .unwrap();
+        }
+        let b = db.open();
+        let a = b.require(1).await.unwrap();
+        assert_eq!(
+            (
+                a.status.as_str(),
+                a.assigned_to.as_deref(),
+                a.branch.as_deref()
+            ),
+            ("active", Some("alpha"), Some("feat/a"))
+        );
+        assert_eq!(b.blocked_by(2).await.unwrap(), vec![1]);
+        assert_eq!(b.logs(1, 10).await.unwrap().len(), 1);
+        assert_eq!(b.set_review(1, "alpha").await.unwrap().status, "review");
+        // The deleted id 3 is not handed out again.
+        let next = b
+            .create("alice", "c", "", "normal", &[], None)
+            .await
+            .unwrap();
+        assert_eq!(next.id, 4);
+        // The rebuilt table's trigger still stamps updates, and reopening is a no-op.
+        drop(b);
+        let b = db.open();
+        assert_eq!(b.require(1).await.unwrap().status, "review");
     }
 
     #[tokio::test]

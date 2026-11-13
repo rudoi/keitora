@@ -14,7 +14,7 @@ function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   return getTransport().invoke<T>(cmd, args);
 }
 
-export type TaskStatus = "open" | "active" | "backlog" | "done" | "cancelled";
+export type TaskStatus = "open" | "active" | "review" | "backlog" | "done" | "cancelled";
 export type Priority = "low" | "normal" | "high" | "urgent";
 
 export interface Task {

@@ -3,7 +3,7 @@
 // do: a worktree lane is the queue; its front *pending* card (open, assigned, not yet
 // sent, not blocked — highest priority, then lowest id) is typed into the session
 // only when the lane is free (live and idle, nothing active, nothing sent and
-// waiting for its claim).
+// waiting for its claim). A card in review stays on its lane but doesn't hold it.
 
 import type { DispatchFailure, Reservation } from "./dispatch";
 import type { WorktreeSession } from "./sessions";
@@ -25,6 +25,7 @@ export type CardState =
   | { kind: "pending"; worktree: string; reason: string; failure: string | null }
   | { kind: "sent"; worktree: string }
   | { kind: "active"; worktree: string | null }
+  | { kind: "review"; worktree: string | null }
   | { kind: "blocked"; by: number[] }
   | { kind: "done" };
 
@@ -121,6 +122,8 @@ export function cardStates(
       out.set(t.id, { kind: "backlog" });
     } else if (t.status === "active") {
       out.set(t.id, { kind: "active", worktree: t.assigned_to });
+    } else if (t.status === "review") {
+      out.set(t.id, { kind: "review", worktree: t.assigned_to });
     } else if (t.blocked_by.length > 0) {
       out.set(t.id, { kind: "blocked", by: t.blocked_by });
     } else if (t.assigned_to && lanes.has(t.assigned_to)) {

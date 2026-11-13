@@ -59,6 +59,11 @@ export function judgeLane(card: TaskWithDeps, lane: LaneRef, ctx: LaneContext): 
   if (card.blocked_by.length > 0) {
     return invalid(`#${id} is blocked by ${card.blocked_by.map((b) => `#${b}`).join(", ")}`);
   }
+  if (card.status === "review") {
+    return invalid(
+      `#${id} is in review on @${card.assigned_to ?? "someone"}; mark it done once reviewed`,
+    );
+  }
   if (card.status === "active") {
     return invalid(
       card.assigned_to === lane.key

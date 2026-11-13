@@ -746,7 +746,9 @@ fn pane_xdg_env_for(
 /// started by an older Keitora with a minimal `PATH` still gives new panes a good
 /// one. Windows: the base is the process `PATH` and `herdr_path` is ignored.
 ///
-/// Wired into `HerdrBackend::spawn_agent`.
+/// The agent launches use [`pane_env_with`], adding [`agent_marker`] and any
+/// launch-specific variables.
+#[cfg(test)]
 pub fn pane_env(
     exe: &str,
     original: &OriginalXdg,
@@ -755,7 +757,15 @@ pub fn pane_env(
     pane_env_with(exe, original, herdr_path, &[])
 }
 
-/// [`pane_env`] with `extra` variables appended last.
+/// The variable marking a pane as an agent's ([`keitora_tasks::AGENT_ENV`]): the
+/// `keitora` CLI reads it to keep agents from marking tasks done. Agent panes only;
+/// a plain shell pane is the user's.
+pub fn agent_marker() -> (String, String) {
+    (keitora_tasks::AGENT_ENV.to_string(), "1".to_string())
+}
+
+/// [`pane_env`] with `extra` variables appended last. Wired into
+/// `HerdrBackend::spawn_agent` and the strict transfer launch.
 pub fn pane_env_with(
     exe: &str,
     original: &OriginalXdg,

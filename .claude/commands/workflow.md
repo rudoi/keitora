@@ -49,8 +49,10 @@ When unsure whether a sub-agent task is "complex" or "scaffold," default to `son
 4. Read the matching `docs/build-plan.md` section; flag any gaps or conflicts with the documented design.
 
 ## Post-workflow protocol
-After finalizing: `./keitora task update <id> --branch <branch>` then `./keitora task done <id>` (report newly-unblocked
-tasks); update `docs/build-plan.md` phase status; update any design notes the implementation changed.
+After finalizing: `./keitora task update <id> --branch <branch>` (and `--pr <url>` once a PR exists) then
+`./keitora task review <id>`, so the task waits in its lane for a human. Agents don't run `task done`; a human does after
+review (or the merge step below, once the human has approved the merge). Update `docs/build-plan.md` phase status; update
+any design notes the implementation changed.
 
 ---
 
@@ -198,7 +200,8 @@ write the final conventional commit (`{type}({scope}): {desc}`, ending with the
 `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>` trailer). Then
 `git push --force-with-lease` and `gh pr merge {pr} --rebase --delete-branch`. Pull `main` forward locally
 (`git checkout main && git fetch && git reset --hard origin/main`).
-Then post-workflow protocol: `./keitora task update <id> --branch <branch>`, `./keitora task done <id>`, update
+Then post-workflow protocol: `./keitora task update <id> --branch <branch>`, then `./keitora task done <id> --force`
+(the human approved this merge at the gate, so it is theirs to finish; report newly-unblocked tasks), update
 `docs/build-plan.md` phase status. **Exit:** merged; state → `complete` (delete the state file).
 
 ---

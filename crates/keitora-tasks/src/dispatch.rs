@@ -99,7 +99,7 @@ pub fn already_dispatched(
 /// Pure: why `task` can't be dispatched onto `worktree`, judged from the task alone,
 /// or `None` when it can. The task-side half of the board's lane rule (`decideLane`):
 /// terminal and blocked cards are refused, and so is anything `assign` would reject
-/// (backlog, active, reserved to another worktree), worded so a CLI caller knows what
+/// (backlog, active, in review, reserved to another worktree), worded so a CLI caller knows what
 /// to do. A task already reserved to `worktree` passes: re-dispatching it there sends
 /// a card queued on that lane once the session is idle, and an already-sent one no-ops.
 pub fn task_refusal(task: &TaskWithDeps, worktree: &str) -> Option<String> {
@@ -115,6 +115,12 @@ pub fn task_refusal(task: &TaskWithDeps, worktree: &str) -> Option<String> {
         "active" => {
             let who = t.assigned_to.as_deref().unwrap_or("someone");
             return Some(format!("task #{id} is already active on @{who}"));
+        }
+        "review" => {
+            let who = t.assigned_to.as_deref().unwrap_or("someone");
+            return Some(format!(
+                "task #{id} is in review on @{who}; mark it done once reviewed"
+            ));
         }
         _ => {}
     }
@@ -480,6 +486,10 @@ mod tests {
             "task #19 is already active on @bravo"
         );
         assert_eq!(
+            refuse(card("review", Some("alpha"), vec![])),
+            "task #19 is in review on @alpha; mark it done once reviewed"
+        );
+        assert_eq!(
             refuse(card("open", None, vec![3, 4])),
             "task #19 is blocked by #3, #4"
         );
@@ -553,6 +563,12 @@ mod tests {
         // Another lane's active task doesn't hold this one.
         let other = vec![lane_card(6, "active", Some("bravo"), "normal")];
         assert_eq!(lane_hold(&other, "alpha", "idle", &none), None);
+        // A card in review stays on the lane but doesn't hold it: the agent is done.
+        let reviewing = vec![
+            lane_card(3, "open", Some("alpha"), "normal"),
+            lane_card(6, "review", Some("alpha"), "normal"),
+        ];
+        assert_eq!(lane_hold(&reviewing, "alpha", "idle", &none), None);
     }
 
     #[test]
