@@ -229,11 +229,6 @@ function AppInner() {
   const registerToggleBacklog = useCallback((fn: () => void) => {
     toggleBacklogRef.current = fn;
   }, []);
-  // And Shift+D: auto-dispatch the selected card (its Dispatch button).
-  const autoDispatchRef = useRef<() => void>(() => {});
-  const registerAutoDispatch = useCallback((fn: () => void) => {
-    autoDispatchRef.current = fn;
-  }, []);
 
   // Per-worktree restart signal: the Rail's "Restart session" context-menu item
   // (and a completed CLI transfer) bumps the entry keyed
@@ -982,7 +977,6 @@ function AppInner() {
       setSelected,
       openCardMenu: () => openCardMenuRef.current(),
       toggleCardBacklog: () => toggleBacklogRef.current(),
-      autoDispatchCard: () => autoDispatchRef.current(),
       adjustFontSize,
       resetFontSize,
       projectNames,
@@ -1268,7 +1262,6 @@ function AppInner() {
                 reload={reloadTasks}
                 registerOpenCardMenu={registerOpenCardMenu}
                 registerToggleBacklog={registerToggleBacklog}
-                registerAutoDispatch={registerAutoDispatch}
                 dispatched={dispatched ?? []}
               />
             </div>

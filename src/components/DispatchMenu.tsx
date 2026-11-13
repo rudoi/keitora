@@ -1,10 +1,11 @@
 // Per-card "Dispatch to…" menu — the keyboard-first parity path for drag-to-
 // dispatch (proposal §4.3). A Radix DropdownMenu opened by a caret on the card
-// header (hover/focus-visible) or by `D` when the card is selected (the parent
-// drives `open`). Order: Dispatch (auto-pick) first (also Shift+D, without the menu);
+// header (hover/focus-visible) or by `d` when the card is selected (the parent
+// drives `open`). Order: Dispatch (auto-pick) first (`d` again in the open menu, so `d, d`);
 // then the pool worktrees (→ send now, accent; → pending, dim) — worktrees outside
 // the dispatch pool never appear; then Mark done (active and review cards), Release,
-// and Move to backlog / Reopen. A done or cancelled card's menu offers only Reopen.
+// and Move to backlog / Reopen (`b`, so `d, b`). A done or cancelled card's menu
+// offers only Reopen.
 
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { ChevronDown } from "lucide-react";
@@ -23,6 +24,25 @@ export const isolateFromCard = {
   onPointerDown: (e: { stopPropagation: () => void }) => e.stopPropagation(),
   onClick: (e: { stopPropagation: () => void }) => e.stopPropagation(),
 };
+
+/** The menu item a bare letter key picks while the menu is open: `d` the auto-pick
+ *  Dispatch, `b` Move to backlog / Reopen from backlog. Null when the key is not a
+ *  shortcut or its item is not on offer. Exported for tests. */
+export function menuShortcut(
+  e: {
+    key: string;
+    ctrlKey: boolean;
+    metaKey: boolean;
+    altKey: boolean;
+    shiftKey: boolean;
+  },
+  offers: { autoDispatch: boolean; backlog: boolean },
+): "autoDispatch" | "backlog" | null {
+  if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return null;
+  if (e.key === "d" && offers.autoDispatch) return "autoDispatch";
+  if (e.key === "b" && offers.backlog) return "backlog";
+  return null;
+}
 
 export function DispatchMenu({
   card,
@@ -74,6 +94,23 @@ export function DispatchMenu({
         .sort((a, b) => STATE_ORDER[a.state] - STATE_ORDER[b.state])
     : [];
 
+  const offersAutoDispatch = !finished && dispatchable && pool.size > 0;
+  const offersBacklog = !finished && (backlog || !inLane);
+  const onContentKeyDown = (e: React.KeyboardEvent) => {
+    isolateFromCard.onKeyDown(e);
+    const pick = menuShortcut(e, {
+      autoDispatch: offersAutoDispatch,
+      backlog: offersBacklog,
+    });
+    if (!pick) return;
+    // preventDefault also skips Radix's typeahead for the letter.
+    e.preventDefault();
+    onOpenChange(false);
+    if (pick === "autoDispatch") onAutoDispatch();
+    else if (backlog) onReopen();
+    else onBacklog();
+  };
+
   const itemCls =
     "flex cursor-pointer items-center gap-2 rounded-chip px-2 py-1.5 text-[11.5px] outline-none data-[highlighted]:bg-bg-3 data-[disabled]:cursor-not-allowed data-[disabled]:opacity-45";
 
@@ -94,6 +131,7 @@ export function DispatchMenu({
           align="end"
           sideOffset={4}
           {...isolateFromCard}
+          onKeyDown={onContentKeyDown}
           className="z-50 min-w-[200px] rounded-card border border-line bg-bg-2 p-1 shadow-[0_8px_24px_rgba(0,0,0,.45)]"
         >
           {finished ? (
@@ -118,14 +156,14 @@ export function DispatchMenu({
                 </div>
               )}
 
-              {dispatchable && pool.size > 0 && (
+              {offersAutoDispatch && (
                 <DropdownMenu.Item
                   onSelect={() => onAutoDispatch()}
                   className={`${itemCls} font-semibold text-accent-text`}
                 >
                   <span className="h-1.5 w-1.5 flex-none rounded-full bg-accent" />
                   <span>Dispatch</span>
-                  <span className="ml-auto text-[10px] font-normal text-tx-3">auto-pick · ⇧D</span>
+                  <span className="ml-auto text-[10px] font-normal text-tx-3">auto-pick · d</span>
                 </DropdownMenu.Item>
               )}
 
