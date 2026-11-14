@@ -58,6 +58,7 @@ import {
   type Status,
 } from "../lib/paneStatus";
 import { isWindows } from "../lib/platform";
+import { chromeStart, stripPromptChrome } from "../lib/promptChrome";
 import { paneRecoveryState, recoveryItem, recoveryPaneMessage } from "../lib/recovery";
 import {
   dimLine,
@@ -65,7 +66,22 @@ import {
   resumeNoticeLine,
   terminateConfirmCopy,
 } from "../lib/resumeNotice";
-import { copyEol, rectSelectionAfterPress, selectionToText } from "../lib/selectionText";
+import {
+  alignShift,
+  boundaryAt,
+  type CellPoint,
+  copyEol,
+  type RowSnapshot,
+  rangeBetween,
+  rectSelectionAfterPress,
+  rowsToText,
+  type SelectionRange,
+  sameSelection,
+  selectionLength,
+  selectionToText,
+  shiftSelection,
+  snapshotRow,
+} from "../lib/selectionText";
 import {
   accumulateWheelLines,
   type Cell,
@@ -123,6 +139,9 @@ function blobToBase64(blob: Blob): Promise<string> {
     reader.readAsDataURL(blob);
   });
 }
+
+/** How long after a scroll its repaints are lined up to move the selection with the text. */
+const SELECTION_FOLLOW_MS = 1000;
 
 /** The history view while no terminal is wired up: does nothing. */
 const IDLE_HISTORY_VIEW: HistoryView = {
@@ -1045,15 +1064,22 @@ export function TerminalPane({
 
     // The selection as text to copy. Soft-wrapped rows are rejoined from the buffer (herdr's
     // frames carry no wrap marks); a rectangle has no wrap meaning, so it keeps xterm's own.
-    const copyText = (): string =>
-      altRectRef.current
-        ? term.getSelection()
-        : selectionToText(
-            term.buffer.active,
-            term.cols,
-            term.getSelectionPosition(),
-            copyEol(isWindows),
-          );
+    //
+    // A selection that has scrolled partly off screen (see the selection follow below) is
+    // copied whole from the rows kept as they scrolled past.
+    // Either way, a CLI prompt box caught in the selection is cut out (stripPromptChrome).
+    const copyText = (): string => {
+      if (altRectRef.current) return term.getSelection();
+      const eol = copyEol(isWindows);
+      const f = follow;
+      const text =
+        f &&
+        sameSelection(term.getSelectionPosition(), f.shown) &&
+        (f.range.start.y < 0 || f.range.end.y >= term.rows)
+          ? rowsToText((y) => f.kept.get(y), term.cols, f.range, eol)
+          : selectionToText(term.buffer.active, term.cols, term.getSelectionPosition(), eol);
+      return stripPromptChrome(text, eol);
+    };
 
     term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
       // We only ever act on keydown; let xterm handle keypress/keyup unchanged.
@@ -1237,6 +1263,7 @@ export function TerminalPane({
       if (!batch || termRef.current !== term || inputBlocked(statusRef.current)) return;
       if (wheelDebug) console.log("[keitora wheel] ptyScroll", batch);
       const { direction, source, lines, column, row } = batch;
+      noteSelectionScroll(direction, lines);
       ptyScroll(projectName, name, direction, source, lines, column, row).catch((err) => {
         // Expected while herdr recovers; the next tick tries again.
         if (wheelDebug) console.debug("[keitora wheel] ptyScroll failed", err);
@@ -1244,6 +1271,212 @@ export function TerminalPane({
       // Once the burst settles, ask whether the viewport ended up in history.
       liveTail.noteScroll(direction);
     }
+
+    // A selection follows the text it covers. xterm keeps no scrollback here and only
+    // paints the viewport herdr (or the app) sends, so a scroll would otherwise leave the
+    // highlight on the same cells while other text moves under it, and copy would take
+    // that other text. A scroll only queues on the backend, so neither its reply nor the
+    // scroll offset says when or how far the content moved; the screen does. The rows on
+    // screen are kept when a scroll goes out with something selected, and each repaint
+    // that follows is lined up against them (alignShift). The selection moves by the
+    // shift found, and is tracked beyond the screen's edges so it comes back when the
+    // text scrolls back into view. A rectangle cannot be re-made through select(), so a
+    // scroll clears one instead.
+    //
+    // Scrolling mid-drag extends the selection, as in other terminals: the point the drag
+    // started at moves with its text while the other end stays under the pointer. xterm's
+    // own drag would put its start back on the next mouse move, so once the start has
+    // moved, the selection is re-made from the two points on every move until release.
+    let follow: {
+      /** The selection, unclipped: rows may lie above or below the screen. */
+      range: SelectionRange;
+      /** What was last shown on screen (undefined: all of it was off screen). */
+      shown: SelectionRange | undefined;
+      /** The screen's rows as of the last alignment. */
+      rows: string[];
+      /**
+       * Every row the selection has had on screen, keyed by where it is now (negative:
+       * above the screen), so copy can still take the rows that scrolled off.
+       */
+      kept: Map<number, RowSnapshot>;
+      /** Lines scrolled since then (positive: content expected to move down). */
+      expected: number;
+      /** Repaints until here count as the scroll's; later ones are the app's own. */
+      until: number;
+    } | null = null;
+    let followRaf: number | null = null;
+    /** A plain left-button drag in progress: where it started, and where the pointer is. */
+    let drag: { anchor: CellPoint; pointer: CellPoint; moved: boolean } | null = null;
+    let dragRaf: number | null = null;
+
+    // The screen's rows as text, with the CLI's prompt box and everything below it
+    // blanked: that chrome stays put while the transcript scrolls, so it is neither lined
+    // up (alignShift skips blank rows) nor kept as scrolled text.
+    function screenRows(): string[] {
+      const buf = term.buffer.active;
+      const rows: string[] = [];
+      for (let y = 0; y < term.rows; y++) {
+        rows.push(buf.getLine(buf.viewportY + y)?.translateToString(true) ?? "");
+      }
+      return rows.fill("", chromeStart(rows));
+    }
+
+    // Record the rows now on screen into `kept`, replacing what was kept at those places.
+    // Rows from the prompt box down are left as kept before: they are fixed chrome.
+    function keepScreen(kept: Map<number, RowSnapshot>) {
+      const buf = term.buffer.active;
+      const rows: string[] = [];
+      for (let y = 0; y < term.rows; y++) {
+        rows.push(buf.getLine(buf.viewportY + y)?.translateToString(true) ?? "");
+      }
+      const end = chromeStart(rows);
+      for (let y = 0; y < end; y++) {
+        kept.set(y, snapshotRow(buf, buf.viewportY + y, term.cols));
+      }
+    }
+
+    // Re-key kept rows after the content moved `d` rows, dropping ones far from the
+    // selection so a long session of scrolling cannot grow it without bound.
+    function shiftKept(f: { range: SelectionRange; kept: Map<number, RowSnapshot> }, d: number) {
+      const lo = Math.min(f.range.start.y, 0) - term.rows;
+      const hi = Math.max(f.range.end.y, term.rows) + term.rows;
+      const next = new Map<number, RowSnapshot>();
+      for (const [y, row] of f.kept) {
+        const ny = y + d;
+        if (ny >= lo && ny <= hi) next.set(ny, row);
+      }
+      f.kept = next;
+    }
+
+    // Show the on-screen part of a range; returns what xterm then reports, so later
+    // comparisons are against its own form of it.
+    function showRange(range: SelectionRange): SelectionRange | undefined {
+      const visible = shiftSelection(range, 0, term.rows, term.cols);
+      if (visible) {
+        term.select(visible.start.x, visible.start.y, selectionLength(visible, term.cols));
+      } else {
+        term.clearSelection();
+      }
+      return term.getSelectionPosition();
+    }
+
+    function pointerCell(e: MouseEvent): CellPoint | null {
+      const screen = hostRef.current?.querySelector(".xterm-screen");
+      if (!screen) return null;
+      return boundaryAt(e.clientX, e.clientY, screen.getBoundingClientRect(), term.cols, term.rows);
+    }
+
+    function noteSelectionScroll(direction: ScrollDirection, lines: number) {
+      if (drag) {
+        if (!follow) {
+          follow = {
+            range: rangeBetween(drag.anchor, drag.pointer),
+            shown: undefined,
+            rows: screenRows(),
+            kept: new Map(),
+            expected: 0,
+            until: 0,
+          };
+          keepScreen(follow.kept);
+        }
+      } else {
+        const current = term.getSelectionPosition();
+        // The user changed or cleared the selection since it was last moved: start over.
+        if (follow && !sameSelection(current, follow.shown)) follow = null;
+        if (!follow) {
+          if (!current) return;
+          if (altRectRef.current) {
+            term.clearSelection();
+            return;
+          }
+          follow = {
+            range: current,
+            shown: current,
+            rows: screenRows(),
+            kept: new Map(),
+            expected: 0,
+            until: 0,
+          };
+          keepScreen(follow.kept);
+        }
+      }
+      follow.expected += direction === "up" ? lines : -lines;
+      follow.until = performance.now() + SELECTION_FOLLOW_MS;
+    }
+
+    function realignSelection() {
+      followRaf = null;
+      const f = follow;
+      if (!f || termRef.current !== term) return;
+      if (!drag && !sameSelection(term.getSelectionPosition(), f.shown)) {
+        follow = null;
+        return;
+      }
+      const rows = screenRows();
+      const d = alignShift(f.rows, rows, f.expected);
+      f.rows = rows;
+      if (d === null) {
+        // Lost track (moved a screen or more in one go): drop it rather than mislead.
+        // Mid-drag the pointer still decides, so just carry on from this screen.
+        if (!drag) {
+          follow = null;
+          term.clearSelection();
+        }
+        return;
+      }
+      if (d === 0) return;
+      f.expected -= d;
+      shiftKept(f, d);
+      keepScreen(f.kept);
+      if (drag) {
+        drag.anchor = { x: drag.anchor.x, y: drag.anchor.y + d };
+        drag.moved = true;
+        f.range = rangeBetween(drag.anchor, drag.pointer);
+      } else {
+        f.range = {
+          start: { x: f.range.start.x, y: f.range.start.y + d },
+          end: { x: f.range.end.x, y: f.range.end.y + d },
+        };
+      }
+      f.shown = showRange(f.range);
+    }
+
+    const followWriteDisp = term.onWriteParsed(() => {
+      if (!follow || performance.now() > follow.until || followRaf !== null) return;
+      followRaf = requestAnimationFrame(realignSelection);
+    });
+
+    // Re-make the dragged selection after xterm has handled the move.
+    function redrawDrag() {
+      dragRaf = null;
+      if (!drag?.moved || !follow || termRef.current !== term) return;
+      follow.range = rangeBetween(drag.anchor, drag.pointer);
+      follow.shown = showRange(follow.range);
+    }
+    const onDragMove = (e: MouseEvent) => {
+      if (!drag) return;
+      drag.pointer = pointerCell(e) ?? drag.pointer;
+      if (drag.moved && dragRaf === null) dragRaf = requestAnimationFrame(redrawDrag);
+    };
+    const onDragUp = (e: MouseEvent) => {
+      onDragMove(e);
+      if (dragRaf !== null) cancelAnimationFrame(dragRaf);
+      redrawDrag();
+      drag = null;
+      window.removeEventListener("mousemove", onDragMove, true);
+      window.removeEventListener("mouseup", onDragUp, true);
+    };
+    const onDragDown = (e: MouseEvent) => {
+      // Only a plain single-click drag: word/line and rectangle selections keep xterm's.
+      if (e.button !== 0 || e.shiftKey || e.altKey || e.detail > 1) return;
+      const p = pointerCell(e);
+      if (!p) return;
+      drag = { anchor: p, pointer: p, moved: false };
+      follow = null;
+      window.addEventListener("mousemove", onDragMove, true);
+      window.addEventListener("mouseup", onDragUp, true);
+    };
+    hostRef.current?.addEventListener("mousedown", onDragDown, true);
 
     // The pill's click / End: one wheel scroll down far enough to reach the live tail
     // (herdr stops there). Queued like any other scroll, so a pending "up" batch goes
@@ -1279,6 +1512,7 @@ export function TerminalPane({
       const { column, row } = cursorAt();
       const n = Math.min(MAX_SCROLL_LINES, Math.abs(lines));
       try {
+        noteSelectionScroll(direction, n);
         await ptyScroll(projectName, name, direction, "wheel", n, column, row);
       } finally {
         liveTail.noteScroll(direction);
@@ -1435,6 +1669,12 @@ export function TerminalPane({
       host?.removeEventListener("copy", onNativeCopy, true);
       host?.removeEventListener("mousedown", onSelectMouseDown, true);
       selectionDisp.dispose();
+      followWriteDisp.dispose();
+      if (followRaf !== null) cancelAnimationFrame(followRaf);
+      if (dragRaf !== null) cancelAnimationFrame(dragRaf);
+      host?.removeEventListener("mousedown", onDragDown, true);
+      window.removeEventListener("mousemove", onDragMove, true);
+      window.removeEventListener("mouseup", onDragUp, true);
       if (sendPasteRef.current === sendPaste) sendPasteRef.current = null;
       if (scrollRaf !== null) cancelAnimationFrame(scrollRaf);
       if (screenRectRaf !== null) cancelAnimationFrame(screenRectRaf);
