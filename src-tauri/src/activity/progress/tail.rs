@@ -206,10 +206,7 @@ fn split_into_lines(chunk: &[u8], cursor: &mut TailCursor, lines: &mut Vec<Strin
     let text = String::from_utf8_lossy(chunk);
     cursor.partial.push_str(&text);
 
-    loop {
-        let Some(nl) = cursor.partial.find('\n') else {
-            break;
-        };
+    while let Some(nl) = cursor.partial.find('\n') {
         let line: String = cursor.partial.drain(..=nl).collect();
         let trimmed = line.trim_end_matches(['\n', '\r']);
         lines.push(trimmed.to_string());
