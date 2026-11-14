@@ -21,7 +21,7 @@ import {
   saveUserSettings,
   setSkipPermissions,
 } from "../lib/settings";
-import { THEME_MODES, useTheme } from "../lib/theme";
+import { isThemeMode, THEME_MODES, themeLabel, useTheme } from "../lib/theme";
 import { RestartDaemonDialog } from "./RestartDaemonDialog";
 import { useToast } from "./Toast";
 import { WorktreePicker } from "./WorktreePicker";
@@ -681,23 +681,26 @@ export function SettingsDrawer({
                 <section className="flex flex-col gap-3 border-t border-line pt-6">
                   <div className={sectionTitle}>Appearance</div>
 
-                  <div className="flex items-center justify-between gap-3">
+                  <label className="flex items-center justify-between gap-3">
                     <span className={label}>Theme</span>
-                    <div className="flex gap-1.5" role="group" aria-label="Theme">
-                      {THEME_MODES.map((m) => (
-                        <button
-                          key={m}
-                          className={themeMode === m ? btnPrimary : btnGhost}
-                          aria-pressed={themeMode === m}
-                          onClick={() => setThemeMode(m)}
-                        >
-                          {m === "light" ? "Light" : m === "dark" ? "Dark" : "System"}
-                        </button>
-                      ))}
+                    <div className="w-44">
+                      <select
+                        className={field}
+                        value={themeMode}
+                        onChange={(e) => {
+                          if (isThemeMode(e.target.value)) setThemeMode(e.target.value);
+                        }}
+                      >
+                        {THEME_MODES.map((m) => (
+                          <option key={m} value={m}>
+                            {themeLabel(m)}
+                          </option>
+                        ))}
+                      </select>
                     </div>
-                  </div>
+                  </label>
                   <p className="text-[11px] text-tx-3">
-                    System follows your OS light/dark setting.
+                    System follows your OS light/dark setting. The named palettes are all dark.
                   </p>
                 </section>
 

@@ -12,7 +12,7 @@ import { Activity, HelpCircle, Settings } from "lucide-react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatBytes, formatCpu, formatUptime } from "../lib/format";
 import type { CliKind, DaemonInfo } from "../lib/ipc";
-import { daemonRestart, daemonStatus } from "../lib/ipc";
+import { daemonRestart, daemonStatus, openWorktreeFolder, openWorktreeShell } from "../lib/ipc";
 import {
   laneMenuAction,
   sessionItemDisabledReason,
@@ -40,6 +40,7 @@ import { useLocalStorageJson } from "../lib/useLocalStorageState";
 import { usePrefersReducedMotion } from "../lib/usePrefersReducedMotion";
 import { useConfirmDialog } from "./ConfirmDialog";
 import { RestartDaemonDialog } from "./RestartDaemonDialog";
+import type { LaneOpenTarget } from "./rail/Lane";
 import { RailProjects } from "./rail/RailProjects";
 import { useToast } from "./Toast";
 
@@ -622,6 +623,20 @@ export function Rail({
     }
   };
 
+  // A lane's folder / shell buttons: the backend resolves the worktree's directory from
+  // the registry by key + name, so this works for any project, active or not.
+  const openLane = useCallback(
+    async (g: GroupModel, worktree: string, target: LaneOpenTarget) => {
+      try {
+        if (target === "folder") await openWorktreeFolder(g.key, worktree);
+        else await openWorktreeShell(g.key, worktree);
+      } catch (e) {
+        showToast(String(e));
+      }
+    },
+    [showToast],
+  );
+
   // Registry only; the list refresh follows project://changed. The removed project's
   // expanded state is forgotten here rather than whenever the list lacks it: a project
   // can drop out of the list transiently (its keitora.toml mid-save).
@@ -698,6 +713,7 @@ export function Rail({
           onToggle={toggleGroup}
           onSelectLane={onSelectLane}
           onOpenDiff={onOpenDiff}
+          onOpenLane={openLane}
           onLaneContextMenu={openLaneMenu}
           onNewWorktree={onNewWorktree}
           onOpenMenu={openProjectMenu}

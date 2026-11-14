@@ -113,6 +113,7 @@ import {
 } from "./lib/warmProjects";
 import { xdgLeakNoticeBody } from "./lib/xdgNotice";
 import "./App.css";
+import "./themes.css";
 
 // Inner component so useToast() can access the ToastProvider above it.
 // Drops persist one at a time and in order, so a slow save can't land after a later one.
