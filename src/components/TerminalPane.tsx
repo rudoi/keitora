@@ -7,7 +7,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { type ITheme, Terminal } from "@xterm/xterm";
+import { Terminal } from "@xterm/xterm";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { classifyAttachError } from "../lib/attachErrors";
 import { useTerminalFontSize } from "../lib/fontSize";
@@ -87,7 +87,8 @@ import {
 } from "../lib/terminalFileDrop";
 import { installTerminalLinks } from "../lib/terminalLinks";
 import { deliverPaste, fallbackPasteRefusedMessage, preparePasteText } from "../lib/terminalPaste";
-import { type ResolvedTheme, useResolvedTheme } from "../lib/theme";
+import { TERMINAL_THEMES } from "../lib/terminalThemes";
+import { useThemeKey } from "../lib/theme";
 import {
   blocksInput,
   restartAfterFailure,
@@ -102,61 +103,6 @@ import { type HistoryView, TerminalSearch } from "./TerminalSearch";
 import { useToast } from "./Toast";
 import { TransferOverlay } from "./TransferOverlay";
 import "@xterm/xterm/css/xterm.css";
-
-// Keitora ANSI palettes — the shell + Claude render in the app's own theme. One per
-// resolved theme; the active one is chosen from useTheme() and swapped live when the
-// theme changes (see the theme effect below). Keep in spirit with the CSS palettes in
-// index.css / App.css.
-const THEMES: Record<ResolvedTheme, ITheme> = {
-  dark: {
-    background: "#0a0e0d",
-    foreground: "#e9efed",
-    cursor: "#f0c665",
-    cursorAccent: "#0a0e0d",
-    selectionBackground: "rgba(240,198,101,.28)",
-    black: "#151c1a",
-    red: "#ff5d5d",
-    green: "#46d18a",
-    yellow: "#e9b13a",
-    blue: "#5b9dff",
-    magenta: "#b18cff",
-    cyan: "#4fd0b4",
-    white: "#9bb0aa",
-    brightBlack: "#637872",
-    brightRed: "#ff7b7b",
-    brightGreen: "#6ee0a3",
-    brightYellow: "#f5c462",
-    brightBlue: "#7fb4ff",
-    brightMagenta: "#c7a6ff",
-    brightCyan: "#5fe6cf",
-    brightWhite: "#e9efed",
-  },
-  light: {
-    background: "#ffffff",
-    foreground: "#14201d",
-    cursor: "#9a6b12",
-    cursorAccent: "#ffffff",
-    selectionBackground: "rgba(240,198,101,.35)",
-    black: "#14201d",
-    red: "#c0392b",
-    green: "#1f9d63",
-    yellow: "#b5791a",
-    blue: "#2f6fe0",
-    magenta: "#8a4fd0",
-    cyan: "#1a9e82",
-    // ANSI "white" (7) is a mid gray on light backgrounds so default-light output stays
-    // visible; foreground (dark) carries normal text. brightWhite (15) → darker for contrast.
-    white: "#657b75",
-    brightBlack: "#7b908a",
-    brightRed: "#d83b3b",
-    brightGreen: "#178a56",
-    brightYellow: "#c67d10",
-    brightBlue: "#1f5fd0",
-    brightMagenta: "#7a3fc0",
-    brightCyan: "#0f8a72",
-    brightWhite: "#3a4a45",
-  },
-};
 
 /**
  * Base64-encode a clipboard image for the save_clipboard_image IPC.
@@ -330,7 +276,7 @@ export function TerminalPane({
   const [showSpinner, setShowSpinner] = useState(false);
   const [fontSize] = useTerminalFontSize();
   // Resolved app theme (light|dark). Chosen at construction and swapped live below.
-  const resolvedTheme = useResolvedTheme();
+  const themeKey = useThemeKey();
   const [showReattachedPill, setShowReattachedPill] = useState(false);
   // "↓ live" pill: the viewport is scrolled up into herdr's history.
   const [showLivePill, setShowLivePill] = useState(false);
@@ -1008,7 +954,7 @@ export function TerminalPane({
       // only paints herdr's viewport, so it keeps none: rows it scrolled off would be
       // stale, and a selection drag or scrollbar could move its viewport onto them.
       scrollback: 0,
-      theme: THEMES[resolvedTheme],
+      theme: TERMINAL_THEMES[themeKey],
     });
     const links = installTerminalLinks(term, {
       context: () => linkContextRef.current,
@@ -1661,12 +1607,12 @@ export function TerminalPane({
   useEffect(() => {
     const term = termRef.current;
     if (!term) return;
-    term.options.theme = THEMES[resolvedTheme];
+    term.options.theme = TERMINAL_THEMES[themeKey];
     // Only force a repaint once the terminal is actually opened (element attached);
     // refreshing an unopened pane has no renderer to drive. Opened panes repaint so the
     // swap is immediate even for the WebGL renderer.
     if (term.element) term.refresh(0, term.rows - 1);
-  }, [resolvedTheme]);
+  }, [themeKey]);
 
   const retryConnection = useCallback(() => {
     // Calling daemonStatus() triggers the client to check connection state.

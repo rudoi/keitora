@@ -310,11 +310,17 @@ body {
   align-items: center;
   gap: 9px;
 }
-/* Diff affordance: a distinct icon button at the right of the name row. Clicking it opens
-   the worktree's diff view (it stops propagation, so the lane's click-to-select still works
-   everywhere else on the row). margin-left:auto pins it to the right edge. */
-.lane-diff-btn {
+/* Lane affordances: icon buttons at the right of the name row — open the worktree folder,
+   open a shell there, view the diff. Each stops propagation, so the lane's click-to-select
+   still works everywhere else on the row. margin-left:auto pins the group to the right edge. */
+.lane-actions {
   margin-left: auto;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+.lane-diff-btn {
   flex: 0 0 auto;
   display: flex;
   align-items: center;

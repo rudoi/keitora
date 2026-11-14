@@ -8,16 +8,20 @@
     />
     <title>Keitora — Logistics Dispatch</title>
     <!-- Anti-FOUC: set data-theme before first paint so the app never flashes the
-         wrong theme. LOCKSTEP with src/lib/theme.ts (storage key + resolution): a
-         missing/invalid pref defaults to "system", which then follows the OS. -->
+         wrong theme. LOCKSTEP with src/lib/theme.ts (storage key, palette list +
+         resolution): a missing/invalid pref defaults to "system", which then follows
+         the OS. Every named palette is dark. -->
     <script>
       (function () {
         var m = "system";
         try {
           m = localStorage.getItem("keitora.theme") || "system";
         } catch (e) {}
-        if (m !== "light" && m !== "dark" && m !== "system") m = "system";
-        var dark = m === "dark";
+        var palettes = ["ayu", "catppuccin", "gruvbox", "hacker", "nord", "solarized", "synthwave", "tokyonight"];
+        var isPalette = palettes.indexOf(m) !== -1;
+        if (m !== "light" && m !== "dark" && m !== "system" && !isPalette) m = "system";
+        if (isPalette) document.documentElement.dataset.palette = m;
+        var dark = m !== "light";
         if (m === "system") {
           try {
             dark = matchMedia("(prefers-color-scheme: dark)").matches;
