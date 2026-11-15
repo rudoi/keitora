@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
   APP_CRATE,
+  bundleOverlay,
+  formatKeyId,
+  isReleaseTagRef,
+  minisignKeyId,
+  readUpdaterPubkey,
+  UPDATER_PUBKEY_PLACEHOLDER,
+  UpdaterSigningError,
+  updaterKeyIdMatches,
+  updaterSigProblem,
   BUMPED_FILES,
   bumpFiles,
   bumpVersion,
@@ -857,5 +866,161 @@ describe("startLine / doneLines", () => {
       "Nothing was changed. Run again without --dry-run to release.",
     ]);
     expect(lines.some((l) => l.startsWith("Tagged"))).toBe(false);
+  });
+});
+
+// Throwaway keys generated with `tauri signer generate` for these tests only; their private halves
+// were never kept. Values are as Tauri stores them: base64 of the whole minisign file text.
+// Key id 1315FAB6E83B1001.
+const FIXTURE_PUBKEY =
+  "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDEzMTVGQUI2RTgzQjEwMDEKUldRQkVEdm90dm9WRS9KbDJ4SjIxbk9Jc2kzYWQ2bWc4NkVZWkgyaTVQS0pJR3FKUHBlakY3dkkK";
+// Key id 9185B0813598F12C.
+const OTHER_PUBKEY =
+  "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDkxODVCMDgxMzU5OEYxMkMKUldRczhaZzFnYkNGa1VadmVDUDRKQ3M0cXhCOGNFSjNDL29EL1AxMWl2dkhZdTM4QVpLZzV6dnkK";
+// A `tauri signer sign` signature of a small dummy file, made with the FIXTURE_PUBKEY key.
+const FIXTURE_SIG =
+  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRQkVEdm90dm9WRXdaUGtMbjhEWmdhZDM0WGtlSDZyeCtKNnV4TzN1d0dQVGk1c1ZOQkZ3WjdxSlBPSEJwT0xUeXNEaHgzcmpiOEFuWUdCU0tlNW1LRzFab2t5SDhEYkFJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0NzA3MDAxCWZpbGU6ZHVtbXkudHh0CnNPbGhCZEpEcnVmOXdJSmJXc2Q5WTBZQk9PcTF4QmFpdW03WnNMb3lZNEVUY3JPU3FPRUYzSUJoTEZ2Um15d2tiZUZIVkFIWXBlMGtxeGRCam84cEF3PT0K";
+
+const TAG_REF = "refs/tags/v0.3.1";
+const BRANCH_REF = "refs/heads/main";
+const PR_REF = "refs/pull/7/merge";
+
+function overlay(
+  target: "windows" | "macos",
+  updaterKey: string | undefined,
+  ref: string | undefined,
+  pubkey = FIXTURE_PUBKEY,
+): unknown {
+  return JSON.parse(bundleOverlay({ target, updaterKey, ref, pubkey }));
+}
+
+function overlayError(input: Parameters<typeof bundleOverlay>[0]): UpdaterSigningError {
+  try {
+    bundleOverlay(input);
+  } catch (e) {
+    expect(e).toBeInstanceOf(UpdaterSigningError);
+    return e as UpdaterSigningError;
+  }
+  throw new Error("bundleOverlay did not throw");
+}
+
+describe("isReleaseTagRef", () => {
+  it("is true only for v* tags", () => {
+    expect(isReleaseTagRef(TAG_REF)).toBe(true);
+    expect(isReleaseTagRef("refs/tags/nightly")).toBe(false);
+    expect(isReleaseTagRef(BRANCH_REF)).toBe(false);
+    expect(isReleaseTagRef(PR_REF)).toBe(false);
+    expect(isReleaseTagRef(undefined)).toBe(false);
+  });
+});
+
+describe("bundleOverlay", () => {
+  it("turns on updater artifacts when the key is set", () => {
+    expect(overlay("windows", "true", TAG_REF)).toEqual({ bundle: { createUpdaterArtifacts: true } });
+  });
+  it("also sets the app target on macOS, so the bundler makes the tarball", () => {
+    expect(overlay("macos", "true", TAG_REF)).toEqual({
+      bundle: { createUpdaterArtifacts: true, targets: ["app", "dmg"] },
+    });
+  });
+  it("is empty without the key off a tag", () => {
+    for (const ref of [BRANCH_REF, PR_REF, undefined]) {
+      for (const key of ["false", undefined, ""]) {
+        expect(overlay("windows", key, ref)).toEqual({});
+        expect(overlay("macos", key, ref)).toEqual({});
+      }
+    }
+  });
+  it("throws UPDATER_KEY_MISSING on a tag without the key", () => {
+    for (const target of ["windows", "macos"] as const) {
+      for (const updaterKey of ["false", undefined]) {
+        const e = overlayError({ target, updaterKey, ref: TAG_REF, pubkey: FIXTURE_PUBKEY });
+        expect(e.code).toBe("UPDATER_KEY_MISSING");
+        expect(e.message).toMatch(/^UPDATER_KEY_MISSING: .*TAURI_SIGNING_PRIVATE_KEY/);
+      }
+    }
+  });
+  it("throws UPDATER_PUBKEY_PLACEHOLDER on a tag with the placeholder pubkey, key or not", () => {
+    for (const updaterKey of ["true", "false"]) {
+      const e = overlayError({
+        target: "macos",
+        updaterKey,
+        ref: TAG_REF,
+        pubkey: UPDATER_PUBKEY_PLACEHOLDER,
+      });
+      expect(e.code).toBe("UPDATER_PUBKEY_PLACEHOLDER");
+      expect(e.message.startsWith("UPDATER_PUBKEY_PLACEHOLDER: ")).toBe(true);
+    }
+  });
+  it("keeps non-tag builds green with the placeholder pubkey", () => {
+    expect(overlay("windows", "false", PR_REF, UPDATER_PUBKEY_PLACEHOLDER)).toEqual({});
+  });
+  it("turns on updater artifacts off a tag too when the key is set", () => {
+    expect(overlay("windows", "true", BRANCH_REF)).toEqual({ bundle: { createUpdaterArtifacts: true } });
+  });
+  it("produces JSON object text in every non-throwing case", () => {
+    const cases = [
+      ["true", TAG_REF],
+      ["false", PR_REF],
+      [undefined, undefined],
+    ] as const;
+    for (const target of ["windows", "macos"] as const) {
+      for (const [updaterKey, ref] of cases) {
+        const text = bundleOverlay({ target, updaterKey, ref, pubkey: FIXTURE_PUBKEY });
+        const parsed: unknown = JSON.parse(text);
+        expect(parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)).toBe(true);
+      }
+    }
+  });
+});
+
+describe("readUpdaterPubkey", () => {
+  it("reads plugins.updater.pubkey", () => {
+    const conf = JSON.stringify({ plugins: { updater: { pubkey: FIXTURE_PUBKEY } } });
+    expect(readUpdaterPubkey(conf)).toBe(FIXTURE_PUBKEY);
+  });
+  it("throws when the pubkey is absent or empty", () => {
+    expect(() => readUpdaterPubkey("{}")).toThrow(/plugins\.updater\.pubkey/);
+    expect(() => readUpdaterPubkey(JSON.stringify({ plugins: { updater: { pubkey: "" } } }))).toThrow();
+  });
+});
+
+describe("updaterKeyIdMatches", () => {
+  it("matches a signature made by the pubkey's key", () => {
+    expect(updaterKeyIdMatches(FIXTURE_PUBKEY, FIXTURE_SIG)).toBe(true);
+    // A trailing newline, as read from a .sig file, does not matter.
+    expect(updaterKeyIdMatches(`${FIXTURE_PUBKEY}\n`, `${FIXTURE_SIG}\n`)).toBe(true);
+  });
+  it("rejects a signature made by another key", () => {
+    expect(updaterKeyIdMatches(OTHER_PUBKEY, FIXTURE_SIG)).toBe(false);
+  });
+  it("reads the key id minisign prints in the comment", () => {
+    expect(formatKeyId(minisignKeyId(FIXTURE_PUBKEY, "pubkey"))).toBe("1315FAB6E83B1001");
+    expect(formatKeyId(minisignKeyId(OTHER_PUBKEY, "pubkey"))).toBe("9185B0813598F12C");
+    expect(formatKeyId(minisignKeyId(FIXTURE_SIG, "signature"))).toBe("1315FAB6E83B1001");
+  });
+  it("throws on values that are not Tauri minisign data", () => {
+    expect(() => updaterKeyIdMatches("not base64!", FIXTURE_SIG)).toThrow(/base64/);
+    // A signature where a pubkey belongs has the wrong length.
+    expect(() => updaterKeyIdMatches(FIXTURE_SIG, FIXTURE_SIG)).toThrow(/expected 42/);
+    const commentOnly = Buffer.from("untrusted comment: nothing here\n").toString("base64");
+    expect(() => updaterKeyIdMatches(commentOnly, FIXTURE_SIG)).toThrow(/no minisign data line/);
+  });
+});
+
+describe("updaterSigProblem", () => {
+  it("is null when the key ids match", () => {
+    expect(updaterSigProblem(FIXTURE_PUBKEY, FIXTURE_SIG)).toBeNull();
+  });
+  it("names both key ids on a mismatch", () => {
+    const problem = updaterSigProblem(OTHER_PUBKEY, FIXTURE_SIG) ?? "";
+    expect(problem).toContain("1315FAB6E83B1001");
+    expect(problem).toContain("9185B0813598F12C");
+    expect(problem).toContain("TAURI_SIGNING_PRIVATE_KEY");
+  });
+  it("refuses the placeholder pubkey", () => {
+    expect(updaterSigProblem(UPDATER_PUBKEY_PLACEHOLDER, FIXTURE_SIG)).toMatch(
+      /^UPDATER_PUBKEY_PLACEHOLDER: /,
+    );
   });
 });

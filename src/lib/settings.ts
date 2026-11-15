@@ -59,6 +59,8 @@ export interface SettingsUser {
   /** Whether a `codex` binary was found on this machine. Gates the
    *  Codex group's enabled state in the drawer. */
   codex_available: boolean;
+  /** Whether the app checks for updates by itself (`[updates] auto_check`). */
+  auto_check_updates: boolean;
 }
 
 /** Everything the settings drawer needs in one round-trip. */
@@ -117,6 +119,14 @@ export function removeProject(name: string): Promise<void> {
  */
 export function setSkipPermissions(cli: CliKind, enabled: boolean): Promise<void> {
   return invoke("set_skip_permissions", { cli, enabled });
+}
+
+/**
+ * Persist the user-level `[updates] auto_check` flag. Persist-only (no
+ * `project://changed` emit).
+ */
+export function setUpdateAutoCheck(enabled: boolean): Promise<void> {
+  return invoke("set_update_auto_check", { enabled });
 }
 
 /**

@@ -2,9 +2,12 @@ name: Release
 
 # Only GitHub-authored actions (actions/*) are used, so no third-party code ever sees a secret. This workflow is the
 # only thing that publishes: scripts/release.ts bumps, commits, tags and pushes; the tag push lands here. A release
-# carries the Windows NSIS installer and the Apple Silicon dmg. Tag runs sign the dmg with the identity from the
-# `release` environment (Developer ID or self-signed) and fail without it; every other run builds unsigned and publishes
-# nothing.
+# carries the Windows NSIS installer and the Apple Silicon dmg, plus the in-app updater's files: the installer's
+# .sig, and Keitora.app.tar.gz with its .sig. Tag runs use the `release` environment: they sign the dmg with the
+# identity stored there (Developer ID or self-signed) and the updater artifacts with the updater key
+# (TAURI_SIGNING_PRIVATE_KEY*), check that each .sig was made by the key whose pubkey is in tauri.conf.json, and fail
+# if any of that is missing. Every other run (PR, schedule, dispatch) never sees a secret, builds unsigned without
+# updater artifacts, and publishes nothing.
 
 on:
   push:
@@ -24,6 +27,10 @@ on:
       - "scripts/stage-sidecars.mjs"
       - "scripts/signing.mjs"
       - "scripts/build-dmg.sh"
+      - "scripts/release.lib.ts"
+      - "scripts/bundle-overlay.ts"
+      - "scripts/check-updater-sig.ts"
+      - "scripts/cli.ts"
       # Toolchain and dependency changes can break a release build that ci.yml's debug build doesn't catch.
       - "rust-toolchain.toml"
       - "Cargo.lock"
@@ -52,20 +59,15 @@ defaults:
     shell: bash
 
 jobs:
+  # Two Windows jobs for the same reason as the two macOS jobs below: the updater key lives in the `release`
+  # environment, so the secret-free job (PR, dispatch, schedule) is kept separate from the tag job. Exactly one of
+  # the two runs, and both upload the same artifact name.
   build-windows:
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-
-      - name: Check the tag matches the app version
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          version="$(node -p "require('./package.json').version")"
-          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match package.json version ${version}" >&2
-            exit 1
-          fi
 
       # The release profile has its own cache key (cargo-release-...), separate from ci.yml's debug entry.
       # Always restored; saved only by scheduled/manual runs on main (see the save step below).
@@ -104,6 +106,80 @@ jobs:
         with:
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
           trim: target/release/bundle
+
+  # Tag runs only. Builds the installer with signed updater artifacts; a tag without the updater key fails. This job
+  # never saves the cache (tag-scoped entries are wasted quota).
+  build-windows-release:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    environment: release
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches the app version
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package.json version ${version}" >&2
+            exit 1
+          fi
+
+      # The expression evaluates to a bare true or false, so no secret value reaches this step or its shell.
+      - name: Detect the updater key
+        id: updater-key
+        env:
+          HAS_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && 'true' || 'false' }}
+        run: echo "has_key=$HAS_KEY" >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          key-prefix: cargo-release
+
+      - uses: ./.github/actions/setup-node-yarn
+
+      # Fails on a tag without the key (UPDATER_KEY_MISSING) or with the placeholder pubkey.
+      - name: Compute the bundle overlay
+        env:
+          UPDATER_KEY: ${{ steps.updater-key.outputs.has_key }}
+        run: yarn --silent tsx scripts/bundle-overlay.ts --target windows --out "$RUNNER_TEMP/bundle-overlay.json"
+
+      # The only step that sees the updater key. The overlay's --config merges after the script's own bundle overlay.
+      - name: Build the installer and its updater signature
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: yarn tauri:bundle --config "$RUNNER_TEMP/bundle-overlay.json"
+
+      - name: Find the installer and its signature
+        id: installer
+        run: |
+          files=(target/release/bundle/nsis/Keitora_*_x64-setup.exe)
+          if [ "${#files[@]}" -ne 1 ] || [ ! -f "${files[0]}" ]; then
+            echo "Expected exactly one installer, found: ${files[*]}" >&2
+            exit 1
+          fi
+          if [ ! -f "${files[0]}.sig" ]; then
+            echo "Missing updater signature ${files[0]}.sig" >&2
+            exit 1
+          fi
+          echo "path=${files[0]}" >> "$GITHUB_OUTPUT"
+
+      # Tauri only warns when the key does not match the committed pubkey; installed copies would reject the update.
+      - name: Check the updater signature's key
+        env:
+          SIG: ${{ steps.installer.outputs.path }}.sig
+        run: yarn --silent tsx scripts/check-updater-sig.ts "$SIG"
+
+      # Both files sit in the same folder, so the artifact is flat.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: keitora-windows
+          path: |
+            ${{ steps.installer.outputs.path }}
+            ${{ steps.installer.outputs.path }}.sig
+          if-no-files-found: error
+          retention-days: 14
 
   # Two macOS jobs rather than one job with a conditional `environment:`. The signing secrets live in the `release`
   # environment, and a job either names an environment or it does not; an empty-string environment is not a documented
@@ -192,11 +268,25 @@ jobs:
           fi
           exit "$missing"
 
+      # The expression evaluates to a bare true or false, so no secret value reaches this step or its shell.
+      - name: Detect the updater key
+        id: updater-key
+        env:
+          HAS_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && 'true' || 'false' }}
+        run: echo "has_key=$HAS_KEY" >> "$GITHUB_OUTPUT"
+
       - uses: ./.github/actions/setup-rust
         with:
           key-prefix: cargo-release
 
       - uses: ./.github/actions/setup-node-yarn
+
+      # Fails on a tag without the key (UPDATER_KEY_MISSING) or with the placeholder pubkey. On macOS the overlay
+      # also adds the `app` bundle target, without which the bundler makes no Keitora.app.tar.gz.
+      - name: Compute the bundle overlay
+        env:
+          UPDATER_KEY: ${{ steps.updater-key.outputs.has_key }}
+        run: yarn --silent tsx scripts/bundle-overlay.ts --target macos --out "$RUNNER_TEMP/bundle-overlay.json"
 
       # The only step that sees the certificate secrets; -x keeps the key non-extractable. A self-signed identity must be
       # trusted, since codesign refuses an untrusted root: trust goes in the admin domain (the user domain would raise a
@@ -254,26 +344,45 @@ jobs:
       # stable designated requirement. Tauri's certificate-import variable is deliberately never set: its importer
       # only recognises Apple-issued identity names and would reject this one; codesign finds the identity in the
       # keychain search list instead. Signing by the pinned SHA-1 (codesign accepts a hash) rather than the name
-      # guarantees the verified certificate is the one used.
+      # guarantees the verified certificate is the one used. The bundler makes Keitora.app.tar.gz from the .app it has
+      # just signed with that identity, so an in-app update keeps the stable designated requirement; the script
+      # verifies the tarball's copy too. This is the only step that sees the updater key.
       - name: Build and verify the signed dmg
         env:
           APPLE_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_SHA1 }}
+          KEITORA_BUNDLE_OVERLAY: ${{ runner.temp }}/bundle-overlay.json
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: bash scripts/build-dmg.sh --sign-only
 
-      - name: Find the dmg
-        id: dmg
+      # One flat folder, so publish finds every file at the top of the artifact.
+      - name: Collect the dmg and the updater tarball
+        id: collect
         run: |
           files=(target/release/bundle/dmg/Keitora_*_aarch64.dmg)
           if [ "${#files[@]}" -ne 1 ] || [ ! -f "${files[0]}" ]; then
             echo "Expected exactly one dmg, found: ${files[*]}" >&2
             exit 1
           fi
-          echo "path=${files[0]}" >> "$GITHUB_OUTPUT"
+          tarball=target/release/bundle/macos/Keitora.app.tar.gz
+          for f in "$tarball" "$tarball.sig"; do
+            [ -f "$f" ] || { echo "Missing updater file: $f" >&2; exit 1; }
+          done
+          out="$RUNNER_TEMP/keitora-macos"
+          mkdir -p "$out"
+          cp "${files[0]}" "$tarball" "$tarball.sig" "$out/"
+          echo "dir=$out" >> "$GITHUB_OUTPUT"
+
+      # Tauri only warns when the key does not match the committed pubkey; installed copies would reject the update.
+      - name: Check the updater signature's key
+        env:
+          SIG: ${{ steps.collect.outputs.dir }}/Keitora.app.tar.gz.sig
+        run: yarn --silent tsx scripts/check-updater-sig.ts "$SIG"
 
       - uses: actions/upload-artifact@v7
         with:
           name: keitora-macos
-          path: ${{ steps.dmg.outputs.path }}
+          path: ${{ steps.collect.outputs.dir }}
           if-no-files-found: error
           retention-days: 14
 
@@ -284,11 +393,11 @@ jobs:
             security delete-keychain "$KEITORA_KEYCHAIN"
           fi
 
-  # Publishes only on a tag push (a manual dispatch on a tag never publishes). One of the two macOS jobs is always
-  # skipped, so `needs` alone would skip this job too; the explicit result checks keep it strict instead.
+  # Publishes only on a tag push (a manual dispatch on a tag never publishes). One job of each pair is always
+  # skipped, so `needs` alone would skip this job too; the explicit result checks on the two tag jobs keep it strict.
   publish:
-    if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.build-windows.result == 'success' && needs.build-macos-release.result == 'success' }}
-    needs: [build-windows, build-macos, build-macos-release]
+    if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.build-windows-release.result == 'success' && needs.build-macos-release.result == 'success' }}
+    needs: [build-windows, build-windows-release, build-macos, build-macos-release]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -307,7 +416,18 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          files=(windows/Keitora_*_x64-setup.exe macos/Keitora_*_aarch64.dmg)
+          # The installers, plus what the in-app updater downloads and verifies.
+          files=(
+            windows/Keitora_*_x64-setup.exe
+            windows/Keitora_*_x64-setup.exe.sig
+            macos/Keitora_*_aarch64.dmg
+            macos/Keitora.app.tar.gz
+            macos/Keitora.app.tar.gz.sig
+          )
+          if [ "${#files[@]}" -ne 5 ]; then
+            echo "Expected exactly five release files, found: ${files[*]}" >&2
+            exit 1
+          fi
           for f in "${files[@]}"; do
             [ -f "$f" ] || { echo "Missing release file: $f" >&2; exit 1; }
           done

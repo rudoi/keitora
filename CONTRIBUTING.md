@@ -148,7 +148,9 @@ If the push fails nothing reaches the remote, and the script undoes the local co
 admins can run it: `main`'s ruleset requires pull requests from everyone else.
 
 `release.yml` builds a Windows NSIS `setup.exe` and an Apple Silicon `.dmg` signed with a
-Developer ID Application identity (not notarized yet). The result appears on the repo's
+Developer ID Application identity (not notarized yet). Tag builds also publish the in-app
+updater's files: `Keitora_<v>_x64-setup.exe.sig`, `Keitora.app.tar.gz` and `Keitora.app.tar.gz.sig`
+(see [Updater signing](#updater-signing)). The result appears on the repo's
 [Releases page](https://github.com/rudoi/keitora/releases). Pull requests that touch the release
 files run the same builds without publishing, and a weekly scheduled run keeps the build cache warm
 and catches runner drift.
@@ -196,6 +198,39 @@ gh api -X PUT repos/{owner}/{repo}/environments/release --input - <<'EOF'
 EOF
 gh api -X POST repos/{owner}/{repo}/environments/release/deployment-branch-policies -f name='v*' -f type=tag
 ```
+
+### Updater signing
+
+Keitora checks `https://api.github.com/repos/rudoi/keitora/releases/latest` (30 s after launch, then
+every 6 h, unless *Automatically check for updates* is off in Settings) and installs a newer release
+in place. herdr is left running, so sessions survive. The app installs only files signed with the
+Tauri updater key whose **public** half is `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`.
+
+The private key and its password are secrets in the `release` environment:
+
+```sh
+yarn tauri signer generate -w ~/keitora-updater.key        # once; prompts for a password
+gh secret set TAURI_SIGNING_PRIVATE_KEY --env release < ~/keitora-updater.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --env release   # prompts for the password
+```
+
+Put the contents of `~/keitora-updater.key.pub` in `tauri.conf.json`. Keep an offline backup of the
+key and password, then delete the local copy.
+
+- **Losing the key strands every installed copy.** Installed apps can only verify updates signed
+  with the key they trust, so a release signed by a new key must be installed by hand.
+- **Rotating** means shipping a release, signed with the old key, whose `tauri.conf.json` holds the
+  new public key. Every release after that is signed with the new key.
+- Tag builds fail without the key (`UPDATER_KEY_MISSING`) and fail if the pubkey is still the
+  `REPLACE_WITH_UPDATER_PUBKEY` placeholder. `scripts/check-updater-sig.ts` also fails a tag build
+  whose `.sig` was made by a key other than the configured pubkey. Tauri only warns about that.
+- Local `yarn tauri dev` and `yarn tauri:bundle` need no key and produce no updater files. The
+  `createUpdaterArtifacts` flag comes from `scripts/bundle-overlay.ts` on CI.
+- `KEITORA_UPDATE_REPO=owner/repo` points the updater at another repo (a fork or a test repo).
+  Downloads still have to verify against the embedded public key. Development builds can check
+  and download but refuse to install.
+- The first release that includes the updater has to be installed by hand. Updates work from that
+  release onwards.
 
 ### Signed macOS builds
 

@@ -261,9 +261,42 @@ pub struct UserConfig {
     /// Omitted from TOML when at its default.
     #[serde(default, skip_serializing_if = "PtyConfig::is_empty")]
     pub pty: PtyConfig,
+    /// Update-check settings. Omitted from TOML when unset.
+    #[serde(default, skip_serializing_if = "UpdatesConfig::is_empty")]
+    pub updates: UpdatesConfig,
     /// Registered projects, keyed by name.
     #[serde(default)]
     pub projects: BTreeMap<String, ProjectRef>,
+}
+
+/// The optional `[updates]` table in the user registry: how the app checks for
+/// new releases.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct UpdatesConfig {
+    /// Whether the app checks for updates by itself at startup and periodically.
+    /// `None` (unset) means on; only an explicit `false` turns it off. Omitted
+    /// from TOML when unset.
+    ///
+    /// Example (user config `keitora.toml`):
+    /// ```toml
+    /// [updates]
+    /// auto_check = false
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_check: Option<bool>,
+}
+
+impl UpdatesConfig {
+    /// True when nothing is configured, so the whole `[updates]` table can be
+    /// omitted from serialized TOML.
+    pub fn is_empty(&self) -> bool {
+        self.auto_check.is_none()
+    }
+
+    /// Whether automatic update checks are enabled (unset → true).
+    pub fn auto_check(&self) -> bool {
+        self.auto_check.unwrap_or(true)
+    }
 }
 
 /// herdr-specific settings under `[pty.herdr]`. Omitted from serialized TOML when
@@ -3939,6 +3972,52 @@ backoff_secs = [0, 10]
         let got = normalize_db_path(&abs, &root);
         assert!(got.is_absolute());
         assert!(got.ends_with("elsewhere/tasks.db"));
+    }
+
+    // --- updates.auto_check ---
+
+    #[test]
+    fn updates_auto_check_defaults_on() {
+        let cfg = UserConfig::default();
+        assert!(cfg.updates.auto_check());
+        assert!(cfg.updates.is_empty());
+    }
+
+    #[test]
+    fn updates_auto_check_false_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("keitora/keitora.toml");
+
+        let mut cfg = UserConfig::default();
+        cfg.updates.auto_check = Some(false);
+        cfg.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[updates]"), "got: {text}");
+        assert!(text.contains("auto_check = false"), "got: {text}");
+
+        let loaded = UserConfig::load_from(&path).unwrap();
+        assert!(!loaded.updates.auto_check());
+        assert_eq!(loaded.updates.auto_check, Some(false));
+    }
+
+    #[test]
+    fn updates_table_omitted_when_unset() {
+        let toml = toml::to_string(&UserConfig::default()).unwrap();
+        assert!(!toml.contains("[updates]"), "got: {toml}");
+        assert!(!toml.contains("auto_check"), "got: {toml}");
+    }
+
+    #[test]
+    fn config_without_updates_table_still_loads() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("keitora.toml");
+        std::fs::write(&path, "[claude]\nautonomy = true\n").unwrap();
+
+        let loaded = UserConfig::load_from(&path).unwrap();
+        assert!(loaded.updates.is_empty());
+        assert!(loaded.updates.auto_check());
+        assert!(loaded.skip_permissions());
     }
 
     // --- skip_permissions ---

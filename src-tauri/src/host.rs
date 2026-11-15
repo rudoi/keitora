@@ -603,6 +603,9 @@ pub struct SettingsUser {
     /// (`discover_cli(CliKind::Codex).is_some()`). Gates the Codex group's
     /// enabled state in the drawer.
     pub codex_available: bool,
+    /// Whether the app checks for updates by itself (`[updates] auto_check`;
+    /// on unless explicitly disabled).
+    pub auto_check_updates: bool,
 }
 
 /// Everything the settings drawer needs in one round-trip.
@@ -658,6 +661,7 @@ fn get_settings() -> Result<SettingsSnapshot, String> {
             codex_autonomy: user_cfg.codex.autonomy.unwrap_or(false),
             default_cli: user_cfg.default_cli.unwrap_or_default(),
             codex_available: keitora_tasks::discover_cli(keitora_tasks::CliKind::Codex).is_some(),
+            auto_check_updates: user_cfg.updates.auto_check(),
         },
     })
 }
@@ -884,6 +888,17 @@ fn set_skip_permissions(cli: keitora_tasks::CliKind, enabled: bool) -> Result<()
         keitora_tasks::CliKind::Claude => user_cfg.claude.autonomy = Some(enabled),
         keitora_tasks::CliKind::Codex => user_cfg.codex.autonomy = Some(enabled),
     }
+    user_cfg.save().map_err(|e| e.to_string())
+}
+
+/// Persist the user-level `[updates] auto_check` flag. Persist-only: no
+/// `project://changed` emit, since nothing reacts at runtime beyond the next
+/// update check reading it.
+#[tauri::command(async)]
+fn set_update_auto_check(enabled: bool) -> Result<(), String> {
+    let _registry = keitora_tasks::UserConfig::write_lock();
+    let mut user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
+    user_cfg.updates.auto_check = Some(enabled);
     user_cfg.save().map_err(|e| e.to_string())
 }
 
@@ -1990,7 +2005,15 @@ fn daemon_list_sessions(client: State<SharedBackend>) -> Result<Vec<SessionHint>
 /// `app.exit(0)` so the `CloseRequested` handler doesn't re-prevent the close that
 /// our own programmatic exit triggers (the `prevent_close` re-entrancy risk).
 #[derive(Default)]
-struct Quitting(Arc<AtomicBool>);
+pub(crate) struct Quitting(Arc<AtomicBool>);
+
+impl Quitting {
+    /// Set the latch, returning its previous value so a caller can restore it if the exit
+    /// it was guarding doesn't happen (a failed update install).
+    pub(crate) fn set(&self, v: bool) -> bool {
+        self.0.swap(v, Ordering::SeqCst)
+    }
+}
 
 /// Pure decision for the `CloseRequested` guard: prevent the window close (to show
 /// the quit-confirm modal) only when we're not already quitting AND the daemon
@@ -2004,7 +2027,7 @@ fn should_prevent_close(quitting: bool, live_sessions: usize) -> bool {
 /// `quitting` latch first so the `CloseRequested` guard allows the exit through.
 #[tauri::command]
 fn app_quit_keep(app: AppHandle, quitting: State<Quitting>) {
-    quitting.0.store(true, Ordering::SeqCst);
+    quitting.set(true);
     app.exit(0);
 }
 
@@ -2012,7 +2035,7 @@ fn app_quit_keep(app: AppHandle, quitting: State<Quitting>) {
 /// error — we're exiting regardless). Sets the `quitting` latch first.
 #[tauri::command]
 fn app_quit_stop(app: AppHandle, client: State<SharedBackend>, quitting: State<Quitting>) {
-    quitting.0.store(true, Ordering::SeqCst);
+    quitting.set(true);
     let _ = client.shutdown();
     app.exit(0);
 }
@@ -2178,10 +2201,16 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        // Download + verify + install only; discovery and the flow run from Rust
+        // (`updater`), and the webview gets no `updater:*` capability.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // Serializes dispatch_apply so concurrent dispatches can't double-inject.
         .manage(crate::dispatch::DispatchGate::default())
         // In-flight transfer markers, cancel flags and diagnostics trails.
         .manage(crate::transfer_registry::TransferRegistry::global());
+    // "Check for Updates…" in the macOS app menu.
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_menu_event(crate::updater::commands::on_menu_event);
 
     builder
         .setup(|app| {
@@ -2207,6 +2236,15 @@ pub fn run() {
             app.manage(crate::diff::watch::DiffWatchers::default());
             // "Quitting now" latch read by the CloseRequested guard below.
             app.manage(Quitting::default());
+            // In-app updates: managed state, leftover cleanup, and the background schedule
+            // (release builds on supported platforms only).
+            crate::updater::startup(app.handle().clone());
+            #[cfg(target_os = "macos")]
+            if crate::updater::release::Platform::current().is_some() {
+                if let Err(e) = crate::updater::commands::install_app_menu(app.handle()) {
+                    log::warn!("[updater] couldn't add the app menu item: {e}");
+                }
+            }
             // Point the tasks + config watchers at the launch-time active project.
             restart_project_watchers(app.handle());
             // Background-project notifications: one watcher per
@@ -2231,6 +2269,15 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle();
+                // Closing mid-install could leave a half-swapped app bundle; the update
+                // restarts the app itself when it's done.
+                if app
+                    .try_state::<crate::updater::Updater>()
+                    .is_some_and(|u| u.is_applying())
+                {
+                    api.prevent_close();
+                    return;
+                }
                 let quitting = app
                     .try_state::<Quitting>()
                     .map(|q| q.0.load(Ordering::SeqCst))
@@ -2300,6 +2347,11 @@ pub fn run() {
             commit_settings_to_project,
             save_user_settings,
             set_skip_permissions,
+            set_update_auto_check,
+            crate::updater::commands::update_status,
+            crate::updater::commands::update_check,
+            crate::updater::commands::update_download,
+            crate::updater::commands::update_apply,
             remove_project,
             tasks::task_actor,
             tasks::sessions_list,
