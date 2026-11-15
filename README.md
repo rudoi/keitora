@@ -84,7 +84,7 @@ yarn tauri:bundle
 The first build compiles a lot of Rust and can take several minutes. When it finishes:
 
 - **macOS:** open the `.dmg` in `target/release/bundle/dmg/` and drag Keitora to
-  Applications. The prebuilt release is signed with a self-signed certificate and isn't notarized,
+  Applications. The prebuilt release is signed with a Developer ID certificate but isn't notarized yet,
   so the first open is blocked; allow it once in System Settings → Privacy & Security →
   **Open Anyway**. If you want agents to take screenshots, build with a signing identity so
   macOS remembers the Screen Recording permission between builds. See
