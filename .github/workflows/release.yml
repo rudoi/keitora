@@ -2,8 +2,9 @@ name: Release
 
 # Only GitHub-authored actions (actions/*) are used, so no third-party code ever sees a secret. This workflow is the
 # only thing that publishes: scripts/release.ts bumps, commits, tags and pushes; the tag push lands here. A release
-# carries the Windows NSIS installer and the Apple Silicon dmg. Tag runs sign the dmg with the self-signed
-# identity from the `release` environment and fail without it; every other run builds unsigned and publishes nothing.
+# carries the Windows NSIS installer and the Apple Silicon dmg. Tag runs sign the dmg with the identity from the
+# `release` environment (Developer ID or self-signed) and fail without it; every other run builds unsigned and publishes
+# nothing.
 
 on:
   push:
@@ -197,10 +198,11 @@ jobs:
 
       - uses: ./.github/actions/setup-node-yarn
 
-      # The only step that sees the certificate secrets. Trust is required: codesign refuses an untrusted self-signed
-      # root, and -x keeps the key non-extractable. Trust goes in the admin domain (the user domain would raise a GUI
-      # prompt) under the relaxed authorizationdb rule; the runner is ephemeral, so nothing is restored. The SHA-1 pin
-      # makes a wrongly exported identity fail loudly instead of silently resetting users' grants.
+      # The only step that sees the certificate secrets; -x keeps the key non-extractable. A self-signed identity must be
+      # trusted, since codesign refuses an untrusted root: trust goes in the admin domain (the user domain would raise a
+      # GUI prompt) under the relaxed authorizationdb rule; the runner is ephemeral, so nothing is restored. A Developer ID
+      # identity only needs its Apple intermediate. The SHA-1 pin makes a wrongly exported identity fail loudly instead
+      # of silently resetting users' grants.
       - name: Import and trust the signing identity
         timeout-minutes: 5
         env:
@@ -222,8 +224,24 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KC" >/dev/null
           security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
           security find-certificate -c "$IDENTITY" -p "$KC" > "$RUNNER_TEMP/id.pem"
-          sudo security authorizationdb write com.apple.trust-settings.admin allow
-          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/id.pem"
+          if [ "$(openssl x509 -in "$RUNNER_TEMP/id.pem" -noout -subject_hash)" = \
+               "$(openssl x509 -in "$RUNNER_TEMP/id.pem" -noout -issuer_hash)" ]; then
+            sudo security authorizationdb write com.apple.trust-settings.admin allow
+            sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/id.pem"
+          else
+            # Apple-issued (Developer ID): the root is already trusted, but the runner may lack the intermediate
+            # and the exported .p12 does not carry it. Fetch the one that issued this certificate; the
+            # find-identity -v check below only passes if it really completes the chain.
+            issuer="$(openssl x509 -in "$RUNNER_TEMP/id.pem" -noout -issuer)"
+            case "$issuer" in
+              *"Developer ID Certification Authority"*"OU=G2"* | *"OU=G2"*"Developer ID Certification Authority"*)
+                ca=DeveloperIDG2CA.cer ;;
+              *"Developer ID Certification Authority"*) ca=DeveloperIDCA.cer ;;
+              *) echo "::error::Unsupported certificate issuer: $issuer" >&2; exit 1 ;;
+            esac
+            curl -fsSL --proto '=https' --retry 3 "https://www.apple.com/certificateauthority/$ca" -o "$RUNNER_TEMP/$ca"
+            security import "$RUNNER_TEMP/$ca" -k "$KC"
+          fi
           # The pin must be a full SHA-1: a partial value would match almost any identity. find-identity prints it
           # in upper case; the build step then signs by this hash, so codesign uses exactly this certificate.
           if ! [[ "$MACOS_SIGNING_SHA1" =~ ^[0-9A-Fa-f]{40}$ ]]; then

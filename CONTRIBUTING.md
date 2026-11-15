@@ -147,8 +147,8 @@ It then commits `chore(release): vX.Y.Z`, tags it and pushes `main` and the tag 
 If the push fails nothing reaches the remote, and the script undoes the local commit and tag. Only
 admins can run it: `main`'s ruleset requires pull requests from everyone else.
 
-`release.yml` builds a Windows NSIS `setup.exe` and an Apple Silicon `.dmg` signed with the
-self-signed "Keitora Local Signing" identity (not notarized). The result appears on the repo's
+`release.yml` builds a Windows NSIS `setup.exe` and an Apple Silicon `.dmg` signed with a
+Developer ID Application identity (not notarized yet). The result appears on the repo's
 [Releases page](https://github.com/rudoi/keitora/releases). Pull requests that touch the release
 files run the same builds without publishing, and a weekly scheduled run keeps the build cache warm
 and catches runner drift.
@@ -159,31 +159,43 @@ patch version.
 
 ### One-time signing setup
 
-Tag builds sign the app with the same certificate every time. macOS ties a Screen Recording grant
-to the bundle id plus the certificate, so a release signed with a different certificate, or ad-hoc,
-resets everyone's permission. CI therefore needs the identity you already use locally. Export it
-once from the Mac that has it:
+Tag builds sign the app with the same identity every time. macOS ties a Screen Recording grant to
+the app's designated requirement. For a Developer ID identity that is the bundle id plus the team
+id, so a renewed certificate keeps everyone's grant, while switching to a self-signed or ad-hoc
+signature resets it. The workflow also accepts a self-signed identity (it trusts that certificate on
+the runner) and pins whichever one you upload by its SHA-1.
 
-1. In Keychain Access, open the login keychain, then **My Certificates**.
-2. Right-click **Keitora Local Signing**, choose **Export...**, and save it as
-   `keitora-signing.p12` with a strong password. The GUI exports only that identity, whereas
-   `security export -t identities` exports every identity in the keychain.
-3. Check it holds the right certificate:
-   `/usr/bin/openssl pkcs12 -in keitora-signing.p12 -nokeys | grep subject`
-4. Get its full 40-character SHA-1 with `security find-identity -v -p codesigning`. Tag runs sign by this hash, so it must be the exact certificate your local builds use.
-5. Store it in the repo's `release` environment, then delete the file:
+Upload the identity from the Mac that holds it, in your own terminal:
 
 ```sh
-base64 -i keitora-signing.p12 | gh secret set MACOS_CERTIFICATE_P12 --env release
-gh secret set MACOS_CERTIFICATE_PASSWORD --env release      # prompts for the password
-gh variable set MACOS_SIGNING_SHA1 --body <SHA-1>
-gh variable set MACOS_SIGNING_IDENTITY --body "<name>"      # only if it isn't "Keitora Local Signing"
-rm -P keitora-signing.p12
+security find-identity -v -p codesigning           # copy the identity's 40-character SHA-1
+bash scripts/macos-signing-secrets.sh <SHA-1>
 ```
 
-Tag runs fail with a clear message while any of these is missing. Also restrict the `release`
-environment to `v*` tags under Settings → Environments → release → Deployment branches and tags,
-so no other ref can read the key.
+The script puts a random export password on the clipboard and walks you through exporting that one
+identity from Keychain Access to `~/keitora-signing-export/signing.p12`. The GUI exports only that
+identity; `security export -t identities` would export every identity in the keychain. The script
+then checks that the `.p12` holds the certificate you named and uploads it with `gh secret set` over
+stdin, so neither the key nor the password is printed or passed as an argument. It sets:
+
+| Name | Kind | Value |
+| --- | --- | --- |
+| `MACOS_CERTIFICATE_P12` | `release` environment secret | base64 of the `.p12` |
+| `MACOS_CERTIFICATE_PASSWORD` | `release` environment secret | its export password |
+| `MACOS_SIGNING_SHA1` | repository variable | the certificate's SHA-1 |
+| `MACOS_SIGNING_IDENTITY` | repository variable | the identity's full name |
+
+Finally it shreds the `.p12` and clears the clipboard. Re-run it whenever the certificate is renewed.
+
+Tag runs fail with a clear message while any of these is missing. The `release` environment must
+exist first, restricted to `v*` tags so no other ref can read the key:
+
+```sh
+gh api -X PUT repos/{owner}/{repo}/environments/release --input - <<'EOF'
+{"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+EOF
+gh api -X POST repos/{owner}/{repo}/environments/release/deployment-branch-policies -f name='v*' -f type=tag
+```
 
 ### Signed macOS builds
 
