@@ -1600,10 +1600,12 @@ fn canonicalize_root(root: &Path) -> PathBuf {
 /// `load()` would produce.
 fn normalize_db_path(raw: &Path, root: &Path) -> PathBuf {
     let expanded = expand_tilde(&raw.to_string_lossy());
+    // A relative path joins the canonical root, so a DB that doesn't exist yet resolves to the
+    // same place it will once created (macOS `/var` is `/private/var`, for one).
     let joined = if expanded.is_absolute() {
         expanded
     } else {
-        root.join(expanded)
+        canonicalize_root(root).join(expanded)
     };
     strip_extended_prefix(joined.canonicalize().unwrap_or(joined))
 }

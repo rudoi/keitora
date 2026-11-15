@@ -1,0 +1,30 @@
+name: Save the Rust cache
+description: >
+  Trims rebuild-every-time output, then saves the cargo registry/git checkouts and target/ under the key
+  setup-rust computed. The path list matches setup-rust's restore. Only actions/* are used (the repo's own rule).
+
+inputs:
+  key:
+    description: The cache-primary-key output of setup-rust
+    required: true
+  trim:
+    description: Space-separated paths (globs allowed) to delete before saving
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Trim before caching
+      if: inputs.trim != ''
+      shell: bash
+      run: rm -rf ${{ inputs.trim }}
+
+    - uses: actions/cache/save@v6
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: ${{ inputs.key }}
