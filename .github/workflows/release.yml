@@ -319,9 +319,10 @@ jobs:
             sudo security authorizationdb write com.apple.trust-settings.admin allow
             sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/id.pem"
           else
-            # Apple-issued (Developer ID): the root is already trusted, but the runner may lack the intermediate
-            # and the exported .p12 does not carry it. Fetch the one that issued this certificate; the
-            # find-identity -v check below only passes if it really completes the chain.
+            # Apple-issued (Developer ID): the root is already trusted, but the chain also needs the intermediate,
+            # which the .p12 may or may not carry. Fetch the one that issued this certificate; an import that
+            # finds it already present is fine, because the find-identity -v check below only passes when the
+            # chain is complete.
             issuer="$(openssl x509 -in "$RUNNER_TEMP/id.pem" -noout -issuer)"
             case "$issuer" in
               *"Developer ID Certification Authority"*"OU=G2"* | *"OU=G2"*"Developer ID Certification Authority"*)
@@ -330,7 +331,12 @@ jobs:
               *) echo "::error::Unsupported certificate issuer: $issuer" >&2; exit 1 ;;
             esac
             curl -fsSL --proto '=https' --retry 3 "https://www.apple.com/certificateauthority/$ca" -o "$RUNNER_TEMP/$ca"
-            security import "$RUNNER_TEMP/$ca" -k "$KC"
+            if ! out="$(security import "$RUNNER_TEMP/$ca" -k "$KC" 2>&1)"; then
+              case "$out" in
+                *"already exists"*) echo "Intermediate $ca is already in the keychain" ;;
+                *) echo "$out" >&2; exit 1 ;;
+              esac
+            fi
           fi
           # The pin must be a full SHA-1: a partial value would match almost any identity. find-identity prints it
           # in upper case; the build step then signs by this hash, so codesign uses exactly this certificate.
