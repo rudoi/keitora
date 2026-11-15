@@ -148,7 +148,7 @@ If the push fails nothing reaches the remote, and the script undoes the local co
 admins can run it: `main`'s ruleset requires pull requests from everyone else.
 
 `release.yml` builds a Windows NSIS `setup.exe` and an Apple Silicon `.dmg` signed with a
-Developer ID Application identity (not notarized yet). Tag builds also publish the in-app
+Developer ID Application identity and notarized (see [Notarization](#notarization)). Tag builds also publish the in-app
 updater's files: `Keitora_<v>_x64-setup.exe.sig`, `Keitora.app.tar.gz` and `Keitora.app.tar.gz.sig`
 (see [Updater signing](#updater-signing)). The result appears on the repo's
 [Releases page](https://github.com/rudoi/keitora/releases). Pull requests that touch the release
@@ -234,11 +234,35 @@ local copy. Commit the `tauri.conf.json` change afterwards.
 - The first release that includes the updater has to be installed by hand. Updates work from that
   release onwards.
 
+### Notarization
+
+Gatekeeper opens a downloaded app without the **Open Anyway** step only if Apple has notarized
+that exact build. Tag builds notarize with an App Store Connect API key from the `release`
+environment. Tauri submits and staples the `.app`, and `scripts/build-dmg.sh` then submits and
+staples the `.dmg`. The script checks both staples and Gatekeeper's verdict and prints Apple's
+log if a submission is rejected. Tag runs fail while any of the three secrets is missing.
+
+1. In App Store Connect, open **Users and Access → Integrations → App Store Connect API → Team
+   Keys**. The Account Holder has to request access before the first key.
+2. Generate a key with the **Developer** role. Note its **Key ID** and the **Issuer ID**, and
+   download `AuthKey_<KEYID>.p8`. Apple offers the download only once.
+3. Store it in the `release` environment, then back up the `.p8` offline and delete it:
+
+```sh
+gh secret set APPLE_API_KEY_P8 --env release < ~/Downloads/AuthKey_<KEYID>.p8
+gh secret set APPLE_API_KEY --env release --body <KEYID>
+gh secret set APPLE_API_ISSUER --env release --body <ISSUER-UUID>
+```
+
+Every executable in the bundle needs the hardened runtime and a secure timestamp, or Apple rejects
+the submission. `tauri.conf.json` turns on the hardened runtime, and Tauri signs the bundled sidecar.
+
 ### Signed macOS builds
 
 `scripts/build-dmg.sh` is the local path for signed and notarized builds. It produces a `.dmg` in
 `target/release/bundle/dmg/` and requires `APPLE_SIGNING_IDENTITY`; `--sign-only` skips
-notarization. CI uses `--sign-only`. To notarize, also set one of these two sets of variables:
+notarization. CI notarizes with the API key below. To notarize, also set one of these two sets
+of variables:
 
 **Apple ID** (simplest for one developer)
 
