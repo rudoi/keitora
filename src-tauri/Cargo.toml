@@ -1,6 +1,6 @@
 [package]
 name = "keitora"
-version = "0.3.0"
+version = "0.4.0"
 description = "Keitora — Logistics Dispatch"
 authors = ["Andrew Rudoi"]
 edition = "2021"
