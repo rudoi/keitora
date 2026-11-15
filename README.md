@@ -84,9 +84,9 @@ yarn tauri:bundle
 The first build compiles a lot of Rust and can take several minutes. When it finishes:
 
 - **macOS:** open the `.dmg` in `target/release/bundle/dmg/` and drag Keitora to
-  Applications. The prebuilt release is signed with a Developer ID certificate but isn't notarized yet,
-  so the first open is blocked; allow it once in System Settings → Privacy & Security →
-  **Open Anyway**. If you want agents to take screenshots, build with a signing identity so
+  Applications. The prebuilt release is signed with a Developer ID certificate and notarized, so it
+  opens normally. A build of your own isn't notarized, so macOS blocks its first open; allow it once
+  in System Settings → Privacy & Security → **Open Anyway**. If you want agents to take screenshots, build with a signing identity so
   macOS remembers the Screen Recording permission between builds. See
   [macOS permissions](CONTRIBUTING.md#macos-permissions-screen-recording).
 - **Windows:** run the installer in `target/release/bundle/nsis/` (or the one you downloaded).

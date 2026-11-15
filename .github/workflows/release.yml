@@ -233,7 +233,7 @@ jobs:
   build-macos-release:
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     runs-on: macos-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     environment: release
     steps:
       - uses: actions/checkout@v7
@@ -252,8 +252,13 @@ jobs:
           HAS_P12: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && 'true' || 'false' }}
           HAS_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD != '' && 'true' || 'false' }}
           HAS_SHA1: ${{ vars.MACOS_SIGNING_SHA1 != '' && 'true' || 'false' }}
+          HAS_NOTARY: ${{ secrets.APPLE_API_KEY_P8 != '' && secrets.APPLE_API_KEY != '' && secrets.APPLE_API_ISSUER != '' && 'true' || 'false' }}
         run: |
           missing=0
+          if [ "$HAS_NOTARY" != "true" ]; then
+            echo "::error::Missing notarization secrets APPLE_API_KEY_P8, APPLE_API_KEY or APPLE_API_ISSUER in the release environment. See CONTRIBUTING.md, \"Notarization\"."
+            missing=1
+          fi
           if [ "$HAS_P12" != "true" ]; then
             echo "::error::Missing secret MACOS_CERTIFICATE_P12 in the release environment. See CONTRIBUTING.md, \"Releases\"."
             missing=1
@@ -352,14 +357,28 @@ jobs:
       # keychain search list instead. Signing by the pinned SHA-1 (codesign accepts a hash) rather than the name
       # guarantees the verified certificate is the one used. The bundler makes Keitora.app.tar.gz from the .app it has
       # just signed with that identity, so an in-app update keeps the stable designated requirement; the script
-      # verifies the tarball's copy too. This is the only step that sees the updater key.
-      - name: Build and verify the signed dmg
+      # verifies the tarball's copy too. This is the only step that sees the updater key and the notarization key.
+      # Notarization: Tauri submits and staples the .app, the script then does the same for the dmg and checks
+      # both staples plus Gatekeeper's verdict. Apple usually answers in minutes; notarytool gives up after 30.
+      # The App Store Connect key is written to a private file for notarytool and removed whatever happens.
+      - name: Build, notarize and verify the signed dmg
+        timeout-minutes: 75
         env:
           APPLE_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_SHA1 }}
           KEITORA_BUNDLE_OVERLAY: ${{ runner.temp }}/bundle-overlay.json
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: bash scripts/build-dmg.sh --sign-only
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          export APPLE_API_KEY_PATH="$RUNNER_TEMP/notary/AuthKey_${APPLE_API_KEY}.p8"
+          trap 'rm -rf "$RUNNER_TEMP/notary"' EXIT
+          mkdir -m 700 "$RUNNER_TEMP/notary"
+          (umask 077 && printf '%s\n' "$APPLE_API_KEY_P8" > "$APPLE_API_KEY_PATH")
+          unset APPLE_API_KEY_P8
+          bash scripts/build-dmg.sh
 
       # One flat folder, so publish finds every file at the top of the artifact.
       - name: Collect the dmg and the updater tarball

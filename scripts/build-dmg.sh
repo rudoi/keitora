@@ -68,6 +68,34 @@ fi
 
 echo "==> Produced DMG: $DMG"
 
+# ── Notarize and staple the .dmg ──────────────────────────────────────────────
+# Tauri notarizes and staples the .app, but not the .dmg it wraps it in. Submitting the dmg
+# lets Gatekeeper accept the download itself, and stapling it lets that check pass offline.
+if [[ "$SIGN_ONLY" == 0 ]]; then
+  if [[ -n "${APPLE_API_KEY:-}" ]]; then
+    NOTARY_AUTH=(--key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER")
+  else
+    NOTARY_AUTH=(--apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID")
+  fi
+  echo "==> Notarizing the dmg (waits for Apple)..."
+  # --wait exits 0 even when Apple rejects the submission, so check the status it reports.
+  if ! NOTARY_OUT=$(xcrun notarytool submit "$DMG" "${NOTARY_AUTH[@]}" --wait --timeout 30m --output-format json); then
+    echo "$NOTARY_OUT" >&2
+    echo "ERROR: notarytool submit failed (credentials, network, or timeout)" >&2
+    exit 1
+  fi
+  read -r NOTARY_ID NOTARY_STATUS < <(printf '%s' "$NOTARY_OUT" |
+    node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);console.log((j.id||"-")+" "+(j.status||"-"))})')
+  echo "==> Notarization $NOTARY_ID: $NOTARY_STATUS"
+  if [[ "$NOTARY_STATUS" != "Accepted" ]]; then
+    # The log names every file Apple rejected and why.
+    xcrun notarytool log "$NOTARY_ID" "${NOTARY_AUTH[@]}" || true
+    echo "ERROR: notarization of $DMG was $NOTARY_STATUS" >&2
+    exit 1
+  fi
+  xcrun stapler staple "$DMG"
+fi
+
 # Verify the app that actually ships in the dmg: mount it read-only and check the copy inside.
 # Without the `app` bundle target Tauri deletes target/release/bundle/macos/Keitora.app once the
 # dmg is built; with it (the updater overlay adds it) the .app stays, and Tauri also packs it into
@@ -122,9 +150,10 @@ if [[ "$SIGN_ONLY" == 0 ]]; then
   echo "==> Verifying Gatekeeper acceptance..."
   spctl --assess --type exec --verbose "$APP"
 
-  # ── Verify notarization staple on .dmg ──────────────────────────────────────
-  echo "==> Verifying notarization staple..."
+  # ── Verify notarization staples ─────────────────────────────────────────────
+  echo "==> Verifying notarization staples..."
   xcrun stapler validate "$DMG"
+  xcrun stapler validate "$APP"
 fi
 
 echo ""
