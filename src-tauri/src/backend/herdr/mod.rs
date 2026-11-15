@@ -7190,11 +7190,19 @@ mod tests {
     // ---- evicting panes that hold a session's agent name ----
 
     /// `cwd` as herdr reports a pane running there (its symlinks resolved).
+    /// The cwd herdr reports for a pane started in `cwd`. On unix herdr resolves symlinks
+    /// (`/var` comes back as `/private/var`); on Windows it reports the path the pane was
+    /// started with, so canonicalizing there would expand 8.3 short names (`RUNNER~1`) that
+    /// herdr never reports. Mirrors `keymap::held_cwd`'s link resolution.
     fn reported_cwd(cwd: &str) -> String {
-        std::fs::canonicalize(cwd)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned()
+        if cfg!(unix) {
+            std::fs::canonicalize(cwd)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            cwd.to_string()
+        }
     }
 
     /// The `agent list` entries holding one of `key`'s agent names.

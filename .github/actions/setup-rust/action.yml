@@ -1,0 +1,40 @@
+name: Set up Rust
+description: >
+  Installs the toolchain pinned in rust-toolchain.toml and restores the cargo cache. Saving is left to the
+  caller, which knows when a run may save. Only actions/* are used (the repo's own rule).
+
+inputs:
+  key-prefix:
+    description: >
+      Cache key prefix, one per build profile ("cargo" for the debug profile, "cargo-release" for the release
+      profile), so a release build never evicts or reads the debug entry.
+    required: false
+    default: cargo
+
+outputs:
+  cache-hit:
+    description: "'true' when the exact key was restored"
+    value: ${{ steps.cache.outputs.cache-hit }}
+  cache-primary-key:
+    description: The key to save under
+    value: ${{ steps.cache.outputs.cache-primary-key }}
+
+runs:
+  using: composite
+  steps:
+    # Installs the toolchain and components pinned in rust-toolchain.toml.
+    - run: rustup toolchain install
+      shell: bash
+
+    - name: Restore cargo cache
+      id: cache
+      uses: actions/cache/restore@v6
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: ${{ inputs.key-prefix }}-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          ${{ inputs.key-prefix }}-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-

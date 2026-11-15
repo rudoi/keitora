@@ -1,0 +1,301 @@
+name: Release
+
+# Only GitHub-authored actions (actions/*) are used, so no third-party code ever sees a secret. This workflow is the
+# only thing that publishes: scripts/release.ts bumps, commits, tags and pushes; the tag push lands here. A release
+# carries the Windows NSIS installer and the Apple Silicon dmg. Tag runs sign the dmg with the self-signed
+# identity from the `release` environment and fail without it; every other run builds unsigned and publishes nothing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  # Keeps the release cache warm (see the save steps) and catches runner-image drift between releases.
+  schedule:
+    - cron: "17 6 * * 1"
+  # Builds both installers (as artifacts) when the release files change, so a PR can prove it without publishing.
+  # workflow_dispatch only runs once this file is on the default branch.
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/actions/**"
+      - "src-tauri/tauri*.json"
+      - "src-tauri/entitlements.plist"
+      - "scripts/stage-sidecars.mjs"
+      - "scripts/signing.mjs"
+      - "scripts/build-dmg.sh"
+      # Toolchain and dependency changes can break a release build that ci.yml's debug build doesn't catch.
+      - "rust-toolchain.toml"
+      - "Cargo.lock"
+      - "src-tauri/Cargo.toml"
+      - "package.json"
+      - "yarn.lock"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # `yarn install` runs `prepare: husky`; hooks are pointless on CI runners.
+  HUSKY: 0
+  # Only scheduled and manual runs on main save the release cache: a tag-scoped entry is unreachable from other
+  # tags, and PR runs would churn the quota.
+  SAVE_RELEASE_CACHE: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches the app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package.json version ${version}" >&2
+            exit 1
+          fi
+
+      # The release profile has its own cache key (cargo-release-...), separate from ci.yml's debug entry.
+      # Always restored; saved only by scheduled/manual runs on main (see the save step below).
+      - uses: ./.github/actions/setup-rust
+        id: cargo-cache
+        with:
+          key-prefix: cargo-release
+
+      - uses: ./.github/actions/setup-node-yarn
+
+      # NSIS tooling downloads at build time; a flake is handled by re-running the job.
+      - name: Build the installer
+        run: yarn tauri:bundle
+
+      - name: Find the installer
+        id: installer
+        run: |
+          files=(target/release/bundle/nsis/Keitora_*_x64-setup.exe)
+          if [ "${#files[@]}" -ne 1 ] || [ ! -f "${files[0]}" ]; then
+            echo "Expected exactly one installer, found: ${files[*]}" >&2
+            exit 1
+          fi
+          echo "path=${files[0]}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: keitora-windows
+          path: ${{ steps.installer.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      # The bundle output is rebuilt every time and already uploaded.
+      - name: Save cargo cache
+        if: env.SAVE_RELEASE_CACHE == 'true' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/save-rust-cache
+        with:
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+          trim: target/release/bundle
+
+  # Two macOS jobs rather than one job with a conditional `environment:`. The signing secrets live in the `release`
+  # environment, and a job either names an environment or it does not; an empty-string environment is not a documented
+  # way to opt out, so the secret-free job (PR, dispatch, schedule) is kept entirely separate from the tag job.
+  # Exactly one of the two runs, and both upload the same artifact name.
+  build-macos:
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-rust
+        id: cargo-cache
+        with:
+          key-prefix: cargo-release
+
+      - uses: ./.github/actions/setup-node-yarn
+
+      # No environment, no secrets: ad-hoc signed (the stage-sidecars.mjs warning prints). Fork PRs succeed unsigned.
+      - name: Build the dmg (ad-hoc)
+        run: yarn tauri:bundle
+
+      - name: Find the dmg
+        id: dmg
+        run: |
+          files=(target/release/bundle/dmg/Keitora_*_aarch64.dmg)
+          if [ "${#files[@]}" -ne 1 ] || [ ! -f "${files[0]}" ]; then
+            echo "Expected exactly one dmg, found: ${files[*]}" >&2
+            exit 1
+          fi
+          echo "path=${files[0]}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: keitora-macos
+          path: ${{ steps.dmg.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      # The bundle output is rebuilt every time and already uploaded.
+      - name: Save cargo cache
+        if: env.SAVE_RELEASE_CACHE == 'true' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/save-rust-cache
+        with:
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+          trim: target/release/bundle
+
+  # Tag runs only. Signing is required: an ad-hoc release has a different designated requirement and would reset
+  # every user's Screen Recording grant. This job never saves the cache (tag-scoped entries are wasted quota).
+  build-macos-release:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: macos-latest
+    timeout-minutes: 90
+    environment: release
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches the app version
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package.json version ${version}" >&2
+            exit 1
+          fi
+
+      # Each expression evaluates to a bare true or false, so no secret value reaches this step or its shell.
+      - name: Require the signing configuration
+        env:
+          HAS_P12: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && 'true' || 'false' }}
+          HAS_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD != '' && 'true' || 'false' }}
+          HAS_SHA1: ${{ vars.MACOS_SIGNING_SHA1 != '' && 'true' || 'false' }}
+        run: |
+          missing=0
+          if [ "$HAS_P12" != "true" ]; then
+            echo "::error::Missing secret MACOS_CERTIFICATE_P12 in the release environment. See CONTRIBUTING.md, \"Releases\"."
+            missing=1
+          fi
+          if [ "$HAS_PASSWORD" != "true" ]; then
+            echo "::error::Missing secret MACOS_CERTIFICATE_PASSWORD in the release environment. See CONTRIBUTING.md, \"Releases\"."
+            missing=1
+          fi
+          if [ "$HAS_SHA1" != "true" ]; then
+            echo "::error::Missing repository variable MACOS_SIGNING_SHA1. See CONTRIBUTING.md, \"Releases\"."
+            missing=1
+          fi
+          exit "$missing"
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          key-prefix: cargo-release
+
+      - uses: ./.github/actions/setup-node-yarn
+
+      # The only step that sees the certificate secrets. Trust is required: codesign refuses an untrusted self-signed
+      # root, and -x keeps the key non-extractable. Trust goes in the admin domain (the user domain would raise a GUI
+      # prompt) under the relaxed authorizationdb rule; the runner is ephemeral, so nothing is restored. The SHA-1 pin
+      # makes a wrongly exported identity fail loudly instead of silently resetting users' grants.
+      - name: Import and trust the signing identity
+        timeout-minutes: 5
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY || 'Keitora Local Signing' }}
+          MACOS_SIGNING_SHA1: ${{ vars.MACOS_SIGNING_SHA1 }}
+        run: |
+          set -euo pipefail
+          KC="$RUNNER_TEMP/keitora-signing.keychain-db"; KC_PASS="$(openssl rand -hex 24)"
+          # Path only (never the password) so the cleanup step can find the keychain.
+          echo "KEITORA_KEYCHAIN=$KC" >> "$GITHUB_ENV"
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/id.p12"
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          security import "$RUNNER_TEMP/id.p12" -k "$KC" -f pkcs12 -P "$MACOS_CERTIFICATE_PASSWORD" -x -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/id.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          security find-certificate -c "$IDENTITY" -p "$KC" > "$RUNNER_TEMP/id.pem"
+          sudo security authorizationdb write com.apple.trust-settings.admin allow
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/id.pem"
+          # The pin must be a full SHA-1: a partial value would match almost any identity. find-identity prints it
+          # in upper case; the build step then signs by this hash, so codesign uses exactly this certificate.
+          if ! [[ "$MACOS_SIGNING_SHA1" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+            echo "::error::MACOS_SIGNING_SHA1 must be the full 40-character SHA-1 from security find-identity." >&2
+            exit 1
+          fi
+          security find-identity -v -p codesigning "$KC" | grep -i -F "$MACOS_SIGNING_SHA1"
+
+      # Stages the sidecar, builds with the bundle overlay, then mounts the dmg and verifies the signature and the
+      # stable designated requirement. Tauri's certificate-import variable is deliberately never set: its importer
+      # only recognises Apple-issued identity names and would reject this one; codesign finds the identity in the
+      # keychain search list instead. Signing by the pinned SHA-1 (codesign accepts a hash) rather than the name
+      # guarantees the verified certificate is the one used.
+      - name: Build and verify the signed dmg
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_SHA1 }}
+        run: bash scripts/build-dmg.sh --sign-only
+
+      - name: Find the dmg
+        id: dmg
+        run: |
+          files=(target/release/bundle/dmg/Keitora_*_aarch64.dmg)
+          if [ "${#files[@]}" -ne 1 ] || [ ! -f "${files[0]}" ]; then
+            echo "Expected exactly one dmg, found: ${files[*]}" >&2
+            exit 1
+          fi
+          echo "path=${files[0]}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: keitora-macos
+          path: ${{ steps.dmg.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Delete the signing keychain
+        if: always()
+        run: |
+          if [ -n "${KEITORA_KEYCHAIN:-}" ] && [ -e "$KEITORA_KEYCHAIN" ]; then
+            security delete-keychain "$KEITORA_KEYCHAIN"
+          fi
+
+  # Publishes only on a tag push (a manual dispatch on a tag never publishes). One of the two macOS jobs is always
+  # skipped, so `needs` alone would skip this job too; the explicit result checks keep it strict instead.
+  publish:
+    if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.build-windows.result == 'success' && needs.build-macos-release.result == 'success' }}
+    needs: [build-windows, build-macos, build-macos-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: keitora-windows
+          path: windows
+      - uses: actions/download-artifact@v8
+        with:
+          name: keitora-macos
+          path: macos
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          files=(windows/Keitora_*_x64-setup.exe macos/Keitora_*_aarch64.dmg)
+          for f in "${files[@]}"; do
+            [ -f "$f" ] || { echo "Missing release file: $f" >&2; exit 1; }
+          done
+          # A re-run of a tag whose release already exists replaces the assets instead of failing.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" "${files[@]}" --title "$TAG" --generate-notes --verify-tag --repo "$GITHUB_REPOSITORY"
+          fi

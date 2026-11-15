@@ -5,7 +5,7 @@ change has to pass. If you use an AI coding agent, point it at [AGENTS.md](AGENT
 
 ## Setup
 
-You need a stable Rust toolchain, Node.js and Yarn. On macOS, also install the Xcode Command Line
+You need Rust (`rust-toolchain.toml` pins the version, and rustup installs it automatically), Node.js and Yarn. On macOS, also install the Xcode Command Line
 Tools (`xcode-select --install`). On Windows you need Git for Windows and the MSVC Rust toolchain;
 [docs/windows-backend.md](docs/windows-backend.md) has the Windows specifics.
 
@@ -107,6 +107,9 @@ falls back to `cargo run -p keitora-cli`.
 - The build has zero warnings. TypeScript is checked by Biome (`noExplicitAny` is an error) and
   `tsc --noEmit`. Rust uses `rustfmt` and Clippy with `clippy::all` and rustc `warnings` denied
   workspace-wide.
+- CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, Clippy with warnings as errors and
+  `cargo test` on Windows, macOS and Linux, plus Biome, `yarn build` and `yarn test`.
+  `rust-toolchain.toml` pins the Rust version; rustup installs it automatically.
 - The pre-commit hook (husky + lint-staged) formats and lints staged files, runs Clippy when Rust
   changed, and `tsc` when TypeScript changed. It installs on `yarn install` and does nothing in a
   worktree that hasn't run it. It formats the staged version of a file, so stage the whole file
@@ -122,14 +125,71 @@ extensions.
 
 ## Releases
 
-`yarn release` builds the bundle for the current platform and uploads it to the GitHub release for
-the current version. `--patch`, `--minor` or `--major` bump the version first, and `--dry-run`
-prints what it would do without doing it.
+Releases are cut by tagging. `yarn release` bumps the version, commits, tags and pushes; the tag
+push runs `.github/workflows/release.yml`, which builds and publishes the installers. The script
+never builds or uploads anything itself.
+
+```sh
+yarn release --patch        # or --minor, --major, or --set X.Y.Z
+yarn release --dry-run      # print every step and change nothing (works from any branch)
+```
+
+`--set X.Y.Z` must be greater than the current version. `--skip-ci-check` releases without a passing
+CI run for `HEAD`, for example while Actions is down.
+
+The script refuses to run unless:
+
+- you are on `main`, with a clean working tree that isn't behind `origin/main`;
+- the tag doesn't exist yet and the version files agree with each other;
+- the latest `ci.yml` run for `HEAD` passed (unless `--skip-ci-check`).
+
+It then commits `chore(release): vX.Y.Z`, tags it and pushes `main` and the tag in one atomic push.
+If the push fails nothing reaches the remote, and the script undoes the local commit and tag. Only
+admins can run it: `main`'s ruleset requires pull requests from everyone else.
+
+`release.yml` builds a Windows NSIS `setup.exe` and an Apple Silicon `.dmg` signed with the
+self-signed "Keitora Local Signing" identity (not notarized). The result appears on the repo's
+[Releases page](https://github.com/rudoi/keitora/releases). Pull requests that touch the release
+files run the same builds without publishing, and a weekly scheduled run keeps the build cache warm
+and catches runner drift.
+
+If a tag's build fails, the tag exists but there is no release. Fix the cause and re-run the failed
+jobs on that tag; publishing replaces any assets already uploaded. Or fix forward and release a new
+patch version.
+
+### One-time signing setup
+
+Tag builds sign the app with the same certificate every time. macOS ties a Screen Recording grant
+to the bundle id plus the certificate, so a release signed with a different certificate, or ad-hoc,
+resets everyone's permission. CI therefore needs the identity you already use locally. Export it
+once from the Mac that has it:
+
+1. In Keychain Access, open the login keychain, then **My Certificates**.
+2. Right-click **Keitora Local Signing**, choose **Export...**, and save it as
+   `keitora-signing.p12` with a strong password. The GUI exports only that identity, whereas
+   `security export -t identities` exports every identity in the keychain.
+3. Check it holds the right certificate:
+   `/usr/bin/openssl pkcs12 -in keitora-signing.p12 -nokeys | grep subject`
+4. Get its full 40-character SHA-1 with `security find-identity -v -p codesigning`. Tag runs sign by this hash, so it must be the exact certificate your local builds use.
+5. Store it in the repo's `release` environment, then delete the file:
+
+```sh
+base64 -i keitora-signing.p12 | gh secret set MACOS_CERTIFICATE_P12 --env release
+gh secret set MACOS_CERTIFICATE_PASSWORD --env release      # prompts for the password
+gh variable set MACOS_SIGNING_SHA1 --body <SHA-1>
+gh variable set MACOS_SIGNING_IDENTITY --body "<name>"      # only if it isn't "Keitora Local Signing"
+rm -P keitora-signing.p12
+```
+
+Tag runs fail with a clear message while any of these is missing. Also restrict the `release`
+environment to `v*` tags under Settings → Environments → release → Deployment branches and tags,
+so no other ref can read the key.
 
 ### Signed macOS builds
 
-`scripts/build-dmg.sh` produces a signed, notarized `.dmg` in `target/release/bundle/dmg/`. Set
-`APPLE_SIGNING_IDENTITY`, plus one of these two sets of notarization variables:
+`scripts/build-dmg.sh` is the local path for signed and notarized builds. It produces a `.dmg` in
+`target/release/bundle/dmg/` and requires `APPLE_SIGNING_IDENTITY`; `--sign-only` skips
+notarization. CI uses `--sign-only`. To notarize, also set one of these two sets of variables:
 
 **Apple ID** (simplest for one developer)
 
@@ -150,15 +210,6 @@ prints what it would do without doing it.
 `APPLE_SIGNING_IDENTITY` is the full certificate name, e.g.
 `Developer ID Application: Jane Smith (AB12CD34EF)`. List yours with
 `security find-identity -v -p codesigning`. Never commit any of these values.
-
-Without notarization credentials, `bash scripts/build-dmg.sh --sign-only` signs the app with
-`APPLE_SIGNING_IDENTITY` and skips notarization. `yarn release` on macOS picks the mode for you:
-
-- **Notarized:** used when one set of notarization variables is complete.
-- **Signed only:** used when no notarization variables are set. It warns that downloaders must
-  allow the app once under System Settings → Privacy & Security → **Open Anyway**.
-- **Stops with an error:** when the variables are only partly set, or when
-  `APPLE_SIGNING_IDENTITY` is missing or `-`.
 
 ### macOS permissions (Screen Recording)
 

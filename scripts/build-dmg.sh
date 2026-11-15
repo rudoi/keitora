@@ -29,7 +29,7 @@ else
   # Notarization: set either Flow A or Flow B vars before running.
   # Flow A: APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
   # Flow B: APPLE_API_KEY, APPLE_API_ISSUER, APPLE_API_KEY_PATH
-  # A set counts only when all three variables are non-empty (same rule as signing.mjs).
+  # A set counts only when all three variables are non-empty.
   if ! [[ -n "${APPLE_ID:-}" && -n "${APPLE_PASSWORD:-}" && -n "${APPLE_TEAM_ID:-}" ]] &&
     ! [[ -n "${APPLE_API_KEY:-}" && -n "${APPLE_API_ISSUER:-}" && -n "${APPLE_API_KEY_PATH:-}" ]]; then
     echo "ERROR: Set all of APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID (Flow A)" >&2
