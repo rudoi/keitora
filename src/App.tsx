@@ -25,6 +25,8 @@ import { SettingsDrawer } from "./components/SettingsDrawer";
 import { TerminalPane } from "./components/TerminalPane";
 import { ToastProvider, useToast } from "./components/Toast";
 import { TopBar, type View } from "./components/TopBar";
+import { UpdateBanner } from "./components/UpdateBanner";
+import { UpdatesProvider } from "./components/UpdatesProvider";
 import { WorktreePicker } from "./components/WorktreePicker";
 import { useAttention } from "./lib/attention";
 import {
@@ -1167,6 +1169,7 @@ function AppInner() {
         worktreeLabel={activeReady ? selected : undefined}
       />
       <RecoveryBanner info={recovery} />
+      <UpdateBanner />
       <div className="body" style={{ position: "relative" }}>
         <Rail
           groups={railGroups}
@@ -1329,14 +1332,16 @@ function AppInner() {
 function App() {
   return (
     <ToastProvider>
-      <ConfirmDialogProvider>
-        <AttentionBannersProvider>
-          <Tooltip.Provider>
-            <AppInner />
-            <QuitConfirmModal />
-          </Tooltip.Provider>
-        </AttentionBannersProvider>
-      </ConfirmDialogProvider>
+      <UpdatesProvider>
+        <ConfirmDialogProvider>
+          <AttentionBannersProvider>
+            <Tooltip.Provider>
+              <AppInner />
+              <QuitConfirmModal />
+            </Tooltip.Provider>
+          </AttentionBannersProvider>
+        </ConfirmDialogProvider>
+      </UpdatesProvider>
     </ToastProvider>
   );
 }

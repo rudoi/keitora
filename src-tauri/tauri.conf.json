@@ -44,5 +44,13 @@
         "displayLanguageSelector": false
       }
     }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhFN0FDMjUzOTQ2RTJBNEEKUldSS0ttNlVVOEo2anEwWGdoc0UwYktuVmJ5OXdja2RmbXNyeTJ5Q0kxMUJBTG1tbGsxZEFjcnEK",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

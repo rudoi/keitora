@@ -632,3 +632,139 @@ export function doneLines(tag: string, dryRun: boolean): string[] {
     "Watch it with: gh run list --workflow release.yml --limit 1",
   ];
 }
+
+// ── updater artifacts ───────────────────────────────────────────────────────
+
+/** The `plugins.updater.pubkey` value that stands in until a real key is generated. */
+export const UPDATER_PUBKEY_PLACEHOLDER = "REPLACE_WITH_UPDATER_PUBKEY";
+
+/** Error codes that open the message of every updater-signing failure. */
+export type UpdaterErrorCode = "UPDATER_KEY_MISSING" | "UPDATER_PUBKEY_PLACEHOLDER";
+
+/** An updater-signing failure; the message starts with the code so CI logs show it. */
+export class UpdaterSigningError extends Error {
+  readonly code: UpdaterErrorCode;
+  constructor(code: UpdaterErrorCode, detail: string) {
+    super(`${code}: ${detail}`);
+    this.name = "UpdaterSigningError";
+    this.code = code;
+  }
+}
+
+export type BundleTarget = "windows" | "macos";
+
+export interface BundleOverlayInput {
+  target: BundleTarget;
+  /** Whether the signing key secret is set: the bare "true"/"false" a workflow step computes. */
+  updaterKey: string | undefined;
+  /** `GITHUB_REF`; undefined outside Actions. */
+  ref: string | undefined;
+  /** `plugins.updater.pubkey` from tauri.conf.json. */
+  pubkey: string;
+}
+
+/** Whether `ref` is a release tag (`refs/tags/v*`), the only ref that publishes. */
+export function isReleaseTagRef(ref: string | undefined): boolean {
+  return (ref ?? "").startsWith("refs/tags/v");
+}
+
+function isPlaceholderPubkey(pubkey: string): boolean {
+  return pubkey.trim() === UPDATER_PUBKEY_PLACEHOLDER;
+}
+
+function placeholderPubkeyError(): UpdaterSigningError {
+  return new UpdaterSigningError(
+    "UPDATER_PUBKEY_PLACEHOLDER",
+    "plugins.updater.pubkey in src-tauri/tauri.conf.json is still the placeholder; a release cannot ship updates nobody can verify",
+  );
+}
+
+/**
+ * The tauri `--config` overlay (as JSON text) that turns on signed updater artifacts. With the key
+ * it sets `bundle.createUpdaterArtifacts`; on macOS it also adds the `app` target, because the
+ * bundler only makes `Keitora.app.tar.gz` when `app` is a target (arrays replace on merge, so this
+ * overrides the base targets on the macOS runner only). Without the key it is `{}`. A release tag
+ * must ship updater artifacts, so a tag without the key, or with the placeholder pubkey, throws.
+ */
+export function bundleOverlay(input: BundleOverlayInput): string {
+  const hasKey = input.updaterKey === "true";
+  if (isReleaseTagRef(input.ref)) {
+    if (isPlaceholderPubkey(input.pubkey)) throw placeholderPubkeyError();
+    if (!hasKey) {
+      throw new UpdaterSigningError(
+        "UPDATER_KEY_MISSING",
+        'secret TAURI_SIGNING_PRIVATE_KEY is not set in the release environment. See CONTRIBUTING.md, "Releases"',
+      );
+    }
+  }
+  if (!hasKey) return "{}";
+  const bundle: Record<string, unknown> = { createUpdaterArtifacts: true };
+  if (input.target === "macos") bundle.targets = ["app", "dmg"];
+  return JSON.stringify({ bundle });
+}
+
+/** `plugins.updater.pubkey` from the text of tauri.conf.json. */
+export function readUpdaterPubkey(tauriConfText: string): string {
+  const conf = JSON.parse(tauriConfText) as { plugins?: { updater?: { pubkey?: unknown } } };
+  const pubkey = conf?.plugins?.updater?.pubkey;
+  if (typeof pubkey !== "string" || pubkey.trim() === "") {
+    throw new Error("tauri.conf.json has no plugins.updater.pubkey");
+  }
+  return pubkey.trim();
+}
+
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+function strictBase64(s: string, what: string): Buffer {
+  const t = s.trim();
+  if (t.length === 0 || t.length % 4 !== 0 || !BASE64_RE.test(t)) {
+    throw new Error(`${what} is not valid base64`);
+  }
+  return Buffer.from(t, "base64");
+}
+
+/**
+ * The 8-byte key id of a minisign public key or signature as Tauri stores it: base64 of the whole
+ * minisign file text. Decoded, the first line that is not an `untrusted comment:` is itself base64
+ * of a 2-byte algorithm tag, the key id, then the key (32 bytes) or the signature (64 bytes).
+ */
+export function minisignKeyId(b64: string, kind: "pubkey" | "signature"): Buffer {
+  const text = strictBase64(b64, `the ${kind}`).toString("utf8");
+  const line = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .find((l) => l !== "" && !l.startsWith("untrusted comment:"));
+  if (!line) throw new Error(`the ${kind} has no minisign data line`);
+  const bytes = strictBase64(line, `the ${kind}'s minisign data line`);
+  const expected = kind === "pubkey" ? 2 + 8 + 32 : 2 + 8 + 64;
+  if (bytes.length !== expected) {
+    throw new Error(`the ${kind} decodes to ${bytes.length} bytes, expected ${expected}`);
+  }
+  const alg = bytes.subarray(0, 2).toString("latin1");
+  const algOk = kind === "pubkey" ? alg === "Ed" : alg === "Ed" || alg === "ED";
+  if (!algOk) throw new Error(`the ${kind} has an unknown minisign algorithm "${alg}"`);
+  return bytes.subarray(2, 10);
+}
+
+/** Whether the signature was made by the key `pubkeyB64` names (both as Tauri stores them). */
+export function updaterKeyIdMatches(pubkeyB64: string, sigB64: string): boolean {
+  return minisignKeyId(pubkeyB64, "pubkey").equals(minisignKeyId(sigB64, "signature"));
+}
+
+/** A key id as minisign prints it: upper-case hex, most significant byte first. */
+export function formatKeyId(id: Buffer): string {
+  return Buffer.from(id).reverse().toString("hex").toUpperCase();
+}
+
+/**
+ * Why an updater signature would fail verification in installed copies, or null when its key id
+ * matches the configured pubkey. Tauri only warns on a mismatched key at build time, so CI turns
+ * this into a failed job.
+ */
+export function updaterSigProblem(pubkeyB64: string, sigB64: string): string | null {
+  if (isPlaceholderPubkey(pubkeyB64)) return placeholderPubkeyError().message;
+  if (updaterKeyIdMatches(pubkeyB64, sigB64)) return null;
+  const want = minisignKeyId(pubkeyB64, "pubkey");
+  const got = minisignKeyId(sigB64, "signature");
+  return `the signature was made by key ${formatKeyId(got)}, but tauri.conf.json trusts key ${formatKeyId(want)}: installed copies would reject this update. TAURI_SIGNING_PRIVATE_KEY does not belong to the committed pubkey`;
+}

@@ -20,10 +20,13 @@ import {
   saveProjectSettings,
   saveUserSettings,
   setSkipPermissions,
+  setUpdateAutoCheck,
 } from "../lib/settings";
 import { isThemeMode, THEME_MODES, themeLabel, useTheme } from "../lib/theme";
+import { errorText, installLabel, isBusy, statusLine } from "../lib/updates";
 import { RestartDaemonDialog } from "./RestartDaemonDialog";
 import { useToast } from "./Toast";
+import { useUpdates } from "./UpdatesProvider";
 import { WorktreePicker } from "./WorktreePicker";
 
 const field =
@@ -238,6 +241,99 @@ function DaemonSection() {
         sessionCount={info.session_count}
         onConfirm={() => void handleRestart()}
       />
+    </section>
+  );
+}
+
+// ── UpdatesSection ────────────────────────────────────────────────────────────
+
+/**
+ * Updates section: current version, the auto-check toggle, a manual check, and the
+ * install action with release notes when an update is available. State lives in
+ * `UpdatesProvider`; only the toggle's value is local (seeded from the drawer's snapshot).
+ */
+function UpdatesSection({ autoCheck: initialAutoCheck }: { autoCheck: boolean }) {
+  const { showToast } = useToast();
+  const { state, check, install } = useUpdates();
+  const [autoCheck, setAutoCheck] = useState(initialAutoCheck);
+  useEffect(() => setAutoCheck(initialAutoCheck), [initialAutoCheck]);
+
+  const unsupported = state.status.type === "unsupported";
+  const busy = isBusy(state);
+
+  // Optimistic: flip now, put it back if the backend refuses.
+  const toggleAutoCheck = () => {
+    const next = !autoCheck;
+    setAutoCheck(next);
+    void setUpdateAutoCheck(next).catch((err: unknown) => {
+      setAutoCheck(!next);
+      showToast(`Could not save setting: ${errorText(err)}`);
+    });
+  };
+
+  return (
+    <section className="flex flex-col gap-3 border-t border-line pt-6">
+      <div className={sectionTitle}>Updates</div>
+      <p className="text-[12px] text-tx-1">Keitora {state.currentVersion || "\u2026"}</p>
+
+      <div className="flex items-center justify-between gap-3">
+        <span className={label}>Automatically check for updates</span>
+        <button
+          className={autoCheck ? btnPrimary : btnGhost}
+          aria-pressed={autoCheck}
+          disabled={unsupported}
+          onClick={toggleAutoCheck}
+        >
+          {autoCheck ? "Enabled" : "Disabled"}
+        </button>
+      </div>
+
+      <div className="flex items-center gap-3">
+        <button
+          className={btnGhost}
+          disabled={unsupported || state.checking || busy}
+          onClick={check}
+        >
+          {state.checking ? (
+            <span className="flex items-center gap-1.5">
+              <Loader2 size={12} className="animate-spin" />
+              Checking…
+            </span>
+          ) : (
+            "Check now"
+          )}
+        </button>
+        <span
+          className={`text-[11px] ${state.status.type === "failed" ? "text-urgent" : "text-tx-3"}`}
+        >
+          {statusLine(state.status)}
+        </span>
+      </div>
+
+      {state.status.type === "available" && (
+        <div className="flex flex-col gap-2">
+          <div>
+            <button className={btnPrimary} disabled={busy} onClick={install}>
+              {busy ? (
+                <span className="flex items-center gap-1.5">
+                  <Loader2 size={12} className="animate-spin" />
+                  {installLabel(state)}
+                </span>
+              ) : (
+                installLabel(state)
+              )}
+            </button>
+          </div>
+          {state.error !== null && !busy && (
+            <p className="text-[11px] text-urgent">Update failed: {state.error}</p>
+          )}
+          {state.status.notes.trim() !== "" && (
+            <div className="whitespace-pre-wrap rounded-chip border border-line bg-bg-2 px-3 py-2 text-[11px] text-tx-2">
+              {state.status.notes}
+            </div>
+          )}
+        </div>
+      )}
     </section>
   );
 }
@@ -1025,6 +1121,9 @@ export function SettingsDrawer({
 
                 {/* ── Daemon ──────────────────────────────────────────────── */}
                 <DaemonSection />
+
+                {/* ── Updates ─────────────────────────────────────────────── */}
+                <UpdatesSection autoCheck={snap?.user.auto_check_updates ?? true} />
               </div>
             )}
           </div>

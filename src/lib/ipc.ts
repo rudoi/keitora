@@ -1180,3 +1180,72 @@ export function keitoraCliStatus(): Promise<CliStatus> {
 export function installKeitoraCli(): Promise<CliStatus> {
   return invoke<CliStatus>("install_keitora_cli");
 }
+
+// ── Updater ────────────────────────────────────────────────────────────────────
+
+/** Mirrors the backend's `UpdateStatus` (tagged by `type`). */
+export type UpdateStatus =
+  | { type: "unchecked" }
+  | { type: "up_to_date" }
+  | {
+      type: "available";
+      version: string;
+      notes: string;
+      release_url: string;
+      published_at: string | null;
+    }
+  | { type: "failed"; message: string }
+  | { type: "unsupported" };
+
+export type UpdatePhase = "idle" | "downloading" | "ready" | "applying";
+
+export interface UpdateProgress {
+  downloaded: number;
+  total: number | null;
+}
+
+/** `update_status` response: the current status plus any in-flight download. */
+export interface UpdateSnapshot {
+  status: UpdateStatus;
+  phase: UpdatePhase;
+  progress: UpdateProgress | null;
+  current_version: string;
+}
+
+/** `updater://status` payload: the status fields plus whether a user asked for the check. */
+export type UpdateStatusEvent = UpdateStatus & { manual: boolean };
+
+/** `updater://progress` payload. */
+export interface UpdateProgressEvent {
+  phase: UpdatePhase;
+  downloaded: number;
+  total: number | null;
+}
+
+export function updateStatus(): Promise<UpdateSnapshot> {
+  return invoke("update_status");
+}
+
+/** Run a check now. The result also arrives as an `updater://status` event (with
+ *  `manual: true`), which is what drives state and toasts. */
+export function updateCheck(): Promise<UpdateStatus> {
+  return invoke("update_check");
+}
+
+/** Download and verify the available update. Rejects with an error string. */
+export function updateDownload(): Promise<void> {
+  return invoke("update_download");
+}
+
+/** Install the downloaded update; the app exits or restarts on success. Rejects with an error string. */
+export function updateApply(): Promise<void> {
+  return invoke("update_apply");
+}
+
+export function onUpdaterStatus(cb: (e: UpdateStatusEvent) => void): Promise<UnlistenFn> {
+  return listen<UpdateStatusEvent>("updater://status", cb);
+}
+
+export function onUpdaterProgress(cb: (e: UpdateProgressEvent) => void): Promise<UnlistenFn> {
+  return listen<UpdateProgressEvent>("updater://progress", cb);
+}

@@ -492,6 +492,17 @@ Status: **Phase 0 ✅ done** · **Phase 1 ✅ done (PR #1)** · **Phase 2 ✅ do
   ignores the XDG isolation and reaches the real server). Tests: `railGroups`, `railExpanded`, `railOrder`,
   `pendingIntent`, `railGroupView`, `laneState`, `dev-herdr` (vitest); `project_order`, `projects_overview`,
   `open_read_only`, `write_lock` (Rust). Visual review done in an isolated run; drag/menu edge cases owed.
+- **#0071 — In-app auto updater. ✅ done.** Keitora reads the public repo's latest release over plain
+  HTTPS (no `gh`), shows a banner and an *Updates* settings section, and downloads, verifies (minisign,
+  via `tauri-plugin-updater` `restore_update`) and installs the update, keeping herdr sessions alive.
+  Windows NSIS relaunches by itself; on macOS the `.app` is swapped in place, then the app restarts.
+  Background checks run 30 s after launch and then every 6 h, controlled by `[updates] auto_check`;
+  macOS also gets a *Check for Updates…* menu item. Tag builds sign the updater files from the
+  `release` environment key through a CI-only `--config` overlay (`scripts/bundle-overlay.ts`) and
+  check the key id (`scripts/check-updater-sig.ts`). tauri was bumped to 2.12. Code is in
+  `src-tauri/src/updater/`; tests cover the release assessment, the phase machine, config and the
+  overlay. Still owed: a live downgrade test once the first signed release exists, and the first
+  real macOS swap.
 - **Phase 5 — Polish & packaging. ✅ done (PR #7).** Scrollback search (xterm search addon + Cmd+F
   overlay); central keymap (`src/lib/keybindings.ts`: Cmd+↑/↓ worktree cycle, Cmd+F
   search, Cmd+K dispatch, `?` cheatsheet, `d` board dispatch; nav chords fire over a focused terminal;

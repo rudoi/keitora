@@ -4,6 +4,9 @@
 #
 #   bash scripts/build-dmg.sh              # sign + notarize (notarization vars required)
 #   bash scripts/build-dmg.sh --sign-only  # sign with a stable identity, skip notarization
+#
+# KEITORA_BUNDLE_OVERLAY (optional): path to an extra tauri config merged last, as written by
+# scripts/bundle-overlay.ts. Release CI uses it to turn on signed updater artifacts.
 set -euo pipefail
 
 SIGN_ONLY=0
@@ -46,8 +49,11 @@ fi
 # .dmg ships the `externalBin` sidecar (plain `tauri build` would omit them).
 echo "==> Staging sidecars..."
 yarn bundle-cli
+# A tarball from an earlier build must never be mistaken for this one's.
+TARBALL=target/release/bundle/macos/Keitora.app.tar.gz
+rm -f "$TARBALL" "$TARBALL.sig"
 echo "==> Running tauri build (frontend + sign [+ notarize], with sidecars)..."
-yarn tauri build --config src-tauri/tauri.bundle.conf.json
+yarn tauri build --config src-tauri/tauri.bundle.conf.json ${KEITORA_BUNDLE_OVERLAY:+--config "$KEITORA_BUNDLE_OVERLAY"}
 
 # ── Locate outputs ────────────────────────────────────────────────────────────
 # This is a Cargo workspace, so the bundle lands in the repo-root target/, not
@@ -62,26 +68,53 @@ fi
 
 echo "==> Produced DMG: $DMG"
 
-# Tauri deletes target/release/bundle/macos/Keitora.app once the dmg is built, so check
-# the app that actually ships: mount the dmg read-only and verify the copy inside it.
+# Verify the app that actually ships in the dmg: mount it read-only and check the copy inside.
+# Without the `app` bundle target Tauri deletes target/release/bundle/macos/Keitora.app once the
+# dmg is built; with it (the updater overlay adds it) the .app stays, and Tauri also packs it into
+# Keitora.app.tar.gz for the in-app updater, which is checked below too.
 MNT=$(mktemp -d)
+TARBALL_DIR=""
+cleanup() {
+  hdiutil detach -quiet "$MNT" || true
+  rmdir "$MNT" 2>/dev/null || true
+  if [[ -n "$TARBALL_DIR" ]]; then rm -rf "$TARBALL_DIR"; fi
+}
+trap cleanup EXIT
 hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "$DMG" >/dev/null
-trap 'hdiutil detach -quiet "$MNT" || true; rmdir "$MNT" 2>/dev/null || true' EXIT
 APP="$MNT/Keitora.app"
 
-# ── Verify code signature on .app ─────────────────────────────────────────────
-echo "==> Verifying code signature..."
-codesign --verify --deep --strict --verbose=2 "$APP"
+# The signature must verify, and the designated requirement must name the bundle id, not a
+# cdhash: TCC stores grants against it, and a cdhash changes on every build.
+verify_app() {
+  local app="$1" req
+  echo "==> Verifying code signature of $app..."
+  codesign --verify --deep --strict --verbose=2 "$app"
+  req=$(codesign -dr - "$app" 2>&1)
+  if [[ "$req" != *'identifier "com.keitora.dispatch"'* ]]; then
+    echo "ERROR: designated requirement of $app is not stable:" >&2
+    echo "$req" >&2
+    exit 1
+  fi
+  echo "==> Designated requirement is stable"
+}
 
-# The designated requirement must name the bundle id, not a cdhash: TCC stores grants
-# against it, and a cdhash changes on every build.
-REQ=$(codesign -dr - "$APP" 2>&1)
-if [[ "$REQ" != *'identifier "com.keitora.dispatch"'* ]]; then
-  echo "ERROR: designated requirement is not stable:" >&2
-  echo "$REQ" >&2
+# ── Verify code signature on .app ─────────────────────────────────────────────
+verify_app "$APP"
+
+# ── Verify the updater tarball's .app ─────────────────────────────────────────
+# An in-app update installs the .app from this tarball, so it must carry the same stable
+# signature. It exists only when the overlay turned on updater artifacts (stale ones were
+# removed before the build), and then it is required.
+if [[ -n "${KEITORA_BUNDLE_OVERLAY:-}" ]] && grep -q '"createUpdaterArtifacts":true' "$KEITORA_BUNDLE_OVERLAY" && [[ ! -f "$TARBALL" ]]; then
+  echo "ERROR: updater artifacts were requested but $TARBALL was not built" >&2
   exit 1
 fi
-echo "==> Designated requirement is stable"
+if [[ -f "$TARBALL" ]]; then
+  TARBALL_DIR=$(mktemp -d)
+  tar -xzf "$TARBALL" -C "$TARBALL_DIR"
+  verify_app "$TARBALL_DIR/Keitora.app"
+  echo "==> Updater tarball: $TARBALL"
+fi
 
 # Gatekeeper and the staple only pass for notarized builds.
 if [[ "$SIGN_ONLY" == 0 ]]; then
