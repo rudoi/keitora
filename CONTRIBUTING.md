@@ -209,13 +209,15 @@ Tauri updater key whose **public** half is `plugins.updater.pubkey` in `src-taur
 The private key and its password are secrets in the `release` environment:
 
 ```sh
-yarn tauri signer generate -w ~/keitora-updater.key        # once; prompts for a password
-gh secret set TAURI_SIGNING_PRIVATE_KEY --env release < ~/keitora-updater.key
-gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --env release   # prompts for the password
+bash scripts/updater-signing-key.sh     # from the repo root, in your own terminal
 ```
 
-Put the contents of `~/keitora-updater.key.pub` in `tauri.conf.json`. Keep an offline backup of the
-key and password, then delete the local copy.
+The script generates the key with a random password, which it puts on the clipboard for the
+`tauri signer` prompts so the password is never shown or typed. It writes the public key into
+`tauri.conf.json` and proves the pair by signing a scratch file and checking it with
+`scripts/check-updater-sig.ts`. Then it uploads the key and password over stdin. Finally it hands
+you the password and `~/keitora-updater/keitora-updater.key` to back up offline before deleting the
+local copy. Commit the `tauri.conf.json` change afterwards.
 
 - **Losing the key strands every installed copy.** Installed apps can only verify updates signed
   with the key they trust, so a release signed by a new key must be installed by hand.
