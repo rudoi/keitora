@@ -117,7 +117,7 @@ keitora task list                   # open and in-progress tasks
 keitora task new "Fix pause menu"   # add a task
 keitora task claim <id>             # take a task for this worktree
 keitora task review <id> --pr <url> # hand finished work over for review
-keitora task update <id> --url <url> # set the task's URL (by default, its PR)
+keitora task update <id> --pr <url> # set or change the task's PR
 keitora task done <id>              # mark it done after review, and see what it unblocked
 ```
 

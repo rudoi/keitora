@@ -15,8 +15,8 @@ export interface TaskFormValues {
   priority: Priority;
   description: string;
   tags: string[];
-  /** The task's URL, by default its pull request ("" for none). */
-  url: string;
+  /** The task's pull request ("" for none). */
+  prUrl: string;
   /** Ids of the tasks this one depends on (edit mode only). */
   blockedBy: number[];
 }
@@ -44,7 +44,7 @@ export function TaskFormDialog({
   const [description, setDescription] = useState(initial?.description ?? "");
   const [tags, setTags] = useState((initial?.tags ?? []).join(", "));
   const tagsId = useId();
-  const [url, setUrl] = useState(initial?.url ?? "");
+  const [prUrl, setPrUrl] = useState(initial?.prUrl ?? "");
   const [blockedBy, setBlockedBy] = useState(formatIds(initial?.blockedBy ?? []));
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -59,7 +59,7 @@ export function TaskFormDialog({
     setPriority(initial?.priority ?? "normal");
     setDescription(initial?.description ?? "");
     setTags((initial?.tags ?? []).join(", "));
-    setUrl(initial?.url ?? "");
+    setPrUrl(initial?.prUrl ?? "");
     setBlockedBy(formatIds(initial?.blockedBy ?? []));
     setErr(null);
     // Re-seed only on open/close transitions, not on every parent re-render
@@ -84,7 +84,7 @@ export function TaskFormDialog({
         priority,
         description: description.trim(),
         tags: parseTags(tags),
-        url: url.trim(),
+        prUrl: prUrl.trim(),
         blockedBy: deps.ids,
       });
       onOpenChange(false);
@@ -143,13 +143,11 @@ export function TaskFormDialog({
       </label>
 
       <label className="flex flex-col gap-1.5">
-        <span className={labelText}>
-          URL <span className="normal-case text-tx-3/70">(the pull request, by default)</span>
-        </span>
+        <span className={labelText}>PR</span>
         <input
           className={`${field} font-mono`}
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
+          value={prUrl}
+          onChange={(e) => setPrUrl(e.target.value)}
           placeholder="https://github.com/owner/repo/pull/1"
         />
       </label>

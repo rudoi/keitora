@@ -16,13 +16,13 @@ import {
   finishActions,
   getTask,
   markTaskDone,
+  prUrlPatch,
   removeTaskDep,
   reopenTask,
   sameTags,
   type TaskDetail,
   unclaimTask,
   updateTask,
-  urlPatch,
 } from "../lib/tasks";
 import { TaskFormDialog } from "./TaskFormDialog";
 
@@ -227,7 +227,7 @@ export function Inspector({
           )}
 
           {task.pr_url && (
-            <Field label="URL">
+            <Field label="PR">
               <button
                 type="button"
                 title="Open in the browser"
@@ -341,7 +341,7 @@ export function Inspector({
             priority: task.priority,
             description: task.description,
             tags: task.tags,
-            url: task.pr_url ?? "",
+            prUrl: task.pr_url ?? "",
             blockedBy: directDeps(detail.deps),
           }}
           onSubmit={async (v) => {
@@ -351,7 +351,7 @@ export function Inspector({
                 priority: v.priority,
                 description: v.description,
                 ...(sameTags(task.tags, v.tags) ? {} : { tags: v.tags }),
-                ...urlPatch(task.pr_url, v.url),
+                ...prUrlPatch(task.pr_url, v.prUrl),
               });
               // Removals first, so swapping one blocker for another never trips the
               // cycle check on an edge that is about to go.
