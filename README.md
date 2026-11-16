@@ -30,8 +30,9 @@ waiting on you, and which are free for the next task.
 
 ## Setup
 
-Keitora runs on macOS and Windows. There are no prebuilt downloads yet, so setup means installing
-a couple of tools and building the app once.
+Keitora runs on macOS and Windows. Prebuilt installers (a macOS Apple Silicon `.dmg` and a Windows
+installer) are on the [Releases page](https://github.com/rudoi/keitora/releases). You can also build
+from source; that means installing a couple of tools and building the app once.
 
 ### 1. Install Claude Code
 
@@ -82,10 +83,14 @@ yarn tauri:bundle
 
 The first build compiles a lot of Rust and can take several minutes. When it finishes:
 
-- **macOS:** open the `.dmg` in `src-tauri/target/release/bundle/dmg/` and drag Keitora to
-  Applications.
-- **Windows:** run the installer in `src-tauri/target/release/bundle/nsis/`. It isn't signed yet,
-  so SmartScreen may warn you; choose **More info**, then **Run anyway**.
+- **macOS:** open the `.dmg` in `target/release/bundle/dmg/` and drag Keitora to
+  Applications. The prebuilt release is signed with a Developer ID certificate and notarized, so it
+  opens normally. A build of your own isn't notarized, so macOS blocks its first open; allow it once
+  in System Settings → Privacy & Security → **Open Anyway**. If you want agents to take screenshots, build with a signing identity so
+  macOS remembers the Screen Recording permission between builds. See
+  [macOS permissions](CONTRIBUTING.md#macos-permissions-screen-recording).
+- **Windows:** run the installer in `target/release/bundle/nsis/` (or the one you downloaded).
+  It isn't code-signed, so SmartScreen may warn you; choose **More info**, then **Run anyway**.
 
 ### 5. Add your first project
 

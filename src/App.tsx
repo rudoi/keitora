@@ -26,6 +26,8 @@ import { SettingsDrawer } from "./components/SettingsDrawer";
 import { TerminalPane } from "./components/TerminalPane";
 import { ToastProvider, useToast } from "./components/Toast";
 import { TopBar, type View } from "./components/TopBar";
+import { UpdateBanner } from "./components/UpdateBanner";
+import { UpdatesProvider } from "./components/UpdatesProvider";
 import { WorktreePicker } from "./components/WorktreePicker";
 import { useAttention } from "./lib/attention";
 import {
@@ -115,6 +117,7 @@ import {
 } from "./lib/warmProjects";
 import { xdgLeakNoticeBody } from "./lib/xdgNotice";
 import "./App.css";
+import "./themes.css";
 
 // Inner component so useToast() can access the ToastProvider above it.
 // Drops persist one at a time and in order, so a slow save can't land after a later one.
@@ -1202,6 +1205,7 @@ function AppInner() {
         worktreeLabel={activeReady ? selected : undefined}
       />
       <RecoveryBanner info={recovery} />
+      <UpdateBanner />
       <div className="body" style={{ position: "relative" }}>
         <Rail
           groups={railGroups}
@@ -1369,14 +1373,16 @@ function AppInner() {
 function App() {
   return (
     <ToastProvider>
-      <ConfirmDialogProvider>
-        <AttentionBannersProvider>
-          <Tooltip.Provider>
-            <AppInner />
-            <QuitConfirmModal />
-          </Tooltip.Provider>
-        </AttentionBannersProvider>
-      </ConfirmDialogProvider>
+      <UpdatesProvider>
+        <ConfirmDialogProvider>
+          <AttentionBannersProvider>
+            <Tooltip.Provider>
+              <AppInner />
+              <QuitConfirmModal />
+            </Tooltip.Provider>
+          </AttentionBannersProvider>
+        </ConfirmDialogProvider>
+      </UpdatesProvider>
     </ToastProvider>
   );
 }

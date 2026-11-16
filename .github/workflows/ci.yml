@@ -1,0 +1,102 @@
+name: CI
+
+# This repo uses only GitHub-authored actions (actions/*), so the Rust toolchain comes
+# from the runner's preinstalled rustup and caching is done with actions/cache directly. The shared
+# setup lives in local composite actions (.github/actions), which follow the same rule.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Nothing here writes to the repo; keep the token read-only whatever the repo default is.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Only PR runs are cancellable: main runs save the caches and must always finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # `yarn install` runs `prepare: husky`; hooks are pointless on CI runners.
+  HUSKY: 0
+  # Incremental artifacts don't help a fresh CI build and roughly double the cache size.
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  # Turning debug info off keeps three OS debug caches inside the repo's cache quota. An env var
+  # rather than RUSTFLAGS, which would rebuild every dependency between steps.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Installs the toolchain and rustfmt pinned in rust-toolchain.toml; no cache.
+      - run: rustup toolchain install
+      - run: cargo fmt --all --check
+
+  rust-os:
+    name: rust-os (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Linux is informational until promoted: Keitora doesn't ship there yet.
+    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      # Tauri's Linux libraries; no test creates a webview, so no Xvfb.
+      - name: Install Linux prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev libxdo-dev libssl-dev build-essential pkg-config
+
+      # Dependency builds are the expensive part, so the action caches the cargo registry/git checkouts and
+      # target/. PRs only restore; pushes to main save, so PR runs don't churn the repo's cache
+      # quota and evict main's entry.
+      - uses: ./.github/actions/setup-rust
+        id: cargo-cache
+
+      # The workspace already denies warnings via [workspace.lints]; the flag keeps that explicit.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # #[ignore]d tests (real herdr, helper children) are never run here.
+      - run: cargo test --workspace --locked
+
+      # Keep only third-party dependency artifacts: workspace crates rebuild every run anyway.
+      - name: Save cargo cache
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/save-rust-cache
+        with:
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+          trim: >-
+            target/debug/build/keitora-* target/debug/deps/keitora* target/debug/deps/libkeitora*
+            target/debug/.fingerprint/keitora* target/debug/keitora*
+
+  # The required check. Its name stays `rust` however the matrix changes. Informational legs carry
+  # continue-on-error, so a failure there doesn't fail rust-os; promote a leg by dropping it from that condition.
+  rust:
+    needs: [fmt, rust-os]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require fmt and every required leg
+        env:
+          FMT_RESULT: ${{ needs.fmt.result }}
+          RUST_OS_RESULT: ${{ needs.rust-os.result }}
+        run: |
+          echo "fmt: $FMT_RESULT, rust-os: $RUST_OS_RESULT"
+          [ "$FMT_RESULT" = success ] && [ "$RUST_OS_RESULT" = success ]
+
+  # Nothing here is platform-specific, so it runs on the cheaper, faster Linux runner.
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-node-yarn
+      # One pass: lint, formatting and import order (biome check would also rewrite locally).
+      - run: yarn biome ci src
+      - run: yarn build
+      - run: yarn test

@@ -31,6 +31,7 @@ import type { GroupModel } from "../../lib/railGroups";
 import { applyOrder, moveToSlot, settleOverride } from "../../lib/railOrder";
 import { useHomeDir, useMinuteNow } from "../../lib/useRailClock";
 import { useToast } from "../Toast";
+import type { LaneOpenTarget } from "./Lane";
 import { ProjectGroup, ProjectGroupOverlay } from "./ProjectGroup";
 
 /**
@@ -59,6 +60,7 @@ export function RailProjects({
   onToggle,
   onSelectLane,
   onOpenDiff,
+  onOpenLane,
   onLaneContextMenu,
   onNewWorktree,
   onOpenMenu,
@@ -75,6 +77,7 @@ export function RailProjects({
   onToggle: (key: string) => void;
   onSelectLane: (g: GroupModel, worktree: string) => void;
   onOpenDiff: (g: GroupModel, worktree: string) => void;
+  onOpenLane: (g: GroupModel, worktree: string, target: LaneOpenTarget) => void;
   onLaneContextMenu: (g: GroupModel, worktree: string, x: number, y: number) => void;
   onNewWorktree: (g: GroupModel) => void;
   onOpenMenu: (g: GroupModel, x: number, y: number, from: HTMLElement | null) => void;
@@ -277,6 +280,7 @@ export function RailProjects({
             onToggle={onToggle}
             onSelectLane={onSelectLane}
             onOpenDiff={onOpenDiff}
+            onOpenLane={onOpenLane}
             onLaneContextMenu={onLaneContextMenu}
             onNewWorktree={onNewWorktree}
             onOpenMenu={onOpenMenu}

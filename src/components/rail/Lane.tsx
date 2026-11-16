@@ -1,7 +1,7 @@
 // One lane row of the rail: a worktree's status block, name, task, stage, branch and build
 // bar. Available lanes are selectable; others render muted with their status.
 
-import { FileDiff } from "lucide-react";
+import { FileDiff, FolderOpen, SquareTerminal } from "lucide-react";
 import type { CSSProperties } from "react";
 import { memo, useEffect, useRef, useState } from "react";
 import {
@@ -13,6 +13,7 @@ import {
 } from "../../lib/activity";
 import type { WorkflowState, WorktreeActivity, WorktreeStatus } from "../../lib/ipc";
 import { blockAnimates } from "../../lib/laneState";
+import { isWindows } from "../../lib/platform";
 import type { LaneModel } from "../../lib/railGroups";
 import { usePrefersReducedMotion } from "../../lib/usePrefersReducedMotion";
 import { ProviderGlyph } from "../ProviderGlyph";
@@ -142,6 +143,11 @@ function LaneBuild({ build }: { build: NonNullable<WorktreeActivity["build"]> })
 
 // ── Lane ───────────────────────────────────────────────────────────────────────
 
+/** What a lane's open buttons hand to the OS: the worktree folder, or a shell in it. */
+export type LaneOpenTarget = "folder" | "shell";
+
+const SHELL_LABEL = isWindows ? "Open PowerShell" : "Open terminal";
+
 // Memoized: the handlers take the worktree name, so the parent passes the same ones to
 // every lane and an unchanged lane skips re-rendering.
 export const Lane = memo(function Lane({
@@ -151,6 +157,7 @@ export const Lane = memo(function Lane({
   hintVisible,
   onSelect,
   onOpenDiff,
+  onOpen,
   onContextMenu,
 }: {
   lane: LaneModel;
@@ -159,6 +166,7 @@ export const Lane = memo(function Lane({
   hintVisible: boolean;
   onSelect: (worktree: string) => void;
   onOpenDiff: (worktree: string) => void;
+  onOpen: (worktree: string, target: LaneOpenTarget) => void;
   onContextMenu: (worktree: string, x: number, y: number) => void;
 }) {
   const reduceMotion = usePrefersReducedMotion();
@@ -237,19 +245,45 @@ export const Lane = memo(function Lane({
             />
           )}
           {ok && (
-            <button
-              type="button"
-              className="lane-diff-btn"
-              title="View diff"
-              aria-label={`View diff for ${lane.name}`}
-              onClick={(e) => {
-                // Distinct from the lane's click-to-select — open the diff instead.
-                e.stopPropagation();
-                onOpenDiff(lane.name);
-              }}
-            >
-              <FileDiff size={13} aria-hidden="true" />
-            </button>
+            <span className="lane-actions">
+              <button
+                type="button"
+                className="lane-diff-btn"
+                title="Open folder"
+                aria-label={`Open folder for ${lane.name}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onOpen(lane.name, "folder");
+                }}
+              >
+                <FolderOpen size={13} aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                className="lane-diff-btn"
+                title={SHELL_LABEL}
+                aria-label={`${SHELL_LABEL} in ${lane.name}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onOpen(lane.name, "shell");
+                }}
+              >
+                <SquareTerminal size={13} aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                className="lane-diff-btn"
+                title="View diff"
+                aria-label={`View diff for ${lane.name}`}
+                onClick={(e) => {
+                  // Distinct from the lane's click-to-select — open the diff instead.
+                  e.stopPropagation();
+                  onOpenDiff(lane.name);
+                }}
+              >
+                <FileDiff size={13} aria-hidden="true" />
+              </button>
+            </span>
           )}
         </div>
         {ok && act?.workflow && <StageChip workflow={act.workflow} />}

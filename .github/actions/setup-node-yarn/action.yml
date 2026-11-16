@@ -1,0 +1,29 @@
+name: Set up Node and Yarn
+description: Installs Node 22 with the yarn cache and runs a frozen-lockfile install. Only actions/* are used.
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 22
+    - id: yarn-dir
+      run: echo "dir=$(yarn cache dir)" >> "$GITHUB_OUTPUT"
+      shell: bash
+    - name: Restore yarn cache
+      id: yarn-cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ steps.yarn-dir.outputs.dir }}
+        key: yarn-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+        restore-keys: |
+          yarn-${{ runner.os }}-
+    - run: yarn install --frozen-lockfile
+      shell: bash
+    # Only main saves, so PR runs never churn the repo's cache quota (same rule as the cargo cache).
+    - name: Save yarn cache
+      if: github.ref == 'refs/heads/main' && steps.yarn-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ steps.yarn-dir.outputs.dir }}
+        key: yarn-${{ runner.os }}-${{ hashFiles('yarn.lock') }}

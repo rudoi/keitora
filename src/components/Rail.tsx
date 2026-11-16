@@ -11,17 +11,16 @@ import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { Activity, HelpCircle, Settings } from "lucide-react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatBytes, formatCpu, formatUptime } from "../lib/format";
-import type { CliKind, DaemonInfo, WorktreeStatus } from "../lib/ipc";
+import type { CliKind, DaemonInfo } from "../lib/ipc";
 import {
   daemonRestart,
   daemonStatus,
   openWorktreeFolder,
-  openWorktreeTerminal,
+  openWorktreeShell,
   setWorktreeDispatch,
 } from "../lib/ipc";
 import {
   laneMenuAction,
-  openItemDisabledReason,
   sessionItemDisabledReason,
   transferDisabledReason,
   type WorktreeMenuItem,
@@ -47,6 +46,7 @@ import { useLocalStorageJson } from "../lib/useLocalStorageState";
 import { usePrefersReducedMotion } from "../lib/usePrefersReducedMotion";
 import { useConfirmDialog } from "./ConfirmDialog";
 import { RestartDaemonDialog } from "./RestartDaemonDialog";
+import type { LaneOpenTarget } from "./rail/Lane";
 import { RailProjects } from "./rail/RailProjects";
 import { useToast } from "./Toast";
 
@@ -271,8 +271,7 @@ function MenuAnchor({ x, y }: { x: number; y: number }) {
 // A live session offers "Restart session", "Start fresh conversation", "Transfer to {other
 // CLI}" and "Terminate session"; a terminated one offers only "Launch" and "Launch fresh"
 // (`worktreeMenuItems`). A lane of a project other than the active one leads with "Focus",
-// under a label naming the lane, and its actions switch to that project first. Below them,
-// "Open folder" and "Open terminal here" act on the worktree's directory without switching.
+// under a label naming the lane, and its actions switch to that project first.
 type WorktreeMenuState = {
   name: string;
   /** Registry key of the lane's project. */
@@ -286,16 +285,6 @@ type WorktreeMenuState = {
   terminated: boolean;
   /** In the dispatch pool (may receive dispatched tasks). */
   dispatch: boolean;
-  /** Whether the worktree's directory exists; gates the open items. */
-  status: WorktreeStatus;
-};
-
-/** The menu's operations on the worktree's directory, below the session entries. */
-type WorktreeOpenItem = "open-folder" | "open-terminal";
-
-const WORKTREE_OPEN_LABEL: Record<WorktreeOpenItem, string> = {
-  "open-folder": "Open folder",
-  "open-terminal": "Open terminal here",
 };
 
 const WORKTREE_ITEM_LABEL: Record<Exclude<WorktreeMenuItem, "transfer">, string> = {
@@ -312,7 +301,6 @@ function WorktreeMenu({
   onOpenChange,
   onPick,
   onToggleDispatch,
-  onOpen,
   codexAvailable,
   transferBusy,
 }: {
@@ -321,8 +309,6 @@ function WorktreeMenu({
   onPick: (state: WorktreeMenuState, item: WorktreeMenuItem, targetCli: CliKind) => void;
   /** Put the worktree in or out of the dispatch pool (active project only). */
   onToggleDispatch: (state: WorktreeMenuState) => void;
-  /** Open the worktree's directory in the file manager or a terminal (any project). */
-  onOpen: (state: WorktreeMenuState, item: WorktreeOpenItem) => void;
   codexAvailable: boolean;
   /** A transfer is already in flight for the menu's worktree. */
   transferBusy: boolean;
@@ -371,27 +357,6 @@ function WorktreeMenu({
             </DropdownMenu.Label>
           )}
           {items.map(item)}
-          {state && (
-            <>
-              <DropdownMenu.Separator className={menuSepCls} />
-              {(["open-folder", "open-terminal"] as const).map((kind) => {
-                const reason = openItemDisabledReason(state.status);
-                return (
-                  <DropdownMenu.Item
-                    key={kind}
-                    disabled={reason !== null}
-                    title={reason ?? undefined}
-                    onSelect={() => {
-                      if (reason === null) onOpen(state, kind);
-                    }}
-                    className={`${menuItemCls} text-tx-2`}
-                  >
-                    {WORKTREE_OPEN_LABEL[kind]}
-                  </DropdownMenu.Item>
-                );
-              })}
-            </>
-          )}
           {state && !state.inactive && (
             <>
               <DropdownMenu.Separator className={menuSepCls} />
@@ -682,6 +647,20 @@ export function Rail({
     }
   };
 
+  // A lane's folder / shell buttons: the backend resolves the worktree's directory from
+  // the registry by key + name, so this works for any project, active or not.
+  const openLane = useCallback(
+    async (g: GroupModel, worktree: string, target: LaneOpenTarget) => {
+      try {
+        if (target === "folder") await openWorktreeFolder(g.key, worktree);
+        else await openWorktreeShell(g.key, worktree);
+      } catch (e) {
+        showToast(String(e));
+      }
+    },
+    [showToast],
+  );
+
   // Registry only; the list refresh follows project://changed. The removed project's
   // expanded state is forgotten here rather than whenever the list lacks it: a project
   // can drop out of the list transiently (its keitora.toml mid-save).
@@ -719,18 +698,8 @@ export function Rail({
       cli: lane.cli,
       terminated: lane.terminated,
       dispatch: lane.dispatch,
-      status: lane.status,
     });
   }, []);
-  // Runs in place for any project: the backend resolves the directory by registry key.
-  const openWorktree = useCallback(
-    (m: WorktreeMenuState, item: WorktreeOpenItem) => {
-      setMenu(null);
-      const run = item === "open-folder" ? openWorktreeFolder : openWorktreeTerminal;
-      run(m.projectKey, m.name).catch((e) => showToast(String(e)));
-    },
-    [showToast],
-  );
   // The worktree list refreshes on worktrees://changed, which the command emits.
   const toggleDispatch = useCallback(
     (m: WorktreeMenuState) => {
@@ -786,6 +755,7 @@ export function Rail({
           onToggle={toggleGroup}
           onSelectLane={onSelectLane}
           onOpenDiff={onOpenDiff}
+          onOpenLane={openLane}
           onLaneContextMenu={openLaneMenu}
           onNewWorktree={onNewWorktree}
           onOpenMenu={openProjectMenu}
@@ -821,7 +791,6 @@ export function Rail({
         }}
         onPick={pickLaneItem}
         onToggleDispatch={toggleDispatch}
-        onOpen={openWorktree}
         codexAvailable={codexAvailable}
         transferBusy={menuBusy}
       />

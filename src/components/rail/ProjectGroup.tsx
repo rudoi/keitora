@@ -32,7 +32,7 @@ import {
   lastActivityLabel,
   sentinelAbove,
 } from "../../lib/railGroupView";
-import { Lane } from "./Lane";
+import { Lane, type LaneOpenTarget } from "./Lane";
 
 function groupClass(group: GroupModel, open: boolean): string {
   return [
@@ -189,6 +189,7 @@ export const ProjectGroup = memo(function ProjectGroup({
   onToggle,
   onSelectLane,
   onOpenDiff,
+  onOpenLane,
   onLaneContextMenu,
   onNewWorktree,
   onOpenMenu,
@@ -208,6 +209,7 @@ export const ProjectGroup = memo(function ProjectGroup({
   onToggle: (key: string) => void;
   onSelectLane: (g: GroupModel, worktree: string) => void;
   onOpenDiff: (g: GroupModel, worktree: string) => void;
+  onOpenLane: (g: GroupModel, worktree: string, target: LaneOpenTarget) => void;
   onLaneContextMenu: (g: GroupModel, worktree: string, x: number, y: number) => void;
   onNewWorktree: (g: GroupModel) => void;
   /** Open the project menu at viewport coordinates; `from` gets focus back on close. */
@@ -248,6 +250,10 @@ export const ProjectGroup = memo(function ProjectGroup({
   groupRef.current = group;
   const selectLane = useCallback((w: string) => onSelectLane(groupRef.current, w), [onSelectLane]);
   const openDiff = useCallback((w: string) => onOpenDiff(groupRef.current, w), [onOpenDiff]);
+  const openLane = useCallback(
+    (w: string, target: LaneOpenTarget) => onOpenLane(groupRef.current, w, target),
+    [onOpenLane],
+  );
   const laneContextMenu = useCallback(
     (w: string, x: number, y: number) => onLaneContextMenu(groupRef.current, w, x, y),
     [onLaneContextMenu],
@@ -345,6 +351,7 @@ export const ProjectGroup = memo(function ProjectGroup({
                   hintVisible={hintVisible}
                   onSelect={selectLane}
                   onOpenDiff={openDiff}
+                  onOpen={openLane}
                   onContextMenu={laneContextMenu}
                 />
               ))

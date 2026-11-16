@@ -310,11 +310,17 @@ body {
   align-items: center;
   gap: 9px;
 }
-/* Diff affordance: a distinct icon button at the right of the name row. Clicking it opens
-   the worktree's diff view (it stops propagation, so the lane's click-to-select still works
-   everywhere else on the row). margin-left:auto pins it to the right edge. */
-.lane-diff-btn {
+/* Lane affordances: icon buttons at the right of the name row — open the worktree folder,
+   open a shell there, view the diff. Each stops propagation, so the lane's click-to-select
+   still works everywhere else on the row. margin-left:auto pins the group to the right edge. */
+.lane-actions {
   margin-left: auto;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+.lane-diff-btn {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
@@ -1307,6 +1313,51 @@ body {
 }
 .recovery-banner[data-phase="Paused"] .recovery-banner-btn:hover {
   background: color-mix(in srgb, var(--on-accent) 20%, transparent);
+}
+
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  padding: 6px 16px;
+  font-size: 12px;
+  color: var(--tx-1);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.update-banner[data-tone="error"] {
+  background: color-mix(in srgb, var(--urgent) 15%, transparent);
+  border-bottom-color: color-mix(in srgb, var(--urgent) 40%, transparent);
+}
+.update-banner-text {
+  flex: 1;
+  min-width: 0;
+}
+.update-banner-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  padding: 2px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  color: var(--tx-1);
+  background: transparent;
+}
+.update-banner-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--tx-1) 10%, transparent);
+}
+.update-banner-btn:disabled {
+  opacity: 0.7;
+}
+.update-banner-btn-primary {
+  border-color: var(--accent);
+}
+.update-banner[data-tone="error"] .update-banner-btn-primary {
+  border-color: var(--urgent);
 }
 
 /* Transient terminal-font-size HUD: a centered "zoom indicator" that flashes the

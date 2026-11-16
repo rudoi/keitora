@@ -1,5 +1,7 @@
-// App theme: light / dark / system, resolved to a `data-theme` attribute on <html>
-// that drives the CSS-variable overrides in index.css + App.css.
+// App theme: light / dark / system, or a named palette (Nord, Gruvbox, ...). The choice is
+// resolved to a `data-theme` attribute (light|dark) on <html> that drives the
+// CSS-variable overrides in index.css + App.css; a named palette additionally sets
+// `data-palette`, whose overrides live in themes.css. Every named palette is dark.
 //
 // A single MODULE-LEVEL store owns everything: the persisted preference (localStorage),
 // the one `prefers-color-scheme` listener, and the one writer of <html data-theme>.
@@ -14,10 +16,50 @@
 
 import { useSyncExternalStore } from "react";
 
-export type ThemeMode = "light" | "dark" | "system";
-export type ResolvedTheme = "light" | "dark";
+export const PALETTES = [
+  "ayu",
+  "catppuccin",
+  "gruvbox",
+  "hacker",
+  "nord",
+  "solarized",
+  "synthwave",
+  "tokyonight",
+] as const;
+export type Palette = (typeof PALETTES)[number];
 
-export const THEME_MODES = ["light", "dark", "system"] as const;
+export type ThemeMode = "light" | "dark" | "system" | Palette;
+export type ResolvedTheme = "light" | "dark";
+/** The concrete look in effect: a base theme, or a named palette. */
+export type ThemeKey = ResolvedTheme | Palette;
+
+export const THEME_MODES: readonly ThemeMode[] = ["system", "dark", "light", ...PALETTES];
+
+const THEME_LABELS: Record<ThemeMode, string> = {
+  system: "System",
+  dark: "Dark",
+  light: "Light",
+  ayu: "Ayu",
+  catppuccin: "Catppuccin",
+  gruvbox: "Gruvbox",
+  hacker: "Hacker",
+  nord: "Nord",
+  solarized: "Solarized",
+  synthwave: "SynthWave '84",
+  tokyonight: "Tokyo Night",
+};
+
+export function themeLabel(mode: ThemeMode): string {
+  return THEME_LABELS[mode];
+}
+
+export function isThemeMode(value: unknown): value is ThemeMode {
+  return typeof value === "string" && (THEME_MODES as readonly string[]).includes(value);
+}
+
+function isPalette(mode: ThemeMode): mode is Palette {
+  return (PALETTES as readonly string[]).includes(mode);
+}
 
 const STORAGE_KEY = "keitora.theme";
 const DEFAULT_MODE: ThemeMode = "system";
@@ -25,13 +67,19 @@ const MEDIA_QUERY = "(prefers-color-scheme: dark)";
 
 // Pure: resolve a mode + OS preference to a concrete theme. Exported for unit testing.
 export function resolveTheme(mode: ThemeMode, prefersDark: boolean): ResolvedTheme {
-  return mode === "system" ? (prefersDark ? "dark" : "light") : mode;
+  if (mode === "system") return prefersDark ? "dark" : "light";
+  return mode === "light" ? "light" : "dark";
+}
+
+// Pure: the concrete look for a mode — the palette itself, or the resolved base theme.
+export function resolveThemeKey(mode: ThemeMode, prefersDark: boolean): ThemeKey {
+  return isPalette(mode) ? mode : resolveTheme(mode, prefersDark);
 }
 
 function readMode(): ThemeMode {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    return raw === "light" || raw === "dark" || raw === "system" ? raw : DEFAULT_MODE;
+    return isThemeMode(raw) ? raw : DEFAULT_MODE;
   } catch {
     return DEFAULT_MODE;
   }
@@ -54,9 +102,16 @@ function currentResolved(): ResolvedTheme {
   return resolveTheme(mode, systemDark);
 }
 
+function currentKey(): ThemeKey {
+  return resolveThemeKey(mode, systemDark);
+}
+
 function applyToDom(): void {
   try {
-    document.documentElement.dataset.theme = currentResolved();
+    const root = document.documentElement;
+    root.dataset.theme = currentResolved();
+    if (isPalette(mode)) root.dataset.palette = mode;
+    else delete root.dataset.palette;
   } catch {
     // no DOM (e.g. a test env) — nothing to reflect onto
   }
@@ -77,7 +132,7 @@ function subscribe(cb: () => void): () => void {
 // Set the preference: persist, reflect to <html>, and notify same-window subscribers.
 // Other windows converge via the `storage` listener below.
 export function setThemeMode(next: ThemeMode): void {
-  mode = THEME_MODES.includes(next) ? next : DEFAULT_MODE;
+  mode = isThemeMode(next) ? next : DEFAULT_MODE;
   try {
     window.localStorage.setItem(STORAGE_KEY, mode);
   } catch {
@@ -118,6 +173,12 @@ applyToDom();
 // the xterm palette. Snapshot is a primitive, so it's referentially stable when unchanged.
 export function useResolvedTheme(): ResolvedTheme {
   return useSyncExternalStore(subscribe, currentResolved, currentResolved);
+}
+
+// The concrete look (base theme or palette) — for consumers that carry their own colors
+// per palette, e.g. the xterm ANSI palette.
+export function useThemeKey(): ThemeKey {
+  return useSyncExternalStore(subscribe, currentKey, currentKey);
 }
 
 // Full theme control: current mode, a setter, and the resolved theme.

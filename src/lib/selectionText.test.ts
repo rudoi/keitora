@@ -1,10 +1,18 @@
 import type { IBuffer } from "@xterm/xterm";
 import { describe, expect, it } from "vitest";
 import {
+  alignShift,
+  boundaryAt,
   copyEol,
+  rangeBetween,
   rectSelectionAfterPress,
+  rowsToText,
   type SelectionRange,
+  sameSelection,
+  selectionLength,
   selectionToText,
+  shiftSelection,
+  snapshotRow,
 } from "./selectionText";
 
 type Cell = { chars: string; width: number };
@@ -219,5 +227,156 @@ describe("rectSelectionAfterPress", () => {
   it("keeps the mode on a right click", () => {
     expect(rectSelectionAfterPress(true, press(2))).toBe(true);
     expect(rectSelectionAfterPress(false, press(2, true))).toBe(false);
+  });
+});
+
+describe("shiftSelection", () => {
+  const range = (sx: number, sy: number, ex: number, ey: number): SelectionRange => ({
+    start: { x: sx, y: sy },
+    end: { x: ex, y: ey },
+  });
+
+  it("moves the selection with the text when history scrolls", () => {
+    // Scrolling up 3 lines pushes the on-screen text 3 rows down.
+    expect(shiftSelection(range(2, 4, 7, 5), 3, 24, 80)).toEqual(range(2, 7, 7, 8));
+    expect(shiftSelection(range(2, 4, 7, 5), -2, 24, 80)).toEqual(range(2, 2, 7, 3));
+  });
+
+  it("leaves an unmoved selection as it is", () => {
+    expect(shiftSelection(range(0, 0, 5, 0), 0, 24, 80)).toEqual(range(0, 0, 5, 0));
+  });
+
+  it("clips a selection partly pushed off the top or bottom", () => {
+    expect(shiftSelection(range(4, 1, 6, 3), -2, 24, 80)).toEqual(range(0, 0, 6, 1));
+    expect(shiftSelection(range(4, 20, 6, 22), 3, 24, 80)).toEqual(range(4, 23, 80, 23));
+  });
+
+  it("drops a selection pushed entirely off screen", () => {
+    expect(shiftSelection(range(0, 1, 5, 2), -3, 24, 80)).toBeNull();
+    expect(shiftSelection(range(0, 20, 5, 22), 4, 24, 80)).toBeNull();
+  });
+
+  it("drops a selection whose only visible part is empty", () => {
+    // Ends at column 0 of the first row left on screen: nothing selected there.
+    expect(shiftSelection(range(5, 0, 0, 2), -2, 24, 80)).toBeNull();
+  });
+});
+
+describe("selectionLength", () => {
+  it("counts cells row-major across rows", () => {
+    expect(selectionLength({ start: { x: 2, y: 1 }, end: { x: 7, y: 1 } }, 80)).toBe(5);
+    expect(selectionLength({ start: { x: 78, y: 1 }, end: { x: 3, y: 2 } }, 80)).toBe(5);
+  });
+});
+
+describe("sameSelection", () => {
+  it("compares every bound, and treats two absent selections as equal", () => {
+    const a = { start: { x: 1, y: 2 }, end: { x: 3, y: 4 } };
+    expect(sameSelection(a, { start: { x: 1, y: 2 }, end: { x: 3, y: 4 } })).toBe(true);
+    expect(sameSelection(a, { start: { x: 1, y: 2 }, end: { x: 3, y: 5 } })).toBe(false);
+    expect(sameSelection(a, undefined)).toBe(false);
+    expect(sameSelection(undefined, undefined)).toBe(true);
+  });
+});
+
+describe("alignShift", () => {
+  const screen = (...rows: string[]) => rows;
+
+  it("finds content that moved down (scrolled up into history)", () => {
+    const before = screen("c", "d", "e", "f", "g");
+    const after = screen("a", "b", "c", "d", "e");
+    expect(alignShift(before, after, 2)).toBe(2);
+  });
+
+  it("finds content that moved up (scrolled back down)", () => {
+    const before = screen("a", "b", "c", "d", "e");
+    const after = screen("d", "e", "f", "g", "h");
+    expect(alignShift(before, after, -3)).toBe(-3);
+  });
+
+  it("reports no movement for an unchanged screen", () => {
+    const rows = screen("a", "b", "c");
+    expect(alignShift(rows, rows, 3)).toBe(0);
+  });
+
+  it("finds a smaller move than asked for when history ran out", () => {
+    const before = screen("b", "c", "d", "e");
+    const after = screen("a", "b", "c", "d");
+    expect(alignShift(before, after, 3)).toBe(1);
+  });
+
+  it("ignores blank rows and uses the expected move to break ties", () => {
+    const before = screen("", "x", "", "x", "");
+    const after = screen("x", "", "x", "", "x");
+    // Shifts of -1 and +1 match equally; the expected direction decides.
+    expect(alignShift(before, after, 1)).toBe(1);
+    expect(alignShift(before, after, -1)).toBe(-1);
+  });
+
+  it("gives up when the screens share nothing", () => {
+    expect(alignShift(screen("a", "b", "c"), screen("x", "y", "z"), 3)).toBeNull();
+    expect(alignShift(screen("", ""), screen("", ""), 0)).toBeNull();
+  });
+
+  it("does not trust a single chance match among many rows", () => {
+    const before = screen("a", "b", "c", "d", "e");
+    const after = screen("v", "w", "x", "c", "z");
+    expect(alignShift(before, after, 0)).toBeNull();
+  });
+});
+
+describe("rangeBetween", () => {
+  it("orders the two points, whichever way the drag went", () => {
+    const down = rangeBetween({ x: 4, y: 2 }, { x: 1, y: 5 });
+    const up = rangeBetween({ x: 1, y: 5 }, { x: 4, y: 2 });
+    expect(down).toEqual({ start: { x: 4, y: 2 }, end: { x: 1, y: 5 } });
+    expect(up).toEqual(down);
+  });
+
+  it("orders by column on the same row", () => {
+    expect(rangeBetween({ x: 9, y: 3 }, { x: 2, y: 3 })).toEqual({
+      start: { x: 2, y: 3 },
+      end: { x: 9, y: 3 },
+    });
+  });
+});
+
+describe("boundaryAt", () => {
+  const screen = { left: 100, top: 50, width: 800, height: 240 }; // 80x24 of 10x10 cells
+
+  it("picks the nearest gap across and the row down", () => {
+    expect(boundaryAt(100 + 34, 50 + 25, screen, 80, 24)).toEqual({ x: 3, y: 2 });
+    expect(boundaryAt(100 + 36, 50 + 25, screen, 80, 24)).toEqual({ x: 4, y: 2 });
+  });
+
+  it("clamps a pointer outside the screen to its edges", () => {
+    expect(boundaryAt(0, 0, screen, 80, 24)).toEqual({ x: 0, y: 0 });
+    expect(boundaryAt(5000, 5000, screen, 80, 24)).toEqual({ x: 80, y: 23 });
+  });
+});
+
+describe("rowsToText", () => {
+  // Rows kept as they scrolled past, keyed by where they are now: -2 and -1 are above the
+  // screen, 0 and 1 are on it.
+  const kept = (buf: Row[], firstY: number) => {
+    const b = fakeBuffer(buf);
+    const map = new Map(buf.map((_, i) => [firstY + i, snapshotRow(b, i, COLS)]));
+    return (y: number) => map.get(y);
+  };
+
+  it("copies rows that have scrolled off the screen", () => {
+    const rowAt = kept([row("one"), row("two"), row("three"), row("four")], -2);
+    expect(rowsToText(rowAt, COLS, rows(-2, 1), "\n")).toBe("one\ntwo\nthree\nfour");
+  });
+
+  it("keeps partial first and last rows and joins wrapped rows", () => {
+    const rowAt = kept([row("abcdef"), row("gh", true), row("ijk")], -1);
+    const range = { start: { x: 2, y: -1 }, end: { x: 2, y: 1 } };
+    expect(rowsToText(rowAt, COLS, range, "\n")).toBe("cdefgh\nij");
+  });
+
+  it("reads a row it never saw as blank", () => {
+    const rowAt = kept([row("top")], -3);
+    expect(rowsToText(rowAt, COLS, rows(-3, -2), "\n")).toBe("top\n");
   });
 });
