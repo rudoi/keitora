@@ -201,7 +201,7 @@ fn collapse(s: &str) -> String {
 fn default_line(ctx: &DispatchContext) -> String {
     let id = ctx.task.id;
     format!(
-        "Please pick up Keitora task #{id}. Run `./keitora task claim {id}` to claim it, then implement it: {title}. {desc}. When your work is ready for review, commit it on a branch, push the branch to origin and open a pull request (unless the task says otherwise), then run `./keitora task review {id} --pr <PR URL>`, which sets the task's URL to that PR, and stop. Don't run `task done`; a human does that after review.",
+        "Please pick up Keitora task #{id}. Run `./keitora task claim {id}` to claim it, then implement it: {title}. {desc}. When your work is ready for review, commit it on a branch, push the branch to origin and open a pull request (unless the task says otherwise), then run `./keitora task review {id} --pr <PR URL>` and stop. Don't run `task done`; a human does that after review.",
         title = ctx.task.title,
         desc = ctx.task.description,
     )
@@ -1462,7 +1462,6 @@ mod tests {
         assert!(line.contains("./keitora task claim 42"));
         assert!(line.contains("push the branch to origin and open a pull request"));
         assert!(line.contains("./keitora task review 42 --pr <PR URL>"));
-        assert!(line.contains("sets the task's URL to that PR"), "{line}");
         assert!(!line.contains("./keitora task done"));
         // The submit byte is NOT carried in-band any more — it is written separately.
         assert!(

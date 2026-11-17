@@ -352,7 +352,7 @@ export function Board({
         tagOptions={projectTags}
         onSubmit={async (v) => {
           const t = await newTask(v.title, v.description, v.priority, v.tags);
-          if (v.url) await updateTask(t.id, { pr_url: v.url });
+          if (v.prUrl) await updateTask(t.id, { pr_url: v.prUrl });
           await reload();
         }}
       />

@@ -5,8 +5,8 @@ import {
   directDeps,
   parseTags,
   parseTaskIds,
+  prUrlPatch,
   sameTags,
-  urlPatch,
 } from "./tasks";
 
 describe("parseTags", () => {
@@ -70,19 +70,19 @@ describe("depChanges", () => {
   });
 });
 
-describe("urlPatch", () => {
-  it("sets a new URL, trimmed", () => {
-    expect(urlPatch(null, " https://example.com/pr/1 ")).toEqual({
+describe("prUrlPatch", () => {
+  it("sets a new PR, trimmed", () => {
+    expect(prUrlPatch(null, " https://example.com/pr/1 ")).toEqual({
       pr_url: "https://example.com/pr/1",
     });
   });
 
-  it("clears a URL emptied in the form", () => {
-    expect(urlPatch("https://example.com/pr/1", "  ")).toEqual({ pr_url: "" });
+  it("clears a PR emptied in the form", () => {
+    expect(prUrlPatch("https://example.com/pr/1", "  ")).toEqual({ pr_url: "" });
   });
 
-  it("is a no-op when the URL didn't change", () => {
-    expect(urlPatch("https://example.com/pr/1", "https://example.com/pr/1")).toEqual({});
-    expect(urlPatch(null, "")).toEqual({});
+  it("is a no-op when the PR didn't change", () => {
+    expect(prUrlPatch("https://example.com/pr/1", "https://example.com/pr/1")).toEqual({});
+    expect(prUrlPatch(null, "")).toEqual({});
   });
 });
