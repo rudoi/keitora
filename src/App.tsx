@@ -1259,6 +1259,7 @@ function AppInner() {
                 failures={dispatchFailures}
                 worktreeNames={worktreeNames}
                 pool={dispatchPool}
+                currentWorktree={selected}
                 sessions={sessions}
                 actor={actor}
                 selectedId={selectedTaskId}
