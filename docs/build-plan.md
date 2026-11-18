@@ -503,6 +503,29 @@ Status: **Phase 0 ✅ done** · **Phase 1 ✅ done (PR #1)** · **Phase 2 ✅ do
   `src-tauri/src/updater/`; tests cover the release assessment, the phase machine, config and the
   overlay. Still owed: a live downgrade test once the first signed release exists, and the first
   real macOS swap.
+- **#0072 — Rail filed one project's worktrees under another. ✅ done (PR #28).** The frontend read
+  the active project and its worktree list separately, and the list carried no project identity. If
+  they disagreed, the warm registry filed the backend's worktrees under the app's stale project until
+  restart. They could disagree two ways: an out-of-order response, or the registry's `active` changing
+  outside the app (`keitora config use`, `init`, a second instance) with nothing watching the registry.
+  Changes:
+  - `worktrees` returns `{ project, worktrees }`, and the warm effect only files a list tagged for
+    its project (`warmDecision`/`worktreesFor`). A settled mismatch re-reads both, once per
+    mismatched pair.
+  - A user-registry watcher reseeds the app when the active project changes outside it
+    (`LAST_ACTIVE`, recorded in `restart_project_watchers`), and refreshes the project list on
+    other edits.
+  - Live resources and the active-project read apply the newest settled result (`newestSettledGate`).
+  - Registry and config writes are atomic (`write_atomic`): they follow symlinks, keep permissions,
+    are serialized within the process, and fall back to an in-place write when Windows refuses
+    the rename.
+  - Live lanes render only for the active registry entry when two entries resolve to one name.
+  Tests cover the tagged list, change detection, atomic writes (including concurrency and
+  symlinks), the gate and out-of-order loads, `warmDecision`, and `activeRegistryKey`.
+  Still owed: a real-app check on macOS (`keitora config use` from a pane, rapid switches).
+  Follow-ups:
+  - One command returning `{summary, worktrees}`, which would remove the frontend reconciliation.
+  - Switching to a twin registry entry (two entries with one resolved name).
 - **Phase 5 — Polish & packaging. ✅ done (PR #7).** Scrollback search (xterm search addon + Cmd+F
   overlay); central keymap (`src/lib/keybindings.ts`: Cmd+↑/↓ worktree cycle, Cmd+F
   search, Cmd+K dispatch, `?` cheatsheet, `d` board dispatch; nav chords fire over a focused terminal;

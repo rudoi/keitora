@@ -809,9 +809,9 @@ impl ProjectSettingsPatch {
 /// dir (used by tests for hermeticity, and as an escape hatch in production);
 /// otherwise it is `dirs::config_dir()/keitora/keitora.toml`.
 ///
-/// `pub(crate)` so `config_edit` writes land on exactly the file `UserConfig`
-/// reads — a single source of truth for the registry path.
-pub(crate) fn user_config_path() -> Result<PathBuf, ResolveError> {
+/// Public so `config_edit` writes and the app's registry watcher use exactly the file
+/// `UserConfig` reads — a single source of truth for the registry path.
+pub fn user_config_path() -> Result<PathBuf, ResolveError> {
     let dir = match std::env::var_os("KEITORA_CONFIG_HOME") {
         Some(home) => PathBuf::from(home),
         None => dirs::config_dir()
@@ -1119,6 +1119,11 @@ impl UserConfig {
 
     /// Serialize to TOML and write to an explicit path (used by tests),
     /// creating parent dirs.
+    ///
+    /// The write is atomic: the text goes to a sibling temp file that is then renamed
+    /// over `path`, so a concurrent reader (the app, the CLI, session hooks) sees either
+    /// the old registry or the new one, never a truncated file that would resolve as
+    /// "no active project".
     pub fn save_to(&self, path: &Path) -> Result<(), ResolveError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -1126,9 +1131,77 @@ impl UserConfig {
         }
         let text = toml::to_string_pretty(self)
             .map_err(|e| ResolveError::Io(format!("serializing user config: {e}")))?;
-        std::fs::write(path, text)
+        write_atomic(path, text.as_bytes())
             .map_err(|e| ResolveError::Io(format!("writing {}: {e}", path.display())))
     }
+}
+
+/// Write `bytes` to `path` via a sibling temp file + rename, so a concurrent reader
+/// sees the old file or the new one, never a partial write. (Not a durability
+/// guarantee: there is no fsync.)
+///
+/// - A symlinked `path` is followed: the link's target is replaced, the link stays.
+/// - An existing file's permissions carry over to the replacement.
+/// - Writes within one process are serialized (on Windows, two renames racing over one
+///   file both fail), and each gets its own temp name, so concurrent writers can't
+///   share (and truncate) one temp file.
+/// - If the rename keeps failing with `PermissionDenied` (Windows: another process
+///   holds the file open without delete sharing), falls back to an in-place write,
+///   which is what the registry always used before.
+///
+/// The temp file is removed when any step fails.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = WRITE.lock().unwrap_or_else(|e| e.into_inner());
+
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("path has no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    let tmp = target.with_file_name(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        drop(f);
+        if let Ok(meta) = std::fs::metadata(&target) {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        rename_replacing(&tmp, &target)
+    })();
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            if e.kind() == std::io::ErrorKind::PermissionDenied && target.exists() {
+                std::fs::write(&target, bytes)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// `std::fs::rename`, retried briefly on `PermissionDenied`: on Windows a rename over a
+/// file another process has open fails, usually transiently.
+fn rename_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+    for _ in 0..5 {
+        match std::fs::rename(from, to) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
+    std::fs::rename(from, to)
 }
 
 // ---------------------------------------------------------------------------
@@ -3476,6 +3549,99 @@ mod tests {
     }
 
     // --- Unit 2: Registry round-trip ---
+
+    #[test]
+    fn registry_save_replaces_atomically_without_leftovers() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("keitora");
+        let path = dir.join("keitora.toml");
+
+        let mut first = UserConfig::default();
+        first.register("proj", PathBuf::from("/Users/x/code/proj"));
+        first.set_active("proj");
+        first.save_to(&path).unwrap();
+
+        // A second save replaces the first in place.
+        let mut second = UserConfig::default();
+        second.register("proj", PathBuf::from("/Users/x/code/proj"));
+        second.register("other-proj", PathBuf::from("/Users/x/code/other-proj"));
+        second.set_active("other-proj");
+        second.save_to(&path).unwrap();
+
+        let loaded = UserConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.active.as_deref(), Some("other-proj"));
+        assert_eq!(loaded.projects.len(), 2);
+
+        // Only the registry itself is left: the temp file was renamed away.
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["keitora.toml".to_string()]);
+    }
+
+    #[test]
+    fn write_atomic_concurrent_writers_never_tear_the_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("keitora.toml");
+        let a = "a".repeat(64 * 1024);
+        let b = "b".repeat(64 * 1024);
+        std::thread::scope(|s| {
+            for body in [&a, &b] {
+                let path = &path;
+                s.spawn(move || {
+                    for _ in 0..20 {
+                        write_atomic(path, body.as_bytes()).unwrap();
+                    }
+                });
+            }
+        });
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text == a || text == b, "torn write: {} bytes", text.len());
+        let names: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["keitora.toml".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_follows_a_symlink_and_keeps_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("dotfiles/keitora.toml");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = tmp.path().join("keitora.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_atomic(&link, b"new").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn write_atomic_cleans_up_when_the_rename_fails() {
+        let tmp = TempDir::new().unwrap();
+        // The target is a non-empty directory, so renaming a file over it fails.
+        let target = tmp.path().join("occupied");
+        std::fs::create_dir_all(target.join("child")).unwrap();
+
+        assert!(write_atomic(&target, b"x").is_err());
+        let names: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["occupied".to_string()]);
+    }
 
     #[test]
     fn registry_round_trips() {
