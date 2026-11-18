@@ -5,6 +5,7 @@
 // Rows are separated by hairlines; empty+offline rows are dimmed. The current
 // worktree's row carries an accent bar and scrolls into view when the board opens
 // (the board mounts on entry) or the current worktree changes while it is showing.
+// Clicking a row outside its cards makes that worktree current.
 
 import { useDroppable } from "@dnd-kit/core";
 import { useCallback, useEffect, useRef } from "react";
@@ -13,6 +14,16 @@ import { type CardEnv, decisionClasses, stateOf } from "./cardHelpers";
 import { laneStatusText } from "./LaneHeader";
 import { TaskCard } from "./TaskCard";
 import type { Lane as LaneData } from "./useBoardLanes";
+
+/** Whether a click on `target` selects the row: not inside a card (that selects the
+ *  card), and not from a card's menu, which is portaled out of the row's DOM but still
+ *  bubbles to it through React. */
+export function selectsRow(
+  row: Pick<Node, "contains">,
+  target: Pick<Element, "closest"> & Node,
+): boolean {
+  return row.contains(target) && target.closest("[data-card-state]") === null;
+}
 
 // ── Props ─────────────────────────────────────────────────────────────────────
 
@@ -25,6 +36,8 @@ interface WorktreeRowProps {
   headerFlash?: boolean;
   /** The worktree the rail and terminal views are on. */
   current?: boolean;
+  /** Make this row's worktree current. */
+  onSelect?: (worktree: string) => void;
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -36,6 +49,7 @@ export function WorktreeRow({
   env,
   headerFlash = false,
   current = false,
+  onSelect,
 }: WorktreeRowProps) {
   const { setNodeRef, isOver } = useDroppable({ id: lane.key });
   const rowRef = useRef<HTMLDivElement | null>(null);
@@ -63,6 +77,10 @@ export function WorktreeRow({
   const inPool = env.pool.has(lane.key);
   const currentCls = current ? "shadow-[inset_3px_0_0_var(--color-accent)]" : "";
 
+  const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (selectsRow(e.currentTarget, e.target as Element)) onSelect?.(lane.key);
+  };
+
   function renderCard(t: LaneData["tasks"][0], fill = false) {
     return (
       <TaskCard
@@ -83,7 +101,8 @@ export function WorktreeRow({
     <div
       ref={setRef}
       aria-current={current ? "true" : undefined}
-      className={`flex h-[128px] shrink-0 items-stretch px-3.5 py-1.5 transition-colors ${stateCls} ${dimCls} ${currentCls}`}
+      onClick={handleClick}
+      className={`flex h-[128px] shrink-0 items-stretch px-3.5 py-1.5 transition-colors ${stateCls} ${dimCls} ${currentCls} ${onSelect && !current ? "cursor-pointer" : ""}`}
     >
       {/* Left: name column */}
       <div
