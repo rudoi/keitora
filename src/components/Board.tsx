@@ -54,6 +54,7 @@ export function Board({
   failures,
   worktreeNames,
   pool,
+  currentWorktree,
   sessions,
   actor,
   selectedId,
@@ -71,6 +72,9 @@ export function Board({
   worktreeNames: string[];
   /** Worktrees in the dispatch pool (may receive tasks). */
   pool: string[];
+  /** The worktree the rail and terminal views are on; its row is marked and scrolled
+   *  into view when the board opens. */
+  currentWorktree: string | null;
   sessions: Map<string, WorktreeSession>;
   actor: string | null;
   selectedId: number | null;
@@ -291,6 +295,7 @@ export function Board({
       decisions={decisions}
       dragging={activeId !== null}
       env={env}
+      currentWorktree={currentWorktree}
       showDone={showDone}
       backlog={{
         shown: showBacklog,

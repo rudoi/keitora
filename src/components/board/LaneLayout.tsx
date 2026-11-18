@@ -14,6 +14,8 @@ interface LaneLayoutProps {
   decisions: Map<string, Decision>;
   dragging: boolean;
   env: CardEnv;
+  /** The worktree the rail and terminal views are on (its row is marked). */
+  currentWorktree: string | null;
   /** When false (default), the Done column is not rendered. */
   showDone: boolean;
   /** The Open lane's backlog toggle. */
@@ -25,6 +27,7 @@ export function LaneLayout({
   decisions,
   dragging,
   env,
+  currentWorktree,
   showDone,
   backlog,
 }: LaneLayoutProps) {
@@ -60,6 +63,7 @@ export function LaneLayout({
             lane={lane}
             decision={decisions.get(lane.key)}
             headerFlash={flyIn?.worktree === lane.key}
+            current={lane.key === currentWorktree}
             {...sharedProps}
           />
         ))}
