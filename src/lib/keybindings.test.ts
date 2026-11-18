@@ -161,6 +161,8 @@ function makeCtx(overrides: Partial<KeyCtx> = {}): KeyCtx {
     hasSelectedCard: false,
     toggleHelp: vi.fn(),
     togglePerf: vi.fn(),
+    stickyNotes: false,
+    toggleStickyNote: vi.fn(),
     openDiff: vi.fn(),
     setView: vi.fn(),
     setSelected: vi.fn(),
@@ -190,6 +192,33 @@ describe("perf.toggle binding", () => {
     const ctx = makeCtx();
     binding?.run(ctx);
     expect(ctx.togglePerf).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("note.toggle binding", () => {
+  const binding = DEFAULT_BINDINGS.find((b) => b.id === "note.toggle");
+
+  it("is a global Cmd+Shift+N chord", () => {
+    expect(binding).toBeDefined();
+    expect(binding?.global).toBe(true);
+    expect(matchesKey(ev({ ctrlKey: true, shiftKey: true, key: "N" }), binding?.keys ?? "")).toBe(
+      true,
+    );
+  });
+
+  it("toggles the note for the focused worktree when enabled", () => {
+    const ctx = makeCtx({ stickyNotes: true, view: "focus", selected: "bravo" });
+    expect(binding?.when(ctx)).toBe(true);
+    binding?.run(ctx);
+    expect(ctx.toggleStickyNote).toHaveBeenCalledTimes(1);
+  });
+
+  it("is inactive when the feature is off, outside focus view, or with no selection", () => {
+    expect(binding?.when(makeCtx({ stickyNotes: false, selected: "bravo" }))).toBe(false);
+    expect(binding?.when(makeCtx({ stickyNotes: true, view: "grid", selected: "bravo" }))).toBe(
+      false,
+    );
+    expect(binding?.when(makeCtx({ stickyNotes: true, selected: null }))).toBe(false);
   });
 });
 

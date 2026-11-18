@@ -1,7 +1,9 @@
 // Top bar: brand, a read-only `project / worktree` breadcrumb, and the
 // Board/Focus/Grid view switch. Project switching lives in the rail's project groups.
 
+import { StickyNote } from "lucide-react";
 import keitoraMark from "../assets/keitora-mark.png";
+import { modKeyLabel } from "../lib/platform";
 
 export type View = "board" | "focus" | "grid";
 
@@ -16,6 +18,8 @@ export function TopBar({
   onView,
   projectLabel,
   worktreeLabel,
+  noteVisible,
+  onToggleNote,
 }: {
   view: View;
   onView: (v: View) => void;
@@ -23,6 +27,10 @@ export function TopBar({
   projectLabel?: string | null;
   /** Selected worktree name; the separator and worktree segment show only when set. */
   worktreeLabel?: string | null;
+  /** Whether the selected worktree's sticky note is showing; the toggle shows only
+   *  when this and `onToggleNote` are set (sticky notes enabled, a note loaded). */
+  noteVisible?: boolean | null;
+  onToggleNote?: () => void;
 }) {
   const crumb = projectLabel
     ? worktreeLabel
@@ -46,6 +54,17 @@ export function TopBar({
             </>
           ) : null}
         </div>
+      ) : null}
+
+      {onToggleNote && noteVisible != null ? (
+        <button
+          className={`topbar-note${noteVisible ? " active" : ""}`}
+          aria-pressed={noteVisible}
+          title={`${noteVisible ? "Hide" : "Show"} sticky note (${modKeyLabel}+Shift+N)`}
+          onClick={onToggleNote}
+        >
+          <StickyNote size={14} />
+        </button>
       ) : null}
 
       <div className="views">

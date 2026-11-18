@@ -23,6 +23,7 @@ import { QuitConfirmModal } from "./components/QuitConfirmModal";
 import { Rail } from "./components/Rail";
 import { RecoveryBanner } from "./components/RecoveryBanner";
 import { SettingsDrawer } from "./components/SettingsDrawer";
+import { StickyNote } from "./components/StickyNote";
 import { TerminalPane } from "./components/TerminalPane";
 import { ToastProvider, useToast } from "./components/Toast";
 import { TopBar, type View } from "./components/TopBar";
@@ -79,6 +80,7 @@ import {
   useWorktreeActivity,
 } from "./lib/sessions";
 import { getSettings } from "./lib/settings";
+import { onStickyNotesEnabled } from "./lib/stickyNotes";
 import { switchProject, switchTarget } from "./lib/switchProject";
 import { useTasks } from "./lib/tasks";
 import {
@@ -105,6 +107,7 @@ import { useLiveResource } from "./lib/useLiveResource";
 import { useLocalStorageState } from "./lib/useLocalStorageState";
 import { useModifierHint } from "./lib/useModifierHint";
 import { useProjectList } from "./lib/useProjectList";
+import { useStickyNote } from "./lib/useStickyNote";
 import {
   activeProject,
   emptyWarmState,
@@ -345,10 +348,28 @@ function AppInner() {
   // Whether Codex is installed — gates the Rail's "Transfer to Codex" menu
   // item. Codex availability is machine-global (PATH-based discovery), so probe once
   // on mount; the Settings drawer re-seeds it via getSettings() whenever it opens.
+  // Whether sticky notes are on (user-level `[sticky_notes] enabled`). Seeded below and
+  // kept live by the settings toggle's event.
+  const [stickyNotesEnabled, setStickyNotesEnabled] = useState(false);
   useEffect(() => {
     void getSettings()
-      .then((s) => setCodexAvailable(s.user.codex_available))
+      .then((s) => {
+        setCodexAvailable(s.user.codex_available);
+        setStickyNotesEnabled(s.user.sticky_notes_enabled);
+      })
       .catch(() => {}); // non-fatal — the transfer item just stays disabled
+  }, []);
+  useEffect(() => {
+    let cancelled = false;
+    let un: (() => void) | undefined;
+    void onStickyNotesEnabled(setStickyNotesEnabled).then((u) => {
+      if (cancelled) u();
+      else un = u;
+    });
+    return () => {
+      cancelled = true;
+      un?.();
+    };
   }, []);
   // Shared task data for the Board + Inspector (one list, one live subscription),
   // scoped to the active project.
@@ -926,6 +947,16 @@ function AppInner() {
   }, []);
   const closePerf = useCallback(() => setPerfOpen(false), []);
   const togglePerf = useCallback(() => setPerfOpen((v) => !v), []);
+  // The selected worktree's sticky note (null while loading or with the feature off).
+  const { note: stickyNote, update: updateStickyNote } = useStickyNote(
+    activeReady ? activeProjectKey : null,
+    activeReady ? selected : null,
+    stickyNotesEnabled,
+    showToast,
+  );
+  const toggleStickyNote = useCallback(() => {
+    if (stickyNote) updateStickyNote({ visible: !stickyNote.visible }, true);
+  }, [stickyNote, updateStickyNote]);
   const openLaneDiff = useCallback((g: GroupModel, w: string) => {
     if (g.isActive && activeReadyRef.current) setDiffTarget(w);
     else
@@ -975,6 +1006,8 @@ function AppInner() {
       hasSelectedCard: selectedTaskId !== null,
       toggleHelp: () => setHelpOpen((o) => !o),
       togglePerf,
+      stickyNotes: stickyNotesEnabled,
+      toggleStickyNote,
       openDiff: (name: string) => setDiffTarget(name),
       setView,
       setSelected,
@@ -997,6 +1030,8 @@ function AppInner() {
       activeProjectKey,
       switchToProject,
       togglePerf,
+      stickyNotesEnabled,
+      toggleStickyNote,
     ],
   );
   useKeybindings(keyCtx);
@@ -1203,6 +1238,8 @@ function AppInner() {
         onView={setView}
         projectLabel={activeProjectKey}
         worktreeLabel={activeReady ? selected : undefined}
+        noteVisible={view === "focus" ? stickyNote?.visible : null}
+        onToggleNote={toggleStickyNote}
       />
       <RecoveryBanner info={recovery} />
       <UpdateBanner />
@@ -1335,6 +1372,15 @@ function AppInner() {
                   launchFresh={launchNonces.get(`${wp.summary.name}/${w.name}`)?.fresh ?? false}
                 />
               )),
+          )}
+          {view === "focus" && selected && stickyNote?.visible && (
+            <StickyNote
+              key={`${activeProjectKey}/${selected}`}
+              note={stickyNote}
+              worktree={selected}
+              onChange={updateStickyNote}
+              onHide={() => updateStickyNote({ visible: false }, true)}
+            />
           )}
         </div>
         {/* Diff view — full-window overlay inside .body (covers the stage, TopBar stays).

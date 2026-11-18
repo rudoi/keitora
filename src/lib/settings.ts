@@ -61,6 +61,8 @@ export interface SettingsUser {
   codex_available: boolean;
   /** Whether the app checks for updates by itself (`[updates] auto_check`). */
   auto_check_updates: boolean;
+  /** Whether per-worktree sticky notes are available (`[sticky_notes] enabled`). */
+  sticky_notes_enabled: boolean;
 }
 
 /** Everything the settings drawer needs in one round-trip. */

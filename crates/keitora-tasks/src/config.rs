@@ -264,6 +264,9 @@ pub struct UserConfig {
     /// Update-check settings. Omitted from TOML when unset.
     #[serde(default, skip_serializing_if = "UpdatesConfig::is_empty")]
     pub updates: UpdatesConfig,
+    /// Sticky-note settings. Omitted from TOML when unset.
+    #[serde(default, skip_serializing_if = "StickyNotesConfig::is_empty")]
+    pub sticky_notes: StickyNotesConfig,
     /// Registered projects, keyed by name.
     #[serde(default)]
     pub projects: BTreeMap<String, ProjectRef>,
@@ -296,6 +299,35 @@ impl UpdatesConfig {
     /// Whether automatic update checks are enabled (unset → true).
     pub fn auto_check(&self) -> bool {
         self.auto_check.unwrap_or(true)
+    }
+}
+
+/// The optional `[sticky_notes]` table in the user registry: whether the per-worktree
+/// sticky note can be shown over the terminal.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct StickyNotesConfig {
+    /// Whether sticky notes are available. `None` (unset) means off; only an explicit
+    /// `true` turns them on. Omitted from TOML when unset.
+    ///
+    /// Example (user config `keitora.toml`):
+    /// ```toml
+    /// [sticky_notes]
+    /// enabled = true
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl StickyNotesConfig {
+    /// True when nothing is configured, so the whole `[sticky_notes]` table can be
+    /// omitted from serialized TOML.
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+    }
+
+    /// Whether sticky notes are enabled (unset → false).
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
     }
 }
 
@@ -4252,6 +4284,34 @@ backoff_secs = [0, 10]
         let got = normalize_db_path(&abs, &root);
         assert!(got.is_absolute());
         assert!(got.ends_with("elsewhere/tasks.db"));
+    }
+
+    // --- sticky_notes.enabled ---
+
+    #[test]
+    fn sticky_notes_default_off_and_omitted() {
+        let cfg = UserConfig::default();
+        assert!(!cfg.sticky_notes.enabled());
+        assert!(cfg.sticky_notes.is_empty());
+        let toml = toml::to_string(&cfg).unwrap();
+        assert!(!toml.contains("[sticky_notes]"), "got: {toml}");
+    }
+
+    #[test]
+    fn sticky_notes_enabled_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("keitora/keitora.toml");
+
+        let mut cfg = UserConfig::default();
+        cfg.sticky_notes.enabled = Some(true);
+        cfg.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[sticky_notes]"), "got: {text}");
+        assert!(text.contains("enabled = true"), "got: {text}");
+
+        let loaded = UserConfig::load_from(&path).unwrap();
+        assert!(loaded.sticky_notes.enabled());
     }
 
     // --- updates.auto_check ---

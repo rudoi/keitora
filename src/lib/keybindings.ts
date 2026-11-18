@@ -23,6 +23,10 @@ export interface KeyCtx {
   toggleHelp: () => void;
   /** Toggle the performance overlay. */
   togglePerf: () => void;
+  /** Whether sticky notes are enabled (the user-level `[sticky_notes] enabled` flag). */
+  stickyNotes: boolean;
+  /** Show or hide the selected worktree's sticky note. */
+  toggleStickyNote: () => void;
   /** Open the full-window diff view for a worktree (by name). */
   openDiff: (name: string) => void;
   setView: (v: View) => void;
@@ -301,6 +305,17 @@ export const DEFAULT_BINDINGS: Keybinding[] = [
     global: true,
     when: () => true,
     run: (ctx) => ctx.togglePerf(),
+  },
+  {
+    // Cmd+Shift+N (Ctrl+Shift+N on Windows/Linux) is not a terminal control code, so it is
+    // safe to bypass the terminal with a global chord.
+    id: "note.toggle",
+    keys: "Cmd+Shift+N",
+    label: "Show / hide the worktree's sticky note",
+    group: "Global",
+    global: true,
+    when: (ctx) => ctx.stickyNotes && ctx.view === "focus" && ctx.selected !== null,
+    run: (ctx) => ctx.toggleStickyNote(),
   },
   {
     id: "help.toggle",

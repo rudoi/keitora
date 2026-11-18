@@ -10,6 +10,7 @@ import { type ReactNode, useEffect, useRef, useState } from "react";
 import type { CliKind, DiffBase, ProjectSummary } from "../lib/ipc";
 import { daemonRestart, daemonShutdown } from "../lib/ipc";
 import { LAYER_MODAL, MODAL_OVERLAY_CLS } from "../lib/layers";
+import { modKeyLabel } from "../lib/platform";
 import { RESTART_FALLBACK_MS, restartOutcome } from "../lib/recovery";
 import { useDaemonStatus, useRecovery } from "../lib/sessions";
 import {
@@ -22,6 +23,7 @@ import {
   setSkipPermissions,
   setUpdateAutoCheck,
 } from "../lib/settings";
+import { setStickyNotesEnabled } from "../lib/stickyNotes";
 import { isThemeMode, THEME_MODES, themeLabel, useTheme } from "../lib/theme";
 import { errorText, installLabel, isBusy, statusLine } from "../lib/updates";
 import { RestartDaemonDialog } from "./RestartDaemonDialog";
@@ -241,6 +243,45 @@ function DaemonSection() {
         sessionCount={info.session_count}
         onConfirm={() => void handleRestart()}
       />
+    </section>
+  );
+}
+
+// ── StickyNotesSection ────────────────────────────────────────────────────────
+
+/**
+ * Sticky notes section: the user-wide toggle for the per-worktree note over the
+ * terminal. The value is local, seeded from the drawer's snapshot; the app follows
+ * the change through the `sticky-notes://enabled` event.
+ */
+function StickyNotesSection({ enabled: initialEnabled }: { enabled: boolean }) {
+  const { showToast } = useToast();
+  const [enabled, setEnabled] = useState(initialEnabled);
+  useEffect(() => setEnabled(initialEnabled), [initialEnabled]);
+
+  // Optimistic: flip now, put it back if the backend refuses.
+  const toggle = () => {
+    const next = !enabled;
+    setEnabled(next);
+    void setStickyNotesEnabled(next).catch((err: unknown) => {
+      setEnabled(!next);
+      showToast(`Could not save setting: ${errorText(err)}`);
+    });
+  };
+
+  return (
+    <section className="flex flex-col gap-3 border-t border-line pt-6">
+      <div className={sectionTitle}>Sticky notes</div>
+      <div className="flex items-center justify-between gap-3">
+        <span className={label}>Show a note over each worktree's terminal</span>
+        <button className={enabled ? btnPrimary : btnGhost} aria-pressed={enabled} onClick={toggle}>
+          {enabled ? "Enabled" : "Disabled"}
+        </button>
+      </div>
+      <p className="text-[11px] text-tx-3">
+        Toggle a worktree's note from the top bar or with {modKeyLabel}+Shift+N. Notes are kept per
+        project, apart from tasks.
+      </p>
     </section>
   );
 }
@@ -1121,6 +1162,9 @@ export function SettingsDrawer({
 
                 {/* ── Daemon ──────────────────────────────────────────────── */}
                 <DaemonSection />
+
+                {/* ── Sticky notes ────────────────────────────────────────── */}
+                <StickyNotesSection enabled={snap?.user.sticky_notes_enabled ?? false} />
 
                 {/* ── Updates ─────────────────────────────────────────────── */}
                 <UpdatesSection autoCheck={snap?.user.auto_check_updates ?? true} />

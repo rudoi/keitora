@@ -17,6 +17,7 @@ mod local_store;
 mod migration;
 mod model;
 mod sqlite_backend;
+pub mod sticky_notes;
 
 #[cfg(test)]
 pub(crate) mod backend_tests;
@@ -42,8 +43,8 @@ pub use config::{
     resolve_keitora_path, resolve_provider_path, resolve_skip_permissions, short_path,
     stamp_from_registry, strip_extended_prefix_str, CliConfig, CliKind, Config, DiffBase,
     DispatchConfig, FieldIntent, HerdrPtyConfig, ProjectConfig, ProjectMeta, ProjectRef,
-    ProjectSettingsPatch, ProviderConfig, PtyConfig, RecoveryConfig, ResolveError, TaskConfig,
-    UserConfig, WorktreeEntry, AGENT_ENV, DISCOVER_NONE_TTL,
+    ProjectSettingsPatch, ProviderConfig, PtyConfig, RecoveryConfig, ResolveError,
+    StickyNotesConfig, TaskConfig, UserConfig, WorktreeEntry, AGENT_ENV, DISCOVER_NONE_TTL,
 };
 // Windows-only: expose the bundled `keitora` CLI on spawned terminals' PATH.
 #[cfg(unix)]
