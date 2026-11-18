@@ -568,9 +568,16 @@ export interface WorktreeInfo {
   terminated: boolean;
 }
 
+/** The active project's worktrees, tagged with the resolved project name they were read
+ *  for (`null` with no active project). */
+export interface ProjectWorktrees {
+  project: string | null;
+  worktrees: WorktreeInfo[];
+}
+
 /** List configured worktrees, each resolved to a path + filesystem status. */
-export function listWorktrees(): Promise<WorktreeInfo[]> {
-  return invoke<WorktreeInfo[]>("worktrees");
+export function listWorktrees(): Promise<ProjectWorktrees> {
+  return invoke<ProjectWorktrees>("worktrees");
 }
 
 /**

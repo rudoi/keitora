@@ -24,9 +24,9 @@ fn load_doc(file: &Path) -> Result<toml_edit::DocumentMut> {
         .map_err(|e| Error::Config(format!("parsing {}: {e}", file.display())))
 }
 
-/// Write `doc` back to `file`.
+/// Write `doc` back to `file` atomically (readers never see a partial file).
 fn save_doc(file: &Path, doc: &toml_edit::DocumentMut) -> Result<()> {
-    std::fs::write(file, doc.to_string())
+    crate::config::write_atomic(file, doc.to_string().as_bytes())
         .map_err(|e| Error::Config(format!("writing {}: {e}", file.display())))
 }
 

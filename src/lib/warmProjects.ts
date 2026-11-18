@@ -2,7 +2,7 @@
 // No React, no Tauri imports — unit-testable and side-effect-free.
 
 import type { View } from "../components/TopBar";
-import type { ProjectSummary, WorktreeInfo } from "./ipc";
+import type { ProjectSummary, ProjectWorktrees, WorktreeInfo } from "./ipc";
 
 export interface WarmProject {
   summary: ProjectSummary;
@@ -146,4 +146,48 @@ export function rememberView(state: WarmState, name: string, view: View): WarmSt
 export function activeProject(state: WarmState): WarmProject | null {
   if (state.active === null) return null;
   return state.projects[state.active] ?? null;
+}
+
+/**
+ * The tagged list's worktrees when it was read for `projectName`, else null. A list read
+ * for another project (a stale response, or the registry's active project moved under
+ * the app) must never be filed under `projectName`.
+ */
+export function worktreesFor(
+  projectName: string | null,
+  tagged: ProjectWorktrees | null,
+): WorktreeInfo[] | null {
+  if (projectName === null || tagged === null || tagged.project !== projectName) return null;
+  return tagged.worktrees;
+}
+
+/**
+ * What the warm-seeding effect does with the live worktree list:
+ * - `skip` while a project switch is still awaiting the backend, or without both inputs;
+ * - `warm` when the list was read for the project the app holds as active;
+ * - `resync` when it was read for a different project: the app's active project and
+ *   the backend's disagree, so both are re-read (the backend's registry is the truth).
+ *   A list read for no project is skipped instead: that is usually a brief resolve
+ *   failure (the project's config mid-write), and re-reading the project then would
+ *   drop the app into onboarding. A real removal reseeds via `project://changed`.
+ *
+ * Under `KEITORA_PROJECT` both reads resolve the env project, so they always agree.
+ */
+export type WarmDecision =
+  | { kind: "skip" }
+  | { kind: "warm"; worktrees: WorktreeInfo[] }
+  | { kind: "resync"; listProject: string };
+
+export function warmDecision(
+  projectName: string | null,
+  tagged: ProjectWorktrees | null,
+  switchInFlight: boolean,
+): WarmDecision {
+  if (switchInFlight || projectName === null || tagged === null || tagged.project === null) {
+    return { kind: "skip" };
+  }
+  const worktrees = worktreesFor(projectName, tagged);
+  return worktrees !== null
+    ? { kind: "warm", worktrees }
+    : { kind: "resync", listProject: tagged.project };
 }

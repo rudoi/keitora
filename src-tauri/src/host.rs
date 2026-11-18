@@ -36,6 +36,18 @@ struct WorktreeView {
     terminated: bool,
 }
 
+/// The active project's worktrees, tagged with the project they were resolved for.
+/// The tag lets the frontend refuse a list that doesn't belong to the project it
+/// thinks is active (a stale response, or the registry's active project changed
+/// underneath it) instead of filing it under the wrong rail group.
+#[derive(Serialize, Default)]
+struct ProjectWorktrees {
+    /// The resolved `[project].name` (what the frontend's `project.name` holds);
+    /// `None` with no active project.
+    project: Option<String>,
+    worktrees: Vec<WorktreeView>,
+}
+
 /// List the configured worktrees, each resolved to a path and classified.
 /// `ResolvedWorktree` serializes `path` as a string, which is what the UI wants.
 ///
@@ -43,7 +55,7 @@ struct WorktreeView {
 /// fails (e.g. `NeedsOnboarding`) yields an empty list rather than an error, so
 /// the rail renders empty until onboarding completes.
 #[tauri::command(async)]
-fn worktrees(client: State<SharedBackend>) -> Result<Vec<WorktreeView>, String> {
+fn worktrees(client: State<SharedBackend>) -> Result<ProjectWorktrees, String> {
     worktrees_in(
         client.inner().as_ref(),
         keitora_tasks::resolve_active().ok(),
@@ -51,19 +63,24 @@ fn worktrees(client: State<SharedBackend>) -> Result<Vec<WorktreeView>, String> 
 }
 
 /// [`worktrees`] for the active project `active` (`None`: no active project yet,
-/// an empty rail).
+/// an empty rail). The tag and the list come from the same resolution, so they
+/// can't disagree.
 fn worktrees_in(
     client: &dyn PtyBackend,
     active: Option<keitora_tasks::ProjectConfig>,
-) -> Result<Vec<WorktreeView>, String> {
+) -> Result<ProjectWorktrees, String> {
     let Some(pc) = active else {
-        return Ok(Vec::new());
+        return Ok(ProjectWorktrees::default());
     };
     let project = pc.project.name.clone();
     let resolved = keitora_tasks::Config::from_project(pc)
         .resolved_worktrees()
         .map_err(|e| e.to_string())?;
-    Ok(worktree_views(client, &project, resolved))
+    let worktrees = worktree_views(client, &project, resolved);
+    Ok(ProjectWorktrees {
+        project: Some(project),
+        worktrees,
+    })
 }
 
 /// Resolved worktrees for `project` with the backend's terminated flag attached.
@@ -265,10 +282,9 @@ fn reorder_projects(app: AppHandle, order: Vec<String>) -> Result<(), String> {
 }
 
 /// Switch the active project by registry name. Emits the project/worktrees/tasks/
-/// sessions change events directly so the frontend reseeds immediately, instead of
-/// waiting on the config-file watcher's ~200 ms debounce (the source of the visible
-/// switch lag). The config watcher still fires shortly after — the duplicate reload
-/// is idempotent.
+/// sessions change events directly so the frontend reseeds immediately. The user
+/// registry watcher sees this write too, but `restart_project_watchers` has recorded
+/// the new active project by then, so it treats the write as already handled.
 #[tauri::command(async)]
 fn set_active_project(app: AppHandle, name: String) -> Result<(), String> {
     {
@@ -280,6 +296,13 @@ fn set_active_project(app: AppHandle, name: String) -> Result<(), String> {
         user_cfg.set_active(&name);
         user_cfg.save().map_err(|e| e.to_string())?;
     }
+    activate_resolved(&app)
+}
+
+/// Reseed everything project-scoped for the registry's (already saved) active
+/// project: hooks, repair pass, watchers, and the frontend's change events. Shared
+/// by an in-app switch and an out-of-app one the registry watcher picks up.
+fn activate_resolved(app: &AppHandle) -> Result<(), String> {
     // The active project changed: drop the cached `(name, db_path)` so the next
     // PTY command re-resolves against the new project, (re)install its worktrees'
     // session hooks off-thread, and kick off the repair pass off-thread. Pass the
@@ -292,13 +315,22 @@ fn set_active_project(app: AppHandle, name: String) -> Result<(), String> {
     // AFTER invalidate + save so `resolve_active()` (read inside the calls) returns
     // the new project. Stops the old watchers (no stale events from the old project)
     // and removes the 30 s poll lag for the new one.
-    restart_project_watchers(&app);
+    restart_project_watchers(app);
     // Reseed the whole project-scoped UI now — don't wait for the fs watcher.
-    let _ = app.emit("project://changed", ());
-    let _ = app.emit("worktrees://changed", ());
-    let _ = app.emit("tasks://changed", ());
-    let _ = app.emit("sessions://changed", ());
+    emit_project_reseed(app);
     Ok(())
+}
+
+/// Tell the frontend that everything project-scoped may have changed.
+fn emit_project_reseed(app: &AppHandle) {
+    for event in [
+        "project://changed",
+        "worktrees://changed",
+        "tasks://changed",
+        "sessions://changed",
+    ] {
+        let _ = app.emit(event, ());
+    }
 }
 
 /// Onboard a folder as a Keitora project: validate it is a git repo, scaffold a
@@ -2079,6 +2111,72 @@ fn start_config_watcher(app: AppHandle) {
     });
 }
 
+/// The registry's active project as of the last activation this process handled.
+/// Recorded by [`restart_project_watchers`], which every activation path (in-app
+/// switch, onboarding, migration, removal, startup, and the registry watcher's own
+/// reseed) runs, so the watcher only reacts to changes made outside the app.
+static LAST_ACTIVE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Record `now` as the handled active project; true when it differs from the last one.
+fn take_active_change(last: &mut Option<String>, now: Option<String>) -> bool {
+    std::mem::replace(last, now.clone()) != now
+}
+
+/// Watch the user registry for an active-project change made outside this app's own
+/// switch paths: `keitora config use`, `keitora init`, or a second Keitora instance.
+/// Without it the frontend keeps the old project while every worktree reload returns
+/// the new one. Started once at setup, after the first [`restart_project_watchers`]
+/// recorded the launch-time project; lives for the app's lifetime. Skipped under
+/// `KEITORA_PROJECT`, where the registry's `active` doesn't pick the project.
+fn start_registry_watcher(app: AppHandle) {
+    if std::env::var_os("KEITORA_PROJECT").is_some() {
+        return;
+    }
+    let Ok(path) = keitora_tasks::user_config_path() else {
+        return;
+    };
+    let (Some(dir), Some(file)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let (dir, file) = (dir.to_path_buf(), file.to_string_lossy().into_owned());
+    // Never signalled: the watcher lives as long as the app.
+    let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(0);
+    thread::spawn(move || {
+        let _keep_alive = stop_tx;
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        crate::db_watch::watch_dir(dir, file, Duration::from_millis(200), stop_rx, || {
+            on_registry_change(&app)
+        });
+    });
+}
+
+/// The registry file changed: reseed if its active project moved; otherwise refresh
+/// just the project list (a project registered or removed from the CLI).
+fn on_registry_change(app: &AppHandle) {
+    // A failed load (a read racing a writer) is skipped; the next write fires again.
+    let Ok(reg) = keitora_tasks::UserConfig::load() else {
+        return;
+    };
+    let changed = {
+        let mut last = LAST_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        take_active_change(&mut last, reg.active.clone())
+    };
+    if !changed {
+        let _ = app.emit("projects://reordered", ());
+        return;
+    }
+    log::info!("[registry] active project changed outside the app; reseeding");
+    if reg.active.is_none() || activate_resolved(app).is_err() {
+        // No (resolvable) active project: tear down the project watchers and let the
+        // frontend reload into its empty / onboarding state.
+        invalidate_active_project();
+        restart_project_watchers(app);
+        emit_project_reseed(app);
+    }
+}
+
 /// (Re)point the project-scoped filesystem watchers (tasks/sessions + config) at the
 /// currently-active project. Called from every project-activation path so live
 /// updates follow the active project without an app restart, and from `remove_project`
@@ -2086,6 +2184,9 @@ fn start_config_watcher(app: AppHandle) {
 /// supersedes its previous watcher thread via the stop-sender swap (no leak); with no
 /// active project both calls stop the prior watcher and start nothing.
 fn restart_project_watchers(app: &AppHandle) {
+    if let Ok(reg) = keitora_tasks::UserConfig::load() {
+        *LAST_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = reg.active;
+    }
     start_tasks_watcher(app.clone());
     start_config_watcher(app.clone());
 }
@@ -2247,6 +2348,8 @@ pub fn run() {
             }
             // Point the tasks + config watchers at the launch-time active project.
             restart_project_watchers(app.handle());
+            // Follow active-project changes made outside the app (CLI, another instance).
+            start_registry_watcher(app.handle().clone());
             // Background-project notifications: one watcher per
             // registered project DB, fires OS notifications for non-active
             // projects' sessions that need input.
@@ -2662,7 +2765,10 @@ mod tests {
                 worktree: "beta".into(),
             });
             let views = worktrees_in(&fake, Some(pc)).unwrap();
-            let json = serde_json::to_value(&views).unwrap();
+            let tagged = serde_json::to_value(&views).unwrap();
+            // The list is tagged with the resolved project it was read for.
+            assert_eq!(tagged["project"], "proj");
+            let json = &tagged["worktrees"];
             let flags: Vec<(String, bool)> = json
                 .as_array()
                 .unwrap()
@@ -2684,7 +2790,43 @@ mod tests {
         fn worktrees_without_an_active_project_are_empty() {
             let fake = FakeBackend::new();
             fake.insert_terminated(key());
-            assert!(worktrees_in(&fake, None).unwrap().is_empty());
+            let views = worktrees_in(&fake, None).unwrap();
+            assert!(views.worktrees.is_empty());
+            assert_eq!(views.project, None);
+            let json = serde_json::to_value(&views).unwrap();
+            assert!(json["project"].is_null());
+        }
+    }
+
+    mod registry_watch {
+        use super::super::take_active_change;
+
+        fn some(s: &str) -> Option<String> {
+            Some(s.to_string())
+        }
+
+        #[test]
+        fn the_same_active_project_is_not_a_change() {
+            let mut last = some("proj");
+            assert!(!take_active_change(&mut last, some("proj")));
+            let mut none = None;
+            assert!(!take_active_change(&mut none, None));
+        }
+
+        #[test]
+        fn a_different_active_project_is_a_change_and_is_recorded() {
+            let mut last = some("proj");
+            assert!(take_active_change(&mut last, some("other-proj")));
+            assert_eq!(last, some("other-proj"));
+            assert!(!take_active_change(&mut last, some("other-proj")));
+        }
+
+        #[test]
+        fn gaining_or_losing_an_active_project_is_a_change() {
+            let mut last = None;
+            assert!(take_active_change(&mut last, some("proj")));
+            assert!(take_active_change(&mut last, None));
+            assert_eq!(last, None);
         }
     }
 

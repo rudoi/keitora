@@ -65,7 +65,7 @@ import {
   shouldDrop,
 } from "./lib/pendingIntent";
 import { useProjectsOverview } from "./lib/projectsOverview";
-import { buildGroups, type GroupModel, shareGroups } from "./lib/railGroups";
+import { activeRegistryKey, buildGroups, type GroupModel, shareGroups } from "./lib/railGroups";
 import { latestWins } from "./lib/railOrder";
 import { nextRestartSignal, type RestartSignal } from "./lib/resumeNotice";
 import { countsByProject } from "./lib/sessionCounts";
@@ -99,7 +99,7 @@ import {
 } from "./lib/transferPhase";
 import { useAppFocus } from "./lib/useAppFocus";
 import { useKeitoraCliInstall } from "./lib/useKeitoraCliInstall";
-import { useLiveResource } from "./lib/useLiveResource";
+import { newestSettledGate, useLiveResource } from "./lib/useLiveResource";
 import { useLocalStorageState } from "./lib/useLocalStorageState";
 import { useModifierHint } from "./lib/useModifierHint";
 import { useProjectList } from "./lib/useProjectList";
@@ -111,7 +111,9 @@ import {
   sameWorktrees,
   setActive,
   type WarmState,
+  warmDecision,
   warmProject,
+  worktreesFor,
 } from "./lib/warmProjects";
 import { xdgLeakNoticeBody } from "./lib/xdgNotice";
 import "./App.css";
@@ -152,13 +154,6 @@ function AppInner() {
   const [warm, setWarm] = useState<WarmState>(emptyWarmState);
   const warmRef = useRef(warm);
   warmRef.current = warm;
-  // The active project's worktrees, sourced from its registry entry so the whole
-  // active-project UI (panes, rail, keymap) flips instantly on a warm switch; falls
-  // back to the live `worktrees` before the project has been warmed.
-  const activeWorktrees = useMemo(
-    () => activeProject(warm)?.worktrees ?? worktrees ?? [],
-    [warm, worktrees],
-  );
   const [selectedTaskId, setSelectedTaskId] = useState<number | null>(null);
   // Persisted *preference* for the inspector's collapsed state.
   const [collapsedPref, setCollapsedPref] = useLocalStorageState(
@@ -308,6 +303,10 @@ function AppInner() {
   // when a switch starts; cleared once the BACKEND confirms the new active project
   // (loadProject resolves with the target) — NOT on the optimistic flip.
   const [switchingTo, setSwitchingTo] = useState<string | null>(null);
+  // Project switches still awaiting the backend. Unlike `switchingTo`, which a safety
+  // timer clears after 4 s for the overlay's sake, this drops only when a switch has
+  // actually finished, so the warm effect never trusts a list from mid-switch.
+  const [switchesInFlight, setSwitchesInFlight] = useState(0);
   // A lane focus/action parked until a project switch settles (see `pendingIntent.ts`).
   // State, not a ref, so the consuming effect below re-runs as the switch progresses.
   const [pending, setPending] = useState<PendingIntent | null>(null);
@@ -316,13 +315,25 @@ function AppInner() {
   // live data (tasks + sessions) so a stale response from a project the user switched
   // away from can't corrupt the active board/lights.
   const activeProjectName = typeof project === "object" && project !== null ? project.name : null;
+  // The live worktree list, only when it was read for the project the app holds as
+  // active; null while it belongs to another project (or none).
+  const matchedWorktrees = useMemo(
+    () => worktreesFor(activeProjectName, worktrees),
+    [activeProjectName, worktrees],
+  );
+  // The active project's worktrees, sourced from its registry entry so the whole
+  // active-project UI (panes, rail, keymap) flips instantly on a warm switch; falls
+  // back to the matched live list before the project has been warmed.
+  const activeWorktrees = useMemo(
+    () => activeProject(warm)?.worktrees ?? matchedWorktrees ?? [],
+    [warm, matchedWorktrees],
+  );
   // The active project's registry key. `project.name` is the resolved `[project].name`,
   // while the registry list (and so the keymap's cycle order) is keyed by registry key;
-  // the two are usually equal but need not be.
+  // the two are usually equal but need not be. When several entries resolve to the
+  // active name, the one the registry marks active wins.
   const activeProjectKey = useMemo(
-    () =>
-      registryProjects.find((p) => p.resolved_name === activeProjectName)?.name ??
-      activeProjectName,
+    () => activeRegistryKey(registryProjects, activeProjectName),
     [registryProjects, activeProjectName],
   );
   // The diff view resolves its worktree against the ACTIVE project, so a project switch would
@@ -356,16 +367,23 @@ function AppInner() {
   useEffect(() => setTaskRev((r) => r + 1), [tasks]);
 
   // Load the active project from the registry. null → onboarding.
+  // Calls overlap (a switch's own reload, `project://changed`, the mismatch resync) and
+  // can settle out of order; only a call newer than the last one applied may set state,
+  // so an older answer can't put the previous project back after a switch.
+  const projectLoadGate = useRef(newestSettledGate()).current;
   const loadProject = useCallback(async () => {
+    const settle = projectLoadGate.begin();
     try {
       const p = await currentProject();
+      if (!settle()) return;
       setProjectError(null);
       setProject(p); // null → onboarding; ProjectSummary → main app
     } catch (e) {
+      if (!settle()) return;
       setProjectError(String(e));
       setProject(null);
     }
-  }, []);
+  }, [projectLoadGate]);
   // Live worktree session states (idle/busy/waiting/offline) for Rail + Board dots.
   // `sessions` is cache-seeded for instant lights on switch-back; `liveSessions`
   // is the uncached live map that drives notifications (so a stale cache seed can't
@@ -713,6 +731,7 @@ function AppInner() {
       buildGroups({
         projects: registryProjects,
         activeResolvedName: activeProjectName,
+        activeKey: activeProjectKey,
         activeReady,
         activeWorktrees,
         sessions,
@@ -730,6 +749,7 @@ function AppInner() {
   }, [
     registryProjects,
     activeProjectName,
+    activeProjectKey,
     activeReady,
     activeWorktrees,
     sessions,
@@ -830,6 +850,7 @@ function AppInner() {
       setSwitchingTo(resolved);
       // Safety net: never trap the user behind the (cold-only) overlay if a reseed hangs.
       window.setTimeout(() => setSwitchingTo((cur) => (cur === resolved ? null : cur)), 4000);
+      setSwitchesInFlight((n) => n + 1);
       try {
         const ok = await switchProject(name, {
           setProject,
@@ -863,6 +884,7 @@ function AppInner() {
         await Promise.all([loadProject(), reloadWorktrees(), reloadSessions()]);
       } finally {
         setSwitchingTo((cur) => (cur === resolved ? null : cur));
+        setSwitchesInFlight((n) => n - 1);
       }
     },
     [project, setProject, showToast, loadProject, reloadWorktrees, reloadSessions],
@@ -971,26 +993,41 @@ function AppInner() {
   // Hold-modifier hint overlay: reveals number badges on rail rows.
   const hintVisible = useModifierHint();
 
-  // Keep the active project warm: seed/refresh its registry entry from the
-  // live worktree list once project + worktrees have SETTLED. Never mid-switch
-  // (`switchingTo` set), when `worktrees` may still belong to the previous project —
-  // warming with that stale list would mis-key the new project's panes. On a
-  // cold switch this seeds the project (defaults focus/view); on a refresh it keeps
-  // the remembered focus/view and just updates summary + worktrees.
+  // Keep the active project warm: seed/refresh its registry entry from the live
+  // worktree list once project + worktrees have SETTLED, and only with a list read for
+  // that project (`warmDecision`). Never mid-switch, when `worktrees` may still belong
+  // to the previous project — warming with it would file another project's worktrees
+  // under this one. On a cold switch this seeds the project (defaults focus/view); on a
+  // refresh it keeps the remembered focus/view and just updates summary + worktrees.
+  //
+  // A settled list read for a different project means the app's active project and the
+  // backend's disagree (an out-of-order response, or the registry changed under the
+  // app): re-read both, once per mismatched pair so a persisting mismatch can't loop.
+  const resyncedFor = useRef<string | null>(null);
   useEffect(() => {
     if (typeof project !== "object" || project === null) return;
-    if (!worktrees) return;
-    if (switchingTo) return;
+    const decision = warmDecision(project.name, worktrees, switchesInFlight > 0);
+    if (decision.kind === "skip") return;
+    if (decision.kind === "resync") {
+      const pair = JSON.stringify([project.name, decision.listProject]);
+      if (resyncedFor.current === pair) return;
+      resyncedFor.current = pair;
+      void loadProject();
+      void reloadWorktrees();
+      return;
+    }
+    resyncedFor.current = null;
+    const list = decision.worktrees;
     setWarm((w) => {
       // Skip the re-warm (and its render cascade) when nothing changed — the 30s live
       // resync hands back a fresh `worktrees` array with identical contents.
       const existing = w.projects[project.name];
-      if (existing && w.active === project.name && sameWorktrees(existing.worktrees, worktrees)) {
+      if (existing && w.active === project.name && sameWorktrees(existing.worktrees, list)) {
         return w;
       }
-      return warmProject(w, { summary: project, worktrees });
+      return warmProject(w, { summary: project, worktrees: list });
     });
-  }, [project, worktrees, switchingTo]);
+  }, [project, worktrees, switchesInFlight, loadProject, reloadWorktrees]);
 
   // OS file drops: a dragged file's paths are visible only to the webview
   // drag-drop event — Tauri strips them from HTML5 drop events — so there is one
@@ -1042,11 +1079,15 @@ function AppInner() {
   }, []);
 
   // Keep the selected worktree valid as the (active project's) worktree list changes.
+  // Before the project is warm, `activeWorktrees` is the matched live list; while that
+  // list belongs to another project it is empty, which must not clear the selection.
+  const hasWarmEntry = activeProject(warm) !== null;
   useEffect(() => {
     if (!worktrees) return;
+    if (!hasWarmEntry && matchedWorktrees === null) return;
     const avail = activeWorktrees.filter((w) => w.status === "available").map((w) => w.name);
     setSelected((cur) => (cur && avail.includes(cur) ? cur : (avail[0] ?? null)));
-  }, [activeWorktrees, worktrees]);
+  }, [activeWorktrees, worktrees, hasWarmEntry, matchedWorktrees]);
 
   // Persist the active project's focus + view into its registry entry, so a
   // later switch-back can restore them. The registry is the per-project memory; global
@@ -1137,8 +1178,9 @@ function AppInner() {
     );
   }
 
-  // 5. No worktrees (valid but empty project — offer discovery).
-  if (worktrees.length === 0) {
+  // 5. No worktrees (valid but empty project — offer discovery). Only for a list read
+  // for this project: one read for another project is resynced, not offered discovery.
+  if (matchedWorktrees !== null && matchedWorktrees.length === 0) {
     return (
       <div className="keitora shell-msg">
         <WorktreePicker
