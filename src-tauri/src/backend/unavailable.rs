@@ -277,6 +277,17 @@ mod tests {
         assert!(matches!(b.kill(&k, 3), Err(PtyBackendError::NotConnected)));
     }
 
+    /// The trait defaults: no shell to name, and no line typed.
+    #[test]
+    fn pane_shell_is_unknown_and_run_line_unsupported_by_default() {
+        let (b, _) = backend();
+        assert_eq!(b.pane_shell(&key()).unwrap(), None);
+        match b.run_line(&key(), 1, "echo hi") {
+            Err(PtyBackendError::Other(m)) => assert!(m.contains("not available"), "{m}"),
+            other => panic!("expected unsupported, got {other:?}"),
+        }
+    }
+
     #[test]
     fn write_line_refusal_keeps_the_task_queued() {
         let (b, _) = backend();

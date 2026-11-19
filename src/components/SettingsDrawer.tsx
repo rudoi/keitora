@@ -7,6 +7,13 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { AlertTriangle, Loader2, X } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
+import {
+  AGENT_CLIS,
+  entryStatusLine,
+  installKindLabel,
+  parseCheckHours,
+} from "../lib/agentUpdates";
+import { btnGhost, btnPrimary } from "../lib/buttonStyles";
 import type { CliKind, DiffBase, ProjectSummary } from "../lib/ipc";
 import { daemonRestart, daemonShutdown } from "../lib/ipc";
 import { LAYER_MODAL, MODAL_OVERLAY_CLS } from "../lib/layers";
@@ -20,6 +27,7 @@ import {
   type SettingsSnapshot,
   saveProjectSettings,
   saveUserSettings,
+  setAgentUpdateCheckHours,
   setSkipPermissions,
   setUpdateAutoCheck,
 } from "../lib/settings";
@@ -27,6 +35,7 @@ import { setStickyNotesEnabled } from "../lib/stickyNotes";
 import { isThemeMode, THEME_MODES, themeLabel, useTheme } from "../lib/theme";
 import { errorText, installLabel, isBusy, statusLine } from "../lib/updates";
 import { useRailView } from "../lib/useRailView";
+import { useAgentUpdates } from "./AgentUpdatesProvider";
 import { RestartDaemonDialog } from "./RestartDaemonDialog";
 import { useToast } from "./Toast";
 import { useUpdates } from "./UpdatesProvider";
@@ -37,10 +46,6 @@ const field =
 const fieldRo = "w-full bg-bg-2 border border-line/60 rounded-chip px-3 py-2 text-tx-3 text-[13px]";
 const label = "text-[10.5px] uppercase tracking-wide text-tx-3";
 const sectionTitle = "text-[12px] font-semibold uppercase tracking-wide text-tx-2";
-const btnPrimary =
-  "rounded-chip border border-accent bg-accent px-3.5 py-1.5 text-[11.5px] font-semibold text-[var(--color-on-accent)] disabled:opacity-60";
-const btnGhost =
-  "rounded-chip border border-line bg-bg-3 px-3 py-1.5 text-[11.5px] text-tx-1 disabled:opacity-50";
 
 /** Build the project-default `DiffBase` from the drawer's kind select + ref/parent text. Always
  *  returns an explicit base (never null): `auto`, or a `ref`/`forkPoint` with empty text, resolve
@@ -405,6 +410,96 @@ function UpdatesSection({ autoCheck: initialAutoCheck }: { autoCheck: boolean })
           )}
         </div>
       )}
+    </section>
+  );
+}
+
+// ── AgentUpdatesSection ───────────────────────────────────────────────────────
+
+/**
+ * Agent CLI updates: per CLI, the installed and latest versions and how it was installed;
+ * the check interval and a manual check. State lives in `AgentUpdatesProvider`; only the
+ * interval's text is local (seeded from the drawer's snapshot).
+ */
+function AgentUpdatesSection({ hours: initialHours }: { hours: number }) {
+  const { showToast } = useToast();
+  const { snapshot, checking, check } = useAgentUpdates();
+  const [hoursText, setHoursText] = useState(String(initialHours));
+  const savedRef = useRef(initialHours);
+  useEffect(() => {
+    savedRef.current = initialHours;
+    setHoursText(String(initialHours));
+  }, [initialHours]);
+
+  const hours = parseCheckHours(hoursText);
+  const saveHours = () => {
+    if (hours === null) {
+      setHoursText(String(savedRef.current));
+      return;
+    }
+    if (hours === savedRef.current) return;
+    const prev = savedRef.current;
+    savedRef.current = hours;
+    void setAgentUpdateCheckHours(hours).catch((err: unknown) => {
+      savedRef.current = prev;
+      setHoursText(String(prev));
+      showToast(`Could not save setting: ${errorText(err)}`);
+    });
+  };
+
+  return (
+    <section className="flex flex-col gap-3 border-t border-line pt-6">
+      <div className={sectionTitle}>agent cli updates</div>
+      {AGENT_CLIS.map((cli) => {
+        const entry = snapshot?.[cli] ?? null;
+        return (
+          <div key={cli} className="flex flex-col gap-0.5">
+            <div className="flex items-baseline justify-between gap-3">
+              <span className="text-[12px] font-semibold text-tx-1">{cli}</span>
+              <span className="text-[11px] text-tx-3">
+                {entry ? entryStatusLine(entry) : "not checked yet"}
+              </span>
+            </div>
+            <span className="text-[11px] text-tx-3">
+              installed {entry?.installed ?? "—"} · latest {entry?.latest ?? "—"} · via{" "}
+              {installKindLabel(entry?.install_kind ?? null)}
+            </span>
+          </div>
+        );
+      })}
+
+      <label className="flex flex-col gap-1.5">
+        <span className={label}>check every (hours, 0 = app start only)</span>
+        <input
+          className={field.replace("w-full", "w-24")}
+          inputMode="numeric"
+          value={hoursText}
+          aria-invalid={hours === null}
+          onChange={(e) => setHoursText(e.target.value)}
+          onBlur={saveHours}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") saveHours();
+          }}
+        />
+      </label>
+
+      <div className="flex items-center gap-3">
+        <button className={btnGhost} disabled={checking} onClick={check}>
+          {checking ? (
+            <span className="flex items-center gap-1.5">
+              <Loader2 size={12} className="animate-spin" />
+              checking…
+            </span>
+          ) : (
+            "check now"
+          )}
+        </button>
+        {snapshot?.checked_at && (
+          <span className="text-[11px] text-tx-3">
+            last checked {new Date(snapshot.checked_at).toLocaleString()}
+          </span>
+        )}
+      </div>
     </section>
   );
 }
@@ -1201,6 +1296,9 @@ export function SettingsDrawer({
 
                 {/* ── Updates ─────────────────────────────────────────────── */}
                 <UpdatesSection autoCheck={snap?.user.auto_check_updates ?? true} />
+
+                {/* ── Agent CLI updates ───────────────────────────────────── */}
+                <AgentUpdatesSection hours={snap?.user.agent_update_check_hours ?? 6} />
               </div>
             )}
           </div>

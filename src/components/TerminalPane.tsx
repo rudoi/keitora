@@ -9,6 +9,15 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  cliTitle,
+  pendingRestartAction,
+  restartNoticeCopy,
+  sessionKey,
+  stoppedForUpdateCopy,
+  updatePromptCliOf,
+  updatePromptHint,
+} from "../lib/agentUpdates";
 import { classifyAttachError } from "../lib/attachErrors";
 import { useTerminalFontSize } from "../lib/fontSize";
 import { createFrameCoalescer, type FrameCoalescer } from "../lib/frameCoalescer";
@@ -115,6 +124,7 @@ import {
   spawnFailedCopy,
   type TransferEntry,
 } from "../lib/transferPhase";
+import { useAgentUpdatePane } from "./AgentUpdatesProvider";
 import { type HistoryView, TerminalSearch } from "./TerminalSearch";
 import { useToast } from "./Toast";
 import { TransferOverlay } from "./TransferOverlay";
@@ -225,6 +235,18 @@ export function TerminalPane({
 }) {
   const paneRef = useRef<HTMLDivElement | null>(null);
   const { showToast } = useToast();
+  // Agent CLI update marks for this pane: a restart onto a new CLI version, stopped for an
+  // update, or parked on the CLI's own update prompt.
+  const agentUpdates = useAgentUpdatePane();
+  const agentUpdatesRef = useRef(agentUpdates);
+  agentUpdatesRef.current = agentUpdates;
+  const paneKey = sessionKey(projectName, name);
+  // A restart mark already set when this pane mounted was asked for while the pane was
+  // away: it is only ever offered, never forced. Cleared with the mark, so a later
+  // request while mounted restarts as usual.
+  const restartCli = agentUpdates.pendingRestart.get(paneKey) ?? null;
+  const markedBeforeMountRef = useRef(restartCli !== null);
+  if (restartCli === null) markedBeforeMountRef.current = false;
   const linkContextRef = useRef({ project: projectName, worktree: name, active });
   linkContextRef.current = { project: projectName, worktree: name, active };
   const linksRef = useRef<ReturnType<typeof installTerminalLinks> | null>(null);
@@ -567,6 +589,9 @@ export function TerminalPane({
       transfer = false,
     ): Promise<SpawnResult> => {
       setSpawnFailure(null);
+      // An update-prompt hint belongs to the session being replaced. (The backend raises a
+      // new one while this spawn is in flight, so it is cleared before, not after.)
+      agentUpdatesRef.current.clearPrompt(sessionKey(projectName, name));
       const term = termRef.current;
       if (!term) return { ok: false, error: "The terminal is not ready." };
       if (via === "spawn" && terminatedRef.current) {
@@ -581,6 +606,8 @@ export function TerminalPane({
             ? await sessionLaunch(projectName, name, path, size, fresh)
             : await ptySpawn(projectName, name, path, size, undefined, fresh, transfer);
         genRef.current = gen;
+        // A new session: a pending restart or stopped-for-update mark is done with.
+        agentUpdatesRef.current.settle(sessionKey(projectName, name));
         updateStatus("running");
         // A fit may have changed the size while the spawn was in flight: send the
         // new one. Still unmeasured, or unchanged: nothing to send.
@@ -604,6 +631,8 @@ export function TerminalPane({
           updateStatus("terminated");
           return { ok: false, error: "The session is terminated." };
         }
+        // The CLI stopped on its own update screen: check now so the banner shows at once.
+        if (updatePromptCliOf(msg) !== null) agentUpdatesRef.current.checkQuietly();
         setSpawnFailure({
           cli: transferRef.current?.to ?? cliRef.current,
           error: msg,
@@ -961,6 +990,35 @@ export function TerminalPane({
     if (!terminatedRef.current && statusRef.current !== "terminated") return;
     void launch(launchFresh);
   }, [launchNonce, launch]);
+
+  // Restart onto an updated CLI (`agent-updates://restart`), per `pendingRestartAction`. A
+  // pane mounted when the user asked takes the mark once it settles and relaunches through
+  // the Kill & Restart path. A pane that mounts later never kills what it attached to: it
+  // shows the notice below instead (and with no session, its fallback spawn already runs
+  // the new version and clears the mark, see `spawn`). A terminated session stays down.
+  const restartAction = pendingRestartAction({
+    pending: restartCli !== null,
+    markedBeforeMount: markedBeforeMountRef.current,
+    status,
+    transferring: Boolean(transferRef.current),
+  });
+  // biome-ignore lint/correctness/useExhaustiveDependencies: takePendingRestart is stable; transfer is read live
+  useEffect(() => {
+    if (restartAction === "drop") agentUpdates.takePendingRestart(paneKey);
+    else if (restartAction === "restart" && agentUpdates.takePendingRestart(paneKey)) {
+      void restart(false);
+    }
+  }, [restartAction, paneKey, restart, transfer]);
+
+  // The update-prompt hint lasts while the session it was raised for does: it goes when
+  // the pane leaves `running` (and at the next spawn, see `spawn`). Keyed on the status
+  // change only, so a hint raised while a restart spawns from an ended pane survives.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reacts to status changes only; the marks are read live
+  useEffect(() => {
+    if (status === "running" || status === "attaching") return;
+    const marks = agentUpdatesRef.current;
+    if (marks.prompted.has(paneKey)) marks.clearPrompt(paneKey);
+  }, [status]);
 
   // Lifetime: create the Terminal, wire I/O, attach or spawn the session. Disposed on unmount.
   // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only terminal setup; all deps are stable refs or callbacks (showToast), intentionally excluded
@@ -1871,6 +1929,11 @@ export function TerminalPane({
     }
   };
   const failedCopy = spawnFailedCopy(spawnFailure?.cli ?? cli, spawnFailure?.error ?? null);
+  // The launch stopped on the CLI's own update screen: offer the updater next to a retry.
+  const updatePromptCli =
+    status === "spawn-failed" && spawnFailure ? updatePromptCliOf(spawnFailure.error) : null;
+  const stoppedFor = agentUpdates.stopped.get(paneKey) ?? null;
+  const promptedCli = status === "running" ? (agentUpdates.prompted.get(paneKey) ?? null) : null;
   const confirmCopy =
     confirmKill === "terminate"
       ? terminateConfirmCopy()
@@ -1898,6 +1961,53 @@ export function TerminalPane({
             termRef.current?.focus();
           }}
         />
+      )}
+
+      {/* The launched CLI sits on its own update screen (the pane is kept so it can be
+          answered in place). */}
+      {promptedCli && !transfer && (
+        <div className="pane-update-hint" role="status">
+          <span>{updatePromptHint(promptedCli)}</span>
+          <button
+            type="button"
+            className="pane-update-hint-btn"
+            onClick={() => agentUpdates.openDialog(promptedCli)}
+          >
+            update {promptedCli}
+          </button>
+          <button
+            type="button"
+            className="pane-update-hint-btn"
+            aria-label="Dismiss"
+            onClick={() => agentUpdates.clearPrompt(paneKey)}
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      {/* The CLI was updated while this pane was away: offer the restart, never force it. */}
+      {restartAction === "notice" && restartCli && !promptedCli && (
+        <div className="pane-update-hint" role="status">
+          <span>{restartNoticeCopy(restartCli, agentUpdates.versions[restartCli] ?? null)}</span>
+          <button
+            type="button"
+            className="pane-update-hint-btn"
+            onClick={() => {
+              if (agentUpdates.takePendingRestart(paneKey)) void restart(false);
+            }}
+          >
+            restart
+          </button>
+          <button
+            type="button"
+            className="pane-update-hint-btn"
+            aria-label="Dismiss"
+            onClick={() => agentUpdates.takePendingRestart(paneKey)}
+          >
+            ×
+          </button>
+        </div>
       )}
 
       {/* "↩ reattached" pill */}
@@ -2017,8 +2127,12 @@ export function TerminalPane({
             <>
               <div className="pane-msg">
                 {status === "spawn-failed" && failedCopy.message}
-                {status === "ended" && "session ended"}
-                {status === "ended-while-away" && "Session ended while away — restart to continue"}
+                {status === "ended" &&
+                  (stoppedFor ? stoppedForUpdateCopy(stoppedFor) : "session ended")}
+                {status === "ended-while-away" &&
+                  (stoppedFor
+                    ? stoppedForUpdateCopy(stoppedFor)
+                    : "Session ended while away — restart to continue")}
                 {status === "lost" && "Session lost (daemon restarted) — start a new session"}
               </div>
               {status === "spawn-failed" && failedCopy.detail && (
@@ -2027,7 +2141,24 @@ export function TerminalPane({
               {/* Confirm surface (when needed) is hoisted below, outside this
                       status !== "running" gate — see the standalone `confirmKill` block. Hide this
                       button while it's open so the two don't render on top of each other. */}
-              {!confirmKill && (
+              {!confirmKill && updatePromptCli && (
+                <div className="pane-btn-row">
+                  <button
+                    ref={restartBtnRef}
+                    className="pane-btn"
+                    onClick={() => agentUpdates.openDialog(updatePromptCli)}
+                  >
+                    Update {cliTitle(updatePromptCli)}
+                  </button>
+                  <button
+                    className="pane-btn pane-btn-secondary"
+                    onClick={() => handleKillRestart("kill_restart")}
+                  >
+                    Retry
+                  </button>
+                </div>
+              )}
+              {!confirmKill && !updatePromptCli && (
                 <div className="pane-btn-row">
                   <button
                     ref={restartBtnRef}

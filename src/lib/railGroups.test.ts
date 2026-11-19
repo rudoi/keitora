@@ -3,6 +3,7 @@ import type { AttentionKind } from "./attention";
 import type { BuildProgress, ProjectSummary, WorktreeActivity, WorktreeInfo } from "./ipc";
 import type { ProjectOverview } from "./projectsOverview";
 import {
+  activeRegistryKey,
   type BuildGroupsInput,
   buildGroups,
   buildLane,
@@ -100,6 +101,7 @@ function input(over: Partial<BuildGroupsInput> = {}): BuildGroupsInput {
   return {
     projects: [alpha, beta],
     activeResolvedName: "alpha-res",
+    activeKey: "alpha",
     activeReady: true,
     activeWorktrees: [wt("a1"), wt("a2")],
     sessions: new Map([["a1", session("alpha-res", "a1", "idle")]]),
@@ -116,7 +118,40 @@ function input(over: Partial<BuildGroupsInput> = {}): BuildGroupsInput {
 
 // ── buildGroups ───────────────────────────────────────────────────────────────
 
+describe("activeRegistryKey", () => {
+  it("prefers the entry the registry marks active among same-named entries", () => {
+    const twin = summary("alpha-twin", "alpha-res");
+    const active = { ...summary("alpha", "alpha-res"), active: true };
+    expect(activeRegistryKey([twin, active], "alpha-res")).toBe("alpha");
+  });
+
+  it("falls back to the first match, then to the resolved name", () => {
+    expect(activeRegistryKey([alpha, beta], "beta-res")).toBe("beta");
+    expect(activeRegistryKey([alpha], "unknown")).toBe("unknown");
+    expect(activeRegistryKey([alpha], null)).toBeNull();
+  });
+});
+
 describe("buildGroups", () => {
+  it("renders live lanes only for the active registry key when two resolve alike", () => {
+    // A second registration that resolves to the active project's name.
+    const twin = summary("alpha-twin", "alpha-res");
+    const twinOverview: ProjectOverview = {
+      key: "alpha-twin",
+      resolved_name: "alpha-res",
+      worktrees: [wt("t1")],
+      sessions: [],
+      active_tasks: [],
+    };
+    const [a, t] = buildGroups(
+      input({ projects: [alpha, twin], overview: [alphaOverview, twinOverview] }),
+    );
+    expect(a.lanes.map((l) => l.name)).toEqual(["a1", "a2"]);
+    // The twin shares the resolved name (so it reads as active for session data) but
+    // shows its own worktrees, not the active project's.
+    expect(t.lanes.map((l) => l.name)).toEqual(["t1"]);
+  });
+
   it("carries each lane's heartbeat and the group's latest one", () => {
     const hb = (w: string, state: SessionState, t: string) => ({
       ...session("beta-res", w, state),

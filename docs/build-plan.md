@@ -320,8 +320,8 @@ Status: **Phase 0 ✅ done** · **Phase 1 ✅ done (PR #1)** · **Phase 2 ✅ do
   *Exit:* Keitora fully replaces the iTerm tabs.
 - **#0033 — Clickable terminal links. Done (PR #123).** Plain and OSC 8 web/file
   links open through system default applications; source location suffixes are
-  removed. File opening validates local worktree containment and rejects executable
-  targets. Hover destinations, error feedback, and selection guards are included.
+  removed. File opening rejects executable targets and network shares (worktree
+  containment was dropped later; see #0074). Hover destinations, error feedback, and selection guards are included.
 - **Phase 2 — Task board. ✅ done (PR #2).** Wired the app onto the `keitora-tasks` crate; `tasks://changed`
   WAL watcher; Board (kanban) + Inspector; claim/unclaim/done/update/new; live updates; Tailwind+Radix UI.
   *Exit met:* the board reflects the DB live and edits round-trip with the `task` CLI. (Dispatch
@@ -505,6 +505,90 @@ Status: **Phase 0 ✅ done** · **Phase 1 ✅ done (PR #1)** · **Phase 2 ✅ do
   `src-tauri/src/updater/`; tests cover the release assessment, the phase machine, config and the
   overlay. Still owed: a live downgrade test once the first signed release exists, and the first
   real macOS swap.
+- **#0072 — Rail filed one project's worktrees under another. ✅ done (PR #28).** The frontend read
+  the active project and its worktree list separately, and the list carried no project identity. If
+  they disagreed, the warm registry filed the backend's worktrees under the app's stale project until
+  restart. They could disagree two ways: an out-of-order response, or the registry's `active` changing
+  outside the app (`keitora config use`, `init`, a second instance) with nothing watching the registry.
+  Changes:
+  - `worktrees` returns `{ project, worktrees }`, and the warm effect only files a list tagged for
+    its project (`warmDecision`/`worktreesFor`). A settled mismatch re-reads both, once per
+    mismatched pair.
+  - A user-registry watcher reseeds the app when the active project changes outside it
+    (`LAST_ACTIVE`, recorded in `restart_project_watchers`), and refreshes the project list on
+    other edits.
+  - Live resources and the active-project read apply the newest settled result (`newestSettledGate`).
+  - Registry and config writes are atomic (`write_atomic`): they follow symlinks, keep permissions,
+    are serialized within the process, and fall back to an in-place write when Windows refuses
+    the rename.
+  - Live lanes render only for the active registry entry when two entries resolve to one name.
+  Tests cover the tagged list, change detection, atomic writes (including concurrency and
+  symlinks), the gate and out-of-order loads, `warmDecision`, and `activeRegistryKey`.
+  Still owed: a real-app check on macOS (`keitora config use` from a pane, rapid switches).
+  Follow-ups:
+  - One command returning `{summary, worktrees}`, which would remove the frontend reconciliation.
+  - Switching to a twin registry entry (two entries with one resolved name).
+- **#0073 — Agent CLI updates. ✅ done (PR #29).** Codex's interactive "Update available" startup
+  screen blocked herdr `agent start`, so fresh launches failed with a PATH error, recovery resumes
+  failed and went serial, and transfers could accept a pane parked on the prompt. Changes:
+  - Every codex launch passes `-c check_for_update_on_startup=false`. Claude's own background
+    updater is left alone.
+  - A backup check reads the screen when a launch still lands on the prompt. It returns a distinct
+    `AgentUpdatePrompt` error, which skips the fallback chain and is not load-related.
+  - `src-tauri/src/agent_updates/` tracks installed vs latest versions for codex and claude, using
+    codex `version.json` or the npm registry, and classifies the install from the symlink-resolved
+    path.
+    - Checks run on app start (after recovery settles), then every `[updates] agent_check_hours`
+      (default 6; 0 = app start only).
+  - A banner offers update / skip this version / later. Update runs the install's own command in a
+    visible pane on a reserved `__keitora` session key, with a sentinel marking completion.
+    - Windows offers to stop live sessions first.
+    - Restarting sessions is always a button.
+  - A guided overlay replaces the PATH error with Update / Retry.
+
+  Still owed:
+  - A live smoke test with an outdated codex.
+  - The Windows stop-first flow.
+  - The macOS brew and native update paths.
+  - `codex update` for native codex installs and the brew cask names are unverified.
+- **#0074 — Terminal link reach. ✅ done.** Two link bugs in agent panes:
+  - Wrapped links only underlined and opened the hovered row's fragment. herdr repaints the
+    screen, so xterm never marks rows wrapped. One provider now finds web and file links on a
+    logical line that joins a row filled to its last cell onto the next non-blank row, dropping
+    that row's leading indent (agent gutters). `WebLinksAddon` was removed. A file link crossing
+    such a join falls back to its pre-join part when the joined path fails to open.
+  - File links outside the worktree were refused. Containment is gone; relative paths still
+    resolve against the worktree, and the existing-file, executable/script and new
+    network-share refusals remain.
+
+  Edge joins are guarded: a web URL only joins across a filled edge when the continuation holds
+  a non-letter; file links carry ordered fallbacks (indent kept, then the row-local links)
+  tried only when the open reports the file missing; row-local links a join would hide are
+  still offered. The extension blocklist grew now that any local path is reachable.
+
+  Known limits: a URL whose split continuation is letters only (`.../getting-st` + `arted`)
+  stays split; the hover range of a joined link includes the continuation's indent cells;
+  `~/` and MSYS `/c/...` paths are not translated. Live smoke owed.
+
+  Follow-ups:
+  - Typed IPC error kinds.
+  - A pane-lifetime attribute instead of reserved-key filters.
+  - Move the TerminalPane wiring onto the launch nonce.
+- **#0075 — Update line per pane shell. ✅ done (PR #32).** The update pane typed a POSIX line
+  (`'…/npm.cmd' install …; echo "…$?"`), but herdr picks the pane shell itself (`SHELL` if set,
+  else PowerShell on Windows; the login shell on macOS), so updates failed on Windows with a
+  PowerShell `ParserError`. Changes:
+  - `agent_update_run` opens the reserved pane in the backend (`AgentUpdates::start_run`),
+    reads its shell (`PtyBackend::pane_shell`: herdr process-info → `HerdrOps::process_name`),
+    and types the line with a gen-checked, recovery-gated `PtyBackend::run_line`. The dialog
+    only attaches.
+  - `model::render_run_line` writes PowerShell (`& 'path' …`, exit from
+    `$(if ($?) {0} else {$LASTEXITCODE})`, `npm` → `npm.cmd`), POSIX (unchanged) and fish
+    (`$status`). An unreadable shell falls back per OS; a known unsupported shell is refused.
+  - A close during a start cancels it; a failed start closes its pane.
+
+  Still owed: live updates with herdr on PowerShell and on Git Bash, and on macOS (zsh/fish).
+
 - **Phase 5 — Polish & packaging. ✅ done (PR #7).** Scrollback search (xterm search addon + Cmd+F
   overlay); central keymap (`src/lib/keybindings.ts`: Cmd+↑/↓ worktree cycle, Cmd+F
   search, Cmd+K dispatch, `?` cheatsheet, `d` board dispatch; nav chords fire over a focused terminal;

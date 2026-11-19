@@ -1,7 +1,8 @@
 //! `FakeBackend` — a scriptable [`PtyBackend`] for unit tests.
 //!
 //! Records every trait call in a log and serves scripted result queues for the
-//! methods tests care about (`write_line`, `kill`, `list_sessions`), plus a hook to
+//! methods tests care about (`write_line`, `kill`, `list_sessions`, `pane_shell`,
+//! `run_line`), plus a hook to
 //! flip a key out of the live-set after N `is_live` calls (to simulate a session
 //! exiting). Needs no `AppHandle`. The whole module is `#[cfg(test)]` (declared so
 //! in `backend/mod.rs`).
@@ -60,6 +61,14 @@ pub enum Call {
         cols: u16,
         rows: u16,
     },
+    PaneShell {
+        key: SessionKey,
+    },
+    RunLine {
+        key: SessionKey,
+        gen: u64,
+        line: String,
+    },
     Kill {
         key: SessionKey,
         gen: u64,
@@ -86,6 +95,12 @@ struct FakeState {
     write_line_results: VecDeque<Result<(), PtyBackendError>>,
     paste_results: VecDeque<Result<(), PtyBackendError>>,
     kill_results: VecDeque<Result<(), PtyBackendError>>,
+    /// `spawn` answers `Ok(1)` once this is empty.
+    spawn_results: VecDeque<Result<u64, PtyBackendError>>,
+    /// What `pane_shell` answers once `pane_shell_results` is empty.
+    pane_shell: Option<String>,
+    pane_shell_results: VecDeque<Result<Option<String>, PtyBackendError>>,
+    run_line_results: VecDeque<Result<(), PtyBackendError>>,
     list_sessions_results: VecDeque<Result<Vec<SessionSummary>, PtyBackendError>>,
     is_live_count: u32,
     live_flip_after: Option<u32>,
@@ -129,9 +144,29 @@ impl FakeBackend {
         self.state.lock().unwrap().paste_results.push_back(r);
     }
 
+    /// Script the next `spawn` result (a terminated key still refuses first).
+    pub fn push_spawn(&self, r: Result<u64, PtyBackendError>) {
+        self.state.lock().unwrap().spawn_results.push_back(r);
+    }
+
     /// Script the next `kill` result.
     pub fn push_kill(&self, r: Result<(), PtyBackendError>) {
         self.state.lock().unwrap().kill_results.push_back(r);
+    }
+
+    /// What `pane_shell` answers from now on (after any queued results).
+    pub fn set_pane_shell(&self, name: Option<&str>) {
+        self.state.lock().unwrap().pane_shell = name.map(str::to_string);
+    }
+
+    /// Script the next `pane_shell` result.
+    pub fn push_pane_shell(&self, r: Result<Option<String>, PtyBackendError>) {
+        self.state.lock().unwrap().pane_shell_results.push_back(r);
+    }
+
+    /// Script the next `run_line` result.
+    pub fn push_run_line(&self, r: Result<(), PtyBackendError>) {
+        self.state.lock().unwrap().run_line_results.push_back(r);
     }
 
     /// Script the next `list_sessions` result.
@@ -189,7 +224,7 @@ impl PtyBackend for FakeBackend {
         if terminated {
             return Err(PtyBackendError::Terminated);
         }
-        Ok(1)
+        st.spawn_results.pop_front().unwrap_or(Ok(1))
     }
 
     fn spawn_agent(
@@ -278,6 +313,25 @@ impl PtyBackend for FakeBackend {
             rows,
         });
         Ok(())
+    }
+
+    fn pane_shell(&self, key: &SessionKey) -> Result<Option<String>, PtyBackendError> {
+        let mut st = self.state.lock().unwrap();
+        st.calls.push(Call::PaneShell { key: key.clone() });
+        match st.pane_shell_results.pop_front() {
+            Some(r) => r,
+            None => Ok(st.pane_shell.clone()),
+        }
+    }
+
+    fn run_line(&self, key: &SessionKey, gen: u64, line: &str) -> Result<(), PtyBackendError> {
+        let mut st = self.state.lock().unwrap();
+        st.calls.push(Call::RunLine {
+            key: key.clone(),
+            gen,
+            line: line.to_string(),
+        });
+        st.run_line_results.pop_front().unwrap_or(Ok(()))
     }
 
     fn kill(&self, key: &SessionKey, gen: u64) -> Result<(), PtyBackendError> {
@@ -413,6 +467,47 @@ mod tests {
                 size: Some((80, 24)),
                 launch,
             }]
+        );
+    }
+
+    #[test]
+    fn pane_shell_and_run_line_answer_from_scripts_and_are_recorded() {
+        let fake = FakeBackend::new();
+        let key = SessionKey {
+            project: "proj".into(),
+            worktree: "wt".into(),
+        };
+        assert_eq!(fake.pane_shell(&key).unwrap(), None);
+        fake.set_pane_shell(Some("pwsh.exe"));
+        fake.push_pane_shell(Err(PtyBackendError::NoSuchSession));
+        assert!(matches!(
+            fake.pane_shell(&key),
+            Err(PtyBackendError::NoSuchSession)
+        ));
+        assert_eq!(fake.pane_shell(&key).unwrap().as_deref(), Some("pwsh.exe"));
+        assert!(fake.run_line(&key, 3, "echo hi").is_ok());
+        fake.push_run_line(Err(PtyBackendError::NoSuchSession));
+        assert!(matches!(
+            fake.run_line(&key, 4, "echo again"),
+            Err(PtyBackendError::NoSuchSession)
+        ));
+        assert_eq!(
+            fake.calls(),
+            vec![
+                Call::PaneShell { key: key.clone() },
+                Call::PaneShell { key: key.clone() },
+                Call::PaneShell { key: key.clone() },
+                Call::RunLine {
+                    key: key.clone(),
+                    gen: 3,
+                    line: "echo hi".into(),
+                },
+                Call::RunLine {
+                    key,
+                    gen: 4,
+                    line: "echo again".into(),
+                },
+            ]
         );
     }
 

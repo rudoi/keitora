@@ -2,10 +2,15 @@ import type { ILink, ILinkProvider, Terminal } from "@xterm/xterm";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   activateTerminalLink,
+  bufferRowReader,
   classifyTerminalLink,
-  createFileLinkProvider,
+  createTerminalLinkProvider,
+  FILE_UNAVAILABLE_ERROR,
   findFileReferences,
+  findLineLinks,
   installTerminalLinks,
+  joinsNext,
+  logicalLineAt,
 } from "./terminalLinks";
 
 vi.hoisted(() => {
@@ -139,6 +144,19 @@ describe("native activation", () => {
     await activateTerminalLink("src/missing.ts", deps);
     expect(deps.showError).toHaveBeenLastCalledWith("Could not open link: Missing file");
   });
+  it("tries fallbacks in order only while the file is unavailable", async () => {
+    const deps = actions();
+    const missing = `${FILE_UNAVAILABLE_ERROR}: not found`;
+    deps.openFile.mockRejectedValueOnce(missing);
+    deps.openFile.mockRejectedValueOnce("Executable files cannot be opened from terminal links");
+    await activateTerminalLink("src/ab.ts", deps, false, [
+      { text: "src/a.ts", delimited: false },
+      { text: "b.ts", delimited: false },
+    ]);
+    expect(deps.openFile).toHaveBeenCalledTimes(2);
+    expect(deps.openFile).toHaveBeenLastCalledWith("project", "epsilon", "src/a.ts");
+    expect(deps.showError).toHaveBeenCalledWith(`Could not open link: ${missing}`);
+  });
   it("ignores hidden panes", async () => {
     const deps = actions();
     deps.context = () => ({ project: "p", worktree: "w", active: false });
@@ -147,7 +165,8 @@ describe("native activation", () => {
   });
 });
 
-function terminalFixture(rows: string[], cols: number) {
+/** A terminal of `rows`; with `wrapped`, every row after the first is marked soft-wrapped. */
+function terminalFixture(rows: string[], cols: number, wrapped = true) {
   const providers: ILinkProvider[] = [];
   const disposals: ReturnType<typeof vi.fn>[] = [];
   const disposable = () => {
@@ -165,7 +184,7 @@ function terminalFixture(rows: string[], cols: number) {
     while (cells.length < cols) cells.push({ getChars: () => "", getWidth: () => 1 });
     return {
       length: cols,
-      isWrapped: index > 0,
+      isWrapped: wrapped && index > 0,
       getCell: (col: number, target?: object) => {
         if (target) Object.assign(target, cells[col]);
         return cells[col];
@@ -178,8 +197,6 @@ function terminalFixture(rows: string[], cols: number) {
     hasSelection: () => false,
     options: { linkHandler: undefined },
     buffer: { active: { getLine: (row: number) => lines[row], getNullCell: () => ({}) } },
-    loadAddon: (addon: { activate(term: Terminal): void }) =>
-      addon.activate(terminal as unknown as Terminal),
     registerLinkProvider: (provider: ILinkProvider) => {
       providers.push(provider);
       return disposable();
@@ -200,7 +217,7 @@ function linksAt(provider: ILinkProvider, row: number) {
 
 it("maps wrapped file references after wide and combining cells", () => {
   const { terminal } = terminalFixture(["界e\u0301 src/long", "file.ts:42"], 12);
-  const provider = createFileLinkProvider(terminal, { activate: vi.fn() });
+  const provider = createTerminalLinkProvider(terminal, { activate: vi.fn() });
   for (const row of [1, 2]) {
     expect(linksAt(provider, row)[0]).toMatchObject({
       text: "src/longfile.ts:42",
@@ -222,7 +239,8 @@ it.each([
   const { terminal, providers } = terminalFixture([reference], reference.length);
   const deps = actions();
   const installed = installTerminalLinks(terminal, deps);
-  const links = linksAt(providers[1], 1);
+  expect(providers).toHaveLength(1);
+  const links = linksAt(providers[0], 1);
   expect(links).toHaveLength(1);
   const link = links[0];
   expect(link.text).toBe("hello world.txt");
@@ -239,7 +257,7 @@ it.each([
   installed.dispose();
 });
 
-it("wires web addon and OSC handlers and disposes hover and registrations", async () => {
+it("wires web links and OSC handlers and disposes hover and registrations", async () => {
   const tooltip = { style: {}, setAttribute: vi.fn(), remove: vi.fn(), textContent: "" };
   const appendChild = vi.fn();
   vi.stubGlobal("document", { createElement: () => tooltip, body: { appendChild } });
@@ -248,6 +266,7 @@ it("wires web addon and OSC handlers and disposes hover and registrations", asyn
   const { terminal, providers, disposals } = terminalFixture(["https://exam", "ple.com/a."], 12);
   const deps = actions();
   const installed = installTerminalLinks(terminal, deps);
+  expect(providers).toHaveLength(1);
   const web = linksAt(providers[0], 1)[0];
   expect(web.text).toBe("https://example.com/a");
   const event = { button: 0 } as MouseEvent;
@@ -283,6 +302,245 @@ it("wires web addon and OSC handlers and disposes hover and registrations", asyn
   installed.dispose();
   expect(tooltip.remove).toHaveBeenCalled();
   expect(removeEventListener).toHaveBeenCalledWith("blur", installed.hide);
+  // The link provider, scroll and resize registrations, each disposed once.
+  expect(disposals).toHaveLength(3);
   expect(disposals.every((dispose) => dispose.mock.calls.length === 1)).toBe(true);
   expect(terminal.options.linkHandler).toBeUndefined();
+});
+
+describe("links across repainted rows", () => {
+  // A repainted screen never marks rows wrapped, so every fixture here passes wrapped=false.
+  function install(rows: string[], cols: number) {
+    vi.stubGlobal("document", {
+      createElement: () => ({ style: {}, setAttribute: vi.fn(), remove: vi.fn() }),
+      body: { appendChild: vi.fn() },
+    });
+    vi.stubGlobal("window", { addEventListener: vi.fn(), removeEventListener: vi.fn() });
+    const { terminal, providers } = terminalFixture(rows, cols, false);
+    const deps = actions();
+    const installed = installTerminalLinks(terminal, deps);
+    return { deps, installed, provider: providers[0] };
+  }
+
+  async function click(link: ILink) {
+    link.activate({ button: 0 } as MouseEvent, link.text);
+    // Let the open and any fallback open settle.
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  }
+
+  it("joins a URL across a filled row and drops the gutter indent", async () => {
+    const { deps, installed, provider } = install(
+      ["see https://example.", "  com/docs/page then"],
+      20,
+    );
+    for (const row of [1, 2]) {
+      const links = linksAt(provider, row);
+      expect(links).toHaveLength(1);
+      expect(links[0]).toMatchObject({
+        text: "https://example.com/docs/page",
+        range: { start: { x: 5, y: 1 }, end: { x: 15, y: 2 } },
+      });
+    }
+    await click(linksAt(provider, 2)[0]);
+    expect(deps.openUrl).toHaveBeenCalledWith("https://example.com/docs/page");
+    installed.dispose();
+  });
+
+  it("joins a file path across a filled row", async () => {
+    const { deps, installed, provider } = install(["edit src/compone", "  nts/App.tsx:12"], 16);
+    for (const row of [1, 2]) {
+      expect(linksAt(provider, row)[0]).toMatchObject({
+        text: "src/components/App.tsx:12",
+        range: { start: { x: 6, y: 1 }, end: { x: 16, y: 2 } },
+      });
+    }
+    await click(linksAt(provider, 1)[0]);
+    expect(deps.openFile).toHaveBeenCalledOnce();
+    expect(deps.openFile).toHaveBeenCalledWith("project", "epsilon", "src/components/App.tsx");
+    installed.dispose();
+  });
+
+  it("falls back to the first row's part when a path absorbed the next row's prose", async () => {
+    const { deps, installed, provider } = install(["open src/main.rs", "  then run it"], 16);
+    const link = linksAt(provider, 1)[0];
+    expect(link).toMatchObject({
+      text: "src/main.rsthen",
+      range: { start: { x: 6, y: 1 }, end: { x: 6, y: 2 } },
+    });
+    deps.openFile.mockRejectedValueOnce(new Error(`${FILE_UNAVAILABLE_ERROR}: not found`));
+    await click(link);
+    expect(deps.openFile).toHaveBeenCalledTimes(2);
+    expect(deps.openFile).toHaveBeenNthCalledWith(1, "project", "epsilon", "src/main.rsthen");
+    expect(deps.openFile).toHaveBeenNthCalledWith(2, "project", "epsilon", "src/main.rs");
+    expect(deps.showError).not.toHaveBeenCalled();
+
+    deps.openFile.mockClear();
+    deps.openFile.mockRejectedValueOnce(new Error(`${FILE_UNAVAILABLE_ERROR}: not found`));
+    deps.openFile.mockRejectedValueOnce(new Error(`${FILE_UNAVAILABLE_ERROR}: also missing`));
+    await click(link);
+    expect(deps.openFile).toHaveBeenCalledTimes(2);
+    expect(deps.showError).toHaveBeenCalledWith(
+      `Could not open link: ${FILE_UNAVAILABLE_ERROR}: not found`,
+    );
+    installed.dispose();
+  });
+
+  it("keeps a row's file link with a location when the next row's word glues onto it", async () => {
+    const { deps, installed, provider } = install(["open src/main.rs:12", "  then run it"], 19);
+    expect(linksAt(provider, 1)).toMatchObject([
+      { text: "src/main.rs:12", range: { start: { x: 6, y: 1 }, end: { x: 19, y: 1 } } },
+    ]);
+    expect(linksAt(provider, 2)).toEqual([]);
+    await click(linksAt(provider, 1)[0]);
+    expect(deps.openFile).toHaveBeenCalledWith("project", "epsilon", "src/main.rs");
+    installed.dispose();
+  });
+
+  it("falls back to the row's own path when it absorbed the last word of the row above", async () => {
+    const { deps, installed, provider } = install(["see the file", "  src/a.ts:3 ok"], 12);
+    const link = linksAt(provider, 2)[0];
+    expect(link).toMatchObject({
+      text: "filesrc/a.ts:3",
+      range: { start: { x: 9, y: 1 }, end: { x: 12, y: 2 } },
+    });
+    deps.openFile.mockRejectedValueOnce(`${FILE_UNAVAILABLE_ERROR}: not found`);
+    await click(link);
+    expect(deps.openFile).toHaveBeenCalledTimes(2);
+    expect(deps.openFile).toHaveBeenLastCalledWith("project", "epsilon", "src/a.ts");
+    expect(deps.showError).not.toHaveBeenCalled();
+    installed.dispose();
+  });
+
+  it("does not fall back when the open was refused rather than missing", async () => {
+    const { deps, installed, provider } = install(["see the file", "  src/a.ts:3 ok"], 12);
+    deps.openFile.mockRejectedValueOnce("Only existing regular files can be opened");
+    await click(linksAt(provider, 2)[0]);
+    expect(deps.openFile).toHaveBeenCalledOnce();
+    expect(deps.showError).toHaveBeenCalledWith(
+      "Could not open link: Only existing regular files can be opened",
+    );
+    installed.dispose();
+  });
+
+  it("falls back to a delimited path with the dropped indent kept as a real space", async () => {
+    const { deps, installed, provider } = install(['see "src/my', ' file.ts" ok'], 11);
+    const link = linksAt(provider, 1)[0];
+    expect(link.text).toBe("src/myfile.ts");
+    deps.openFile.mockRejectedValueOnce(new Error(`${FILE_UNAVAILABLE_ERROR}: not found`));
+    await click(link);
+    expect(deps.openFile).toHaveBeenCalledTimes(2);
+    expect(deps.openFile).toHaveBeenLastCalledWith("project", "epsilon", "src/my file.ts");
+    expect(deps.showError).not.toHaveBeenCalled();
+    installed.dispose();
+  });
+
+  it("drops a no-break-space indent on a filled-row join", () => {
+    const { installed, provider } = install(["edit src/compone", "  nts/App.tsx:12"], 16);
+    expect(linksAt(provider, 2)[0]).toMatchObject({
+      text: "src/components/App.tsx:12",
+      range: { start: { x: 6, y: 1 }, end: { x: 16, y: 2 } },
+    });
+    installed.dispose();
+  });
+
+  it("does not let a URL at the right edge absorb the next row's word", () => {
+    const { installed, provider } = install(["see https://example.com/docs", "  and more"], 28);
+    expect(linksAt(provider, 1)).toMatchObject([
+      { text: "https://example.com/docs", range: { start: { x: 5, y: 1 }, end: { x: 28, y: 1 } } },
+    ]);
+    expect(linksAt(provider, 2)).toEqual([]);
+    installed.dispose();
+  });
+
+  it("does not join a row that stops short of the last cell", () => {
+    const { installed, provider } = install(["see https://example", "  .com/docs"], 20);
+    expect(linksAt(provider, 1)).toMatchObject([
+      { text: "https://example", range: { start: { x: 5, y: 1 }, end: { x: 19, y: 1 } } },
+    ]);
+    installed.dispose();
+  });
+
+  it("does not join a filled row onto a blank row", () => {
+    const { installed, provider } = install(["src/a.ts:1", "      "], 10);
+    expect(linksAt(provider, 1)).toMatchObject([
+      { text: "src/a.ts:1", range: { start: { x: 1, y: 1 }, end: { x: 10, y: 1 } } },
+    ]);
+    installed.dispose();
+  });
+
+  it("does not join a row ending in a box-drawing border", () => {
+    const { installed, provider } = install(["│ https://exam │", "│ ple.com      │"], 16);
+    expect(linksAt(provider, 1)).toMatchObject([
+      { text: "https://exam", range: { start: { x: 3, y: 1 }, end: { x: 14, y: 1 } } },
+    ]);
+    installed.dispose();
+  });
+
+  it("joins at a wide glyph filling the last two cells", () => {
+    const { installed, provider } = install(["see src/界", "  a.ts:3"], 10);
+    for (const row of [1, 2]) {
+      expect(linksAt(provider, row)[0]).toMatchObject({
+        text: "src/界a.ts:3",
+        range: { start: { x: 5, y: 1 }, end: { x: 8, y: 2 } },
+      });
+    }
+    installed.dispose();
+  });
+
+  it("joins past the padding cell a wrapped wide glyph leaves", () => {
+    const { installed, provider } = install(["see src/a", "界.ts:3"], 10);
+    for (const row of [1, 2]) {
+      expect(linksAt(provider, row)[0]).toMatchObject({
+        text: "src/a界.ts:3",
+        range: { start: { x: 5, y: 1 }, end: { x: 7, y: 2 } },
+      });
+    }
+    installed.dispose();
+  });
+});
+
+describe("logical lines", () => {
+  function buffer(rows: string[], cols: number) {
+    return terminalFixture(rows, cols, false).terminal.buffer.active;
+  }
+
+  it("builds the same line from any of its rows, with the indent left out of the maps", () => {
+    const reader = bufferRowReader(buffer(["abcd", "  e", "gh"], 4), 4);
+    for (const row of [0, 1]) {
+      expect(logicalLineAt(reader, row, 100)).toEqual({
+        text: "abcde ",
+        xs: [1, 2, 3, 4, 3, 4],
+        ys: [1, 1, 1, 1, 2, 2],
+        breaks: [4],
+        indents: ["  "],
+      });
+    }
+    // "  e" stops short of the last cell, so the third row starts a line of its own.
+    expect(logicalLineAt(reader, 2, 100).text).toBe("gh  ");
+  });
+
+  it("caps the rows a line spans", () => {
+    const reader = bufferRowReader(buffer(["abcd", "efgh", "ijkl", "mnop"], 4), 4);
+    expect(logicalLineAt(reader, 1, 1).text).toBe("abcdefgh");
+    expect(joinsNext(reader, 3)).toBeNull();
+  });
+
+  it("joins soft-wrapped rows verbatim", () => {
+    const { terminal } = terminalFixture(["ab  ", "  cd"], 4);
+    const reader = bufferRowReader(terminal.buffer.active, 4);
+    expect(joinsNext(reader, 0)).toBe("wrap");
+    expect(logicalLineAt(reader, 1, 100)).toMatchObject({ text: "ab    cd", breaks: [] });
+  });
+
+  it("keeps a URL joined while the text past the join is more than letters", () => {
+    expect(findLineLinks({ text: "https://example.com/do/csand", breaks: [22, 25] })).toMatchObject(
+      [{ text: "https://example.com/do/cs", index: 0 }],
+    );
+  });
+
+  it("prefers a web link over a file reading of the same text", () => {
+    expect(findLineLinks({ text: "see https://example.com/src/a.ts:3 now", breaks: [] })).toEqual([
+      { text: "https://example.com/src/a.ts:3", index: 4, delimited: false },
+    ]);
+  });
 });

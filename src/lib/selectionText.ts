@@ -1,6 +1,6 @@
 // Rebuilding a terminal selection as text, with soft-wrapped rows rejoined.
 import type { IBuffer } from "@xterm/xterm";
-import { bufferRowCells, type RowCells, wrapsWideGlyphAfter } from "./bufferText";
+import { bufferRowCells, isBlank, isFilled, type RowCells } from "./bufferText";
 
 /** A selection's bounds, 0-based and ordered (start first); `end.x` is exclusive (as xterm reports it). */
 export interface SelectionRange {
@@ -23,33 +23,6 @@ export function rectSelectionAfterPress(
   press: Pick<MouseEvent, "button" | "altKey" | "shiftKey">,
 ): boolean {
   return press.button === 0 && !press.shiftKey ? press.altKey : rect;
-}
-
-const isBlank = (s: string) => /^ *$/.test(s);
-
-/** Box drawing and block elements: a row ending in one is a border, not wrapped text. */
-function isBoxGlyph(chars: string): boolean {
-  const cp = chars.codePointAt(0) ?? 0;
-  return cp >= 0x2500 && cp <= 0x259f;
-}
-
-/**
- * Whether row `y` is filled to its last cell, so its text plausibly continues on the next
- * row. A wide glyph across the last two cells counts, as does an empty last cell left by a
- * wide glyph that wrapped. A trailing box-drawing glyph does not.
- */
-function isFilled(buffer: IBuffer, y: number, cols: number): boolean {
-  const line = buffer.getLine(y);
-  if (!line || cols < 1) return false;
-  const last = line.getCell(cols - 1);
-  let chars = last?.getChars() ?? "";
-  if (last?.getWidth() === 0) {
-    chars = line.getCell(cols - 2)?.getChars() ?? "";
-  } else if (!chars) {
-    return wrapsWideGlyphAfter(buffer, y);
-  }
-  if (!chars || isBoxGlyph(chars)) return false;
-  return chars !== " " && chars !== " ";
 }
 
 /**

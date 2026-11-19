@@ -361,13 +361,44 @@ pub struct UpdatesConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_check: Option<bool>,
+    /// How often, in hours, the agent CLIs (Claude Code, Codex) are checked for
+    /// a newer release. Unset means 6; `0` means only at app start; any other
+    /// value is clamped to `1..=168`. Read through [`Self::agent_check_hours`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_check_hours: Option<u32>,
+    /// A Codex version the user chose to skip. A newer release shows the update
+    /// banner again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_skip_codex: Option<String>,
+    /// A Claude Code version the user chose to skip. Same rule as
+    /// `agent_skip_codex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_skip_claude: Option<String>,
 }
 
 impl UpdatesConfig {
+    /// Default agent CLI check interval, in hours.
+    pub const DEFAULT_AGENT_CHECK_HOURS: u32 = 6;
+    /// Longest allowed agent CLI check interval (one week), in hours.
+    pub const MAX_AGENT_CHECK_HOURS: u32 = 168;
+
     /// True when nothing is configured, so the whole `[updates]` table can be
     /// omitted from serialized TOML.
     pub fn is_empty(&self) -> bool {
         self.auto_check.is_none()
+            && self.agent_check_hours.is_none()
+            && self.agent_skip_codex.is_none()
+            && self.agent_skip_claude.is_none()
+    }
+
+    /// The effective agent CLI check interval in hours: unset → 6, `0` stays
+    /// `0` (check at app start only), anything else clamped to `1..=168`.
+    pub fn agent_check_hours(&self) -> u32 {
+        match self.agent_check_hours {
+            None => Self::DEFAULT_AGENT_CHECK_HOURS,
+            Some(0) => 0,
+            Some(h) => h.clamp(1, Self::MAX_AGENT_CHECK_HOURS),
+        }
     }
 
     /// Whether automatic update checks are enabled (unset → true).
@@ -947,9 +978,9 @@ impl ProjectSettingsPatch {
 /// dir (used by tests for hermeticity, and as an escape hatch in production);
 /// otherwise it is `dirs::config_dir()/keitora/keitora.toml`.
 ///
-/// `pub(crate)` so `config_edit` writes land on exactly the file `UserConfig`
-/// reads — a single source of truth for the registry path.
-pub(crate) fn user_config_path() -> Result<PathBuf, ResolveError> {
+/// Public so `config_edit` writes and the app's registry watcher use exactly the file
+/// `UserConfig` reads — a single source of truth for the registry path.
+pub fn user_config_path() -> Result<PathBuf, ResolveError> {
     let dir = match std::env::var_os("KEITORA_CONFIG_HOME") {
         Some(home) => PathBuf::from(home),
         None => dirs::config_dir()
@@ -970,6 +1001,15 @@ impl UserConfig {
     pub fn write_lock() -> std::sync::MutexGuard<'static, ()> {
         // The guarded data is `()`: a panic mid-write leaves nothing to repair.
         REGISTRY_WRITE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Load, change with `f`, and save the registry, all under [`Self::write_lock`].
+    /// Not reentrant: `f` must not call another registry writer.
+    pub fn update(f: impl FnOnce(&mut UserConfig)) -> Result<(), ResolveError> {
+        let _registry = Self::write_lock();
+        let mut cfg = Self::load()?;
+        f(&mut cfg);
+        cfg.save()
     }
 
     /// Load the registry from the OS path. Returns the default (empty) registry
@@ -1339,6 +1379,11 @@ impl UserConfig {
 
     /// Serialize to TOML and write to an explicit path (used by tests),
     /// creating parent dirs.
+    ///
+    /// The write is atomic: the text goes to a sibling temp file that is then renamed
+    /// over `path`, so a concurrent reader (the app, the CLI, session hooks) sees either
+    /// the old registry or the new one, never a truncated file that would resolve as
+    /// "no active project".
     pub fn save_to(&self, path: &Path) -> Result<(), ResolveError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -1346,9 +1391,77 @@ impl UserConfig {
         }
         let text = toml::to_string_pretty(self)
             .map_err(|e| ResolveError::Io(format!("serializing user config: {e}")))?;
-        std::fs::write(path, text)
+        write_atomic(path, text.as_bytes())
             .map_err(|e| ResolveError::Io(format!("writing {}: {e}", path.display())))
     }
+}
+
+/// Write `bytes` to `path` via a sibling temp file + rename, so a concurrent reader
+/// sees the old file or the new one, never a partial write. (Not a durability
+/// guarantee: there is no fsync.)
+///
+/// - A symlinked `path` is followed: the link's target is replaced, the link stays.
+/// - An existing file's permissions carry over to the replacement.
+/// - Writes within one process are serialized (on Windows, two renames racing over one
+///   file both fail), and each gets its own temp name, so concurrent writers can't
+///   share (and truncate) one temp file.
+/// - If the rename keeps failing with `PermissionDenied` (Windows: another process
+///   holds the file open without delete sharing), falls back to an in-place write,
+///   which is what the registry always used before.
+///
+/// The temp file is removed when any step fails.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = WRITE.lock().unwrap_or_else(|e| e.into_inner());
+
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("path has no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    let tmp = target.with_file_name(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        drop(f);
+        if let Ok(meta) = std::fs::metadata(&target) {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        rename_replacing(&tmp, &target)
+    })();
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            if e.kind() == std::io::ErrorKind::PermissionDenied && target.exists() {
+                std::fs::write(&target, bytes)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// `std::fs::rename`, retried briefly on `PermissionDenied`: on Windows a rename over a
+/// file another process has open fails, usually transiently.
+fn rename_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+    for _ in 0..5 {
+        match std::fs::rename(from, to) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
+    std::fs::rename(from, to)
 }
 
 // ---------------------------------------------------------------------------
@@ -1571,6 +1684,14 @@ impl ProjectConfig {
             .ok_or_else(|| ResolveError::Io("keitora.toml has no parent dir".to_string()))?;
         cfg.root = canonicalize_root(&root);
         cfg.tasks.db_path = normalize_db_path(&cfg.tasks.db_path, &cfg.root);
+        if cfg.project.name == RESERVED_PROJECT_NAME {
+            let name = unreserved_project_name(&cfg.project.name, &cfg.root);
+            log::warn!(
+                "{}: the project name \"{RESERVED_PROJECT_NAME}\" is reserved; using \"{name}\"",
+                toml_path.display()
+            );
+            cfg.project.name = name;
+        }
 
         Ok(cfg)
     }
@@ -1672,6 +1793,7 @@ impl ProjectConfig {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "project".to_string());
+        let name = unreserved_project_name(&name, root);
         let worktrees_dir = format!("~/.keitora/{name}");
         let db_path = PathBuf::from(format!("~/.keitora/{name}/shared/tasks.db"));
         ProjectConfig {
@@ -1919,6 +2041,23 @@ pub fn stamp_from_registry(cfg: &mut ProjectConfig, registry: &UserConfig) {
         apply_registry_overrides(cfg, pref);
         cfg.apply_registry_worktrees(pref);
     }
+}
+
+/// The project name Keitora reserves for its own utility sessions: no project may
+/// resolve to it, so a project's sessions can never alias them.
+pub const RESERVED_PROJECT_NAME: &str = "__keitora";
+
+/// `name` as a project name: unchanged unless it is [`RESERVED_PROJECT_NAME`], which
+/// becomes `root`'s folder name, or (when that is the reserved name too, or there is
+/// none) the reserved name with a `-project` suffix.
+pub fn unreserved_project_name(name: &str, root: &Path) -> String {
+    if name != RESERVED_PROJECT_NAME {
+        return name.to_string();
+    }
+    root.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty() && n != RESERVED_PROJECT_NAME)
+        .unwrap_or_else(|| format!("{RESERVED_PROJECT_NAME}-project"))
 }
 
 /// Build the effective [`ProjectConfig`] for a registered project: load its
@@ -3916,6 +4055,99 @@ mod tests {
     // --- Unit 2: Registry round-trip ---
 
     #[test]
+    fn registry_save_replaces_atomically_without_leftovers() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("keitora");
+        let path = dir.join("keitora.toml");
+
+        let mut first = UserConfig::default();
+        first.register("proj", PathBuf::from("/Users/x/code/proj"));
+        first.set_active("proj");
+        first.save_to(&path).unwrap();
+
+        // A second save replaces the first in place.
+        let mut second = UserConfig::default();
+        second.register("proj", PathBuf::from("/Users/x/code/proj"));
+        second.register("other-proj", PathBuf::from("/Users/x/code/other-proj"));
+        second.set_active("other-proj");
+        second.save_to(&path).unwrap();
+
+        let loaded = UserConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.active.as_deref(), Some("other-proj"));
+        assert_eq!(loaded.projects.len(), 2);
+
+        // Only the registry itself is left: the temp file was renamed away.
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["keitora.toml".to_string()]);
+    }
+
+    #[test]
+    fn write_atomic_concurrent_writers_never_tear_the_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("keitora.toml");
+        let a = "a".repeat(64 * 1024);
+        let b = "b".repeat(64 * 1024);
+        std::thread::scope(|s| {
+            for body in [&a, &b] {
+                let path = &path;
+                s.spawn(move || {
+                    for _ in 0..20 {
+                        write_atomic(path, body.as_bytes()).unwrap();
+                    }
+                });
+            }
+        });
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text == a || text == b, "torn write: {} bytes", text.len());
+        let names: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["keitora.toml".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_follows_a_symlink_and_keeps_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("dotfiles/keitora.toml");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = tmp.path().join("keitora.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_atomic(&link, b"new").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn write_atomic_cleans_up_when_the_rename_fails() {
+        let tmp = TempDir::new().unwrap();
+        // The target is a non-empty directory, so renaming a file over it fails.
+        let target = tmp.path().join("occupied");
+        std::fs::create_dir_all(target.join("child")).unwrap();
+
+        assert!(write_atomic(&target, b"x").is_err());
+        let names: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["occupied".to_string()]);
+    }
+
+    #[test]
     fn registry_round_trips() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("keitora/keitora.toml");
@@ -4572,6 +4804,67 @@ backoff_secs = [0, 10]
     }
 
     #[test]
+    fn agent_check_hours_effective_value() {
+        let cases: &[(Option<u32>, u32)] = &[
+            (None, 6),
+            (Some(0), 0),
+            (Some(1), 1),
+            (Some(6), 6),
+            (Some(24), 24),
+            (Some(168), 168),
+            (Some(169), 168),
+            (Some(u32::MAX), 168),
+        ];
+        for (raw, want) in cases {
+            let cfg = UpdatesConfig {
+                agent_check_hours: *raw,
+                ..Default::default()
+            };
+            assert_eq!(cfg.agent_check_hours(), *want, "raw {raw:?}");
+        }
+    }
+
+    #[test]
+    fn updates_is_empty_covers_agent_fields() {
+        assert!(UpdatesConfig::default().is_empty());
+        let with = |f: fn(&mut UpdatesConfig)| {
+            let mut c = UpdatesConfig::default();
+            f(&mut c);
+            c
+        };
+        assert!(!with(|c| c.auto_check = Some(true)).is_empty());
+        assert!(!with(|c| c.agent_check_hours = Some(0)).is_empty());
+        assert!(!with(|c| c.agent_skip_codex = Some("0.163.0".into())).is_empty());
+        assert!(!with(|c| c.agent_skip_claude = Some("2.1.328".into())).is_empty());
+    }
+
+    #[test]
+    fn updates_agent_fields_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("keitora/keitora.toml");
+
+        let mut cfg = UserConfig::default();
+        cfg.updates.agent_check_hours = Some(0);
+        cfg.updates.agent_skip_codex = Some("0.163.0".into());
+        cfg.updates.agent_skip_claude = Some("2.1.328".into());
+        cfg.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[updates]"), "got: {text}");
+        assert!(text.contains("agent_check_hours = 0"), "got: {text}");
+        assert!(
+            text.contains("agent_skip_codex = \"0.163.0\""),
+            "got: {text}"
+        );
+        assert!(!text.contains("auto_check ="), "got: {text}");
+
+        let loaded = UserConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.updates, cfg.updates);
+        assert_eq!(loaded.updates.agent_check_hours(), 0);
+        assert!(loaded.updates.auto_check());
+    }
+
+    #[test]
     fn updates_table_omitted_when_unset() {
         let toml = toml::to_string(&UserConfig::default()).unwrap();
         assert!(!toml.contains("[updates]"), "got: {toml}");
@@ -4620,6 +4913,25 @@ backoff_secs = [0, 10]
 
         let loaded = UserConfig::load_from(&path).unwrap();
         assert!(loaded.skip_permissions());
+    }
+
+    #[test]
+    fn update_loads_mutates_and_saves() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("KEITORA_CONFIG_HOME", tmp.path().join("user_config"));
+
+        UserConfig::update(|c| c.updates.agent_check_hours = Some(12)).unwrap();
+        UserConfig::update(|c| c.updates.agent_skip_codex = Some("0.163.0".into())).unwrap();
+        let loaded = UserConfig::load().unwrap();
+        assert_eq!(
+            loaded.updates.agent_check_hours,
+            Some(12),
+            "an earlier update survives a later one"
+        );
+        assert_eq!(loaded.updates.agent_skip_codex.as_deref(), Some("0.163.0"));
+
+        std::env::remove_var("KEITORA_CONFIG_HOME");
     }
 
     #[test]
@@ -5472,6 +5784,51 @@ relay_url = \"https://relay.example\"
     }
 
     // --- effective_config: keitora.toml optional + registry overlay ---
+
+    #[test]
+    fn unreserved_project_name_falls_back_to_the_folder() {
+        let root = Path::new("/repos/proj");
+        assert_eq!(unreserved_project_name("proj", root), "proj");
+        assert_eq!(unreserved_project_name("__keitora2", root), "__keitora2");
+        assert_eq!(unreserved_project_name("__keitora", root), "proj");
+        assert_eq!(
+            unreserved_project_name("__keitora", Path::new("/repos/__keitora")),
+            "__keitora-project"
+        );
+        assert_eq!(
+            unreserved_project_name("__keitora", Path::new("/")),
+            "__keitora-project"
+        );
+    }
+
+    #[test]
+    fn a_committed_reserved_name_resolves_to_the_folder_name() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("keitora.toml"),
+            "[project]
+name = \"__keitora\"
+
+[tasks]
+db_path = \"tasks.db\"
+",
+        )
+        .unwrap();
+        assert_eq!(ProjectConfig::load(&root).unwrap().project.name, "proj");
+        let pref = ProjectRef::new(root.clone());
+        assert_eq!(effective_config(&pref).unwrap().project.name, "proj");
+    }
+
+    #[test]
+    fn a_fileless_reserved_folder_never_resolves_to_the_reserved_name() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("__keitora");
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg = effective_config(&ProjectRef::new(root)).unwrap();
+        assert_eq!(cfg.project.name, "__keitora-project");
+    }
 
     #[test]
     fn effective_config_fileless_uses_scaffold_defaults() {
