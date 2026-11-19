@@ -3,9 +3,18 @@
 //! human stays in the loop — Keitora only performs the mechanical injection, and
 //! only into idle sessions.
 //!
+//! The same apply also serves CLI dispatch requests (`keitora task dispatch`), which
+//! arrive as `dispatch_requests` rows in a registered project's `tasks.db` and are
+//! executed by `run_dispatch_requests` when a tasks-DB watcher sees one. Going
+//! through this one path keeps the gate, the reserve, the inject and the audit log
+//! shared, so a CLI dispatch can't race a board dispatch. A request is stricter than
+//! a drag: only an idle session takes it, and one that sends nothing leaves nothing
+//! reserved (the board, not the request table, is the queue).
+//!
 //! The IPC-facing command is thin; the testable core is pure functions:
-//! `decide` (dispatch-vs-queue), `render_steps` (the ritual lines), and
-//! `injection_outcome` (the write result → audit decision).
+//! `decide` (dispatch-vs-queue), `render_steps` (the ritual lines),
+//! `injection_outcome` (the write result → audit decision), and for requests
+//! `request_refusal` (the lane rule) and `request_outcome` (result → row status).
 
 use std::time::Duration;
 
@@ -228,6 +237,21 @@ fn select_ritual_steps(cfg: &DispatchConfig, cli: CliKind) -> &[String] {
     }
 }
 
+/// Who is asking for a dispatch, which decides how strict the apply is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyMode {
+    /// A board drag or the card menu. The board already ran its lane rule
+    /// (`decideLane`), so the apply reserves and decides inject-vs-queue: a busy
+    /// session gets the card queued on its lane.
+    Board,
+    /// A CLI dispatch request from `tasks.db`: "send this task to that session now".
+    /// Nobody has checked anything yet, so the apply does it before reserving: an
+    /// unknown worktree, a terminal, blocked or elsewhere-reserved task, and any
+    /// session that isn't idle (busy, waiting or offline) are refused, not queued.
+    /// The board is the queue; a request either lands or leaves nothing behind.
+    Request,
+}
+
 /// State-aware apply: reserve the task for `worktree` always, then inject it iff
 /// the worktree is idle with a live PTY (else leave it reserved/queued). The
 /// backend is authoritative on the idle decision so we never write into a busy PTY.
@@ -239,16 +263,86 @@ pub async fn dispatch_apply(
     gate: State<'_, DispatchGate>,
     registry: State<'_, TransferRegistry>,
 ) -> Result<DispatchOutcome, String> {
+    apply(
+        &worktree,
+        task_id,
+        ApplyMode::Board,
+        None,
+        client.inner(),
+        &gate,
+        &registry,
+    )
+    .await
+}
+
+/// The body of [`dispatch_apply`], shared with the CLI request executor
+/// ([`run_dispatch_requests`]) so both go through one gate, one reserve, one
+/// inject and one audit log. `project` is the project to dispatch in; `None` means
+/// the active one (the board's).
+async fn apply(
+    worktree: &str,
+    task_id: i64,
+    mode: ApplyMode,
+    project: Option<keitora_tasks::ProjectConfig>,
+    client: &SharedBackend,
+    gate: &DispatchGate,
+    registry: &TransferRegistry,
+) -> Result<DispatchOutcome, String> {
+    let worktree = worktree.to_string();
     // Hold the dispatch gate for the whole command so the guard-check → reserve →
     // inject → log sequence is atomic vs. concurrent dispatch_apply calls.
     // `tokio::sync::Mutex::lock` is cancel-safe and does not poison, so the guard is
     // always acquired cleanly.
     let _gate = gate.0.lock().await;
 
-    let (backend, config) = crate::tasks::open_backend()?;
+    let (backend, config) = match project {
+        Some(pc) => (
+            keitora_tasks::open_backend(&pc).map_err(|e| e.to_string())?,
+            pc,
+        ),
+        None => crate::tasks::open_backend()?,
+    };
     // Before anything is reserved: a worktree mid-transfer is never injected into.
-    if let Some(reason) = transfer_refusal(&registry, &config.project.name, &worktree) {
+    if let Some(reason) = transfer_refusal(registry, &config.project.name, &worktree) {
         return Err(reason);
+    }
+
+    // Live state via the shared reconciled view, so the idle rule matches
+    // `sessions_list`. `decide` is a pre-filter on the idle rule;
+    // the AUTHORITATIVE liveness check is the daemon's `write_line` result below
+    // (D6). A reconciled non-`offline` session is one the daemon holds live, so we
+    // feed `state != "offline"` for `has_live_pty` — but the daemon is the final
+    // word on whether the write actually landed. Read before the reserve, so a
+    // failure here is an `Err` with nothing reserved.
+    // Reuse the `config` already resolved by `open_backend` for both the project
+    // name and the LocalStore open inside `reconciled_sessions` (FIX 6).
+    let project = config.project.name.clone();
+    let live = client.live_set_snapshot();
+    let bg = background_set(client.as_ref()); // on-demand, exact; empty on RPC error
+    let sessions = crate::tasks::reconciled_sessions(&live, &bg, &project, &config)?;
+    let state = sessions
+        .iter()
+        .find(|s| s.worktree == worktree)
+        .map(|s| s.state.clone())
+        .unwrap_or_else(|| "offline".to_string());
+    let has_live_pty = state != "offline";
+
+    // Request mode: refuse up front, and note whether the task was already reserved
+    // here (a card queued on this lane), so a failed inject leaves it as it was.
+    let mut reserved_before = false;
+    if mode == ApplyMode::Request {
+        let twd = backend.get(task_id).await.map_err(|e| e.to_string())?;
+        if let Some(reason) = request_refusal(
+            twd.as_ref(),
+            task_id,
+            &worktree,
+            &config.worktrees(),
+            &state,
+        ) {
+            return Err(reason);
+        }
+        reserved_before =
+            twd.is_some_and(|t| t.task.assigned_to.as_deref() == Some(worktree.as_str()));
     }
 
     // Idempotency guard + reserve in one intent-level call. If this task is
@@ -271,26 +365,9 @@ pub async fn dispatch_apply(
         ReserveOutcome::Reserved(task) => task,
     };
 
-    // Live state via the shared reconciled view, so the idle rule matches
-    // `sessions_list`. `decide` is a pre-filter on the idle rule;
-    // the AUTHORITATIVE liveness check is the daemon's `write_line` result below
-    // (D6). A reconciled non-`offline` session is one the daemon holds live, so we
-    // feed `state != "offline"` for `has_live_pty` — but the daemon is the final
-    // word on whether the write actually landed.
-    // Reuse the `config` already resolved by `open_backend` for both the project
-    // name and the LocalStore open inside `reconciled_sessions` (FIX 6).
-    let project = config.project.name.clone();
-    let live = client.live_set_snapshot();
-    let bg = background_set(client.inner().as_ref()); // on-demand, exact; empty on RPC error
-    let sessions = crate::tasks::reconciled_sessions(&live, &bg, &project, &config)?;
-    let state = sessions
-        .iter()
-        .find(|s| s.worktree == worktree)
-        .map(|s| s.state.clone())
-        .unwrap_or_else(|| "offline".to_string());
-    let has_live_pty = state != "offline";
-
-    match decide(&state, has_live_pty) {
+    // Why an inject sent nothing, for a request's refusal reason.
+    let mut inject_detail = String::new();
+    let mut outcome = match decide(&state, has_live_pty) {
         Decision::Dispatched => {
             let ctx = DispatchContext {
                 task: &task,
@@ -332,7 +409,7 @@ pub async fn dispatch_apply(
             // submitted line before the next arrives — bounded and small for the
             // handful of steps a ritual holds.
             let (result, sent_any) = inject_steps(
-                client.inner().as_ref(),
+                client.as_ref(),
                 &key,
                 &steps,
                 SUBMIT_DELAY.as_millis() as u32,
@@ -350,7 +427,8 @@ pub async fn dispatch_apply(
             let _ = backend
                 .dispatch_log_add(task_id, &worktree, decision, &detail)
                 .await;
-            Ok(outcome)
+            inject_detail = detail;
+            outcome
         }
         Decision::Queued => {
             // Best-effort audit, matching the Dispatched branch: the task is already
@@ -360,10 +438,190 @@ pub async fn dispatch_apply(
                 .dispatch_log_add(task_id, &worktree, "queued", "")
                 .await;
             let terminated = client.terminated_keys(&project).contains(&worktree);
-            Ok(DispatchOutcome {
+            DispatchOutcome {
                 dispatched: false,
                 reason: Some(queued_reason(&worktree, terminated)),
-            })
+            }
+        }
+    };
+
+    // A request that sent nothing leaves nothing behind: undo the reserve it made
+    // (a partial inject reports `dispatched` and is kept, since the agent has input).
+    // Best-effort, like the audit writes; the outcome stays not-dispatched either way.
+    if mode == ApplyMode::Request && !outcome.dispatched {
+        if !reserved_before {
+            let _ = backend.release(task_id, "keitora").await;
+            let _ = backend
+                .dispatch_log_add(task_id, &worktree, "released", "nothing was sent")
+                .await;
+        }
+        outcome.reason = Some(request_miss_reason(
+            &worktree,
+            &inject_detail,
+            reserved_before,
+        ));
+    }
+    Ok(outcome)
+}
+
+/// Pure: why a CLI dispatch request for `task_id` onto `worktree` (whose reconciled
+/// session is in `state`) must be refused before anything is reserved, or `None` to
+/// go ahead. `configured` is the project's worktree list; an empty list doesn't
+/// restrict, matching how `reconciled_sessions` scopes. Task-side, these are the
+/// board's lane checks; session-side, only an idle session passes.
+fn request_refusal(
+    task: Option<&keitora_tasks::TaskWithDeps>,
+    task_id: i64,
+    worktree: &str,
+    configured: &[String],
+    state: &str,
+) -> Option<String> {
+    if !configured.is_empty() && !configured.iter().any(|w| w == worktree) {
+        return Some(format!(
+            "unknown worktree `{worktree}`; expected one of: {}",
+            configured.join(", ")
+        ));
+    }
+    let Some(task) = task else {
+        return Some(format!("task #{task_id} not found"));
+    };
+    keitora_tasks::dispatch::task_refusal(task, worktree)
+        .or_else(|| keitora_tasks::dispatch::session_refusal(state, worktree))
+}
+
+/// Pure: the refusal reason for a request whose inject sent nothing. `detail` is the
+/// write error (may be empty); `reserved_before` says the card was already queued on
+/// that lane, so it stays there rather than being released.
+fn request_miss_reason(worktree: &str, detail: &str, reserved_before: bool) -> String {
+    let why = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" ({detail})")
+    };
+    let left = if reserved_before {
+        "it stays queued on the board as before"
+    } else {
+        "nothing is left reserved"
+    };
+    format!("could not send to @{worktree}{why}; {left}")
+}
+
+/// How old a pending dispatch request may be before the app refuses it rather than
+/// acting on it: a request made while the app was closed shouldn't fire whenever it
+/// next opens.
+const REQUEST_MAX_AGE_SECS: i64 = 600;
+
+/// Pure: the `(status, reason)` a dispatch request resolves to, from its apply
+/// result. An inject (or an idempotent re-apply) is `applied`; anything else is
+/// `refused`: an `Err` (nothing was reserved) or an inject that sent nothing (its
+/// reserve was undone).
+fn request_outcome(result: &Result<DispatchOutcome, String>) -> (&'static str, String) {
+    match result {
+        Ok(o) if o.dispatched => ("applied", o.reason.clone().unwrap_or_default()),
+        Ok(o) => (
+            "refused",
+            o.reason
+                .clone()
+                .unwrap_or_else(|| "nothing was sent".to_string()),
+        ),
+        Err(e) => ("refused", e.clone()),
+    }
+}
+
+/// If `local` (the DB of registered project `project`) holds pending CLI dispatch
+/// requests, start [`run_dispatch_requests`] for it. Called from the tasks-DB
+/// watchers on each debounced write; a cheap indexed read when there are none.
+pub(crate) fn spawn_pending_requests<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    local: &keitora_tasks::LocalStore,
+    project: &str,
+) {
+    let has_pending = local
+        .dispatch_requests_pending()
+        .is_ok_and(|p| !p.is_empty());
+    if has_pending {
+        tauri::async_runtime::spawn(run_dispatch_requests(app.clone(), project.to_string()));
+    }
+}
+
+/// Execute `project`'s pending CLI dispatch requests (`keitora task dispatch`),
+/// oldest first, each through [`apply`] in request mode, and record each outcome on
+/// its row. `project` is a resolved `[project].name` from the app's registry; the
+/// tasks-DB watchers call this when they see a pending row in that project's DB (the
+/// active project's watcher, and each registered project's background watcher).
+///
+/// Safe to run concurrently with itself and with board dispatches: each request is
+/// taken with a compare-and-set (`dispatch_request_begin`), so it executes once,
+/// and every apply holds the [`DispatchGate`].
+pub(crate) async fn run_dispatch_requests<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    project: String,
+) {
+    use tauri::Manager;
+
+    let (Some(client), Some(gate), Some(registry)) = (
+        app.try_state::<SharedBackend>(),
+        app.try_state::<DispatchGate>(),
+        app.try_state::<TransferRegistry>(),
+    ) else {
+        return; // still starting up; the next DB event retries
+    };
+    let Some(config) = keitora_tasks::UserConfig::load()
+        .ok()
+        .and_then(|u| u.project_config_by_name(&project))
+    else {
+        log::warn!("dispatch requests: project {project} is not registered");
+        return;
+    };
+    let db_path = config.tasks.db_path.to_string_lossy().into_owned();
+    let local = match keitora_tasks::LocalStore::open(&db_path) {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!("dispatch requests: cannot open {db_path}: {e}");
+            return;
+        }
+    };
+    match local.dispatch_requests_expire(REQUEST_MAX_AGE_SECS) {
+        Ok(0) => {}
+        Ok(n) => log::info!("dispatch requests: {n} expired unprocessed in {project}"),
+        Err(e) => log::warn!("dispatch requests: expiry failed: {e}"),
+    }
+    let pending = match local.dispatch_requests_pending() {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("dispatch requests: cannot list pending: {e}");
+            return;
+        }
+    };
+    for req in pending {
+        match local.dispatch_request_begin(req.id) {
+            Ok(true) => {}
+            Ok(false) => continue, // another pass took it
+            Err(e) => {
+                log::warn!("dispatch request {}: cannot begin: {e}", req.id);
+                continue;
+            }
+        }
+        let result = apply(
+            &req.worktree,
+            req.task_id,
+            ApplyMode::Request,
+            Some(config.clone()),
+            client.inner(),
+            &gate,
+            &registry,
+        )
+        .await;
+        let (status, reason) = request_outcome(&result);
+        log::info!(
+            "dispatch request {} ({project}: task #{} → {}, by {}): {status} {reason}",
+            req.id,
+            req.task_id,
+            req.worktree,
+            req.requested_by
+        );
+        if let Err(e) = local.dispatch_request_resolve(req.id, status, &reason) {
+            log::warn!("dispatch request {}: cannot record outcome: {e}", req.id);
         }
     }
 }
@@ -420,6 +678,110 @@ mod tests {
         assert_eq!(
             transfer_refusal(&r, "proj-a", "alpha").as_deref(),
             Some("a transfer is in progress for worktree `alpha`; try again when it finishes")
+        );
+    }
+
+    fn open_card(assigned_to: Option<&str>, blocked_by: Vec<i64>) -> keitora_tasks::TaskWithDeps {
+        let mut task = task_fixture(5, "t", "d");
+        task.status = "open".to_string();
+        task.assigned_to = assigned_to.map(str::to_string);
+        keitora_tasks::TaskWithDeps {
+            task,
+            blocked_by,
+            blocks: vec![],
+        }
+    }
+
+    #[test]
+    fn request_refusal_follows_the_lane_rule() {
+        let wts = vec!["alpha".to_string(), "bravo".to_string()];
+        let card = open_card(None, vec![]);
+        // Only an idle session takes a request.
+        assert_eq!(request_refusal(Some(&card), 5, "alpha", &wts, "idle"), None);
+        // Busy, waiting and offline are refused, not queued: the board is the queue.
+        for state in ["busy", "waiting", "offline"] {
+            let msg = request_refusal(Some(&card), 5, "alpha", &wts, state).expect(state);
+            assert!(msg.starts_with(&format!("@alpha is {state}")), "{msg}");
+        }
+        // A blocked task is refused whatever the session state.
+        assert_eq!(
+            request_refusal(Some(&open_card(None, vec![2])), 5, "alpha", &wts, "idle"),
+            Some("task #5 is blocked by #2".to_string())
+        );
+        // Reserved elsewhere is refused; reserved here goes ahead (sends a queued task).
+        assert!(request_refusal(
+            Some(&open_card(Some("bravo"), vec![])),
+            5,
+            "alpha",
+            &wts,
+            "idle"
+        )
+        .is_some());
+        assert_eq!(
+            request_refusal(
+                Some(&open_card(Some("alpha"), vec![])),
+                5,
+                "alpha",
+                &wts,
+                "idle"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn request_refusal_checks_worktree_then_task() {
+        let wts = vec!["alpha".to_string()];
+        let card = open_card(None, vec![]);
+        assert_eq!(
+            request_refusal(Some(&card), 5, "zulu", &wts, "idle"),
+            Some("unknown worktree `zulu`; expected one of: alpha".to_string())
+        );
+        assert_eq!(
+            request_refusal(None, 9, "alpha", &wts, "idle"),
+            Some("task #9 not found".to_string())
+        );
+        // No configured worktrees: no restriction, as in `reconciled_sessions`.
+        assert_eq!(request_refusal(Some(&card), 5, "zulu", &[], "idle"), None);
+    }
+
+    #[test]
+    fn request_miss_reason_says_what_was_left() {
+        assert_eq!(
+            request_miss_reason("alpha", "no live session", false),
+            "could not send to @alpha (no live session); nothing is left reserved"
+        );
+        assert_eq!(
+            request_miss_reason("alpha", "", true),
+            "could not send to @alpha; it stays queued on the board as before"
+        );
+    }
+
+    #[test]
+    fn request_outcome_maps_apply_results() {
+        let ok = |dispatched: bool, reason: Option<&str>| {
+            Ok(DispatchOutcome {
+                dispatched,
+                reason: reason.map(str::to_string),
+            })
+        };
+        assert_eq!(request_outcome(&ok(true, None)), ("applied", String::new()));
+        assert_eq!(
+            request_outcome(&ok(true, Some("already dispatched"))),
+            ("applied", "already dispatched".to_string())
+        );
+        // An inject that sent nothing is refused (its reserve was undone).
+        assert_eq!(
+            request_outcome(&ok(false, Some("alpha: could not inject (gone)"))),
+            ("refused", "alpha: could not inject (gone)".to_string())
+        );
+        assert_eq!(
+            request_outcome(&ok(false, None)),
+            ("refused", "nothing was sent".to_string())
+        );
+        assert_eq!(
+            request_outcome(&Err("task #5 is done".to_string())),
+            ("refused", "task #5 is done".to_string())
         );
     }
 
