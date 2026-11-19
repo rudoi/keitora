@@ -131,6 +131,47 @@ pub struct DispatchLogEntry {
     pub created_at: String,
 }
 
+/// Every `dispatch_requests.status`. `pending` → `running` → one of the two terminal
+/// outcomes; see [`DispatchRequest`].
+pub const DISPATCH_REQUEST_STATUSES: [&str; 4] = ["pending", "running", "applied", "refused"];
+
+/// The terminal subset of [`DISPATCH_REQUEST_STATUSES`]: what the app resolves a
+/// request to once it has acted on it.
+pub const DISPATCH_REQUEST_OUTCOMES: [&str; 2] = ["applied", "refused"];
+
+/// A request, written by another process (the CLI's `task dispatch`), for the running
+/// app to send `task_id` to the session on `worktree` now. The app executes it through
+/// the same path as a board drag and records the outcome here, so the requester can
+/// wait for it.
+///
+/// This is a mailbox, not a queue: a request either reaches an idle session at once
+/// or is refused. Queuing work on a busy session is what the board's lanes are for.
+///
+/// `status` is `pending` until the app picks it up, `running` while it executes, then
+/// `applied` (typed into the idle session, or already dispatched there) or `refused`
+/// (with `reason`; nothing is left reserved).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DispatchRequest {
+    pub id: i64,
+    pub task_id: i64,
+    pub worktree: String,
+    /// Who asked (the requesting worktree / actor), for the audit trail.
+    pub requested_by: String,
+    pub status: String,
+    /// Why the request was refused (or a note on how it applied); empty otherwise.
+    pub reason: String,
+    pub created_at: String,
+    /// When the app resolved it to a terminal status; `None` while pending/running.
+    pub resolved_at: Option<String>,
+}
+
+impl DispatchRequest {
+    /// Whether the app has finished with this request.
+    pub fn is_resolved(&self) -> bool {
+        DISPATCH_REQUEST_OUTCOMES.contains(&self.status.as_str())
+    }
+}
+
 /// Filters for `Store::list`.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

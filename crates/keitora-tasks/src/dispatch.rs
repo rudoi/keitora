@@ -1,4 +1,6 @@
-//! Pure rendering for custom dispatch steps.
+//! Pure rendering for custom dispatch steps, plus the pure dispatch preconditions
+//! ([`task_refusal`], [`session_refusal`]) that a CLI dispatch request is checked
+//! against.
 //!
 //! A dispatched task's prompt lines (configured in `[dispatch].steps`, see
 //! [`crate::DispatchConfig`]) are templates with a fixed placeholder set. This
@@ -6,7 +8,7 @@
 //! deliberately Tauri-free and fully unit-tested; the orchestration (writing the
 //! lines into a PTY, the submit byte, inter-step delays) lives in the app crate.
 
-use crate::Task;
+use crate::{Task, TaskWithDeps};
 
 /// Everything a dispatch step can interpolate: the reserved task plus the
 /// worktree it is being dispatched into (authoritative — equals `assigned_to`
@@ -88,6 +90,58 @@ pub fn already_dispatched(
     latest_decision: Option<&str>,
 ) -> bool {
     status == "open" && assigned_to == Some(worktree) && latest_decision == Some("dispatched")
+}
+
+/// Pure: why `task` can't be dispatched onto `worktree`, judged from the task alone,
+/// or `None` when it can. The task-side half of the board's lane rule (`decideLane`):
+/// terminal and blocked cards are refused, and so is anything `assign` would reject
+/// (backlog, active, reserved to another worktree), worded so a CLI caller knows what
+/// to do. A task already reserved to `worktree` passes: re-dispatching it there sends
+/// a card queued on that lane once the session is idle, and an already-sent one no-ops.
+pub fn task_refusal(task: &TaskWithDeps, worktree: &str) -> Option<String> {
+    let t = &task.task;
+    let id = t.id;
+    match t.status.as_str() {
+        "done" | "cancelled" => return Some(format!("task #{id} is {}", t.status)),
+        "backlog" => return Some(format!("task #{id} is in the backlog; reopen it first")),
+        "active" => {
+            let who = t.assigned_to.as_deref().unwrap_or("someone");
+            return Some(format!("task #{id} is already active on @{who}"));
+        }
+        _ => {}
+    }
+    if !task.blocked_by.is_empty() {
+        let ids = task
+            .blocked_by
+            .iter()
+            .map(|b| format!("#{b}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!("task #{id} is blocked by {ids}"));
+    }
+    match t.assigned_to.as_deref() {
+        Some(other) if other != worktree => Some(format!(
+            "task #{id} is reserved for @{other}; release it first"
+        )),
+        _ => None,
+    }
+}
+
+/// Pure: why a session in `state` can't take a CLI dispatch, or `None` when it can.
+/// Only an `idle` session takes one. A `busy` or `waiting` session is refused rather
+/// than queued: the board's lanes are the queue, and a CLI request is a "send it now"
+/// that either lands or doesn't. `offline` is refused too, since dispatch only types
+/// into a live session and never starts one.
+pub fn session_refusal(state: &str, worktree: &str) -> Option<String> {
+    match state {
+        "idle" => None,
+        "busy" | "waiting" => Some(format!(
+            "@{worktree} is {state}; dispatch only sends to an idle session (queue it on the board instead)"
+        )),
+        other => Some(format!(
+            "@{worktree} is {other}; start its session first (dispatch never launches an agent)"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -253,5 +307,68 @@ mod tests {
             Some("suggested")
         ));
         assert!(!already_dispatched("open", Some("feng"), "feng", None));
+    }
+
+    fn card(status: &str, assigned_to: Option<&str>, blocked_by: Vec<i64>) -> TaskWithDeps {
+        let mut t = task();
+        t.status = status.to_string();
+        t.assigned_to = assigned_to.map(str::to_string);
+        TaskWithDeps {
+            task: t,
+            blocked_by,
+            blocks: vec![],
+        }
+    }
+
+    #[test]
+    fn task_refusal_passes_open_unassigned_and_reserved_here() {
+        assert_eq!(task_refusal(&card("open", None, vec![]), "alpha"), None);
+        // Reserved to this worktree: re-dispatch sends a queued task / no-ops a sent one.
+        assert_eq!(
+            task_refusal(&card("open", Some("alpha"), vec![]), "alpha"),
+            None
+        );
+    }
+
+    #[test]
+    fn task_refusal_rejects_what_the_board_or_assign_would() {
+        let refuse = |c: TaskWithDeps| task_refusal(&c, "alpha").expect("refused");
+        assert_eq!(refuse(card("done", None, vec![])), "task #19 is done");
+        assert_eq!(
+            refuse(card("cancelled", None, vec![])),
+            "task #19 is cancelled"
+        );
+        assert_eq!(
+            refuse(card("backlog", None, vec![])),
+            "task #19 is in the backlog; reopen it first"
+        );
+        assert_eq!(
+            refuse(card("active", Some("bravo"), vec![])),
+            "task #19 is already active on @bravo"
+        );
+        assert_eq!(
+            refuse(card("open", None, vec![3, 4])),
+            "task #19 is blocked by #3, #4"
+        );
+        assert_eq!(
+            refuse(card("open", Some("bravo"), vec![])),
+            "task #19 is reserved for @bravo; release it first"
+        );
+        // Terminal beats blocked, matching the board's order of checks.
+        assert_eq!(refuse(card("done", None, vec![3])), "task #19 is done");
+    }
+
+    #[test]
+    fn session_refusal_truth_table() {
+        assert_eq!(session_refusal("idle", "alpha"), None);
+        // Busy and waiting are refused, not queued: the board is the queue.
+        for state in ["busy", "waiting"] {
+            let msg = session_refusal(state, "alpha").expect("refused");
+            assert!(msg.starts_with(&format!("@alpha is {state}")), "{msg}");
+            assert!(msg.contains("only sends to an idle session"), "{msg}");
+        }
+        let msg = session_refusal("offline", "alpha").expect("refused");
+        assert!(msg.starts_with("@alpha is offline"), "{msg}");
+        assert!(session_refusal("", "alpha").is_some());
     }
 }

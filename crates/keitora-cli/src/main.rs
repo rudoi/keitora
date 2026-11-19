@@ -7,8 +7,8 @@ use std::error::Error;
 use clap::{Parser, Subcommand};
 use keitora_tasks::{
     current_worktree, find_legacy_config, migrate_legacy, resolve, BackendError, ClaimOutcome,
-    Config, ListFilter, LocalStore, ProjectConfig, ResolveError, Task, TaskBackend, TaskUpdate,
-    UserConfig, PRIORITIES, STATUSES,
+    Config, DispatchLogEntry, DispatchRequest, ListFilter, LocalStore, ProjectConfig, ResolveError,
+    Task, TaskBackend, TaskUpdate, UserConfig, WorktreeSession, PRIORITIES, STATUSES,
 };
 use serde_json::json;
 
@@ -110,6 +110,32 @@ enum TaskCmd {
     /// Permanently delete a task.
     #[command(visible_alias = "rm")]
     Delete { id: i64 },
+    /// Ask the running Keitora app to send a task to a worktree's idle session now, as
+    /// a board drag would. A busy, waiting or offline session is refused (queue work on
+    /// the board instead). Needs the app running, with this project registered in it.
+    Dispatch {
+        id: i64,
+        /// The worktree to dispatch onto
+        #[arg(long)]
+        worktree: String,
+        /// Wait up to this many seconds for the app's outcome (0: don't wait)
+        #[arg(long, default_value_t = 0)]
+        wait: u64,
+        /// After the prompt is sent, keep waiting (within --wait) until the worktree's
+        /// agent claims the task; exit non-zero if it doesn't
+        #[arg(long)]
+        until_claimed: bool,
+    },
+    /// Stream session-state changes, dispatch-log entries and dispatch requests
+    /// (one line per change; JSON lines with --json) until interrupted
+    Watch {
+        /// Only this worktree's changes
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Poll interval in milliseconds
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -247,7 +273,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             local.session_upsert(&me, &state, current, None)?;
             emit_ok(cli.json, &format!("  {me} session → {state}"))?;
         }
-        Cmd::Task(task) => run_task(task, backend.as_ref(), &config, cli.json).await?,
+        Cmd::Task(task) => run_task(task, backend.as_ref(), &local, &config, cli.json).await?,
     }
 
     Ok(())
@@ -258,6 +284,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 async fn run_task(
     task: TaskCmd,
     backend: &dyn TaskBackend,
+    local: &LocalStore,
     config: &Config,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -594,9 +621,371 @@ async fn run_task(
             backend.delete(id).await?;
             emit_ok(json, &format!("  Deleted task #{id}"))?;
         }
+        TaskCmd::Dispatch {
+            id,
+            worktree,
+            wait,
+            until_claimed,
+        } => {
+            cmd_task_dispatch(
+                backend,
+                local,
+                config,
+                &me,
+                id,
+                &worktree,
+                wait,
+                until_claimed,
+                json,
+            )
+            .await?
+        }
+        TaskCmd::Watch {
+            worktree,
+            interval_ms,
+        } => {
+            cmd_task_watch(
+                backend,
+                local,
+                config,
+                worktree.as_deref(),
+                interval_ms,
+                json,
+            )
+            .await?
+        }
     }
 
     Ok(())
+}
+
+// ---- task dispatch / watch ----
+
+/// How often `task dispatch --wait` re-reads its request row.
+const DISPATCH_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// `keitora task dispatch`: write a dispatch request into the project's `tasks.db`
+/// for the running app to execute through its own dispatch path (the CLI never types
+/// into a pane itself, so it can't race the app's writer). The request is a
+/// short-lived "send it now" message, not a queue entry: the app sends the task to an
+/// idle session or refuses it. Checks what it can up front (the project is registered
+/// with the app, the worktree name, the task), then optionally waits for the outcome.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_task_dispatch(
+    backend: &dyn TaskBackend,
+    local: &LocalStore,
+    config: &Config,
+    me: &str,
+    id: i64,
+    worktree: &str,
+    wait: u64,
+    until_claimed: bool,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    if until_claimed && wait == 0 {
+        return Err("--until-claimed needs --wait <secs> to bound how long it waits".into());
+    }
+    // The app only reads requests from the DBs of projects in its registry; anywhere
+    // else a request would sit unread until it expired.
+    let root = &config.project_config().root;
+    let registry = UserConfig::load().map_err(|e| e.to_string())?;
+    if registry.project_ref_by_root(root).is_none() {
+        return Err(unregistered_message(root).into());
+    }
+    if !config.worktrees.is_empty() && !config.worktrees.iter().any(|w| w == worktree) {
+        return Err(format!(
+            "unknown worktree \"{worktree}\" — must be one of: {}",
+            config.worktrees.join(", ")
+        )
+        .into());
+    }
+    let twd = backend
+        .get(id)
+        .await?
+        .ok_or_else(|| format!("task #{id} not found"))?;
+    if let Some(reason) = keitora_tasks::dispatch::task_refusal(&twd, worktree) {
+        return Err(reason.into());
+    }
+
+    let mut req = local.dispatch_request_add(id, worktree, me)?;
+    // One budget for the whole wait: the app's outcome, then (with --until-claimed)
+    // the agent's claim.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+    if wait > 0 {
+        while !req.is_resolved() && std::time::Instant::now() < deadline {
+            std::thread::sleep(DISPATCH_WAIT_POLL);
+            req = local
+                .dispatch_request_get(req.id)?
+                .ok_or_else(|| format!("dispatch request {} vanished", req.id))?;
+        }
+        // Withdraw a request nobody picked up, so it can't fire later unexpectedly.
+        if req.status == "pending"
+            && local.dispatch_request_cancel(
+                req.id,
+                &format!("no running Keitora app picked it up within {wait}s"),
+            )?
+        {
+            req = local.dispatch_request_get(req.id)?.unwrap_or(req);
+        }
+    }
+
+    // `applied` means the prompt was typed; --until-claimed waits on until the agent
+    // in that worktree has actually taken the task.
+    let mut claim = None;
+    if until_claimed && req.status == "applied" {
+        let mut progress = ClaimProgress::Waiting;
+        loop {
+            if let Some(twd) = backend.get(id).await? {
+                progress = claim_progress(&twd.task, worktree);
+            }
+            if progress != ClaimProgress::Waiting || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(DISPATCH_WAIT_POLL);
+        }
+        claim = Some(progress);
+    }
+
+    if json {
+        let mut v = serde_json::to_value(&req)?;
+        if let (Some(p), Some(obj)) = (&claim, v.as_object_mut()) {
+            obj.insert("claimed".into(), json!(*p == ClaimProgress::Claimed));
+        }
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        println!("{}", dispatch_request_message(&req, wait > 0));
+        if claim == Some(ClaimProgress::Claimed) {
+            println!("  Claimed by @{worktree}");
+        }
+    }
+    match req.status.as_str() {
+        "refused" => {
+            Err(format!("dispatch of #{id} to @{worktree} refused: {}", req.reason).into())
+        }
+        "running" => {
+            Err(format!("dispatch of #{id} to @{worktree} still running after {wait}s").into())
+        }
+        _ => match claim {
+            Some(ClaimProgress::Waiting) => Err(format!(
+                "dispatch of #{id} to @{worktree} applied, but not claimed within {wait}s"
+            )
+            .into()),
+            Some(ClaimProgress::Lost(why)) => {
+                Err(format!("dispatch of #{id} to @{worktree} applied, but {why}").into())
+            }
+            _ => Ok(()),
+        },
+    }
+}
+
+/// Where a dispatched task stands, for `--until-claimed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClaimProgress {
+    /// Still reserved to the worktree, not yet claimed.
+    Waiting,
+    /// The worktree's agent claimed it (it is active there, or already done there).
+    Claimed,
+    /// It went somewhere else; waiting longer won't make it claimed here.
+    Lost(String),
+}
+
+/// Pure: classify `task` after a dispatch onto `worktree`.
+fn claim_progress(task: &Task, worktree: &str) -> ClaimProgress {
+    let here = task.assigned_to.as_deref() == Some(worktree);
+    match (task.status.as_str(), here) {
+        ("active" | "done", true) => ClaimProgress::Claimed,
+        ("open", true) => ClaimProgress::Waiting,
+        ("active", false) => ClaimProgress::Lost(format!(
+            "it was claimed by @{}",
+            task.assigned_to.as_deref().unwrap_or("someone else")
+        )),
+        ("open", false) => ClaimProgress::Lost("it was released".to_string()),
+        (status, _) => ClaimProgress::Lost(format!("it is now {status}")),
+    }
+}
+
+/// The error for a `task dispatch` from a project the app hasn't registered.
+fn unregistered_message(root: &std::path::Path) -> String {
+    format!(
+        "the project at {} isn't registered with Keitora, so the app would never pick up \
+         the request — add it in the app first (or run from a registered project)",
+        root.display()
+    )
+}
+
+/// The human-readable line for a dispatch request's current state. `waited` is
+/// whether the caller waited for the outcome (a bare `pending` is expected otherwise).
+fn dispatch_request_message(req: &DispatchRequest, waited: bool) -> String {
+    let (id, wt) = (req.task_id, &req.worktree);
+    let suffix = if req.reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", req.reason)
+    };
+    match req.status.as_str() {
+        "applied" => format!("  Dispatched #{id} to @{wt}{suffix}"),
+        "refused" => format!("  Refused #{id} → @{wt}{suffix}"),
+        "pending" if !waited => format!(
+            "  Requested dispatch of #{id} to @{wt} (request {}); the running Keitora app applies it",
+            req.id
+        ),
+        other => format!("  Request {} for #{id} → @{wt} is {other}{suffix}", req.id),
+    }
+}
+
+/// What `task watch` has already reported, so each poll emits only what changed.
+#[derive(Debug, Default)]
+struct WatchState {
+    /// Per worktree: the last reported `(state, current_task_id)`. Heartbeat-only
+    /// re-upserts don't change it, so they aren't reported.
+    sessions: std::collections::HashMap<String, (String, Option<i64>)>,
+    /// Highest dispatch-log id already reported (or present when the watch started).
+    last_log_id: i64,
+    /// Per request id: the last reported status.
+    requests: std::collections::HashMap<i64, String>,
+}
+
+impl WatchState {
+    /// Start from the current dispatch log and requests without reporting them, so a
+    /// watch streams what happens from now on. Sessions are left empty: the first
+    /// poll reports every session's current state as a baseline.
+    fn seeded(log: &[DispatchLogEntry], requests: &[DispatchRequest]) -> Self {
+        WatchState {
+            sessions: Default::default(),
+            last_log_id: log.iter().map(|e| e.id).max().unwrap_or(0),
+            requests: requests.iter().map(|r| (r.id, r.status.clone())).collect(),
+        }
+    }
+
+    /// One poll: the events (JSON objects tagged with `"event"`) for every change
+    /// since the last poll, oldest first within each kind, limited to `worktree` when
+    /// given. Sessions come first, then dispatch-log entries, then requests.
+    fn step(
+        &mut self,
+        sessions: &[WorktreeSession],
+        log: &[DispatchLogEntry],
+        requests: &[DispatchRequest],
+        worktree: Option<&str>,
+    ) -> Vec<serde_json::Value> {
+        let wanted = |w: &str| worktree.is_none_or(|f| f == w);
+        let mut out = Vec::new();
+        for s in sessions.iter().filter(|s| wanted(&s.worktree)) {
+            let now = (s.state.clone(), s.current_task_id);
+            if self.sessions.get(&s.worktree) != Some(&now) {
+                self.sessions.insert(s.worktree.clone(), now);
+                out.push(tagged("session", serde_json::to_value(s)));
+            }
+        }
+        let mut fresh: Vec<&DispatchLogEntry> =
+            log.iter().filter(|e| e.id > self.last_log_id).collect();
+        fresh.sort_by_key(|e| e.id);
+        for e in fresh {
+            self.last_log_id = self.last_log_id.max(e.id);
+            if wanted(&e.worktree) {
+                out.push(tagged("dispatch", serde_json::to_value(e)));
+            }
+        }
+        let mut reqs: Vec<&DispatchRequest> = requests.iter().collect();
+        reqs.sort_by_key(|r| r.id);
+        for r in reqs {
+            if self.requests.get(&r.id) != Some(&r.status) {
+                self.requests.insert(r.id, r.status.clone());
+                if wanted(&r.worktree) {
+                    out.push(tagged("request", serde_json::to_value(r)));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// `value` (a serialized row) with an `"event": kind` field added.
+fn tagged(kind: &str, value: serde_json::Result<serde_json::Value>) -> serde_json::Value {
+    let mut v = value.unwrap_or_else(|_| json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("event".into(), json!(kind));
+    }
+    v
+}
+
+/// The human-readable line for one `task watch` event.
+fn watch_line(ev: &serde_json::Value) -> String {
+    let s = |k: &str| ev.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let n = |k: &str| ev.get(k).and_then(|v| v.as_i64());
+    let line = match s("event").as_str() {
+        "session" => {
+            let task = n("current_task_id")
+                .map(|t| format!("  (task #{t})"))
+                .unwrap_or_default();
+            format!("  @{}  {}{task}", s("worktree"), s("state"))
+        }
+        "dispatch" => format!(
+            "  #{} → @{}  {}  {}",
+            n("task_id").unwrap_or(0),
+            s("worktree"),
+            s("decision"),
+            s("rationale")
+        ),
+        "request" => format!(
+            "  request {}: #{} → @{}  {}  {}",
+            n("id").unwrap_or(0),
+            n("task_id").unwrap_or(0),
+            s("worktree"),
+            s("status"),
+            s("reason")
+        ),
+        _ => ev.to_string(),
+    };
+    line.trim_end().to_string()
+}
+
+/// How many recent dispatch-log entries / requests each `task watch` poll reads.
+const WATCH_WINDOW: i64 = 100;
+
+/// `keitora task watch`: poll the project's `tasks.db` and print each change in
+/// `worktree_sessions`, the dispatch log and the dispatch requests, one line each
+/// (JSON lines with `--json`), until interrupted or stdout closes. Session states are
+/// what the agent hooks last wrote; only the app reconciles them with live panes.
+async fn cmd_task_watch(
+    backend: &dyn TaskBackend,
+    local: &LocalStore,
+    config: &Config,
+    worktree: Option<&str>,
+    interval_ms: u64,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    use std::io::Write;
+
+    let interval = std::time::Duration::from_millis(interval_ms.max(50));
+    let mut state = WatchState::seeded(
+        &backend.dispatch_log_list(WATCH_WINDOW).await?,
+        &local.dispatch_requests_list(WATCH_WINDOW)?,
+    );
+    loop {
+        // Scope sessions to this project's worktrees, as the app does; the table
+        // holds a row for every worktree that ever ran a session.
+        let sessions: Vec<_> = local
+            .sessions_list()?
+            .into_iter()
+            .filter(|s| config.worktrees.is_empty() || config.worktrees.contains(&s.worktree))
+            .collect();
+        let events = state.step(
+            &sessions,
+            &backend.dispatch_log_list(WATCH_WINDOW).await?,
+            &local.dispatch_requests_list(WATCH_WINDOW)?,
+            worktree,
+        );
+        let mut out = std::io::stdout().lock();
+        for ev in &events {
+            let line = if json { ev.to_string() } else { watch_line(ev) };
+            // A closed pipe (e.g. `| head`) ends the watch cleanly.
+            if writeln!(out, "{line}").and_then(|_| out.flush()).is_err() {
+                return Ok(());
+            }
+        }
+        drop(out);
+        std::thread::sleep(interval);
+    }
 }
 
 // ---- config subcommand dispatch ----
@@ -841,5 +1230,343 @@ mod tests {
         assert!(Cli::try_parse_from(["keitora", "task", "list", "--json"]).is_ok());
         // Old flat form must NOT parse anymore (clean break — no `task` alias).
         assert!(Cli::try_parse_from(["keitora", "list"]).is_err());
+    }
+
+    #[test]
+    fn parses_task_dispatch_and_watch() {
+        match Cli::try_parse_from(["keitora", "task", "dispatch", "7", "--worktree", "alpha"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Task(TaskCmd::Dispatch {
+                id,
+                worktree,
+                wait,
+                until_claimed,
+            }) => {
+                assert_eq!(
+                    (id, worktree.as_str(), wait, until_claimed),
+                    (7, "alpha", 0, false)
+                );
+            }
+            _ => panic!("expected `task dispatch`"),
+        }
+        match Cli::try_parse_from([
+            "keitora",
+            "task",
+            "dispatch",
+            "7",
+            "--worktree",
+            "alpha",
+            "--wait",
+            "30",
+            "--json",
+        ])
+        .unwrap()
+        .cmd
+        {
+            Cmd::Task(TaskCmd::Dispatch { wait, .. }) => assert_eq!(wait, 30),
+            _ => panic!("expected `task dispatch`"),
+        }
+        // There is no `--queue`: the board is the queue.
+        assert!(Cli::try_parse_from([
+            "keitora",
+            "task",
+            "dispatch",
+            "7",
+            "--worktree",
+            "alpha",
+            "--queue"
+        ])
+        .is_err());
+        // The worktree is required.
+        assert!(Cli::try_parse_from(["keitora", "task", "dispatch", "7"]).is_err());
+
+        match Cli::try_parse_from(["keitora", "task", "watch"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Task(TaskCmd::Watch {
+                worktree,
+                interval_ms,
+            }) => assert_eq!((worktree, interval_ms), (None, 1000)),
+            _ => panic!("expected `task watch`"),
+        }
+        match Cli::try_parse_from(["keitora", "task", "watch", "--worktree", "bravo", "--json"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Task(TaskCmd::Watch { worktree, .. }) => {
+                assert_eq!(worktree.as_deref(), Some("bravo"))
+            }
+            _ => panic!("expected `task watch`"),
+        }
+    }
+
+    fn session(worktree: &str, state: &str, task: Option<i64>, beat: &str) -> WorktreeSession {
+        WorktreeSession {
+            project: String::new(),
+            worktree: worktree.into(),
+            state: state.into(),
+            current_task_id: task,
+            pid: None,
+            last_heartbeat: beat.into(),
+        }
+    }
+
+    fn log_entry(id: i64, task_id: i64, worktree: &str, decision: &str) -> DispatchLogEntry {
+        DispatchLogEntry {
+            id,
+            task_id,
+            worktree: worktree.into(),
+            decision: decision.into(),
+            rationale: String::new(),
+            created_at: "2026-01-01 00:00:00".into(),
+        }
+    }
+
+    fn request(id: i64, worktree: &str, status: &str) -> DispatchRequest {
+        DispatchRequest {
+            id,
+            task_id: 5,
+            worktree: worktree.into(),
+            requested_by: "me".into(),
+            status: status.into(),
+            reason: String::new(),
+            created_at: "2026-01-01 00:00:00".into(),
+            resolved_at: None,
+        }
+    }
+
+    fn kinds(events: &[serde_json::Value]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| e["event"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn watch_reports_a_session_baseline_then_only_real_changes() {
+        let mut w = WatchState::seeded(&[], &[]);
+        let first = w.step(
+            &[
+                session("alpha", "idle", None, "t1"),
+                session("bravo", "busy", Some(3), "t1"),
+            ],
+            &[],
+            &[],
+            None,
+        );
+        assert_eq!(kinds(&first), vec!["session", "session"]);
+        assert_eq!(first[1]["worktree"], "bravo");
+        assert_eq!(first[1]["current_task_id"], 3);
+        // A heartbeat-only re-upsert is not a change.
+        let beat = w.step(
+            &[
+                session("alpha", "idle", None, "t2"),
+                session("bravo", "busy", Some(3), "t2"),
+            ],
+            &[],
+            &[],
+            None,
+        );
+        assert!(beat.is_empty());
+        // A state change or a task-pointer change is.
+        let changed = w.step(
+            &[
+                session("alpha", "busy", None, "t3"),
+                session("bravo", "busy", None, "t3"),
+            ],
+            &[],
+            &[],
+            None,
+        );
+        assert_eq!(kinds(&changed), vec!["session", "session"]);
+        assert_eq!(changed[0]["state"], "busy");
+    }
+
+    #[test]
+    fn watch_streams_only_new_log_entries_and_request_transitions() {
+        // Present at start: not reported.
+        let mut w = WatchState::seeded(
+            &[log_entry(4, 1, "alpha", "queued")],
+            &[request(1, "alpha", "applied")],
+        );
+        // The log arrives newest first; events come out oldest first.
+        let ev = w.step(
+            &[],
+            &[
+                log_entry(6, 2, "alpha", "dispatched"),
+                log_entry(5, 1, "alpha", "dispatched"),
+                log_entry(4, 1, "alpha", "queued"),
+            ],
+            &[
+                request(2, "alpha", "pending"),
+                request(1, "alpha", "applied"),
+            ],
+            None,
+        );
+        assert_eq!(kinds(&ev), vec!["dispatch", "dispatch", "request"]);
+        assert_eq!(ev[0]["id"], 5);
+        assert_eq!(ev[1]["id"], 6);
+        assert_eq!(ev[2]["status"], "pending");
+        // Same data again: nothing new. A status change is.
+        let again = w.step(
+            &[],
+            &[log_entry(6, 2, "alpha", "dispatched")],
+            &[request(2, "alpha", "pending")],
+            None,
+        );
+        assert!(again.is_empty());
+        let moved = w.step(&[], &[], &[request(2, "alpha", "refused")], None);
+        assert_eq!(kinds(&moved), vec!["request"]);
+        assert_eq!(moved[0]["status"], "refused");
+    }
+
+    #[test]
+    fn watch_filters_to_one_worktree() {
+        let mut w = WatchState::seeded(&[], &[]);
+        let ev = w.step(
+            &[
+                session("alpha", "idle", None, "t"),
+                session("bravo", "idle", None, "t"),
+            ],
+            &[
+                log_entry(2, 1, "bravo", "dispatched"),
+                log_entry(1, 1, "alpha", "dispatched"),
+            ],
+            &[
+                request(1, "bravo", "pending"),
+                request(2, "alpha", "pending"),
+            ],
+            Some("alpha"),
+        );
+        assert_eq!(kinds(&ev), vec!["session", "dispatch", "request"]);
+        assert!(ev.iter().all(|e| e["worktree"] == "alpha"));
+        // A filtered-out log entry still advances the cursor (not re-reported later).
+        assert_eq!(w.last_log_id, 2);
+    }
+
+    #[test]
+    fn watch_lines_are_readable() {
+        let ev = tagged(
+            "session",
+            serde_json::to_value(session("alpha", "busy", Some(3), "t")),
+        );
+        assert_eq!(watch_line(&ev), "  @alpha  busy  (task #3)");
+        let ev = tagged(
+            "dispatch",
+            serde_json::to_value(log_entry(1, 5, "alpha", "queued")),
+        );
+        assert_eq!(watch_line(&ev), "  #5 → @alpha  queued");
+        let mut r = request(9, "alpha", "refused");
+        r.reason = "task #5 is done".into();
+        let ev = tagged("request", serde_json::to_value(&r));
+        assert_eq!(
+            watch_line(&ev),
+            "  request 9: #5 → @alpha  refused  task #5 is done"
+        );
+        assert_eq!(ev["event"], "request");
+    }
+
+    #[test]
+    fn dispatch_request_messages() {
+        let mut r = request(3, "alpha", "pending");
+        assert!(dispatch_request_message(&r, false).contains("Requested dispatch of #5 to @alpha"));
+        assert_eq!(
+            dispatch_request_message(&r, true),
+            "  Request 3 for #5 → @alpha is pending"
+        );
+        r.status = "applied".into();
+        assert_eq!(
+            dispatch_request_message(&r, true),
+            "  Dispatched #5 to @alpha"
+        );
+        r.status = "refused".into();
+        r.reason = "@alpha is busy".into();
+        assert_eq!(
+            dispatch_request_message(&r, true),
+            "  Refused #5 → @alpha (@alpha is busy)"
+        );
+    }
+
+    #[test]
+    fn unregistered_message_names_the_project_root() {
+        let msg = unregistered_message(std::path::Path::new("D:/repos/proj"));
+        assert!(msg.contains("D:/repos/proj"), "{msg}");
+        assert!(msg.contains("isn't registered with Keitora"), "{msg}");
+    }
+
+    #[test]
+    fn parses_until_claimed() {
+        match Cli::try_parse_from([
+            "keitora",
+            "task",
+            "dispatch",
+            "7",
+            "--worktree",
+            "alpha",
+            "--wait",
+            "60",
+            "--until-claimed",
+        ])
+        .unwrap()
+        .cmd
+        {
+            Cmd::Task(TaskCmd::Dispatch {
+                wait,
+                until_claimed,
+                ..
+            }) => assert!(until_claimed && wait == 60),
+            _ => panic!("expected `task dispatch`"),
+        }
+    }
+
+    fn task_in(status: &str, assigned_to: Option<&str>) -> Task {
+        Task {
+            id: 5,
+            title: "t".into(),
+            description: String::new(),
+            status: status.into(),
+            priority: "normal".into(),
+            assigned_to: assigned_to.map(str::to_string),
+            created_by: None,
+            tags: vec![],
+            branch: None,
+            pr_url: None,
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-01 00:00:00".into(),
+        }
+    }
+
+    #[test]
+    fn claim_progress_waits_for_the_worktree_to_claim() {
+        // Reserved here, not yet claimed: keep waiting.
+        assert_eq!(
+            claim_progress(&task_in("open", Some("alpha")), "alpha"),
+            ClaimProgress::Waiting
+        );
+        // Claimed here (or already finished here): done.
+        assert_eq!(
+            claim_progress(&task_in("active", Some("alpha")), "alpha"),
+            ClaimProgress::Claimed
+        );
+        assert_eq!(
+            claim_progress(&task_in("done", Some("alpha")), "alpha"),
+            ClaimProgress::Claimed
+        );
+        // Anything else won't turn into a claim here: stop with the reason.
+        assert_eq!(
+            claim_progress(&task_in("active", Some("bravo")), "alpha"),
+            ClaimProgress::Lost("it was claimed by @bravo".into())
+        );
+        assert_eq!(
+            claim_progress(&task_in("open", None), "alpha"),
+            ClaimProgress::Lost("it was released".into())
+        );
+        assert_eq!(
+            claim_progress(&task_in("cancelled", Some("alpha")), "alpha"),
+            ClaimProgress::Lost("it is now cancelled".into())
+        );
     }
 }
