@@ -40,10 +40,10 @@ pub use config::{
     is_safe_claude_session_id, keitora_on_path, login_path, resolve, resolve_active,
     resolve_autonomy, resolve_claude_path, resolve_cli, resolve_keitora_path,
     resolve_provider_path, resolve_skip_permissions, short_path, stamp_from_registry,
-    strip_extended_prefix_str, user_config_path, CliConfig, CliKind, Config, DiffBase,
-    DispatchConfig, FieldIntent, HerdrPtyConfig, ProjectConfig, ProjectMeta, ProjectRef,
-    ProjectSettingsPatch, ProviderConfig, PtyConfig, RecoveryConfig, ResolveError, TaskConfig,
-    UserConfig, WorktreeEntry, DISCOVER_NONE_TTL,
+    strip_extended_prefix_str, unreserved_project_name, user_config_path, CliConfig, CliKind,
+    Config, DiffBase, DispatchConfig, FieldIntent, HerdrPtyConfig, ProjectConfig, ProjectMeta,
+    ProjectRef, ProjectSettingsPatch, ProviderConfig, PtyConfig, RecoveryConfig, ResolveError,
+    TaskConfig, UpdatesConfig, UserConfig, WorktreeEntry, DISCOVER_NONE_TTL, RESERVED_PROJECT_NAME,
 };
 // Windows-only: expose the bundled `keitora` CLI on spawned terminals' PATH.
 #[cfg(unix)]

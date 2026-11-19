@@ -7,6 +7,9 @@ import * as Tooltip from "@radix-ui/react-tooltip";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AddProjectDialog } from "./components/AddProjectDialog";
+import { AgentUpdateBanner } from "./components/AgentUpdateBanner";
+import { AgentUpdateDialogHost } from "./components/AgentUpdateDialog";
+import { AgentUpdatesProvider } from "./components/AgentUpdatesProvider";
 import { AttentionBannersProvider, useAttentionBanners } from "./components/AttentionBanners";
 import { Board } from "./components/Board";
 import { ConfirmDialogProvider, useConfirmDialog } from "./components/ConfirmDialog";
@@ -1212,6 +1215,9 @@ function AppInner() {
       />
       <RecoveryBanner info={recovery} />
       <UpdateBanner />
+      <AgentUpdateBanner recovery={recovery} />
+      {/* Hosts a terminal pane, so it gets the daemon and recovery state every pane gets. */}
+      <AgentUpdateDialogHost daemonInfo={daemonInfo} recovery={recovery} />
       <div className="body" style={{ position: "relative" }}>
         <Rail
           groups={railGroups}
@@ -1375,14 +1381,16 @@ function App() {
   return (
     <ToastProvider>
       <UpdatesProvider>
-        <ConfirmDialogProvider>
-          <AttentionBannersProvider>
-            <Tooltip.Provider>
-              <AppInner />
-              <QuitConfirmModal />
-            </Tooltip.Provider>
-          </AttentionBannersProvider>
-        </ConfirmDialogProvider>
+        <AgentUpdatesProvider>
+          <ConfirmDialogProvider>
+            <AttentionBannersProvider>
+              <Tooltip.Provider>
+                <AppInner />
+                <QuitConfirmModal />
+              </Tooltip.Provider>
+            </AttentionBannersProvider>
+          </ConfirmDialogProvider>
+        </AgentUpdatesProvider>
       </UpdatesProvider>
     </ToastProvider>
   );

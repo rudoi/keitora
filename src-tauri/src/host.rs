@@ -358,10 +358,12 @@ fn onboard_project(app: AppHandle, path: String) -> Result<ProjectSummary, Strin
     //         preserving worktrees/db pointer) then use the resulting name.
     //      c. neither → register file-less; the name is the root basename.
     // The folder basename — the file-less project name, and the fallback when a
-    // committed file isn't where we expect.
+    // committed file isn't where we expect. Like a committed name (which
+    // `ProjectConfig::load` already maps), never the name Keitora reserves for its
+    // own sessions.
     let basename = || {
         root.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
+            .map(|n| keitora_tasks::unreserved_project_name(&n.to_string_lossy(), root))
             .ok_or_else(|| format!("cannot derive a project name from path: {path}"))
     };
     let toml_path = root.join("keitora.toml");
@@ -638,6 +640,9 @@ pub struct SettingsUser {
     /// Whether the app checks for updates by itself (`[updates] auto_check`;
     /// on unless explicitly disabled).
     pub auto_check_updates: bool,
+    /// Effective agent CLI update-check interval in hours
+    /// (`[updates] agent_check_hours`: unset → 6, `0` = app start only).
+    pub agent_update_check_hours: u32,
 }
 
 /// Everything the settings drawer needs in one round-trip.
@@ -694,6 +699,7 @@ fn get_settings() -> Result<SettingsSnapshot, String> {
             default_cli: user_cfg.default_cli.unwrap_or_default(),
             codex_available: keitora_tasks::discover_cli(keitora_tasks::CliKind::Codex).is_some(),
             auto_check_updates: user_cfg.updates.auto_check(),
+            agent_update_check_hours: user_cfg.updates.agent_check_hours(),
         },
     })
 }
@@ -928,10 +934,16 @@ fn set_skip_permissions(cli: keitora_tasks::CliKind, enabled: bool) -> Result<()
 /// update check reading it.
 #[tauri::command(async)]
 fn set_update_auto_check(enabled: bool) -> Result<(), String> {
-    let _registry = keitora_tasks::UserConfig::write_lock();
-    let mut user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
-    user_cfg.updates.auto_check = Some(enabled);
-    user_cfg.save().map_err(|e| e.to_string())
+    keitora_tasks::UserConfig::update(|c| c.updates.auto_check = Some(enabled))
+        .map_err(|e| e.to_string())
+}
+
+/// Persist the user-level `[updates] agent_check_hours` interval. Persist-only:
+/// the agent update scheduler re-reads it on its next tick.
+#[tauri::command(async)]
+fn set_agent_update_check_hours(hours: u32) -> Result<(), String> {
+    keitora_tasks::UserConfig::update(|c| c.updates.agent_check_hours = Some(hours))
+        .map_err(|e| e.to_string())
 }
 
 /// Remove a project from the user registry (clearing `active` if it pointed at
@@ -1275,13 +1287,13 @@ pub(crate) fn spawn_pty(
     transfer: bool,
 ) -> Result<u64, String> {
     let size = requested_size(cols, rows);
-    // The PTY identity is the explicit `project` param; `active_project()` is kept
-    // only for the `db_path` the daemon needs to mark the worktree offline on exit.
-    let (_, db_path) = active_project()?;
     let key = SessionKey {
         project,
         worktree: id,
     };
+    // The PTY identity is the explicit `project` param; `active_project()` is kept
+    // only for the `db_path` the daemon needs to mark the worktree offline on exit.
+    let db_path = spawn_db_path(&key, active_project)?;
     // Re-derive the default launch from persisted state on EVERY spawn.
     // This runs on first launch, hard-restart, daemon-crash re-attach, and
     // app relaunch alike — the frontend's `ptySpawn` never carries a command — so
@@ -1302,6 +1314,20 @@ pub(crate) fn spawn_pty(
     spawn_pty_with(
         client, key, cwd, db_path, size, command, fresh, transfer, resolve,
     )
+}
+
+/// The task DB a spawn of `key` marks the worktree offline in: the active project's,
+/// so a spawn needs an active project. Keitora's reserved utility pane belongs to no
+/// project (its cwd comes from the update's run plan), so it has no DB and spawns
+/// with no project active.
+fn spawn_db_path(
+    key: &SessionKey,
+    active: impl FnOnce() -> Result<(String, String), String>,
+) -> Result<String, String> {
+    if key.is_reserved() {
+        return Ok(String::new());
+    }
+    active().map(|(_, db_path)| db_path)
 }
 
 /// [`spawn_pty`] once the key, size and `db_path` are known, with the launch
@@ -1327,6 +1353,10 @@ fn spawn_pty_with(
         return client
             .spawn(key, cwd, db_path, size, Some(command))
             .map_err(spawn_err_kind);
+    }
+    // The reserved pane only ever runs the command it was given: it has no agent.
+    if key.is_reserved() {
+        return Err(format!("{key} is reserved: it spawns only with a command"));
     }
     let launch = launch_for_spawn(resolve(&key), fresh, transfer);
     client
@@ -1450,7 +1480,10 @@ pub(crate) fn resolve_agent_launch(key: &SessionKey) -> Option<(String, AgentLau
 /// [`resolve_agent_launch`] over a loaded registry: the project is matched by
 /// its resolved name (`[project].name`, the name session keys carry), not the
 /// registry map key; the launch uses that project's own settings.
-fn launch_for(user: &keitora_tasks::UserConfig, key: &SessionKey) -> Option<(String, AgentLaunch)> {
+pub(crate) fn launch_for(
+    user: &keitora_tasks::UserConfig,
+    key: &SessionKey,
+) -> Option<(String, AgentLaunch)> {
     for pref in user.projects.values() {
         let Ok(pc) = keitora_tasks::effective_config(pref) else {
             continue;
@@ -2340,6 +2373,8 @@ pub fn run() {
             // In-app updates: managed state, leftover cleanup, and the background schedule
             // (release builds on supported platforms only).
             crate::updater::startup(app.handle().clone());
+            // Agent CLI update checks: managed state and the background schedule.
+            crate::agent_updates::startup(app.handle().clone());
             #[cfg(target_os = "macos")]
             if crate::updater::release::Platform::current().is_some() {
                 if let Err(e) = crate::updater::commands::install_app_menu(app.handle()) {
@@ -2451,10 +2486,19 @@ pub fn run() {
             save_user_settings,
             set_skip_permissions,
             set_update_auto_check,
+            set_agent_update_check_hours,
             crate::updater::commands::update_status,
             crate::updater::commands::update_check,
             crate::updater::commands::update_download,
             crate::updater::commands::update_apply,
+            crate::agent_updates::commands::agent_updates_status,
+            crate::agent_updates::commands::agent_updates_check,
+            crate::agent_updates::commands::agent_update_skip,
+            crate::agent_updates::commands::agent_update_run,
+            crate::agent_updates::commands::agent_update_close,
+            crate::agent_updates::commands::agent_update_live_sessions,
+            crate::agent_updates::commands::agent_update_stop,
+            crate::agent_updates::commands::agent_update_restart,
             remove_project,
             tasks::task_actor,
             tasks::sessions_list,
@@ -2542,6 +2586,12 @@ mod tests {
         assert_eq!(kind(PtyBackendError::NotConnected), "herdr unreachable");
         assert_eq!(kind(PtyBackendError::NoSuchSession), "no live session");
         assert_eq!(kind(PtyBackendError::Other("boom".into())), "boom");
+        assert_eq!(
+            kind(PtyBackendError::AgentUpdatePrompt(
+                keitora_tasks::CliKind::Codex
+            )),
+            "AgentUpdatePrompt: codex"
+        );
     }
 
     #[test]
@@ -3646,6 +3696,69 @@ mod tests {
             let got = spawned_launch(&spawn(CliKind::Claude, None, false, true));
             assert_eq!(got.policy, LaunchPolicy::Default);
             assert_eq!(got.cli, CliKind::Claude);
+        }
+
+        /// The reserved update pane needs no active project: it has no task DB.
+        #[test]
+        fn the_reserved_key_spawns_with_no_active_project() {
+            use super::super::spawn_db_path;
+            let no_project =
+                || -> Result<(String, String), String> { Err("no active project".into()) };
+            assert_eq!(
+                spawn_db_path(&SessionKey::agent_update(), no_project).as_deref(),
+                Ok("")
+            );
+            assert_eq!(
+                spawn_db_path(&key(), no_project),
+                Err("no active project".to_string())
+            );
+            assert_eq!(
+                spawn_db_path(&key(), || Ok(("proj-a".into(), "/db".into()))).as_deref(),
+                Ok("/db")
+            );
+
+            let fake = FakeBackend::new();
+            spawn_pty_with(
+                &fake,
+                SessionKey::agent_update(),
+                "/home/me".into(),
+                String::new(),
+                Some((80, 24)),
+                Some("echo hi".into()),
+                false,
+                false,
+                |_: &SessionKey| panic!("no launch is resolved"),
+            )
+            .unwrap();
+            assert_eq!(
+                fake.calls(),
+                vec![Call::Spawn {
+                    key: SessionKey::agent_update(),
+                    cwd: "/home/me".into(),
+                    db_path: String::new(),
+                    size: Some((80, 24)),
+                    command: Some("echo hi".into()),
+                }]
+            );
+        }
+
+        #[test]
+        fn the_reserved_key_never_spawns_an_agent() {
+            let fake = FakeBackend::new();
+            let err = spawn_pty_with(
+                &fake,
+                SessionKey::agent_update(),
+                "/home/me".into(),
+                String::new(),
+                None,
+                None,
+                false,
+                false,
+                |_: &SessionKey| panic!("no launch is resolved"),
+            )
+            .unwrap_err();
+            assert!(err.contains("reserved"), "{err}");
+            assert!(fake.calls().is_empty());
         }
 
         #[test]

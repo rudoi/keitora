@@ -2330,14 +2330,18 @@ static HANDOFF_SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// `None` → `exec resume --last …` (a native Codex worktree with no imported
 /// thread; `--last` resolves to this cwd's most-recent rollout once the live
 /// session is released). Both are a single token in the `SESSION_ID` slot of
-/// `codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]`. Pure + testable.
+/// `codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]`. The startup update check is
+/// switched off first, as for every codex launch. Pure + testable.
 fn summary_args<'a>(
     resume: Option<&'a str>,
     prompt: &'a str,
     schema: &'a str,
     out: &'a str,
-) -> [&'a str; 8] {
+) -> [&'a str; 10] {
+    let [flag, no_update_check] = crate::backend::herdr::agent::CODEX_NO_UPDATE_CHECK;
     [
+        flag,
+        no_update_check,
         "exec",
         "resume",
         resume.unwrap_or("--last"),
@@ -3889,6 +3893,8 @@ mod tests {
         assert_eq!(
             summary_args(Some("0199-abc"), "PROMPT", "/tmp/s.json", "/tmp/o.json"),
             [
+                "-c",
+                "check_for_update_on_startup=false",
                 "exec",
                 "resume",
                 "0199-abc",
@@ -3907,6 +3913,8 @@ mod tests {
         assert_eq!(
             summary_args(None, "PROMPT", "/tmp/s.json", "/tmp/o.json"),
             [
+                "-c",
+                "check_for_update_on_startup=false",
                 "exec",
                 "resume",
                 "--last",

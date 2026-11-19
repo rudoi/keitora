@@ -73,13 +73,32 @@ pub fn parse_repo(s: &str) -> Option<(String, String)> {
     Some((owner.to_string(), repo.to_string()))
 }
 
-/// The real source: GitHub's REST API over a single reused blocking client.
+/// The process-wide blocking HTTP client, shared by the app updater and the agent CLI
+/// update checks. Built on first use, on a blocking thread (never on the setup thread or
+/// inside an async task: the blocking client owns a runtime), then reused. Installs the
+/// crypto provider first. Requests may set their own timeout and `User-Agent`.
+pub(crate) fn http_client() -> Result<&'static reqwest::blocking::Client, SourceError> {
+    static CLIENT: OnceLock<Result<reqwest::blocking::Client, SourceError>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            install_crypto_provider();
+            reqwest::blocking::Client::builder()
+                .user_agent(concat!("Keitora/", env!("CARGO_PKG_VERSION")))
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .map_err(|e| {
+                    log::error!("[updater] http client build failed: {e}");
+                    SourceError::Client
+                })
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+/// The real source: GitHub's REST API over the shared [`http_client`].
 pub struct GithubSource {
     user_agent: String,
     latest_url: String,
-    /// Built on first use, on a blocking thread (never on the setup thread or inside an
-    /// async task: the blocking client owns a runtime), then reused.
-    client: OnceLock<Result<reqwest::blocking::Client, SourceError>>,
 }
 
 impl GithubSource {
@@ -88,25 +107,14 @@ impl GithubSource {
         GithubSource {
             user_agent: format!("Keitora/{app_version}"),
             latest_url: format!("https://api.github.com/repos/{owner}/{repo}/releases/latest"),
-            client: OnceLock::new(),
         }
     }
 
-    /// The shared client. Requires [`install_crypto_provider`] to have run.
-    fn client(&self) -> Result<&reqwest::blocking::Client, SourceError> {
-        self.client
-            .get_or_init(|| {
-                reqwest::blocking::Client::builder()
-                    .user_agent(self.user_agent.as_str())
-                    .timeout(REQUEST_TIMEOUT)
-                    .build()
-                    .map_err(|e| {
-                        log::error!("[updater] http client build failed: {e}");
-                        SourceError::Client
-                    })
-            })
-            .as_ref()
-            .map_err(Clone::clone)
+    /// A GET of `url` on the shared client, carrying this source's `User-Agent`.
+    fn get(&self, url: &str) -> Result<reqwest::blocking::RequestBuilder, SourceError> {
+        Ok(http_client()?
+            .get(url)
+            .header(reqwest::header::USER_AGENT, self.user_agent.as_str()))
     }
 
     /// The repo to read releases from: `KEITORA_UPDATE_REPO` when valid, else the default.
@@ -149,8 +157,7 @@ fn check_status(resp: &reqwest::blocking::Response) -> Result<(), SourceError> {
 impl ReleaseSource for GithubSource {
     fn latest(&self) -> Result<Option<String>, SourceError> {
         let resp = self
-            .client()?
-            .get(&self.latest_url)
+            .get(&self.latest_url)?
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -163,7 +170,7 @@ impl ReleaseSource for GithubSource {
     }
 
     fn fetch_text(&self, url: &str) -> Result<String, SourceError> {
-        let resp = self.client()?.get(url).send().map_err(send_error)?;
+        let resp = self.get(url)?.send().map_err(send_error)?;
         check_status(&resp)?;
         read_text(resp)
     }

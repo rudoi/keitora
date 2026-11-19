@@ -74,20 +74,10 @@ pub fn resolve_codex_env(p: &CodexEnvProbe) -> Result<CodexEnv, String> {
         },
     };
 
-    let exe_dir = Path::new(&exe)
-        .parent()
-        .map(|d| d.to_string_lossy().into_owned())
-        .filter(|d| !d.is_empty());
-    let path = compose_path(exe_dir.as_deref(), p.base_path.as_deref(), p.path_sep);
-
-    let env_home = p.env_codex_home.as_deref().filter(|s| !s.is_empty());
-    let (codex_home, codex_home_source) = match env_home {
-        Some(h) => (PathBuf::from(h), CodexHomeSource::EnvVar),
-        None => match &p.home_dir {
-            Some(h) => (h.join(".codex"), CodexHomeSource::Default),
-            None => return Err("could not resolve home directory for CODEX_HOME".to_string()),
-        },
-    };
+    let path = path_for_exe(&exe, p.base_path.as_deref(), p.path_sep);
+    let (codex_home, codex_home_source) =
+        codex_home_dir(p.env_codex_home.as_deref(), p.home_dir.as_deref())
+            .ok_or_else(|| "could not resolve home directory for CODEX_HOME".to_string())?;
 
     Ok(CodexEnv {
         exe,
@@ -105,13 +95,7 @@ pub fn probe_codex_env_from_machine(
     project: &ProjectConfig,
     user: &UserConfig,
 ) -> CodexEnvProbe<'static> {
-    #[cfg(unix)]
-    let (base_path, path_sep) = (keitora_tasks::unix_spawn_path(), ':');
-    #[cfg(not(unix))]
-    let (base_path, path_sep) = (
-        std::env::var_os("PATH").map(|s| s.to_string_lossy().into_owned()),
-        ';',
-    );
+    let (base_path, path_sep) = base_spawn_path();
     CodexEnvProbe {
         configured: keitora_tasks::resolve_provider_path(CliKind::Codex, Some(project), user),
         discover: &|| keitora_tasks::discover_cli_cached(CliKind::Codex),
@@ -137,6 +121,44 @@ impl CodexEnv {
             self.codex_home_source = CodexHomeSource::Initialize;
         }
         self
+    }
+}
+
+/// The `PATH` a spawned CLI starts from, and its separator: the login-shell spawn path on
+/// unix (runs the login shell the first time), the process `PATH` on Windows.
+pub(crate) fn base_spawn_path() -> (Option<String>, char) {
+    #[cfg(unix)]
+    {
+        (keitora_tasks::unix_spawn_path(), ':')
+    }
+    #[cfg(not(unix))]
+    {
+        (
+            std::env::var_os("PATH").map(|s| s.to_string_lossy().into_owned()),
+            ';',
+        )
+    }
+}
+
+/// `PATH` for running `exe`: its own directory first (an npm shim needs its `node`
+/// alongside), then `base`. See [`compose_path`].
+pub(crate) fn path_for_exe(exe: &str, base: Option<&str>, sep: char) -> Option<String> {
+    let exe_dir = Path::new(exe)
+        .parent()
+        .map(|d| d.to_string_lossy().into_owned())
+        .filter(|d| !d.is_empty());
+    compose_path(exe_dir.as_deref(), base, sep)
+}
+
+/// Codex's home before `initialize` reports one: `CODEX_HOME` when set and non-empty,
+/// else `~/.codex`. `None` when neither is known.
+pub(crate) fn codex_home_dir(
+    env_codex_home: Option<&str>,
+    home: Option<&Path>,
+) -> Option<(PathBuf, CodexHomeSource)> {
+    match env_codex_home.filter(|h| !h.is_empty()) {
+        Some(h) => Some((PathBuf::from(h), CodexHomeSource::EnvVar)),
+        None => home.map(|h| (h.join(".codex"), CodexHomeSource::Default)),
     }
 }
 
@@ -178,7 +200,8 @@ pub fn parse_codex_version_output(stdout: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn starts_with_semver(tok: &str) -> bool {
+/// Whether `tok` begins with `N.N.N` (a pre-release or build suffix may follow).
+pub(crate) fn starts_with_semver(tok: &str) -> bool {
     let mut parts = tok.splitn(3, '.');
     let digits = |s: Option<&str>, trailing_ok: bool| match s {
         Some(s) => {
@@ -190,12 +213,16 @@ fn starts_with_semver(tok: &str) -> bool {
     digits(parts.next(), false) && digits(parts.next(), false) && digits(parts.next(), true)
 }
 
-type VersionCache = Mutex<HashMap<String, (Instant, Option<String>)>>;
+/// Per-exe version probe results: when probed and what was found.
+pub(crate) type VersionCache = Mutex<HashMap<String, (Instant, Option<String>)>>;
 
-/// Cache-aware version lookup: a `Some` is kept per exe for the process, a `None` for
-/// [`keitora_tasks::DISCOVER_NONE_TTL`] (as CLI discovery does), then retried. `probe`
+/// The `codex --version` results, shared so an update can invalidate them.
+static CODEX_VERSION_CACHE: OnceLock<VersionCache> = OnceLock::new();
+
+/// Cache-aware version lookup: a `Some` is kept per exe until it is invalidated, a `None`
+/// for [`keitora_tasks::DISCOVER_NONE_TTL`] (as CLI discovery does), then retried. `probe`
 /// runs outside the lock.
-fn codex_version_with(
+pub(crate) fn cached_version_with(
     cache: &VersionCache,
     exe: &str,
     path: Option<&str>,
@@ -219,16 +246,36 @@ fn codex_version_with(
     found
 }
 
+/// Forget the cached version of `exe`, so the next lookup probes it again (after the
+/// CLI was updated in place).
+pub(crate) fn invalidate_version(cache: &VersionCache, exe: &str) {
+    cache.lock().unwrap_or_else(|e| e.into_inner()).remove(exe);
+}
+
 /// `codex --version`, cached per exe (a miss for 30 s), bounded to 5 s.
 pub fn codex_version(exe: &str, path: Option<&str>) -> Option<String> {
-    static CACHE: OnceLock<VersionCache> = OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    codex_version_with(cache, exe, path, Instant::now(), &probe_codex_version)
+    let cache = CODEX_VERSION_CACHE.get_or_init(Default::default);
+    cached_version_with(cache, exe, path, Instant::now(), &probe_codex_version)
+}
+
+/// Drop the cached `codex --version` of `exe`; call after the CLI was updated.
+pub fn invalidate_codex_version(exe: &str) {
+    invalidate_version(CODEX_VERSION_CACHE.get_or_init(Default::default), exe);
 }
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn probe_codex_version(exe: &str, path: Option<&str>) -> Option<String> {
+    probe_cli_version(exe, path, parse_codex_version_output)
+}
+
+/// Run `<exe> --version` (bounded to 5 s, no console window) with `PATH` set to `path`
+/// when given, and parse its stdout with `parse`. `None` on any failure.
+pub(crate) fn probe_cli_version(
+    exe: &str,
+    path: Option<&str>,
+    parse: fn(&str) -> Option<String>,
+) -> Option<String> {
     let mut cmd = crate::transfer::codex_command(exe, &["--version"]);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -255,7 +302,7 @@ fn probe_codex_version(exe: &str, path: Option<&str>) -> Option<String> {
     }
     let mut out = String::new();
     child.stdout.take()?.read_to_string(&mut out).ok()?;
-    parse_codex_version_output(&out)
+    parse(&out)
 }
 
 #[cfg(test)]
@@ -366,6 +413,34 @@ mod tests {
     }
 
     #[test]
+    fn codex_home_dir_env_then_default() {
+        assert_eq!(
+            codex_home_dir(Some("D:/scratch/codex"), Some(Path::new("C:/Users/x"))),
+            Some((PathBuf::from("D:/scratch/codex"), CodexHomeSource::EnvVar))
+        );
+        assert_eq!(
+            codex_home_dir(Some(""), Some(Path::new("/Users/me"))),
+            Some((
+                PathBuf::from("/Users/me").join(".codex"),
+                CodexHomeSource::Default
+            ))
+        );
+        assert_eq!(codex_home_dir(None, None), None);
+    }
+
+    #[test]
+    fn path_for_exe_leads_with_the_exe_dir() {
+        assert_eq!(
+            path_for_exe("/opt/x/bin/codex", Some("/usr/bin:/opt/x/bin"), ':').as_deref(),
+            Some("/opt/x/bin:/usr/bin")
+        );
+        assert_eq!(
+            path_for_exe("codex", Some("/usr/bin"), ':').as_deref(),
+            Some("/usr/bin")
+        );
+    }
+
+    #[test]
     fn codex_home_errors_without_home_and_env() {
         let err = resolve_codex_env(&probe(None, &none, None, None, None)).unwrap_err();
         assert!(err.contains("home directory"), "{err}");
@@ -410,18 +485,53 @@ mod tests {
             Some("0.166.0".to_string())
         };
         assert_eq!(
-            codex_version_with(&cache, "/a/codex", None, now, &found).as_deref(),
+            cached_version_with(&cache, "/a/codex", None, now, &found).as_deref(),
             Some("0.166.0")
         );
         let much_later = now + keitora_tasks::DISCOVER_NONE_TTL * 10;
         assert_eq!(
-            codex_version_with(&cache, "/a/codex", Some("/p"), much_later, &found).as_deref(),
+            cached_version_with(&cache, "/a/codex", Some("/p"), much_later, &found).as_deref(),
             Some("0.166.0")
         );
         assert_eq!(calls.get(), 1, "a hit is kept for the process");
         // A different exe has its own entry.
-        codex_version_with(&cache, "/b/codex", None, now, &found);
+        cached_version_with(&cache, "/b/codex", None, now, &found);
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn invalidating_a_version_probes_that_exe_again() {
+        let cache = VersionCache::default();
+        let now = Instant::now();
+        let calls = Cell::new(0);
+        let version = Cell::new("0.160.0");
+        let probe = |_: &str, _: Option<&str>| {
+            calls.set(calls.get() + 1);
+            Some(version.get().to_string())
+        };
+        assert_eq!(
+            cached_version_with(&cache, "/a/codex", None, now, &probe).as_deref(),
+            Some("0.160.0")
+        );
+        cached_version_with(&cache, "/b/codex", None, now, &probe);
+        assert_eq!(calls.get(), 2);
+
+        version.set("0.163.0");
+        invalidate_version(&cache, "/a/codex");
+        assert_eq!(
+            cached_version_with(&cache, "/a/codex", None, now, &probe).as_deref(),
+            Some("0.163.0"),
+            "the invalidated exe is probed again"
+        );
+        assert_eq!(calls.get(), 3);
+        assert_eq!(
+            cached_version_with(&cache, "/b/codex", None, now, &probe).as_deref(),
+            Some("0.160.0"),
+            "other exes keep their entry"
+        );
+        assert_eq!(calls.get(), 3);
+        // Invalidating an unknown exe is a no-op.
+        invalidate_version(&cache, "/c/codex");
     }
 
     #[test]
@@ -438,20 +548,20 @@ mod tests {
             Some("0.166.0".to_string())
         };
         assert_eq!(
-            codex_version_with(&cache, "/c/codex", None, base, &missing),
+            cached_version_with(&cache, "/c/codex", None, base, &missing),
             None
         );
         // Within the TTL the miss is answered from the cache, even if the exe now works.
         let soon = base + Duration::from_secs(10);
         assert_eq!(
-            codex_version_with(&cache, "/c/codex", None, soon, &found),
+            cached_version_with(&cache, "/c/codex", None, soon, &found),
             None
         );
         assert_eq!(calls.get(), 1, "a recent miss is not re-probed");
         // Past the TTL it is probed again.
         let later = base + keitora_tasks::DISCOVER_NONE_TTL + Duration::from_secs(1);
         assert_eq!(
-            codex_version_with(&cache, "/c/codex", None, later, &found).as_deref(),
+            cached_version_with(&cache, "/c/codex", None, later, &found).as_deref(),
             Some("0.166.0")
         );
         assert_eq!(calls.get(), 2);

@@ -5,6 +5,7 @@
 // (+ `dispatch`, `tasks`, `hooks`).
 
 mod activity;
+mod agent_updates;
 mod backend;
 mod bg_notifier;
 mod cli_install;
