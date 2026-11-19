@@ -16,6 +16,8 @@ pub fn open_terminal_file(
     let config = keitora_tasks::resolve_active().map_err(|e| e.to_string())?;
     let root = worktree_root(&config, &project, &worktree)?;
     let target = validate_target(&root, &path)?;
+    // Some default handlers mis-handle the `\\?\` prefix canonicalization adds on Windows.
+    let target = dunce::simplified(&target);
     app.opener()
         .open_path(target.to_string_lossy().into_owned(), None::<String>)
         .map_err(|e| format!("Could not open file: {e}"))
@@ -140,6 +142,33 @@ fn validate_extension(path: &Path) -> Result<(), String> {
             | "appxbundle"
             | "msix"
             | "msixbundle"
+            // Other handlers that run code, mount images, or install on open.
+            | "msc"
+            | "chm"
+            | "hlp"
+            | "xll"
+            | "gadget"
+            | "ps1xml"
+            | "wsc"
+            | "sct"
+            | "cab"
+            | "diagcab"
+            | "iso"
+            | "img"
+            | "vhd"
+            | "vhdx"
+            | "jnlp"
+            | "settingcontent-ms"
+            | "library-ms"
+            | "search-ms"
+            | "searchconnector-ms"
+            | "terminal"
+            | "tool"
+            | "scpt"
+            | "applescript"
+            | "pkg"
+            | "mpkg"
+            | "dmg"
     ) {
         return Err(
             "Executable files, scripts, and shortcuts cannot be opened from terminal links".into(),
@@ -154,23 +183,34 @@ fn validate_target(root: &Path, path: &str) -> Result<PathBuf, String> {
     let root = root
         .canonicalize()
         .map_err(|e| format!("Worktree is unavailable: {e}"))?;
-    #[cfg(windows)]
-    if matches!(root.components().next(), Some(std::path::Component::Prefix(prefix))
-        if matches!(prefix.kind(), std::path::Prefix::UNC(_, _) | std::path::Prefix::VerbatimUNC(_, _)))
-    {
+    // Relative paths resolve against the worktree; absolute ones may point anywhere local.
+    if Path::new(path).is_relative() && is_network_path(&root) {
         return Err("Network worktrees cannot open local terminal file links".into());
     }
     let candidate = root.join(path);
     let target = candidate
         .canonicalize()
         .map_err(|e| format!("File is unavailable: {e}"))?;
-    validate_canonical_target(&root, &target)?;
+    validate_canonical_target(&target)?;
     Ok(target)
 }
 
-fn validate_canonical_target(root: &Path, target: &Path) -> Result<(), String> {
-    if !target.starts_with(root) {
-        return Err("File is outside this terminal's worktree".into());
+/// Whether a canonical path lives on a network share (or a raw device namespace).
+#[cfg(windows)]
+fn is_network_path(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    matches!(path.components().next(), Some(Component::Prefix(prefix))
+        if matches!(prefix.kind(), Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) | Prefix::DeviceNS(_)))
+}
+
+#[cfg(not(windows))]
+fn is_network_path(_path: &Path) -> bool {
+    false
+}
+
+fn validate_canonical_target(target: &Path) -> Result<(), String> {
+    if is_network_path(target) {
+        return Err("Files on network shares cannot be opened from terminal links".into());
     }
     if !target.is_file() {
         return Err("Only existing regular files can be opened".into());
@@ -256,19 +296,57 @@ mod tests {
     }
 
     #[test]
-    fn terminal_links_reject_missing_directory_traversal_and_sibling_prefix() {
+    fn terminal_links_reject_missing_and_directories() {
         let fixture = Fixture::new();
-        std::fs::write(fixture.0.join("outside.txt"), "outside").unwrap();
+        std::fs::create_dir(fixture.root().join("folder")).unwrap();
+        for path in ["missing.txt", ".", "folder", "../missing.txt"] {
+            assert!(validate_target(&fixture.root(), path).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn terminal_links_open_files_outside_the_worktree() {
+        let fixture = Fixture::new();
+        let outside = fixture.0.join("outside.txt");
+        std::fs::write(&outside, "outside").unwrap();
         std::fs::create_dir(fixture.0.join("worktree-sibling")).unwrap();
         let sibling = fixture.0.join("worktree-sibling/file.txt");
         std::fs::write(&sibling, "outside").unwrap();
-        for path in [
-            "missing.txt",
-            ".",
-            "../outside.txt",
-            sibling.to_str().unwrap(),
+        for (path, expected) in [
+            ("../outside.txt".to_string(), &outside),
+            (outside.to_str().unwrap().to_string(), &outside),
+            ("../worktree-sibling/file.txt".to_string(), &sibling),
+            (sibling.to_str().unwrap().to_string(), &sibling),
         ] {
-            assert!(validate_target(&fixture.root(), path).is_err(), "{path}");
+            assert_eq!(
+                validate_target(&fixture.root(), &path).unwrap(),
+                expected.canonicalize().unwrap(),
+                "{path}"
+            );
+        }
+        // Safety checks still apply outside the worktree.
+        let script = fixture.0.join("run.bat");
+        std::fs::write(&script, "text").unwrap();
+        assert!(validate_target(&fixture.root(), script.to_str().unwrap()).is_err());
+        assert!(validate_target(&fixture.root(), "../run.bat").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn terminal_links_refuse_network_targets() {
+        for path in [
+            r"\\?\UNC\server\share\file.txt",
+            r"\\server\share\file.txt",
+            r"\\.\PhysicalDrive0",
+        ] {
+            assert!(is_network_path(Path::new(path)), "{path}");
+            assert!(
+                validate_canonical_target(Path::new(path)).is_err(),
+                "{path}"
+            );
+        }
+        for path in [r"\\?\C:\repo\file.txt", r"C:\repo\file.txt"] {
+            assert!(!is_network_path(Path::new(path)), "{path}");
         }
     }
 
@@ -317,6 +395,13 @@ mod tests {
             "run.url",
             "run.desktop",
             "run.py",
+            "console.msc",
+            "help.CHM",
+            "disk.iso",
+            "launch.jnlp",
+            "run.settingcontent-ms",
+            "run.terminal",
+            "installer.dmg",
         ] {
             fixture.write(name, b"text");
             assert!(validate_target(&fixture.root(), name).is_err(), "{name}");
@@ -357,12 +442,11 @@ mod tests {
     #[test]
     fn terminal_links_validate_resolved_alias_targets() {
         let fixture = Fixture::new();
-        let root = fixture.root().canonicalize().unwrap();
         let executable = fixture.write("run.exe", b"text").canonicalize().unwrap();
         let outside = fixture.0.join("outside.txt");
         std::fs::write(&outside, "outside").unwrap();
-        assert!(validate_canonical_target(&root, &outside.canonicalize().unwrap()).is_err());
-        assert!(validate_canonical_target(&root, &executable).is_err());
+        assert!(validate_canonical_target(&outside.canonicalize().unwrap()).is_ok());
+        assert!(validate_canonical_target(&executable).is_err());
     }
 
     #[test]
@@ -370,7 +454,7 @@ mod tests {
         windows,
         ignore = "requires Windows Developer Mode or symlink privilege; run with --ignored"
     )]
-    fn terminal_links_reject_symlink_escape_and_executable_alias() {
+    fn terminal_links_follow_symlink_escape_but_reject_executable_alias() {
         let fixture = Fixture::new();
         let outside = fixture.0.join("outside.txt");
         std::fs::write(&outside, "outside").unwrap();
@@ -382,7 +466,8 @@ mod tests {
             #[cfg(unix)]
             let result = std::os::unix::fs::symlink(&target, &link);
             result.expect("symlink test requires Developer Mode or symlink permission");
-            assert!(validate_target(&fixture.root(), name).is_err());
         }
+        assert!(validate_target(&fixture.root(), "escape.txt").is_ok());
+        assert!(validate_target(&fixture.root(), "alias.txt").is_err());
     }
 }

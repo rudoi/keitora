@@ -320,8 +320,8 @@ Status: **Phase 0 ✅ done** · **Phase 1 ✅ done (PR #1)** · **Phase 2 ✅ do
   *Exit:* Keitora fully replaces the iTerm tabs.
 - **#0033 — Clickable terminal links. Done (PR #123).** Plain and OSC 8 web/file
   links open through system default applications; source location suffixes are
-  removed. File opening validates local worktree containment and rejects executable
-  targets. Hover destinations, error feedback, and selection guards are included.
+  removed. File opening rejects executable targets and network shares (worktree
+  containment was dropped later; see #0074). Hover destinations, error feedback, and selection guards are included.
 - **Phase 2 — Task board. ✅ done (PR #2).** Wired the app onto the `keitora-tasks` crate; `tasks://changed`
   WAL watcher; Board (kanban) + Inspector; claim/unclaim/done/update/new; live updates; Tailwind+Radix UI.
   *Exit met:* the board reflects the DB live and edits round-trip with the `task` CLI. (Dispatch
@@ -549,6 +549,24 @@ Status: **Phase 0 ✅ done** · **Phase 1 ✅ done (PR #1)** · **Phase 2 ✅ do
   - The Windows stop-first flow.
   - The macOS brew and native update paths.
   - `codex update` for native codex installs and the brew cask names are unverified.
+- **#0074 — Terminal link reach. ✅ done.** Two link bugs in agent panes:
+  - Wrapped links only underlined and opened the hovered row's fragment. herdr repaints the
+    screen, so xterm never marks rows wrapped. One provider now finds web and file links on a
+    logical line that joins a row filled to its last cell onto the next non-blank row, dropping
+    that row's leading indent (agent gutters). `WebLinksAddon` was removed. A file link crossing
+    such a join falls back to its pre-join part when the joined path fails to open.
+  - File links outside the worktree were refused. Containment is gone; relative paths still
+    resolve against the worktree, and the existing-file, executable/script and new
+    network-share refusals remain.
+
+  Edge joins are guarded: a web URL only joins across a filled edge when the continuation holds
+  a non-letter; file links carry ordered fallbacks (indent kept, then the row-local links)
+  tried only when the open reports the file missing; row-local links a join would hide are
+  still offered. The extension blocklist grew now that any local path is reachable.
+
+  Known limits: a URL whose split continuation is letters only (`.../getting-st` + `arted`)
+  stays split; the hover range of a joined link includes the continuation's indent cells;
+  `~/` and MSYS `/c/...` paths are not translated. Live smoke owed.
 
   Follow-ups:
   - Typed IPC error kinds.
