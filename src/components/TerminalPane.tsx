@@ -195,7 +195,6 @@ export function TerminalPane({
   terminateNonce,
   launchNonce,
   launchFresh = false,
-  command,
 }: {
   name: string;
   path: string;
@@ -233,8 +232,6 @@ export function TerminalPane({
   launchNonce: number;
   /** Whether the latest `launchNonce` bump asked for a new, empty conversation. */
   launchFresh?: boolean;
-  /** Shell line typed into a fresh pane on spawn; set only by `AgentUpdateDialog`. */
-  command?: string;
 }) {
   const paneRef = useRef<HTMLDivElement | null>(null);
   const { showToast } = useToast();
@@ -607,7 +604,7 @@ export function TerminalPane({
         const gen =
           via === "launch"
             ? await sessionLaunch(projectName, name, path, size, fresh)
-            : await ptySpawn(projectName, name, path, size, command, fresh, transfer);
+            : await ptySpawn(projectName, name, path, size, undefined, fresh, transfer);
         genRef.current = gen;
         // A new session: a pending restart or stopped-for-update mark is done with.
         agentUpdatesRef.current.settle(sessionKey(projectName, name));
@@ -646,7 +643,7 @@ export function TerminalPane({
         return { ok: false, error: msg };
       }
     },
-    [name, path, projectName, command, updateStatus, settleRecoveringRefusal, attachAfterSpawn],
+    [name, path, projectName, updateStatus, settleRecoveringRefusal, attachAfterSpawn],
   );
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: stable callback; name/path/projectName/updateStatus identity-stable

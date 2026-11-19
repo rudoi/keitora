@@ -1308,7 +1308,10 @@ export interface AgentUpdatesSnapshot {
   running: CliKind | null;
 }
 
-/** What the update dialog's pane spawns with. */
+/** A started update run. The backend has already opened the update pane and typed
+ *  the update into it (written for the pane's own shell); the dialog's pane attaches to
+ *  it. `command` is the update as shown to the user, never typed; `cwd` is where the
+ *  pane runs. */
 export interface RunPlan {
   command: string;
   cwd: string;
@@ -1359,8 +1362,9 @@ export function agentUpdateSkip(cli: CliKind, version: string): Promise<AgentUpd
   return invoke("agent_update_skip", { cli, version });
 }
 
-/** Start updating `cli`: returns the command and cwd for the update pane. Rejects when
- *  Keitora has no command for this install. */
+/** Start updating `cli`: opens the update pane and starts the update in it, then returns
+ *  what is running and where. Rejects when Keitora has no command for this install, or
+ *  the pane could not be opened or typed into. */
 export function agentUpdateRun(cli: CliKind): Promise<RunPlan> {
   return invoke("agent_update_run", { cli });
 }

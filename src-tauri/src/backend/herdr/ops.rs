@@ -220,6 +220,9 @@ pub trait HerdrOps: Send + Sync {
     /// Pid + start time of the running server; changes whenever the server
     /// process is replaced.
     fn server_instance(&self) -> Option<ServerInstance>;
+    /// The name of process `pid` (a pane's shell: `pwsh.exe`, `bash`, `zsh`, …);
+    /// `None` when it cannot be read or the process is gone.
+    fn process_name(&self, pid: u32) -> Option<String>;
 }
 
 /// How a process exited. `code` is `ExitStatus::code()` (on Windows an NTSTATUS
@@ -318,6 +321,7 @@ pub enum Op {
     SpawnBridge,
     ServerPid,
     ServerInstance,
+    ProcessName,
 }
 
 #[cfg(test)]

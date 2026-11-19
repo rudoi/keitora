@@ -554,6 +554,21 @@ Status: **Phase 0 ✅ done** · **Phase 1 ✅ done (PR #1)** · **Phase 2 ✅ do
   - Typed IPC error kinds.
   - A pane-lifetime attribute instead of reserved-key filters.
   - Move the TerminalPane wiring onto the launch nonce.
+- **#0075 — Update line per pane shell. ✅ done (PR #32).** The update pane typed a POSIX line
+  (`'…/npm.cmd' install …; echo "…$?"`), but herdr picks the pane shell itself (`SHELL` if set,
+  else PowerShell on Windows; the login shell on macOS), so updates failed on Windows with a
+  PowerShell `ParserError`. Changes:
+  - `agent_update_run` opens the reserved pane in the backend (`AgentUpdates::start_run`),
+    reads its shell (`PtyBackend::pane_shell`: herdr process-info → `HerdrOps::process_name`),
+    and types the line with a gen-checked, recovery-gated `PtyBackend::run_line`. The dialog
+    only attaches.
+  - `model::render_run_line` writes PowerShell (`& 'path' …`, exit from
+    `$(if ($?) {0} else {$LASTEXITCODE})`, `npm` → `npm.cmd`), POSIX (unchanged) and fish
+    (`$status`). An unreadable shell falls back per OS; a known unsupported shell is refused.
+  - A close during a start cancels it; a failed start closes its pane.
+
+  Still owed: live updates with herdr on PowerShell and on Git Bash, and on macOS (zsh/fish).
+
 - **Phase 5 — Polish & packaging. ✅ done (PR #7).** Scrollback search (xterm search addon + Cmd+F
   overlay); central keymap (`src/lib/keybindings.ts`: Cmd+↑/↓ worktree cycle, Cmd+F
   search, Cmd+K dispatch, `?` cheatsheet, `d` board dispatch; nav chords fire over a focused terminal;

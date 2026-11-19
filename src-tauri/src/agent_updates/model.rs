@@ -176,14 +176,62 @@ fn classify_path(cli: CliKind, exe_path: &str, home: Option<&str>) -> InstallKin
     InstallKind::Unknown
 }
 
+/// What Keitora runs to update a CLI, kept structured until the update pane's shell is
+/// known (each shell quotes and invokes a program differently).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateCommand {
+    /// The program: a found npm by its `/`-separated absolute path, or a bare name
+    /// (`npm`, `brew`, `claude`, `codex`) looked up on `PATH`.
+    pub program: String,
+    /// Whether `program` is a path (an npm found beside the install) that must be quoted;
+    /// a bare name is typed as is.
+    pub program_is_path: bool,
+    /// The rest of the command line, never quoted.
+    pub args: &'static str,
+}
+
+impl UpdateCommand {
+    /// The command as shown to the user (the dialog's "Running …" line and the wire
+    /// `command`): the program, double-quoted only when it holds whitespace, then the
+    /// arguments. Never typed into a shell.
+    pub fn display(&self) -> String {
+        let program = if self.program.chars().any(char::is_whitespace) {
+            format!("\"{}\"", self.program)
+        } else {
+            self.program.clone()
+        };
+        join_args(program, self.args)
+    }
+
+    /// The command as typed into a shell: a path program quoted with `quote`, a bare one
+    /// as is, then the arguments.
+    fn typed_with(&self, quote: fn(&str) -> String) -> String {
+        let program = if self.program_is_path {
+            quote(&self.program)
+        } else {
+            self.program.clone()
+        };
+        join_args(program, self.args)
+    }
+}
+
+/// `program` then `args`, space-separated (no trailing space without arguments).
+fn join_args(program: String, args: &str) -> String {
+    if args.is_empty() {
+        program
+    } else {
+        format!("{program} {args}")
+    }
+}
+
 /// How `cli` installed as some [`InstallKind`] is updated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateCommands {
     /// What Keitora runs, or `None` when it only shows guidance (an unknown install, or
     /// a native install whose updater Keitora does not run).
-    pub run: Option<String>,
+    pub run: Option<UpdateCommand>,
     /// The command to show the user: what Keitora would run, else a suggestion for their
-    /// own terminal.
+    /// own terminal. Written for a POSIX shell.
     pub guidance: String,
 }
 
@@ -199,22 +247,89 @@ pub fn update_commands(cli: CliKind, kind: InstallKind, npm: Option<&str>) -> Up
         InstallKind::Native => (info.native_update, info.native_update_runs),
         InstallKind::Unknown => (info.npm, false),
     };
-    let cmd = match (kind, npm, cmd.strip_prefix("npm ")) {
-        (InstallKind::Npm, Some(npm), Some(rest)) => {
-            format!("{} {rest}", posix_quote(&npm.replace('\\', "/")))
-        }
-        _ => cmd.to_string(),
+    let (program, args) = cmd.split_once(' ').unwrap_or((cmd, ""));
+    let command = match (kind, npm) {
+        (InstallKind::Npm, Some(npm)) if program == "npm" => UpdateCommand {
+            program: npm.replace('\\', "/"),
+            program_is_path: true,
+            args,
+        },
+        _ => UpdateCommand {
+            program: program.to_string(),
+            program_is_path: false,
+            args,
+        },
     };
     UpdateCommands {
-        run: runs.then(|| cmd.clone()),
-        guidance: cmd,
+        guidance: command.typed_with(posix_quote),
+        run: runs.then_some(command),
     }
 }
 
-/// `s` single-quoted for a POSIX shell (the update pane's shell; Git Bash on
-/// Windows): each `'` inside becomes `'\''`.
+/// `s` single-quoted for a POSIX shell: each `'` inside becomes `'\''`.
 fn posix_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// `s` single-quoted for fish, where a backslash escapes `\` and `'` inside single quotes.
+fn fish_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\\', r"\\").replace('\'', r"\'"))
+}
+
+/// `s` single-quoted for PowerShell, which reads the curly single quotes (U+2018, U+2019,
+/// U+201A, U+201B) as `'` too: each of them inside is doubled.
+fn powershell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
+/// The family of shell the update pane runs, which decides how the update line is
+/// written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellFamily {
+    /// `pwsh` / `powershell`.
+    PowerShell,
+    /// `bash`, `zsh`, `sh` and the other POSIX shells.
+    Posix,
+    Fish,
+}
+
+impl ShellFamily {
+    /// The family of a shell process named `name` (a bare name or a path, a login
+    /// shell's `-zsh`, with or without `.exe`, any case); `None` for a shell it does not
+    /// know.
+    pub fn classify(name: &str) -> Option<ShellFamily> {
+        let name = name.trim().to_lowercase();
+        let base = name.rsplit(['/', '\\']).next().unwrap_or(&name);
+        let base = base.strip_prefix('-').unwrap_or(base);
+        let base = base.strip_suffix(".exe").unwrap_or(base);
+        match base {
+            "pwsh" | "powershell" => Some(ShellFamily::PowerShell),
+            "bash" | "zsh" | "sh" | "dash" | "ksh" | "mksh" | "yash" | "ash" => {
+                Some(ShellFamily::Posix)
+            }
+            "fish" => Some(ShellFamily::Fish),
+            _ => None,
+        }
+    }
+
+    /// The family assumed when the pane's shell cannot be told: PowerShell on Windows
+    /// (herdr's own choice there without `SHELL`), POSIX elsewhere.
+    pub fn fallback(windows: bool) -> ShellFamily {
+        if windows {
+            ShellFamily::PowerShell
+        } else {
+            ShellFamily::Posix
+        }
+    }
 }
 
 /// Where the npm that owns an npm-installed CLI may be, most likely first, each
@@ -330,15 +445,47 @@ pub fn assess(
     }
 }
 
-/// The shell line typed into the update pane: the update, then the sentinel with its
-/// exit code. POSIX syntax (the pane shell is Git Bash on Windows).
-pub fn build_run_command(command: &str) -> String {
-    format!("{command}; echo \"{SENTINEL}$?\"")
+/// The line typed into the update pane, written for its shell `family`: the update,
+/// then an echo of [`SENTINEL`] followed by the update's exit code. `windows`: the pane
+/// runs on Windows, where PowerShell must call npm's `npm.cmd` (its `npm.ps1` is
+/// blocked under the default execution policy).
+pub fn render_run_line(cmd: &UpdateCommand, family: ShellFamily, windows: bool) -> String {
+    // (quoting, what goes before the command, the exit-code variable)
+    let (quote, prefix, exit): (fn(&str) -> String, &str, &str) = match family {
+        ShellFamily::Posix => (posix_quote, "", "$?"),
+        ShellFamily::Fish => (fish_quote, "", "$status"),
+        // `$?` is true after a native command that exited 0 and after a function or alias
+        // that succeeded (which leave `$LASTEXITCODE` alone); otherwise the native exit
+        // code. Seeded so a command that never ran (not found) reports 1, not a stale 0.
+        ShellFamily::PowerShell => (
+            powershell_quote,
+            "$LASTEXITCODE = 1; & ",
+            "$(if ($?) {0} else {$LASTEXITCODE})",
+        ),
+    };
+    let npm_cmd;
+    let cmd = if family == ShellFamily::PowerShell
+        && windows
+        && !cmd.program_is_path
+        && cmd.program == "npm"
+    {
+        npm_cmd = UpdateCommand {
+            program: "npm.cmd".to_string(),
+            ..cmd.clone()
+        };
+        &npm_cmd
+    } else {
+        cmd
+    };
+    format!(
+        "{prefix}{}; echo \"{SENTINEL}{exit}\"",
+        cmd.typed_with(quote)
+    )
 }
 
 /// The exit code from the last sentinel line in `history`. The echoed command line also
-/// contains the marker, but it does not start a line and ends in `$?"`, so it never
-/// matches.
+/// contains the marker, but it does not start a line and ends in the shell's exit-code
+/// variable (`$?"`, `$status"`, `…$LASTEXITCODE})"`), so it never matches.
 pub fn parse_sentinel(history: &str) -> Option<i32> {
     history.lines().rev().find_map(|line| {
         line.trim()
@@ -712,32 +859,51 @@ mod tests {
             Some("/Users/me/.nvm/versions/node/v22.0.0/bin/npm"),
         );
         assert_eq!(
-            cmds.run.as_deref(),
-            Some("'/Users/me/.nvm/versions/node/v22.0.0/bin/npm' install -g @openai/codex@latest")
+            cmds.run,
+            Some(UpdateCommand {
+                program: "/Users/me/.nvm/versions/node/v22.0.0/bin/npm".into(),
+                program_is_path: true,
+                args: "install -g @openai/codex@latest",
+            })
         );
-        assert_eq!(Some(cmds.guidance.as_str()), cmds.run.as_deref());
+        assert_eq!(
+            cmds.guidance,
+            "'/Users/me/.nvm/versions/node/v22.0.0/bin/npm' install -g @openai/codex@latest"
+        );
         // Spaces and quotes survive the POSIX shell.
+        let cmds = update_commands(Claude, Npm, Some("C:\\Program Files\\nodejs\\npm.cmd"));
         assert_eq!(
-            update_commands(Claude, Npm, Some("C:\\Program Files\\nodejs\\npm.cmd"))
-                .run
-                .as_deref(),
-            Some("'C:/Program Files/nodejs/npm.cmd' install -g @anthropic-ai/claude-code@latest")
+            cmds.guidance,
+            "'C:/Program Files/nodejs/npm.cmd' install -g @anthropic-ai/claude-code@latest"
         );
         assert_eq!(
-            update_commands(Codex, Npm, Some("/opt/it's node/bin/npm"))
-                .run
-                .as_deref(),
-            Some(r"'/opt/it'\''s node/bin/npm' install -g @openai/codex@latest")
+            cmds.run.unwrap().program,
+            "C:/Program Files/nodejs/npm.cmd",
+            "forward slashes, unquoted until the shell is known"
+        );
+        assert_eq!(
+            update_commands(Codex, Npm, Some("/opt/it's node/bin/npm")).guidance,
+            r"'/opt/it'\''s node/bin/npm' install -g @openai/codex@latest"
         );
         // Not found: the bare npm on PATH.
+        let cmds = update_commands(Codex, Npm, None);
         assert_eq!(
-            update_commands(Codex, Npm, None).run.as_deref(),
-            Some("npm install -g @openai/codex@latest")
+            cmds.run,
+            Some(UpdateCommand {
+                program: "npm".into(),
+                program_is_path: false,
+                args: "install -g @openai/codex@latest",
+            })
         );
+        assert_eq!(cmds.guidance, "npm install -g @openai/codex@latest");
         // Other install kinds ignore it.
         assert_eq!(
-            update_commands(Codex, Brew, Some("/x/npm")).run.as_deref(),
-            Some("brew upgrade --cask codex")
+            update_commands(Codex, Brew, Some("/x/npm")).run,
+            Some(UpdateCommand {
+                program: "brew".into(),
+                program_is_path: false,
+                args: "upgrade --cask codex",
+            })
         );
         assert_eq!(
             update_commands(Codex, Unknown, Some("/x/npm")).guidance,
@@ -786,7 +952,11 @@ mod tests {
         ];
         for (cli, kind, run, shown) in cases {
             let cmds = update_commands(*cli, *kind, None);
-            assert_eq!(cmds.run.as_deref(), *run, "{cli:?} {kind:?}");
+            assert_eq!(
+                cmds.run.as_ref().map(UpdateCommand::display).as_deref(),
+                *run,
+                "{cli:?} {kind:?}"
+            );
             assert_eq!(cmds.guidance, *shown, "{cli:?} {kind:?}");
         }
     }
@@ -901,12 +1071,213 @@ mod tests {
         );
     }
 
+    fn bare(program: &str, args: &'static str) -> UpdateCommand {
+        UpdateCommand {
+            program: program.into(),
+            program_is_path: false,
+            args,
+        }
+    }
+
+    fn path(program: &str, args: &'static str) -> UpdateCommand {
+        UpdateCommand {
+            program: program.into(),
+            program_is_path: true,
+            args,
+        }
+    }
+
     #[test]
-    fn run_command_appends_the_sentinel() {
+    fn shell_names_classify_into_families() {
+        use ShellFamily::*;
+        let cases: &[(&str, Option<ShellFamily>)] = &[
+            ("pwsh", Some(PowerShell)),
+            ("pwsh.exe", Some(PowerShell)),
+            ("powershell.exe", Some(PowerShell)),
+            ("PowerShell.EXE", Some(PowerShell)),
+            (
+                "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+                Some(PowerShell),
+            ),
+            ("bash", Some(Posix)),
+            ("bash.exe", Some(Posix)),
+            ("C:/Program Files/Git/usr/bin/bash.exe", Some(Posix)),
+            ("zsh", Some(Posix)),
+            ("-zsh", Some(Posix)),
+            ("/bin/zsh", Some(Posix)),
+            ("/bin/-bash", Some(Posix)),
+            ("sh", Some(Posix)),
+            ("dash", Some(Posix)),
+            ("ksh", Some(Posix)),
+            ("mksh", Some(Posix)),
+            ("yash", Some(Posix)),
+            ("ash", Some(Posix)),
+            ("fish", Some(Fish)),
+            ("-fish", Some(Fish)),
+            ("/opt/homebrew/bin/fish", Some(Fish)),
+            ("cmd.exe", None),
+            ("nu", None),
+            ("elvish", None),
+            ("xonsh", None),
+            ("bashful", None),
+            ("", None),
+        ];
+        for (name, want) in cases {
+            assert_eq!(ShellFamily::classify(name), *want, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn the_fallback_is_powershell_on_windows_and_posix_elsewhere() {
+        assert_eq!(ShellFamily::fallback(true), ShellFamily::PowerShell);
+        assert_eq!(ShellFamily::fallback(false), ShellFamily::Posix);
+    }
+
+    /// The POSIX line is exactly what was typed before the shell was detected.
+    #[test]
+    fn posix_rendering_is_unchanged() {
+        for windows in [false, true] {
+            assert_eq!(
+                render_run_line(&bare("claude", "update"), ShellFamily::Posix, windows),
+                "claude update; echo \"__KEITORA_AGENT_UPDATE_DONE:$?\""
+            );
+            assert_eq!(
+                render_run_line(
+                    &bare("npm", "install -g @openai/codex@latest"),
+                    ShellFamily::Posix,
+                    windows
+                ),
+                "npm install -g @openai/codex@latest; echo \"__KEITORA_AGENT_UPDATE_DONE:$?\""
+            );
+        }
         assert_eq!(
-            build_run_command("claude update"),
-            "claude update; echo \"__KEITORA_AGENT_UPDATE_DONE:$?\""
+            render_run_line(
+                &path("C:/x/npm.cmd", "install -g @openai/codex@latest"),
+                ShellFamily::Posix,
+                true
+            ),
+            "'C:/x/npm.cmd' install -g @openai/codex@latest; echo \"__KEITORA_AGENT_UPDATE_DONE:$?\""
         );
+        assert_eq!(
+            render_run_line(
+                &path("/opt/it's node/bin/npm", "install -g @openai/codex@latest"),
+                ShellFamily::Posix,
+                false
+            ),
+            r#"'/opt/it'\''s node/bin/npm' install -g @openai/codex@latest; echo "__KEITORA_AGENT_UPDATE_DONE:$?""#
+        );
+        // The same line the update commands' POSIX guidance gives, plus the sentinel.
+        let cmds = update_commands(
+            CliKind::Codex,
+            InstallKind::Npm,
+            Some("C:\\Program Files\\nodejs\\npm.cmd"),
+        );
+        assert_eq!(
+            render_run_line(cmds.run.as_ref().unwrap(), ShellFamily::Posix, true),
+            format!("{}; echo \"__KEITORA_AGENT_UPDATE_DONE:$?\"", cmds.guidance)
+        );
+    }
+
+    #[test]
+    fn powershell_rendering_calls_the_program_and_reports_lastexitcode() {
+        let ps = ShellFamily::PowerShell;
+        assert_eq!(
+            render_run_line(
+                &path("C:/x/npm.cmd", "install -g @openai/codex@latest"),
+                ps,
+                true
+            ),
+            "$LASTEXITCODE = 1; & 'C:/x/npm.cmd' install -g @openai/codex@latest; \
+             echo \"__KEITORA_AGENT_UPDATE_DONE:$(if ($?) {0} else {$LASTEXITCODE})\""
+        );
+        assert_eq!(
+            render_run_line(
+                &path(
+                    "C:/Program Files/nodejs/npm.cmd",
+                    "install -g @anthropic-ai/claude-code@latest"
+                ),
+                ps,
+                true
+            ),
+            "$LASTEXITCODE = 1; & 'C:/Program Files/nodejs/npm.cmd' install -g \
+             @anthropic-ai/claude-code@latest; echo \"__KEITORA_AGENT_UPDATE_DONE:$(if ($?) {0} else {$LASTEXITCODE})\""
+        );
+        assert_eq!(
+            render_run_line(&bare("claude", "update"), ps, true),
+            "$LASTEXITCODE = 1; & claude update; echo \"__KEITORA_AGENT_UPDATE_DONE:$(if ($?) {0} else {$LASTEXITCODE})\""
+        );
+        // A bare npm is npm.cmd only on Windows (npm.ps1 is blocked by default there).
+        assert_eq!(
+            render_run_line(&bare("npm", "install -g @openai/codex@latest"), ps, true),
+            "$LASTEXITCODE = 1; & npm.cmd install -g @openai/codex@latest; \
+             echo \"__KEITORA_AGENT_UPDATE_DONE:$(if ($?) {0} else {$LASTEXITCODE})\""
+        );
+        assert_eq!(
+            render_run_line(&bare("npm", "install -g @openai/codex@latest"), ps, false),
+            "$LASTEXITCODE = 1; & npm install -g @openai/codex@latest; \
+             echo \"__KEITORA_AGENT_UPDATE_DONE:$(if ($?) {0} else {$LASTEXITCODE})\""
+        );
+        // A found npm path is never renamed.
+        assert!(
+            render_run_line(&path("/usr/bin/npm", "x"), ps, true).contains("& '/usr/bin/npm' x")
+        );
+        // POSIX and fish never rename npm.
+        assert!(render_run_line(&bare("npm", "x"), ShellFamily::Posix, true).starts_with("npm x;"));
+        assert!(render_run_line(&bare("npm", "x"), ShellFamily::Fish, true).starts_with("npm x;"));
+    }
+
+    #[test]
+    fn powershell_quoting_doubles_straight_and_curly_single_quotes() {
+        let line = |p: &str| render_run_line(&path(p, "x"), ShellFamily::PowerShell, true);
+        assert!(line("C:/it's/npm.cmd").contains("& 'C:/it''s/npm.cmd' x;"));
+        assert!(line("C:/a\u{2018}b\u{2019}c\u{201A}d\u{201B}e/npm.cmd").contains(
+            "& 'C:/a\u{2018}\u{2018}b\u{2019}\u{2019}c\u{201A}\u{201A}d\u{201B}\u{201B}e/npm.cmd' x;"
+        ));
+        // `$`, backticks and double quotes are literal inside single quotes.
+        assert!(line("C:/$x`y\"z/npm.cmd").contains("& 'C:/$x`y\"z/npm.cmd' x;"));
+    }
+
+    #[test]
+    fn fish_rendering_quotes_its_way_and_reports_status() {
+        let fish = ShellFamily::Fish;
+        assert_eq!(
+            render_run_line(&bare("claude", "update"), fish, false),
+            "claude update; echo \"__KEITORA_AGENT_UPDATE_DONE:$status\""
+        );
+        assert_eq!(
+            render_run_line(
+                &path(
+                    "/Users/me/my node/bin/npm",
+                    "install -g @openai/codex@latest"
+                ),
+                fish,
+                false
+            ),
+            "'/Users/me/my node/bin/npm' install -g @openai/codex@latest; \
+             echo \"__KEITORA_AGENT_UPDATE_DONE:$status\""
+        );
+        assert_eq!(
+            render_run_line(&path(r"/opt/it's\node/npm", "x"), fish, false),
+            r#"'/opt/it\'s\\node/npm' x; echo "__KEITORA_AGENT_UPDATE_DONE:$status""#
+        );
+    }
+
+    #[test]
+    fn display_text_quotes_only_a_program_with_whitespace() {
+        assert_eq!(bare("claude", "update").display(), "claude update");
+        assert_eq!(
+            path("C:/x/npm.cmd", "install -g @openai/codex@latest").display(),
+            "C:/x/npm.cmd install -g @openai/codex@latest"
+        );
+        assert_eq!(
+            path(
+                "C:/Program Files/nodejs/npm.cmd",
+                "install -g @openai/codex@latest"
+            )
+            .display(),
+            "\"C:/Program Files/nodejs/npm.cmd\" install -g @openai/codex@latest"
+        );
+        assert_eq!(bare("brew", "").display(), "brew");
     }
 
     #[test]
@@ -938,6 +1309,43 @@ mod tests {
         ];
         for (text, want) in cases {
             assert_eq!(parse_sentinel(text), *want, "{text:?}");
+        }
+    }
+
+    /// Each shell's echoed command line, whole or wrapped onto its own row, never reads
+    /// as an exit line; the echo's output does.
+    #[test]
+    fn sentinel_parsing_ignores_every_shells_echoed_line() {
+        let cmd = path("C:/x/npm.cmd", "install -g @openai/codex@latest");
+        for (family, prompt) in [
+            (ShellFamily::Posix, "$ "),
+            (ShellFamily::Fish, "me@host ~> "),
+            (ShellFamily::PowerShell, "PS C:\\Users\\x> "),
+        ] {
+            let line = render_run_line(&cmd, family, true);
+            let typed = format!("{prompt}{line}");
+            assert_eq!(parse_sentinel(&typed), None, "{typed}");
+            // A wrapped row starting at the marker still ends in the variable.
+            let tail = &line[line.find(SENTINEL).unwrap()..];
+            assert_eq!(parse_sentinel(tail), None, "{tail}");
+            assert_eq!(
+                parse_sentinel(&format!(
+                    "{typed}\nadded 1 package\n__KEITORA_AGENT_UPDATE_DONE:0\n{prompt}"
+                )),
+                Some(0),
+                "{family:?}"
+            );
+            assert_eq!(
+                parse_sentinel(&format!("{typed}\r\n__KEITORA_AGENT_UPDATE_DONE:1\r\n")),
+                Some(1),
+                "{family:?}"
+            );
+        }
+        for wrapped in [
+            "__KEITORA_AGENT_UPDATE_DONE:$status\"",
+            "__KEITORA_AGENT_UPDATE_DONE:$(if ($?) {0} else {$LASTEXITCODE})\"",
+        ] {
+            assert_eq!(parse_sentinel(wrapped), None);
         }
     }
 

@@ -1,8 +1,10 @@
 // The update dialog: runs a CLI's update command in a visible terminal pane on the
-// reserved session key, then reports how it went. On Windows a running CLI holds its
-// executable open, so it first offers to stop that CLI's sessions. Closing ends the
-// pane, so while the command runs every way out (close button, outside click) asks for
-// confirmation first, and Escape stays with the terminal.
+// reserved session key, then reports how it went. The backend opens that pane and types
+// the update into it (written for the pane's own shell); the dialog's pane only attaches
+// to it. On Windows a running CLI holds its executable open, so it first offers to stop
+// that CLI's sessions. Closing ends the pane, so while the command runs every way out
+// (close button, outside click) asks for confirmation first, and Escape stays with the
+// terminal.
 
 import * as Dialog from "@radix-ui/react-dialog";
 import { Loader2 } from "lucide-react";
@@ -218,7 +220,6 @@ export function AgentUpdateDialog({
                   terminated={false}
                   terminateNonce={0}
                   launchNonce={0}
-                  command={step.plan.command}
                 />
               </div>
               <div className="flex items-center justify-end gap-2">

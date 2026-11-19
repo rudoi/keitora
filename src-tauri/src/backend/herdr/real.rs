@@ -41,7 +41,8 @@ pub struct RealHerdr {
     /// `server` (e.g. the server survived an app restart). Re-validated cheaply on
     /// each lookup and re-scanned only if it no longer matches.
     pid_cache: Mutex<Option<u32>>,
-    /// Process table used by [`HerdrOps::server_instance`].
+    /// Process table used by [`HerdrOps::server_instance`] and
+    /// [`HerdrOps::process_name`].
     sys: Mutex<sysinfo::System>,
 }
 
@@ -590,6 +591,27 @@ impl HerdrOps for RealHerdr {
         let start_time = sys.process(sysinfo::Pid::from_u32(pid))?.start_time();
         Some(ServerInstance { pid, start_time })
     }
+
+    /// Refreshes just `pid` in the shared process table, then reads its name (or, when
+    /// the platform gives none, its executable's file name).
+    fn process_name(&self, pid: u32) -> Option<String> {
+        let mut sys = self.sys.lock().unwrap();
+        let spid = sysinfo::Pid::from_u32(pid);
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[spid]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::OnlyIfNotSet),
+        );
+        let p = sys.process(spid)?;
+        let name = p.name().to_string_lossy().into_owned();
+        if !name.is_empty() {
+            return Some(name);
+        }
+        p.exe()
+            .and_then(Path::file_name)
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+    }
 }
 
 /// A precomputed "is this our herdr binary?" matcher. Resolving it once (canonicalizing our
@@ -777,6 +799,19 @@ mod tests {
         // No subcommand, or an empty/unreadable argv → no match (we leave stats blank).
         assert!(!is_server_cmd(&argv(&["herdr"])));
         assert!(!is_server_cmd(&[]));
+    }
+
+    /// The name of a live process (this test's own) is read; a pid nothing runs as
+    /// reads as `None`.
+    #[test]
+    fn process_name_reads_a_live_process_by_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env =
+            HerdrEnv::with_exe_and_home(PathBuf::from("herdr"), tmp.path().join("h")).unwrap();
+        let real = RealHerdr::new(env);
+        let name = real.process_name(std::process::id()).expect("own process");
+        assert!(!name.is_empty());
+        assert_eq!(real.process_name(u32::MAX - 1), None);
     }
 
     /// A rediscovery swaps the executable every later spawn uses; the env the

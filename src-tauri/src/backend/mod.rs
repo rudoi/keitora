@@ -633,6 +633,23 @@ pub trait PtyBackend: Send + Sync + 'static {
         ))
     }
 
+    /// The process name of a session's shell (`pwsh.exe`, `bash`, `zsh`, …), or `None`
+    /// when the backend cannot tell. Default: `None`.
+    fn pane_shell(&self, key: &SessionKey) -> Result<Option<String>, PtyBackendError> {
+        let _ = key;
+        Ok(None)
+    }
+
+    /// Type `line` into a plain shell session and submit it, only while the session is
+    /// still the one spawned at `gen` (a replaced or closed session is `NoSuchSession`).
+    /// Default: unsupported.
+    fn run_line(&self, key: &SessionKey, gen: u64, line: &str) -> Result<(), PtyBackendError> {
+        let _ = (key, gen, line);
+        Err(PtyBackendError::Other(
+            "typing a command line is not available on this backend".to_string(),
+        ))
+    }
+
     /// Generation-gated kill: a kill for an older generation than the live one is a
     /// no-op `Ok`.
     fn kill(&self, key: &SessionKey, gen: u64) -> Result<(), PtyBackendError>;
