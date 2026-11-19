@@ -100,6 +100,8 @@ struct FakeState {
     /// What `pane_process_info` answers, by pane id; a pane without an entry is
     /// not found.
     process_info: HashMap<String, PaneProcessInfo>,
+    /// What `process_name` answers, by pid; a pid without an entry has no name.
+    process_names: HashMap<u32, String>,
     /// What `pane_read` answers, by pane id; a pane without an entry reads
     /// [`Self::default_pane_text`].
     pane_text: HashMap<String, String>,
@@ -371,6 +373,7 @@ impl FakeHerdr {
                     panes: Vec::new(),
                     closed: Vec::new(),
                     process_info: HashMap::new(),
+                    process_names: HashMap::new(),
                     pane_text: HashMap::new(),
                     default_pane_text: String::new(),
                     next_workspace: 0,
@@ -471,6 +474,11 @@ impl FakeHerdr {
     /// What `pane_process_info` answers for `pane_id` from now on.
     pub fn set_process_info(&self, pane_id: &str, info: PaneProcessInfo) {
         self.state().process_info.insert(pane_id.to_string(), info);
+    }
+
+    /// What `process_name` answers for `pid` from now on.
+    pub fn set_process_name(&self, pid: u32, name: &str) {
+        self.state().process_names.insert(pid, name.to_string());
     }
 
     /// Simulate the agent exiting in (or returning to) its shell.
@@ -1195,6 +1203,14 @@ impl HerdrOps for FakeHerdr {
             return None;
         }
         st.instance
+    }
+
+    /// The name scripted with [`FakeHerdr::set_process_name`]. An OS read, not a
+    /// herdr call: it answers whether or not the server runs.
+    fn process_name(&self, pid: u32) -> Option<String> {
+        let mut st = self.state();
+        st.record(Op::ProcessName, pid.to_string());
+        st.process_names.get(&pid).cloned()
     }
 }
 

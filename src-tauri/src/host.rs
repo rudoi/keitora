@@ -1354,9 +1354,10 @@ fn spawn_pty_with(
             .spawn(key, cwd, db_path, size, Some(command))
             .map_err(spawn_err_kind);
     }
-    // The reserved pane only ever runs the command it was given: it has no agent.
+    // The reserved update pane is opened by the update run itself, never by a pane
+    // spawn: one asked for here means the run's pane has gone.
     if key.is_reserved() {
-        return Err(format!("{key} is reserved: it spawns only with a command"));
+        return Err("the update pane has closed; start the update again".to_string());
     }
     let launch = launch_for_spawn(resolve(&key), fresh, transfer);
     client
@@ -3757,7 +3758,7 @@ mod tests {
                 |_: &SessionKey| panic!("no launch is resolved"),
             )
             .unwrap_err();
-            assert!(err.contains("reserved"), "{err}");
+            assert!(err.contains("update pane has closed"), "{err}");
             assert!(fake.calls().is_empty());
         }
 

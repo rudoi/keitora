@@ -58,11 +58,13 @@ pub async fn agent_update_skip(
     .await
 }
 
-/// Start updating `cli`. The command line is built here from the assessed install kind
-/// (the frontend never sends one); refused when Keitora has no command for this install.
-/// Any earlier update pane is closed. The reply is what the dialog's pane spawns with
-/// (`pty_spawn` on the reserved key with `command`); a watcher reads the pane's history
-/// until the exit line and then emits `agent-updates://run`.
+/// Start updating `cli`. The command is chosen here from the assessed install kind (the
+/// frontend never sends one); refused when Keitora has no command for this install. Any
+/// earlier update pane is closed, then the reserved pane is opened as a plain shell and
+/// the update is typed into it, written for that pane's shell (PowerShell, POSIX or
+/// fish), before this replies. The reply is what runs (display text) and where; the
+/// dialog's pane only attaches. A watcher reads the pane's history until the exit line
+/// and then emits `agent-updates://run`.
 #[tauri::command(async)]
 pub async fn agent_update_run(app: AppHandle, cli: CliKind) -> Result<RunPlan, String> {
     blocking(app, move |app| {
@@ -70,13 +72,8 @@ pub async fn agent_update_run(app: AppHandle, cli: CliKind) -> Result<RunPlan, S
         if updates.snapshot().checked_at.is_none() {
             updates.check(false);
         }
-        let ticket = updates.begin_run(cli)?;
         let backend = backend(&app);
-        // A leftover pane from an earlier run would answer the attach (and its history
-        // could hold an old exit line), so it goes first.
-        if let Err(e) = backend.kill_live(&SessionKey::agent_update(), None) {
-            log::info!("[agent-updates] closing an earlier update pane: {e}");
-        }
+        let ticket = updates.start_run(&*backend, cli, cfg!(windows))?;
         let plan = ticket.plan.clone();
         spawn_watcher(app.clone(), backend, ticket);
         Ok(plan)

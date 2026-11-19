@@ -1,7 +1,8 @@
 //! Agent CLI updates: knows each CLI's installed and latest version and how it was
 //! installed, checks on app start (once session recovery settles) and every
-//! `[updates] agent_check_hours`, and runs an update in Keitora's reserved pane, watching
-//! it to completion through the pane's history.
+//! `[updates] agent_check_hours`, and runs an update in Keitora's reserved pane: it opens
+//! the pane, asks which shell herdr started there, types the update written for that
+//! shell, then watches it to completion through the pane's history.
 //!
 //! [`AgentUpdates`] holds the state and every decision over a [`Prober`] and an
 //! [`EmitSink`], so it tests without an `AppHandle`. The Tauri commands are in
@@ -21,8 +22,8 @@ use tauri::{AppHandle, Manager};
 
 use crate::activity::lock;
 use crate::backend::herdr::recovery::Phase;
-use crate::backend::{EmitSink, SessionKey, SharedBackend};
-use model::{AgentUpdateState, InstallKind, RunOutcome};
+use crate::backend::{EmitSink, PtyBackend, SessionKey, SharedBackend};
+use model::{AgentUpdateState, InstallKind, RunOutcome, ShellFamily, UpdateCommand};
 use probe::{MachineProber, Prober};
 
 pub const STATUS_EVENT: &str = "agent-updates://status";
@@ -78,8 +79,12 @@ pub struct AgentUpdateEntry {
     /// The executable checked (`None` when not found).
     pub exe: Option<String>,
     pub install_kind: Option<InstallKind>,
-    /// What Keitora runs to update; `None` means there is no Update button.
+    /// What Keitora runs to update, as shown to the user; `None` means there is no
+    /// Update button.
     pub command: Option<String>,
+    /// The same command, structured, for writing it in the update pane's shell.
+    #[serde(skip)]
+    pub run: Option<UpdateCommand>,
     /// The command to show the user (the run command, or a suggestion for their own
     /// terminal when there is none).
     pub guidance: Option<String>,
@@ -95,6 +100,7 @@ impl AgentUpdateEntry {
             exe: None,
             install_kind: None,
             command: None,
+            run: None,
             guidance: None,
         }
     }
@@ -153,7 +159,8 @@ impl AgentUpdatesSnapshot {
     }
 }
 
-/// `agent_update_run` reply: the shell line to type into the reserved pane and where.
+/// `agent_update_run` reply: the update running in the reserved pane, as shown to the
+/// user ([`UpdateCommand::display`]; never typed), and where it runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunPlan {
     pub command: String,
@@ -167,6 +174,8 @@ pub struct RunTicket {
     gen: u64,
     exe: Option<String>,
     before: Option<String>,
+    /// What runs, written for the pane's shell once that is known.
+    command: UpdateCommand,
     pub plan: RunPlan,
 }
 
@@ -214,6 +223,8 @@ pub struct AgentUpdates {
     run_gen: Mutex<u64>,
     /// Signalled whenever `run_gen` changes, so a waiting watcher stops at once.
     run_changed: Condvar,
+    /// Serialises run starts, so two never open or type into the update pane at once.
+    run_lock: Mutex<()>,
 }
 
 impl AgentUpdates {
@@ -226,6 +237,7 @@ impl AgentUpdates {
             check_lock: Mutex::new(None),
             run_gen: Mutex::new(0),
             run_changed: Condvar::new(),
+            run_lock: Mutex::new(()),
         }
     }
 
@@ -271,13 +283,14 @@ impl AgentUpdates {
             })
             .flatten();
         let cmds = model::update_commands(cli, kind, npm.as_deref());
+        let command = cmds.run.as_ref().map(UpdateCommand::display);
         let latest = self.prober.latest(cli);
         let state = model::assess(
             true,
             installed.as_deref(),
             latest.as_deref(),
             skipped_version(cfg, cli),
-            cmds.run.clone(),
+            command.clone(),
         );
         AgentUpdateEntry {
             cli,
@@ -286,7 +299,8 @@ impl AgentUpdates {
             latest,
             exe: Some(exe),
             install_kind: Some(kind),
-            command: cmds.run,
+            command,
+            run: cmds.run,
             guidance: Some(cmds.guidance),
         }
     }
@@ -343,7 +357,7 @@ impl AgentUpdates {
     /// no home directory to run it in. Supersedes any earlier run's watcher.
     pub fn begin_run(&self, cli: CliKind) -> Result<RunTicket, String> {
         let entry = self.snapshot().entry(cli).clone();
-        let Some(command) = entry.command.clone() else {
+        let Some(command) = entry.run.clone() else {
             return Err(format!(
                 "Keitora can't update {} here; run the suggested command in your own terminal",
                 model::cli_title(cli)
@@ -361,10 +375,62 @@ impl AgentUpdates {
             exe: entry.exe,
             before: entry.installed,
             plan: RunPlan {
-                command: model::build_run_command(&command),
+                command: command.display(),
                 cwd,
             },
+            command,
         })
+    }
+
+    /// Start updating `cli` in the reserved pane of `backend`: begin the run, close any
+    /// earlier update pane, open a plain shell pane, find which shell it runs, and type
+    /// the update written for that shell. `windows`: the pane runs on Windows. Refused
+    /// as [`Self::begin_run`] is; a pane that cannot be opened or typed into ends the run
+    /// and is reported. Only one start runs at a time.
+    pub fn start_run(
+        &self,
+        backend: &dyn PtyBackend,
+        cli: CliKind,
+        windows: bool,
+    ) -> Result<RunTicket, String> {
+        let _serial = lock(&self.run_lock);
+        let ticket = self.begin_run(cli)?;
+        let key = SessionKey::agent_update();
+        // A leftover pane from an earlier run would answer the attach (and its history
+        // could hold an old exit line), so it goes first.
+        if let Err(e) = backend.kill_live(&key, None) {
+            log::info!("[agent-updates] closing an earlier update pane: {e}");
+        }
+        let gen = match backend.spawn(
+            key.clone(),
+            ticket.plan.cwd.clone(),
+            String::new(),
+            None,
+            None,
+        ) {
+            Ok(gen) => gen,
+            Err(e) => return Err(self.abandon(cli, format!("couldn't open the update pane: {e}"))),
+        };
+        // From here on a failure also closes the pane just opened, so no idle shell (or
+        // half-started update) outlives the run.
+        let typed = pane_shell_family(backend, &key, windows)
+            .map(|family| model::render_run_line(&ticket.command, family, windows))
+            .and_then(|line| {
+                // Closed while the pane was opening: never start an update nobody watches.
+                if !self.is_current(&ticket) {
+                    return Err("the update was closed before it started".to_string());
+                }
+                backend
+                    .run_line(&key, gen, &line)
+                    .map_err(|e| format!("couldn't start the update: {e}"))
+            });
+        if let Err(e) = typed {
+            if let Err(kill) = backend.kill(&key, gen) {
+                log::info!("[agent-updates] closing the unused update pane: {kill}");
+            }
+            return Err(self.abandon(cli, e));
+        }
+        Ok(ticket)
     }
 
     fn is_current(&self, ticket: &RunTicket) -> bool {
@@ -462,6 +528,22 @@ impl AgentUpdates {
 
     /// The update pane is closing: stop watching it.
     pub fn close(&self) {
+        // Waits out a run being started, so a close during it supersedes the run before
+        // the caller kills the update pane (which then exists to be killed).
+        let _serial = lock(&self.run_lock);
+        self.end_run();
+    }
+
+    /// End a failed start: log `e`, end the run (the caller holds `run_lock`), hand `e`
+    /// back.
+    fn abandon(&self, cli: CliKind, e: String) -> String {
+        log::warn!("[agent-updates] {cli:?} update run: {e}");
+        self.end_run();
+        e
+    }
+
+    /// Supersede the current run (its watcher stops) and clear `running`.
+    fn end_run(&self) {
         self.bump_run_gen();
         if self.snapshot().running.is_some() {
             self.update(|s| s.running = None);
@@ -517,6 +599,35 @@ impl AgentUpdates {
     }
 }
 
+/// The shell family of `key`'s pane in `backend`, or the platform's fallback (logged)
+/// when its shell cannot be told or is not one Keitora writes for.
+fn pane_shell_family(
+    backend: &dyn PtyBackend,
+    key: &SessionKey,
+    windows: bool,
+) -> Result<ShellFamily, String> {
+    let why = match backend.pane_shell(key) {
+        Ok(Some(name)) => {
+            return match ShellFamily::classify(&name) {
+                Some(family) => {
+                    log::info!("[agent-updates] update pane shell: {name} ({family:?})");
+                    Ok(family)
+                }
+                // A shell Keitora does not write for would get a line it cannot run and
+                // never report back: refuse now rather than time out.
+                None => Err(format!(
+                    "the update pane runs {name}, which Keitora can't run the update in;                      run the suggested command in your own terminal"
+                )),
+            };
+        }
+        Ok(None) => "its shell could not be told".to_string(),
+        Err(e) => format!("its shell could not be read ({e})"),
+    };
+    let fallback = ShellFamily::fallback(windows);
+    log::info!("[agent-updates] update pane: {why}; writing the update for {fallback:?}");
+    Ok(fallback)
+}
+
 /// The live sessions whose agent is `cli` (never the reserved pane). The user config is
 /// loaded once for every key.
 pub fn live_sessions(backend: &SharedBackend, cli: CliKind) -> Result<Vec<SessionKey>, String> {
@@ -539,7 +650,7 @@ pub fn spawn_watcher(app: AppHandle, backend: SharedBackend, ticket: RunTicket) 
         .spawn(move || {
             let key = SessionKey::agent_update();
             let updates = app.state::<AgentUpdates>();
-            // Reads fail until the frontend has spawned the pane; they are retried.
+            // A read that fails (herdr busy or briefly unreachable) is retried.
             updates.watch(
                 &ticket,
                 || backend.read_history(&key, WATCH_LINES).ok(),
@@ -608,6 +719,8 @@ fn spawn_schedule(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::fake::{Call, FakeBackend};
+    use crate::backend::PtyBackendError;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -837,20 +950,301 @@ mod tests {
     }
 
     #[test]
-    fn run_plan_carries_the_sentinel_and_home() {
+    fn run_plan_carries_the_display_command_and_home() {
         let (updates, _rec) = updates_with(prober(), Arc::default());
         updates.check(true);
         let ticket = updates.begin_run(CliKind::Codex).unwrap();
         assert_eq!(
             ticket.plan,
             RunPlan {
-                command:
-                    "npm install -g @openai/codex@latest; echo \"__KEITORA_AGENT_UPDATE_DONE:$?\""
-                        .into(),
+                command: "npm install -g @openai/codex@latest".into(),
                 cwd: "/Users/me".into(),
-            }
+            },
+            "what runs, as shown; the typed line depends on the pane's shell"
         );
         assert_eq!(updates.snapshot().running, Some(CliKind::Codex));
+    }
+
+    /// Checked, with Codex's update ready to run.
+    fn checked() -> (AgentUpdates, Arc<Recorder>) {
+        let (updates, rec) = updates_with(prober(), Arc::default());
+        updates.check(true);
+        (updates, rec)
+    }
+
+    /// The `run_line` calls `backend` received, as (gen, line).
+    fn typed(backend: &FakeBackend) -> Vec<(u64, String)> {
+        backend
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::RunLine { key, gen, line } => {
+                    assert_eq!(key, SessionKey::agent_update());
+                    Some((gen, line))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn start_run_opens_a_plain_shell_then_types_once_at_its_generation() {
+        let (updates, _rec) = checked();
+        let backend = FakeBackend::new();
+        backend.push_spawn(Ok(7));
+        backend.set_pane_shell(Some("pwsh.exe"));
+        let ticket = updates.start_run(&backend, CliKind::Codex, true).unwrap();
+        let key = SessionKey::agent_update();
+        assert_eq!(
+            backend.calls(),
+            vec![
+                // The earlier pane's lookup (none live), then the new pane.
+                Call::ListSessions,
+                Call::Spawn {
+                    key: key.clone(),
+                    cwd: "/Users/me".into(),
+                    db_path: String::new(),
+                    size: None,
+                    command: None,
+                },
+                Call::PaneShell { key: key.clone() },
+                Call::RunLine {
+                    key,
+                    gen: 7,
+                    line:
+                        "$LASTEXITCODE = 1; & npm.cmd install -g @openai/codex@latest; \
+                           echo \"__KEITORA_AGENT_UPDATE_DONE:$(if ($?) {0} else {$LASTEXITCODE})\""
+                            .into(),
+                },
+            ]
+        );
+        assert_eq!(ticket.plan.command, "npm install -g @openai/codex@latest");
+        assert_eq!(updates.snapshot().running, Some(CliKind::Codex));
+        assert!(updates.is_current(&ticket));
+    }
+
+    #[test]
+    fn start_run_closes_an_earlier_update_pane_first() {
+        let (updates, _rec) = checked();
+        let backend = FakeBackend::new();
+        backend.push_list_sessions(Ok(vec![crate::backend::SessionSummary {
+            key: SessionKey::agent_update(),
+            gen: 3,
+            state_hint: None,
+        }]));
+        updates.start_run(&backend, CliKind::Codex, false).unwrap();
+        let calls = backend.calls();
+        assert_eq!(
+            calls[1],
+            Call::Kill {
+                key: SessionKey::agent_update(),
+                gen: 3
+            }
+        );
+        assert!(matches!(calls[2], Call::Spawn { .. }));
+    }
+
+    #[test]
+    fn start_run_writes_the_line_for_the_detected_shell() {
+        let posix = "npm install -g @openai/codex@latest; echo \"__KEITORA_AGENT_UPDATE_DONE:$?\"";
+        let fish =
+            "npm install -g @openai/codex@latest; echo \"__KEITORA_AGENT_UPDATE_DONE:$status\"";
+        let ps = |npm: &str| {
+            format!(
+                "$LASTEXITCODE = 1; & {npm} install -g @openai/codex@latest; \
+                 echo \"__KEITORA_AGENT_UPDATE_DONE:$(if ($?) {{0}} else {{$LASTEXITCODE}})\""
+            )
+        };
+        let cases: Vec<(Option<&str>, bool, String)> = vec![
+            (Some("pwsh.exe"), true, ps("npm.cmd")),
+            (Some("powershell.exe"), true, ps("npm.cmd")),
+            (Some("pwsh"), false, ps("npm")),
+            (Some("bash.exe"), true, posix.to_string()),
+            (Some("bash"), false, posix.to_string()),
+            (Some("-zsh"), false, posix.to_string()),
+            (Some("fish"), false, fish.to_string()),
+            // Unreadable: the platform's fallback.
+            (None, true, ps("npm.cmd")),
+            (None, false, posix.to_string()),
+        ];
+        for (shell, windows, want) in cases {
+            let (updates, _rec) = checked();
+            let backend = FakeBackend::new();
+            backend.set_pane_shell(shell);
+            updates
+                .start_run(&backend, CliKind::Codex, windows)
+                .unwrap();
+            assert_eq!(
+                typed(&backend),
+                vec![(1, want)],
+                "{shell:?} windows={windows}"
+            );
+        }
+    }
+
+    #[test]
+    fn start_run_falls_back_when_the_shell_cannot_be_read() {
+        for (windows, prefix) in [(true, "$LASTEXITCODE = 1; & npm.cmd "), (false, "npm ")] {
+            let (updates, _rec) = checked();
+            let backend = FakeBackend::new();
+            backend.push_pane_shell(Err(PtyBackendError::NotConnected));
+            updates
+                .start_run(&backend, CliKind::Codex, windows)
+                .unwrap();
+            let lines = typed(&backend);
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].1.starts_with(prefix), "{:?}", lines[0].1);
+        }
+    }
+
+    /// A found npm is typed by its quoted path in the pane's shell.
+    #[test]
+    fn start_run_quotes_a_found_npm_for_the_panes_shell() {
+        let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+        let bin = "/Users/me/it's node/bin";
+        for (shell, want) in [
+            (
+                "pwsh.exe",
+                format!(
+                    "$LASTEXITCODE = 1; & '/Users/me/it''s node/bin/{npm}' install -g \
+                     @openai/codex@latest; echo \"__KEITORA_AGENT_UPDATE_DONE:$(if ($?) {{0}} else {{$LASTEXITCODE}})\""
+                ),
+            ),
+            (
+                "bash",
+                format!(
+                    "'/Users/me/it'\\''s node/bin/{npm}' install -g @openai/codex@latest; \
+                     echo \"__KEITORA_AGENT_UPDATE_DONE:$?\""
+                ),
+            ),
+            (
+                "fish",
+                format!(
+                    "'/Users/me/it\\'s node/bin/{npm}' install -g @openai/codex@latest; \
+                     echo \"__KEITORA_AGENT_UPDATE_DONE:$status\""
+                ),
+            ),
+        ] {
+            let mut p = prober();
+            p.exes.insert(CliKind::Codex, format!("{bin}/codex"));
+            p.links.insert(
+                format!("{bin}/codex"),
+                "/Users/me/it's node/lib/node_modules/@openai/codex/bin/codex.js".into(),
+            );
+            p.files.push(format!("{bin}/{npm}"));
+            let (updates, _rec) = updates_with(p, Arc::default());
+            updates.check(true);
+            let backend = FakeBackend::new();
+            backend.set_pane_shell(Some(shell));
+            let ticket = updates.start_run(&backend, CliKind::Codex, true).unwrap();
+            assert_eq!(typed(&backend), vec![(1, want)], "{shell}");
+            assert_eq!(
+                ticket.plan.command,
+                format!("\"{bin}/{npm}\" install -g @openai/codex@latest")
+            );
+        }
+    }
+
+    #[test]
+    fn a_pane_that_cannot_be_opened_ends_the_run() {
+        let (updates, rec) = checked();
+        let backend = FakeBackend::new();
+        backend.push_spawn(Err(PtyBackendError::RecoveryPending));
+        let err = updates
+            .start_run(&backend, CliKind::Codex, true)
+            .unwrap_err();
+        assert_eq!(err, "couldn't open the update pane: herdr is recovering");
+        assert!(backend
+            .calls()
+            .iter()
+            .all(|c| !matches!(c, Call::PaneShell { .. } | Call::RunLine { .. })));
+        assert_eq!(updates.snapshot().running, None);
+        assert_eq!(*lock(&updates.run_gen), 2, "begun, then closed");
+        assert_eq!(
+            rec.named(STATUS_EVENT).last().unwrap()["running"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn a_line_that_cannot_be_typed_ends_the_run() {
+        let (updates, _rec) = checked();
+        let backend = FakeBackend::new();
+        backend.set_pane_shell(Some("bash"));
+        backend.push_run_line(Err(PtyBackendError::NoSuchSession));
+        let err = updates
+            .start_run(&backend, CliKind::Codex, false)
+            .unwrap_err();
+        assert_eq!(err, "couldn't start the update: no live session");
+        assert_eq!(typed(&backend).len(), 1);
+        assert!(killed_at(&backend, 1), "the pane it opened is closed");
+        assert_eq!(updates.snapshot().running, None);
+        assert_eq!(*lock(&updates.run_gen), 2, "begun, then closed");
+        // A later start runs normally.
+        updates.start_run(&backend, CliKind::Codex, false).unwrap();
+        assert_eq!(updates.snapshot().running, Some(CliKind::Codex));
+    }
+
+    /// Whether the fake recorded a kill of the update pane at `gen`.
+    fn killed_at(backend: &FakeBackend, gen: u64) -> bool {
+        backend.calls().iter().any(|c| {
+            matches!(c, Call::Kill { key, gen: g } if *key == SessionKey::agent_update() && *g == gen)
+        })
+    }
+
+    /// A shell Keitora does not write for is refused at once (no line it can't run, no
+    /// 15-minute wait), and the pane opened for it is closed.
+    #[test]
+    fn an_unknown_shell_is_refused_and_its_pane_closed() {
+        for (shell, windows) in [("cmd.exe", true), ("nu", false)] {
+            let (updates, _rec) = checked();
+            let backend = FakeBackend::new();
+            backend.set_pane_shell(Some(shell));
+            let err = updates
+                .start_run(&backend, CliKind::Codex, windows)
+                .unwrap_err();
+            assert!(
+                err.contains(shell) && err.contains("your own terminal"),
+                "{err}"
+            );
+            assert!(typed(&backend).is_empty(), "{shell}: nothing typed");
+            assert!(killed_at(&backend, 1), "{shell}: pane closed");
+            assert_eq!(updates.snapshot().running, None);
+        }
+    }
+
+    /// A close waits out a start in progress, so it supersedes the run before its caller
+    /// kills the update pane (which by then exists).
+    #[test]
+    fn close_waits_for_a_start_in_progress() {
+        let (updates, _rec) = checked();
+        let updates = Arc::new(updates);
+        let starting = lock(&updates.run_lock);
+        let closer = {
+            let updates = Arc::clone(&updates);
+            thread::spawn(move || updates.close())
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(*lock(&updates.run_gen), 0, "close is held behind the start");
+        drop(starting);
+        closer.join().unwrap();
+        assert_eq!(*lock(&updates.run_gen), 1);
+    }
+
+    #[test]
+    fn a_refused_run_opens_no_pane() {
+        let mut p = prober();
+        p.exes
+            .insert(CliKind::Codex, "/Users/me/.codex/bin/codex".into());
+        let (updates, _rec) = updates_with(p, Arc::default());
+        updates.check(true);
+        let backend = FakeBackend::new();
+        let err = updates
+            .start_run(&backend, CliKind::Codex, true)
+            .unwrap_err();
+        assert!(err.contains("your own terminal"), "{err}");
+        assert!(backend.calls().is_empty());
+        assert_eq!(updates.snapshot().running, None);
     }
 
     /// The npm beside an npm install runs the update, by its quoted absolute path.
@@ -870,8 +1264,16 @@ mod tests {
         assert_eq!(snap.codex.install_kind, Some(InstallKind::Npm));
         assert_eq!(
             snap.codex.command,
+            Some(format!("\"{bin}/{npm}\" install -g @openai/codex@latest")),
+            "shown with the path double-quoted"
+        );
+        assert_eq!(
+            snap.codex.guidance,
             Some(format!("'{bin}/{npm}' install -g @openai/codex@latest"))
         );
+        let run = snap.codex.run.unwrap();
+        assert_eq!(run.program, format!("{bin}/{npm}"));
+        assert!(run.program_is_path);
     }
 
     /// A brew launcher linking into node_modules is an npm install; with no npm found

@@ -2817,6 +2817,29 @@ impl PtyBackend for HerdrBackend {
             .pane_read(&pane.pane_id, "recent", "text", Some(lines))?)
     }
 
+    fn pane_shell(&self, key: &SessionKey) -> Result<Option<String>, PtyBackendError> {
+        // A pane of a replaced server is absent, never another pane's shell.
+        let pane = self
+            .keymap
+            .get_current(key)
+            .ok_or(PtyBackendError::NoSuchSession)?;
+        let info = self.ops.pane_process_info(&pane.pane_id)?;
+        Ok(self.ops.process_name(info.shell_pid))
+    }
+
+    fn run_line(&self, key: &SessionKey, gen: u64, line: &str) -> Result<(), PtyBackendError> {
+        self.gate.admit_session(key)?;
+        // Only into the pane spawned at `gen`: a replaced or closed one never gets it.
+        let pane = self
+            .keymap
+            .get_current(key)
+            .filter(|p| p.gen == gen)
+            .ok_or(PtyBackendError::NoSuchSession)?;
+        // The pane is an interactive shell; herdr types the line and submits it.
+        self.ops.pane_run(&pane.pane_id, &[line])?;
+        Ok(())
+    }
+
     fn kill(&self, key: &SessionKey, gen: u64) -> Result<(), PtyBackendError> {
         // A session that is live during recovery (resumed already, or the
         // driver's own resume in flight) may be killed. Asked before the cancel
@@ -4342,6 +4365,140 @@ mod tests {
             Err(PtyBackendError::NoSuchSession)
         ));
         assert_eq!(count(&fake, ops::Op::PaneRead), 0);
+    }
+
+    #[test]
+    fn pane_shell_names_the_process_herdr_reports_as_the_panes_shell() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let key = SessionKey::agent_update();
+        backend
+            .spawn(key.clone(), "/home/me".into(), String::new(), None, None)
+            .unwrap();
+        let pane_id = backend.keymap.get(&key).unwrap().pane_id;
+        // herdr has no process info for the pane: its not-found is the session's.
+        assert!(matches!(
+            backend.pane_shell(&key),
+            Err(PtyBackendError::NoSuchSession)
+        ));
+        fake.set_process_info(
+            &pane_id,
+            cli::PaneProcessInfo {
+                shell_pid: 4100,
+                foreground_pids: vec![4200],
+            },
+        );
+        assert_eq!(backend.pane_shell(&key).unwrap(), None, "no name read");
+        fake.set_process_name(4100, "pwsh.exe");
+        fake.set_process_name(4200, "node.exe");
+        assert_eq!(
+            backend.pane_shell(&key).unwrap().as_deref(),
+            Some("pwsh.exe"),
+            "the shell, not the foreground process"
+        );
+        let names: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter(|c| c.op == ops::Op::ProcessName)
+            .map(|c| c.args)
+            .collect();
+        assert_eq!(names, ["4100", "4100"]);
+    }
+
+    #[test]
+    fn pane_shell_without_a_current_pane_is_no_such_session() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        assert!(matches!(
+            backend.pane_shell(&skey("nope")),
+            Err(PtyBackendError::NoSuchSession)
+        ));
+        backend
+            .spawn(skey("a"), "/repos/a".into(), String::new(), None, None)
+            .unwrap();
+        let pane_id = backend.keymap.get(&skey("a")).unwrap().pane_id;
+        fake.set_process_info(
+            &pane_id,
+            cli::PaneProcessInfo {
+                shell_pid: 7,
+                foreground_pids: Vec::new(),
+            },
+        );
+        fake.set_process_name(7, "bash");
+        assert_eq!(
+            backend.pane_shell(&skey("a")).unwrap().as_deref(),
+            Some("bash")
+        );
+        // The server was replaced: its old pane is not asked about.
+        backend
+            .keymap
+            .set_generation(backend.keymap.generation().next());
+        assert!(matches!(
+            backend.pane_shell(&skey("a")),
+            Err(PtyBackendError::NoSuchSession)
+        ));
+        assert_eq!(count(&fake, ops::Op::PaneProcessInfo), 1);
+    }
+
+    #[test]
+    fn run_line_types_into_the_pane_spawned_at_its_generation() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let key = SessionKey::agent_update();
+        let gen = backend
+            .spawn(key.clone(), "/home/me".into(), String::new(), None, None)
+            .unwrap();
+        assert_eq!(count(&fake, ops::Op::PaneRun), 0, "a plain shell");
+        let pane_id = backend.keymap.get(&key).unwrap().pane_id;
+        let line = "$LASTEXITCODE = 1; & 'C:/x/npm.cmd' install; echo \"done:$LASTEXITCODE\"";
+        backend.run_line(&key, gen, line).unwrap();
+        let runs = |fake: &fake::FakeHerdr| -> Vec<String> {
+            fake.calls()
+                .into_iter()
+                .filter(|c| c.op == ops::Op::PaneRun)
+                .map(|c| c.args)
+                .collect()
+        };
+        assert_eq!(runs(&fake), [format!("{pane_id} {line}")]);
+
+        // A stale generation (the pane was replaced) is refused untyped.
+        assert!(matches!(
+            backend.run_line(&key, gen + 1, "echo late"),
+            Err(PtyBackendError::NoSuchSession)
+        ));
+        let newer = backend
+            .spawn(key.clone(), "/home/me".into(), String::new(), None, None)
+            .unwrap();
+        assert!(newer > gen);
+        assert!(matches!(
+            backend.run_line(&key, gen, "echo old"),
+            Err(PtyBackendError::NoSuchSession)
+        ));
+        assert!(matches!(
+            backend.run_line(&skey("nope"), 1, "echo none"),
+            Err(PtyBackendError::NoSuchSession)
+        ));
+        assert_eq!(runs(&fake).len(), 1);
+    }
+
+    #[test]
+    fn run_line_is_refused_while_recovery_holds_the_key() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let key = SessionKey::agent_update();
+        let gen = backend
+            .spawn(key.clone(), "/home/me".into(), String::new(), None, None)
+            .unwrap();
+        backend.gate.set_view(
+            recovery::RecoveryPhase::Resuming,
+            HashSet::from([skey("x")]),
+            HashSet::new(),
+        );
+        assert!(matches!(
+            backend.run_line(&key, gen, "echo hi"),
+            Err(PtyBackendError::RecoveryPending)
+        ));
+        assert_eq!(count(&fake, ops::Op::PaneRun), 0);
     }
 
     #[test]
