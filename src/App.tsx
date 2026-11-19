@@ -51,6 +51,8 @@ import {
   type ProjectSummary,
   previewClaudeTransfer,
   reorderProjects,
+  setWorktreeEmoji,
+  setWorktreeOrder,
   takeXdgLeakNotice,
   transferDiagnostics,
   transferSettled,
@@ -108,6 +110,7 @@ import { useLocalStorageState } from "./lib/useLocalStorageState";
 import { useModifierHint } from "./lib/useModifierHint";
 import { useProjectList } from "./lib/useProjectList";
 import { useStickyNote } from "./lib/useStickyNote";
+import { useRailView } from "./lib/useRailView";
 import {
   activeProject,
   emptyWarmState,
@@ -118,6 +121,7 @@ import {
   type WarmState,
   warmProject,
 } from "./lib/warmProjects";
+import { settleWorktreeOrders } from "./lib/worktreeOrder";
 import { xdgLeakNoticeBody } from "./lib/xdgNotice";
 import "./App.css";
 import "./themes.css";
@@ -125,6 +129,16 @@ import "./themes.css";
 // Inner component so useToast() can access the ToastProvider above it.
 // Drops persist one at a time and in order, so a slow save can't land after a later one.
 const persistProjectOrder = latestWins(reorderProjects);
+// The same per project, for worktree orders.
+const worktreeOrderSavers = new Map<string, (order: string[]) => Promise<void>>();
+function persistWorktreeOrder(key: string, order: string[]): Promise<void> {
+  let save = worktreeOrderSavers.get(key);
+  if (save === undefined) {
+    save = latestWins((o: string[]) => setWorktreeOrder(key, o));
+    worktreeOrderSavers.set(key, save);
+  }
+  return save(order);
+}
 
 function AppInner() {
   // First-run nudge to put the `keitora` CLI on PATH (so session hooks work anywhere).
@@ -198,6 +212,16 @@ function AppInner() {
   // the keyboard cycle order can never disagree. One
   // fetch + one subscription via useProjectList.
   const registryProjects = useProjectList();
+  // How the rail sorts and filters worktrees, and whether they carry emoji.
+  const { view: railView, update: updateRailView } = useRailView();
+  // Dropped worktree orders by project key, shown until the project list reports them.
+  const [worktreeOrders, setWorktreeOrders] = useState<Readonly<Record<string, readonly string[]>>>(
+    {},
+  );
+  useEffect(
+    () => setWorktreeOrders((cur) => settleWorktreeOrders(cur, registryProjects)),
+    [registryProjects],
+  );
   // Worktrees + session states of every registered project, for the rail's groups of
   // projects other than the active one (null until the first load).
   const projectsOverview = useProjectsOverview();
@@ -759,6 +783,8 @@ function AppInner() {
         liveCounts: projectSessionCounts,
         selected,
         maxDots: 8,
+        view: railView,
+        worktreeOrders,
       }),
     );
     prevRailGroups.current = next;
@@ -775,7 +801,37 @@ function AppInner() {
     worktreeActivity,
     projectSessionCounts,
     selected,
+    railView,
+    worktreeOrders,
   ]);
+
+  // A worktree dropped in a new place: show the order at once, switch to custom order
+  // (a drag means "keep them like this"), and persist both.
+  const reorderWorktrees = useCallback(
+    (g: GroupModel, order: string[]) => {
+      setWorktreeOrders((cur) => ({ ...cur, [g.key]: order }));
+      const failed = (e: unknown) => {
+        // Revert only if no later drop has replaced this one.
+        setWorktreeOrders((cur) => {
+          if (cur[g.key] !== order) return cur;
+          const { [g.key]: _, ...rest } = cur;
+          return rest;
+        });
+        showToast(String(e));
+      };
+      persistWorktreeOrder(g.key, order).catch(failed);
+      if (railView.worktree_sort !== "custom") {
+        updateRailView({ worktree_sort: "custom" }).catch((e: unknown) => showToast(String(e)));
+      }
+    },
+    [railView.worktree_sort, updateRailView, showToast],
+  );
+  const setLaneEmoji = useCallback(
+    (g: GroupModel, worktree: string, emoji: string | null) => {
+      setWorktreeEmoji(g.key, worktree, emoji).catch((e: unknown) => showToast(String(e)));
+    },
+    [showToast],
+  );
 
   // Run a lane action in the active project, through the same handlers as the rail's
   // worktree menu. Lane actions need a worktree; "new-worktree" is project-level.
@@ -991,9 +1047,15 @@ function AppInner() {
 
   // ── Central keymap ──────────────────────────────────────────────────────────
   // Ordered list of available worktree names; drives Cmd+Up/Down cycling.
+  // Follows the active group's lanes once they are its own, so the keys walk the rail's
+  // order and skip worktrees its emoji filter hides.
+  const activeGroupLanes = activeReady ? railGroups.find((g) => g.isActive)?.lanes : undefined;
   const availableWorktrees = useMemo(
-    () => activeWorktrees.filter((w) => w.status === "available").map((w) => w.name),
-    [activeWorktrees],
+    () =>
+      (activeGroupLanes ?? activeWorktrees)
+        .filter((w) => w.status === "available")
+        .map((w) => w.name),
+    [activeGroupLanes, activeWorktrees],
   );
   // Ordered project names for the cycle chords. Memoized so the keymap ctx stays
   // stable across project-list refreshes that don't change the names.
@@ -1252,6 +1314,10 @@ function AppInner() {
           onLaneAction={laneAction}
           onNewWorktree={newWorktreeIn}
           onReorder={persistProjectOrder}
+          railView={railView}
+          onRailView={updateRailView}
+          onReorderWorktrees={reorderWorktrees}
+          onSetEmoji={setLaneEmoji}
           onAddProject={() => setAddProjectOpen(true)}
           onOpenSettings={() => setSettingsOpen(true)}
           onOpenHelp={() => setHelpOpen(true)}

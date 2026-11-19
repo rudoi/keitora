@@ -8,10 +8,10 @@
 // header looks selected, and the focused lane carries the rail's single accent focus bar.
 
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { Activity, HelpCircle, Settings } from "lucide-react";
+import { Activity, ArrowDownUp, HelpCircle, Settings } from "lucide-react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatBytes, formatCpu, formatUptime } from "../lib/format";
-import type { CliKind, DaemonInfo } from "../lib/ipc";
+import type { CliKind, DaemonInfo, RailView, WorktreeSort } from "../lib/ipc";
 import {
   daemonRestart,
   daemonStatus,
@@ -44,6 +44,7 @@ import { removeProject } from "../lib/settings";
 import { transferKey } from "../lib/transferPhase";
 import { useLocalStorageJson } from "../lib/useLocalStorageState";
 import { usePrefersReducedMotion } from "../lib/usePrefersReducedMotion";
+import { EMOJI_PALETTE, effectiveView, emojiChoices, SORT_LABEL } from "../lib/worktreeOrder";
 import { useConfirmDialog } from "./ConfirmDialog";
 import { RestartDaemonDialog } from "./RestartDaemonDialog";
 import type { LaneOpenTarget } from "./rail/Lane";
@@ -301,6 +302,7 @@ function WorktreeMenu({
   onOpenChange,
   onPick,
   onToggleDispatch,
+  onSetEmoji,
   codexAvailable,
   transferBusy,
 }: {
@@ -309,6 +311,8 @@ function WorktreeMenu({
   onPick: (state: WorktreeMenuState, item: WorktreeMenuItem, targetCli: CliKind) => void;
   /** Put the worktree in or out of the dispatch pool (active project only). */
   onToggleDispatch: (state: WorktreeMenuState) => void;
+  /** Open the emoji picker for the worktree; absent while emoji are off. */
+  onSetEmoji?: (state: WorktreeMenuState) => void;
   codexAvailable: boolean;
   /** A transfer is already in flight for the menu's worktree. */
   transferBusy: boolean;
@@ -357,6 +361,17 @@ function WorktreeMenu({
             </DropdownMenu.Label>
           )}
           {items.map(item)}
+          {state && onSetEmoji && (
+            <>
+              <DropdownMenu.Separator className={menuSepCls} />
+              <DropdownMenu.Item
+                onSelect={() => onSetEmoji(state)}
+                className={`${menuItemCls} text-tx-2`}
+              >
+                Set emoji…
+              </DropdownMenu.Item>
+            </>
+          )}
           {state && !state.inactive && (
             <>
               <DropdownMenu.Separator className={menuSepCls} />
@@ -368,6 +383,154 @@ function WorktreeMenu({
               >
                 {state.dispatch ? "✓ " : ""}Accept dispatched tasks
               </DropdownMenu.CheckboxItem>
+            </>
+          )}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
+// A worktree's emoji picker: the palette, and a way to clear the emoji. Opened from the
+// lane's emoji button or its menu, at the button (or where the menu was).
+type EmojiPickerState = {
+  projectKey: string;
+  name: string;
+  current: string | null;
+  x: number;
+  y: number;
+};
+
+function EmojiPicker({
+  state,
+  onOpenChange,
+  onPick,
+}: {
+  state: EmojiPickerState | null;
+  onOpenChange: (open: boolean) => void;
+  onPick: (state: EmojiPickerState, emoji: string | null) => void;
+}) {
+  return (
+    <DropdownMenu.Root open={state !== null} onOpenChange={onOpenChange}>
+      <MenuAnchor x={state?.x ?? 0} y={state?.y ?? 0} />
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content align="start" sideOffset={2} className={menuContentCls}>
+          {state && (
+            <>
+              <DropdownMenu.Label className={menuLabelCls}>
+                Emoji for {state.name}
+              </DropdownMenu.Label>
+              <div className="emoji-grid">
+                {EMOJI_PALETTE.map((e) => (
+                  <DropdownMenu.Item
+                    key={e}
+                    onSelect={() => onPick(state, e)}
+                    className={e === state.current ? "emoji-cell current" : "emoji-cell"}
+                    aria-label={e}
+                  >
+                    {e}
+                  </DropdownMenu.Item>
+                ))}
+              </div>
+              {state.current !== null && (
+                <>
+                  <DropdownMenu.Separator className={menuSepCls} />
+                  <DropdownMenu.Item
+                    onSelect={() => onPick(state, null)}
+                    className={`${menuItemCls} text-tx-2`}
+                  >
+                    Remove emoji
+                  </DropdownMenu.Item>
+                </>
+              )}
+            </>
+          )}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
+const SORTS: readonly WorktreeSort[] = ["custom", "alpha", "emoji"];
+
+// The rail's worktree sort and emoji filter, from the button beside "Projects". Applies to
+// every project. Emoji sort and filter only exist while emoji are on.
+function WorktreeViewMenu({
+  view,
+  inUse,
+  onChange,
+}: {
+  view: RailView;
+  /** Every emoji some worktree has. */
+  inUse: string[];
+  onChange: (patch: Partial<RailView>) => void;
+}) {
+  const shown = effectiveView(view);
+  const choices = view.emoji ? emojiChoices(inUse, view.hidden_emoji) : [];
+  const filtering = shown.hidden_emoji.length > 0;
+  const title = `Sort worktrees: ${SORT_LABEL[shown.worktree_sort]}${
+    filtering ? ` · ${shown.hidden_emoji.length} emoji hidden` : ""
+  }`;
+  const toggle = (e: string) =>
+    onChange({
+      hidden_emoji: view.hidden_emoji.includes(e)
+        ? view.hidden_emoji.filter((x) => x !== e)
+        : [...view.hidden_emoji, e],
+    });
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <button
+          type="button"
+          className={
+            filtering ? "rail-add-btn rail-view-btn filtering" : "rail-add-btn rail-view-btn"
+          }
+          title={title}
+          aria-label={title}
+        >
+          <ArrowDownUp size={13} aria-hidden="true" />
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content align="end" sideOffset={4} className={menuContentCls}>
+          <DropdownMenu.Label className={menuLabelCls}>Sort worktrees</DropdownMenu.Label>
+          <DropdownMenu.RadioGroup
+            value={shown.worktree_sort}
+            onValueChange={(v) => onChange({ worktree_sort: v as WorktreeSort })}
+          >
+            {SORTS.filter((s) => s !== "emoji" || view.emoji).map((s) => (
+              <DropdownMenu.RadioItem key={s} value={s} className={`${menuItemCls} text-tx-2`}>
+                <span className="w-3">{s === shown.worktree_sort ? "✓" : ""}</span>
+                {SORT_LABEL[s]}
+              </DropdownMenu.RadioItem>
+            ))}
+          </DropdownMenu.RadioGroup>
+          {view.emoji && (
+            <>
+              <DropdownMenu.Separator className={menuSepCls} />
+              <DropdownMenu.Label className={menuLabelCls}>Show</DropdownMenu.Label>
+              {choices.length === 0 ? (
+                <div className="px-2 py-1.5 text-[11.5px] text-tx-3">No emoji set yet</div>
+              ) : (
+                choices.map((e) => {
+                  const on = !view.hidden_emoji.includes(e);
+                  return (
+                    <DropdownMenu.CheckboxItem
+                      key={e}
+                      checked={on}
+                      // Stay open, so several can be toggled in a row.
+                      onSelect={(ev) => {
+                        ev.preventDefault();
+                        toggle(e);
+                      }}
+                      className={`${menuItemCls} text-tx-2`}
+                    >
+                      <span className="w-3">{on ? "✓" : ""}</span>
+                      <span className={on ? "" : "opacity-45"}>{e}</span>
+                    </DropdownMenu.CheckboxItem>
+                  );
+                })
+              )}
             </>
           )}
         </DropdownMenu.Content>
@@ -516,6 +679,10 @@ export function Rail({
   onLaneAction,
   onNewWorktree,
   onReorder,
+  railView,
+  onRailView,
+  onReorderWorktrees,
+  onSetEmoji,
   onAddProject,
   onOpenSettings,
   onOpenHelp,
@@ -537,6 +704,12 @@ export function Rail({
   onNewWorktree: (g: GroupModel) => void;
   /** Persist a new project order (registry keys). */
   onReorder: (keys: string[]) => Promise<void>;
+  /** How worktrees are sorted and filtered, and whether they carry emoji. */
+  railView: RailView;
+  onRailView: (patch: Partial<RailView>) => Promise<void>;
+  /** A worktree was dropped in a new place: the project's new worktree order. */
+  onReorderWorktrees: (g: GroupModel, order: string[]) => void;
+  onSetEmoji: (g: GroupModel, worktree: string, emoji: string | null) => void;
   onAddProject: () => void;
   onOpenSettings: () => void;
   onOpenHelp: () => void;
@@ -561,6 +734,7 @@ export function Rail({
   // ⋯ button that opened it; null for a right-click).
   const [projectMenu, setProjectMenu] = useState<ProjectMenuState | null>(null);
   const projectMenuReturn = useRef<HTMLElement | null>(null);
+  const [emojiPicker, setEmojiPicker] = useState<EmojiPickerState | null>(null);
   const { showToast } = useToast();
   const { confirmDialog } = useConfirmDialog();
   const reduceMotion = usePrefersReducedMotion();
@@ -727,12 +901,35 @@ export function Rail({
 
   const menuGroup = projectMenu ? (groups.find((g) => g.key === projectMenu.key) ?? null) : null;
 
+  const openEmojiPicker = useCallback((g: GroupModel, name: string, x: number, y: number) => {
+    setEmojiPicker({
+      projectKey: g.key,
+      name,
+      current: g.summary.worktree_emoji?.[name] ?? null,
+      x,
+      y,
+    });
+  }, []);
+  const pickEmoji = (p: EmojiPickerState, emoji: string | null) => {
+    setEmojiPicker(null);
+    const g = groups.find((x) => x.key === p.projectKey);
+    if (g) onSetEmoji(g, p.name, emoji);
+  };
+  const emojiInUse = useMemo(
+    () => groups.flatMap((g) => Object.values(g.summary.worktree_emoji ?? {})),
+    [groups],
+  );
+  const changeView = (patch: Partial<RailView>) => {
+    onRailView(patch).catch((e: unknown) => showToast(String(e)));
+  };
+
   return (
     <nav className="rail">
       <div className="rail-label-row">
         <div className="rail-label">Projects</div>
         <div className="rail-label-actions">
           {hintVisible && <span className="rail-cycle-hint">{modKeyLabel} ← →</span>}
+          <WorktreeViewMenu view={railView} inUse={emojiInUse} onChange={changeView} />
           <button
             type="button"
             className="rail-add-btn"
@@ -752,11 +949,14 @@ export function Rail({
           selected={selected}
           hintVisible={hintVisible}
           reduceMotion={reduceMotion}
+          emojiOn={railView.emoji}
           onToggle={toggleGroup}
           onSelectLane={onSelectLane}
           onOpenDiff={onOpenDiff}
           onOpenLane={openLane}
           onLaneContextMenu={openLaneMenu}
+          onLaneEmoji={openEmojiPicker}
+          onReorderLanes={onReorderWorktrees}
           onNewWorktree={onNewWorktree}
           onOpenMenu={openProjectMenu}
           onReorder={onReorder}
@@ -791,8 +991,24 @@ export function Rail({
         }}
         onPick={pickLaneItem}
         onToggleDispatch={toggleDispatch}
+        onSetEmoji={
+          railView.emoji
+            ? (m) => {
+                setMenu(null);
+                const g = groups.find((x) => x.key === m.projectKey);
+                if (g) openEmojiPicker(g, m.name, m.x, m.y);
+              }
+            : undefined
+        }
         codexAvailable={codexAvailable}
         transferBusy={menuBusy}
+      />
+      <EmojiPicker
+        state={emojiPicker}
+        onOpenChange={(open) => {
+          if (!open) setEmojiPicker(null);
+        }}
+        onPick={pickEmoji}
       />
       <ProjectMenu
         state={projectMenu}

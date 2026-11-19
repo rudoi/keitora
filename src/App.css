@@ -2576,3 +2576,76 @@ html[data-theme="light"] .rail-group-overlay .rail-group-head {
 .sticky-note-text::placeholder {
   color: var(--tx-3);
 }
+/* A lane while it is dragged within its group: lifted above its neighbours, which slide
+   apart to show where it lands. */
+.lane-sortable {
+  touch-action: none;
+}
+.lane-sortable.is-dragging {
+  position: relative;
+  z-index: 10;
+  cursor: grabbing;
+}
+.lane-sortable.is-dragging .lane {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+
+/* A worktree's emoji, leading its name row; a click opens the picker. */
+.lane-emoji {
+  flex: none;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  padding: 1px 2px;
+  margin: -2px -4px -2px -2px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-chip);
+  background: transparent;
+  cursor: pointer;
+}
+.lane-emoji:hover {
+  background: var(--bg-3);
+  border-color: var(--line);
+}
+
+/* Worktrees left out by the emoji filter, counted under the group's lanes. */
+.rail-group-hidden {
+  padding: 0 0 8px 4px;
+  font-size: 10.5px;
+  color: var(--tx-3);
+}
+
+/* The worktree sort/filter button beside "Projects"; accent while a filter hides some. */
+.rail-view-btn {
+  display: flex;
+  align-items: center;
+  padding: 4px 5px;
+}
+.rail-view-btn.filtering {
+  color: var(--accent-text);
+}
+
+/* The emoji picker's palette. */
+.emoji-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 28px);
+  gap: 2px;
+  padding: 2px;
+}
+.emoji-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  font-size: 16px;
+  border-radius: var(--radius-chip);
+  cursor: pointer;
+  outline: none;
+}
+.emoji-cell[data-highlighted] {
+  background: var(--bg-3);
+}
+.emoji-cell.current {
+  box-shadow: inset 0 0 0 1px var(--accent);
+}

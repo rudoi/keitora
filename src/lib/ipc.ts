@@ -987,6 +987,10 @@ export interface ProjectSummary {
   db_path: string; // absolute path to the SQLite task DB
   worktrees: string[]; // configured worktree names
   backend: string; // backend kind from [tasks] backend (e.g. "sqlite" | "github")
+  /** The rail's custom worktree order; only `list_projects` fills it. */
+  worktree_order?: string[];
+  /** Each worktree's emoji, by worktree name; only `list_projects` fills it. */
+  worktree_emoji?: Record<string, string>;
 }
 
 /** Return the active project, or null if no project is configured. */
@@ -1007,6 +1011,45 @@ export function setActiveProject(name: string): Promise<void> {
 /** Persist the project display order (a permutation of the registry keys). */
 export function reorderProjects(order: string[]): Promise<void> {
   return invoke("reorder_projects", { order });
+}
+
+/** Persist a project's custom worktree order (registry key + worktree names). */
+export function setWorktreeOrder(key: string, order: string[]): Promise<void> {
+  return invoke("set_worktree_order", { key, order });
+}
+
+/** Set one worktree's emoji, or clear it with null. */
+export function setWorktreeEmoji(
+  key: string,
+  worktree: string,
+  emoji: string | null,
+): Promise<void> {
+  return invoke("set_worktree_emoji", { key, worktree, emoji });
+}
+
+/** How the rail sorts each project's worktrees (the user registry's `[rail] worktree_sort`). */
+export type WorktreeSort = "custom" | "alpha" | "emoji";
+
+/** The user registry's `[rail]` table, defaults applied. */
+export interface RailView {
+  /** Worktrees show (and can be given) an emoji. */
+  emoji: boolean;
+  worktree_sort: WorktreeSort;
+  /** Emoji whose worktrees the rail leaves out. */
+  hidden_emoji: string[];
+}
+
+export function getRailView(): Promise<RailView> {
+  return invoke<RailView>("get_rail_view");
+}
+
+/** Update the given parts of the `[rail]` table. Emits `rail://changed`. */
+export function setRailView(patch: Partial<RailView>): Promise<void> {
+  return invoke("set_rail_view", {
+    emoji: patch.emoji ?? null,
+    worktreeSort: patch.worktree_sort ?? null,
+    hiddenEmoji: patch.hidden_emoji ?? null,
+  });
 }
 
 /**

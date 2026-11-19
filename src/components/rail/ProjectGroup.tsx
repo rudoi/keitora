@@ -9,10 +9,26 @@
 // picks up, arrows move, Space drops, Escape cancels). While a drag runs, the group stays
 // in place, dimmed, and a lifted copy of its header (ProjectGroupOverlay) follows the
 // pointer; RailProjects draws the line where it will land.
+//
+// Lanes are draggable too, within their group (pointer only, past the same threshold so a
+// click still selects): they slide apart to show where the dragged one lands, and a drop
+// saves the new custom order through `onReorderLanes`.
 
-import { useDraggable } from "@dnd-kit/core";
+import {
+  closestCenter,
+  DndContext,
+  type DragEndEvent,
+  type Modifier,
+  PointerSensor,
+  useDraggable,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { ChevronRight, Ellipsis, GripVertical, Plus } from "lucide-react";
 import {
+  type ComponentProps,
   type CSSProperties,
   memo,
   type Ref,
@@ -24,7 +40,7 @@ import {
 } from "react";
 import { shortPath, tailPath } from "../../lib/format";
 import { projectHue, projectMonogram } from "../../lib/projectHue";
-import type { GroupModel } from "../../lib/railGroups";
+import type { GroupModel, LaneModel } from "../../lib/railGroups";
 import {
   groupAriaLabel,
   headerView,
@@ -32,6 +48,7 @@ import {
   lastActivityLabel,
   sentinelAbove,
 } from "../../lib/railGroupView";
+import { moveWorktree } from "../../lib/worktreeOrder";
 import { Lane, type LaneOpenTarget } from "./Lane";
 
 function groupClass(group: GroupModel, open: boolean): string {
@@ -175,6 +192,75 @@ export function ProjectGroupOverlay({
   );
 }
 
+/** A dragged lane only moves up and down. */
+const lockToY: Modifier = ({ transform }) => ({ ...transform, x: 0 });
+
+type LaneProps = Omit<ComponentProps<typeof Lane>, "lane" | "isSelected" | "hintBadge">;
+
+function SortableLane({
+  lane,
+  isSelected,
+  hintBadge,
+  ...rest
+}: LaneProps & { lane: LaneModel; isSelected: boolean; hintBadge?: number }) {
+  const { setNodeRef, listeners, transform, transition, isDragging } = useSortable({
+    id: lane.name,
+  });
+  return (
+    <div
+      ref={setNodeRef}
+      className={isDragging ? "lane-sortable is-dragging" : "lane-sortable"}
+      style={{ transform: CSS.Translate.toString(transform), transition }}
+      {...listeners}
+    >
+      <Lane lane={lane} isSelected={isSelected} hintBadge={hintBadge} {...rest} />
+    </div>
+  );
+}
+
+/** A group's lanes, reorderable by drag. `order` is every lane's name, hidden ones too. */
+function LaneList({
+  lanes,
+  order,
+  selected,
+  badges,
+  onReorder,
+  ...rest
+}: LaneProps & {
+  lanes: LaneModel[];
+  order: string[];
+  selected: string | null;
+  badges: Map<string, number> | null;
+  onReorder: (order: string[]) => void;
+}) {
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
+  const onDragEnd = (e: DragEndEvent) => {
+    if (!e.over) return;
+    const next = moveWorktree(order, String(e.active.id), String(e.over.id));
+    if (next !== null) onReorder(next);
+  };
+  return (
+    <DndContext
+      sensors={sensors}
+      collisionDetection={closestCenter}
+      modifiers={[lockToY]}
+      onDragEnd={onDragEnd}
+    >
+      <SortableContext items={lanes.map((l) => l.name)} strategy={verticalListSortingStrategy}>
+        {lanes.map((lane) => (
+          <SortableLane
+            key={lane.name}
+            lane={lane}
+            isSelected={lane.name === selected}
+            hintBadge={badges?.get(lane.name)}
+            {...rest}
+          />
+        ))}
+      </SortableContext>
+    </DndContext>
+  );
+}
+
 // Memoized: the handlers are shared by every group and take the group, which each binds
 // itself, so a group whose props did not change skips re-rendering.
 export const ProjectGroup = memo(function ProjectGroup({
@@ -184,6 +270,7 @@ export const ProjectGroup = memo(function ProjectGroup({
   selected,
   hintVisible,
   reduceMotion,
+  emojiOn,
   home,
   now,
   onToggle,
@@ -191,6 +278,8 @@ export const ProjectGroup = memo(function ProjectGroup({
   onOpenDiff,
   onOpenLane,
   onLaneContextMenu,
+  onLaneEmoji,
+  onReorderLanes,
   onNewWorktree,
   onOpenMenu,
 }: {
@@ -202,6 +291,8 @@ export const ProjectGroup = memo(function ProjectGroup({
   selected: string | null;
   hintVisible: boolean;
   reduceMotion: boolean;
+  /** Lanes show their emoji and offer to set one. */
+  emojiOn: boolean;
   /** The home directory, shown as `~` in the project path; null until known. */
   home: string | null;
   /** The minute clock that ages the last-activity label. */
@@ -211,6 +302,10 @@ export const ProjectGroup = memo(function ProjectGroup({
   onOpenDiff: (g: GroupModel, worktree: string) => void;
   onOpenLane: (g: GroupModel, worktree: string, target: LaneOpenTarget) => void;
   onLaneContextMenu: (g: GroupModel, worktree: string, x: number, y: number) => void;
+  /** Open the emoji picker for a lane at viewport coordinates. */
+  onLaneEmoji: (g: GroupModel, worktree: string, x: number, y: number) => void;
+  /** A lane was dropped in a new place: every lane's name in the new order. */
+  onReorderLanes: (g: GroupModel, order: string[]) => void;
   onNewWorktree: (g: GroupModel) => void;
   /** Open the project menu at viewport coordinates; `from` gets focus back on close. */
   onOpenMenu: (g: GroupModel, x: number, y: number, from: HTMLElement | null) => void;
@@ -257,6 +352,14 @@ export const ProjectGroup = memo(function ProjectGroup({
   const laneContextMenu = useCallback(
     (w: string, x: number, y: number) => onLaneContextMenu(groupRef.current, w, x, y),
     [onLaneContextMenu],
+  );
+  const laneEmoji = useCallback(
+    (w: string, x: number, y: number) => onLaneEmoji(groupRef.current, w, x, y),
+    [onLaneEmoji],
+  );
+  const reorderLanes = useCallback(
+    (order: string[]) => onReorderLanes(groupRef.current, order),
+    [onReorderLanes],
   );
 
   const { key, isActive, lanes, summaryStats: stats } = group;
@@ -339,22 +442,28 @@ export const ProjectGroup = memo(function ProjectGroup({
       <div className="rail-group-body" id={bodyId} role="group" aria-label={`${key} worktrees`}>
         <div className="rail-group-body-inner">
           <div className="rail-group-lanes">
-            {lanes.length === 0 ? (
+            {lanes.length === 0 && group.hiddenLanes === 0 ? (
               <div className="rail-group-empty">{group.loading ? "Loading…" : "No worktrees"}</div>
             ) : (
-              lanes.map((lane) => (
-                <Lane
-                  key={lane.name}
-                  lane={lane}
-                  isSelected={isActive && lane.name === selected}
-                  hintBadge={badges?.get(lane.name)}
-                  hintVisible={hintVisible}
-                  onSelect={selectLane}
-                  onOpenDiff={openDiff}
-                  onOpen={openLane}
-                  onContextMenu={laneContextMenu}
-                />
-              ))
+              <LaneList
+                lanes={lanes}
+                order={group.order}
+                selected={isActive ? selected : null}
+                badges={badges}
+                hintVisible={hintVisible}
+                emojiOn={emojiOn}
+                onSelect={selectLane}
+                onOpenDiff={openDiff}
+                onOpen={openLane}
+                onContextMenu={laneContextMenu}
+                onEmoji={laneEmoji}
+                onReorder={reorderLanes}
+              />
+            )}
+            {group.hiddenLanes > 0 && (
+              <div className="rail-group-hidden">
+                {group.hiddenLanes} hidden by the emoji filter
+              </div>
             )}
           </div>
         </div>

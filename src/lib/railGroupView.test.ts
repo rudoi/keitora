@@ -39,6 +39,7 @@ function lane(name: string, status: LaneModel["status"] = "available"): LaneMode
     building: false,
     working: false,
     blockState: status === "available" ? "idle" : "offline",
+    emoji: null,
   };
 }
 

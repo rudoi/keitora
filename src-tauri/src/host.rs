@@ -103,6 +103,10 @@ pub struct ProjectSummary {
     pub worktrees: Vec<String>,
     /// Backend kind string from `[tasks] backend` (e.g. `"sqlite"`, `"github"`).
     pub backend: String,
+    /// The rail's custom worktree order (registry `worktree_order`); empty when unset.
+    pub worktree_order: Vec<String>,
+    /// Each worktree's emoji, by worktree name (registry `worktree_emoji`).
+    pub worktree_emoji: std::collections::BTreeMap<String, String>,
 }
 
 /// Build a `ProjectSummary` from a resolved `ProjectConfig`. The registry name is
@@ -117,6 +121,8 @@ fn project_summary(pc: &keitora_tasks::ProjectConfig, active: bool) -> ProjectSu
         db_path: pc.tasks.db_path.display().to_string(),
         worktrees: pc.worktrees(),
         backend: pc.tasks.backend.clone(),
+        worktree_order: Vec::new(),
+        worktree_emoji: std::collections::BTreeMap::new(),
     }
 }
 
@@ -152,6 +158,9 @@ fn project_summaries(user_cfg: &keitora_tasks::UserConfig) -> Vec<ProjectSummary
             Err(_) => continue,
         };
         let mut summary = project_summary(&pc, name == active_name);
+        let pref = &user_cfg.projects[&name];
+        summary.worktree_order = pref.worktree_order.clone();
+        summary.worktree_emoji = pref.worktree_emoji.clone();
         // Prefer the registry key as the display name (it is what set_active uses);
         // `resolved_name` keeps the session namespace.
         summary.name = name;
@@ -261,6 +270,90 @@ fn reorder_projects(app: AppHandle, order: Vec<String>) -> Result<(), String> {
     // Only the order changed: a dedicated event so project-scoped consumers of
     // `project://changed` (project reload, diff refresh) are not re-run.
     let _ = app.emit("projects://reordered", ());
+    Ok(())
+}
+
+/// Persist a project's custom worktree order (registry key + worktree names) and tell
+/// the frontend to reload the project list, which carries it.
+#[tauri::command(async)]
+fn set_worktree_order(app: AppHandle, key: String, order: Vec<String>) -> Result<(), String> {
+    {
+        let _registry = keitora_tasks::UserConfig::write_lock();
+        let mut user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
+        if !user_cfg.set_worktree_order(&key, order) {
+            return Err(format!("no project named {key}"));
+        }
+        user_cfg.save().map_err(|e| e.to_string())?;
+    }
+    let _ = app.emit("projects://reordered", ());
+    Ok(())
+}
+
+/// Set (or, with `None`, clear) one worktree's emoji and tell the frontend to reload
+/// the project list, which carries it.
+#[tauri::command(async)]
+fn set_worktree_emoji(
+    app: AppHandle,
+    key: String,
+    worktree: String,
+    emoji: Option<String>,
+) -> Result<(), String> {
+    {
+        let _registry = keitora_tasks::UserConfig::write_lock();
+        let mut user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
+        user_cfg.set_worktree_emoji(&key, &worktree, emoji)?;
+        user_cfg.save().map_err(|e| e.to_string())?;
+    }
+    let _ = app.emit("projects://reordered", ());
+    Ok(())
+}
+
+/// How the rail lists worktrees: the `[rail]` table with its defaults applied.
+#[derive(serde::Serialize, Debug, PartialEq)]
+pub struct RailView {
+    pub emoji: bool,
+    pub worktree_sort: keitora_tasks::WorktreeSort,
+    pub hidden_emoji: Vec<String>,
+}
+
+fn rail_view(cfg: &keitora_tasks::RailConfig) -> RailView {
+    RailView {
+        emoji: cfg.emoji(),
+        worktree_sort: cfg.worktree_sort(),
+        hidden_emoji: cfg.hidden_emoji.clone(),
+    }
+}
+
+#[tauri::command(async)]
+fn get_rail_view() -> Result<RailView, String> {
+    let user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
+    Ok(rail_view(&user_cfg.rail))
+}
+
+/// Update the given parts of the `[rail]` table (an omitted one is left as is) and
+/// emit `rail://changed`.
+#[tauri::command(async)]
+fn set_rail_view(
+    app: AppHandle,
+    emoji: Option<bool>,
+    worktree_sort: Option<keitora_tasks::WorktreeSort>,
+    hidden_emoji: Option<Vec<String>>,
+) -> Result<(), String> {
+    {
+        let _registry = keitora_tasks::UserConfig::write_lock();
+        let mut user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
+        if emoji.is_some() {
+            user_cfg.rail.emoji = emoji;
+        }
+        if worktree_sort.is_some() {
+            user_cfg.rail.worktree_sort = worktree_sort;
+        }
+        if let Some(hidden) = hidden_emoji {
+            user_cfg.rail.set_hidden_emoji(hidden);
+        }
+        user_cfg.save().map_err(|e| e.to_string())?;
+    }
+    let _ = app.emit("rail://changed", ());
     Ok(())
 }
 
@@ -2459,6 +2552,10 @@ pub fn run() {
             projects_overview,
             set_active_project,
             reorder_projects,
+            set_worktree_order,
+            set_worktree_emoji,
+            get_rail_view,
+            set_rail_view,
             onboard_project,
             detect_legacy,
             migrate_legacy,
@@ -3164,6 +3261,50 @@ mod tests {
         );
         assert_eq!(s.worktrees, vec!["acme".to_string()]);
         assert!(s.active);
+    }
+
+    /// `project_summaries` carries each project's worktree order and emoji from its
+    /// registry entry.
+    #[test]
+    fn project_summary_list_carries_worktree_order_and_emoji() {
+        use keitora_tasks::{ProjectRef, UserConfig};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = UserConfig::default();
+        for name in ["proj", "other-proj"] {
+            let root = tmp.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            cfg.projects.insert(name.into(), ProjectRef::new(root));
+        }
+        cfg.set_worktree_order("proj", vec!["bravo".into(), "alpha".into()]);
+        cfg.set_worktree_emoji("proj", "alpha", Some("🔥".into()))
+            .unwrap();
+
+        let list = super::project_summaries(&cfg);
+        let proj = list.iter().find(|s| s.name == "proj").unwrap();
+        assert_eq!(proj.worktree_order, vec!["bravo", "alpha"]);
+        assert_eq!(proj.worktree_emoji["alpha"], "🔥");
+        let other = list.iter().find(|s| s.name == "other-proj").unwrap();
+        assert!(other.worktree_order.is_empty());
+        assert!(other.worktree_emoji.is_empty());
+    }
+
+    #[test]
+    fn rail_view_applies_defaults() {
+        let mut rail = keitora_tasks::RailConfig::default();
+        assert_eq!(
+            super::rail_view(&rail),
+            super::RailView {
+                emoji: false,
+                worktree_sort: keitora_tasks::WorktreeSort::Custom,
+                hidden_emoji: vec![],
+            }
+        );
+        rail.emoji = Some(true);
+        rail.worktree_sort = Some(keitora_tasks::WorktreeSort::Alpha);
+        let v = super::rail_view(&rail);
+        assert!(v.emoji);
+        assert_eq!(v.worktree_sort, keitora_tasks::WorktreeSort::Alpha);
     }
 
     /// `project_summaries` follows the registry's display order, reports the

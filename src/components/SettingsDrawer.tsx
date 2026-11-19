@@ -26,6 +26,7 @@ import {
 import { setStickyNotesEnabled } from "../lib/stickyNotes";
 import { isThemeMode, THEME_MODES, themeLabel, useTheme } from "../lib/theme";
 import { errorText, installLabel, isBusy, statusLine } from "../lib/updates";
+import { useRailView } from "../lib/useRailView";
 import { RestartDaemonDialog } from "./RestartDaemonDialog";
 import { useToast } from "./Toast";
 import { useUpdates } from "./UpdatesProvider";
@@ -287,6 +288,35 @@ function StickyNotesSection({ enabled: initialEnabled }: { enabled: boolean }) {
 }
 
 // ── UpdatesSection ────────────────────────────────────────────────────────────
+
+/**
+ * Rail section: whether worktrees carry an emoji (`[rail] emoji`), which turns on the
+ * lane emoji button, the emoji sort and the emoji filter.
+ */
+function RailSection() {
+  const { showToast } = useToast();
+  const { view, update } = useRailView();
+  const toggle = () => {
+    void update({ emoji: !view.emoji }).catch((err: unknown) =>
+      showToast(`Could not save setting: ${errorText(err)}`),
+    );
+  };
+  return (
+    <section className="flex flex-col gap-3 border-t border-line pt-6">
+      <div className={sectionTitle}>Rail</div>
+      <div className="flex items-center justify-between gap-3">
+        <span className={label}>Worktree emoji (show, set, sort and filter by)</span>
+        <button
+          className={view.emoji ? btnPrimary : btnGhost}
+          aria-pressed={view.emoji}
+          onClick={toggle}
+        >
+          {view.emoji ? "Enabled" : "Disabled"}
+        </button>
+      </div>
+    </section>
+  );
+}
 
 /**
  * Updates section: current version, the auto-check toggle, a manual check, and the
@@ -1159,6 +1189,9 @@ export function SettingsDrawer({
                     </div>
                   </div>
                 )}
+
+                {/* ── Rail ────────────────────────────────────────────────── */}
+                <RailSection />
 
                 {/* ── Daemon ──────────────────────────────────────────────── */}
                 <DaemonSection />
