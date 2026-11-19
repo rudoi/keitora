@@ -2233,11 +2233,12 @@ dependencies = [
 
 [[package]]
 name = "keitora"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
  "dirs 6.0.0",
+ "dunce",
  "env_logger",
  "keitora-tasks",
  "log",

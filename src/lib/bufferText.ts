@@ -1,6 +1,9 @@
 // Reading an xterm buffer row back as text, with a map from the text to cell columns.
 import type { IBuffer, IBufferCell } from "@xterm/xterm";
 
+/** Whether `text` is only spaces (including the no-break spaces some TUIs paint). */
+export const isBlank = (text: string) => /^[  ]*$/.test(text);
+
 /** A buffer row's text with the cell column of each UTF-16 unit, plus one entry for its end. */
 export interface RowCells {
   text: string;
@@ -18,6 +21,31 @@ export function wrapsWideGlyphAfter(buffer: IBuffer, row: number): boolean {
       ?.getCell(0)
       ?.getWidth() === 2
   );
+}
+
+/** Box drawing and block elements: a row ending in one is a border, not wrapped text. */
+function isBoxGlyph(chars: string): boolean {
+  const cp = chars.codePointAt(0) ?? 0;
+  return cp >= 0x2500 && cp <= 0x259f;
+}
+
+/**
+ * Whether row `y` is filled to its last cell, so its text plausibly continues on the next
+ * row. A wide glyph across the last two cells counts, as does an empty last cell left by a
+ * wide glyph that wrapped. A trailing box-drawing glyph does not.
+ */
+export function isFilled(buffer: IBuffer, y: number, cols: number): boolean {
+  const line = buffer.getLine(y);
+  if (!line || cols < 1) return false;
+  const last = line.getCell(cols - 1);
+  let chars = last?.getChars() ?? "";
+  if (last?.getWidth() === 0) {
+    chars = line.getCell(cols - 2)?.getChars() ?? "";
+  } else if (!chars) {
+    return wrapsWideGlyphAfter(buffer, y);
+  }
+  if (!chars || isBoxGlyph(chars)) return false;
+  return chars !== " " && chars !== " ";
 }
 
 /**

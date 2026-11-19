@@ -9,9 +9,9 @@
 //
 // Mechanism: when the caller already holds the target `ProjectSummary`, flip the
 // UI optimistically before the backend round-trip. `set_active_project` writes
-// the user config file; the backend config-file watcher detects that write and
-// fires `project://changed`, which drives `loadProject()` → `setProject` again
-// with the reconciled value (same data — no flicker). On error, revert.
+// the user registry and emits `project://changed` itself, which drives
+// `loadProject()` → `setProject` again with the reconciled value (same data — no
+// flicker). On error, revert.
 
 import { type ProjectSummary, setActiveProject } from "./ipc";
 
@@ -60,9 +60,9 @@ export async function switchProject(
   }
 
   try {
-    // 2. Backend round-trip. set_active_project writes the config file, which the
-    //    config-file watcher picks up and fires project://changed → loadProject().
-    //    That reconciliation sets project state again to the same value — no flicker.
+    // 2. Backend round-trip. set_active_project writes the user registry and emits
+    //    project://changed → loadProject(). That reconciliation sets project state
+    //    again to the same value — no flicker.
     //    The backend also restarts the tasks/sessions watcher on the new DB, so
     //    tasks://changed and sessions://changed begin firing for the new project.
     await setActiveProject(name);

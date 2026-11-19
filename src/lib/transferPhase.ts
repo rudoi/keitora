@@ -4,6 +4,7 @@
 // effects instead of running them, and the controller owns the single backstop timer, so
 // every decision is unit-testable without React or Tauri.
 
+import { cliTitle, updatePromptCliOf } from "./agentUpdates";
 import type { CliKind, PtyResumeEvent, TransferOutcome, TransferProgress } from "./ipc";
 import type { Status } from "./paneStatus";
 import type { RestartSignal } from "./resumeNotice";
@@ -301,7 +302,8 @@ export const MID_TURN_NOTE =
 
 /**
  * The spawn-failed screen's copy. The strict launch's own failure string already names
- * the CLI and the attempts, so it is shown as-is; any other error goes to the detail line.
+ * the CLI and the attempts, so it is shown as-is; a launch stopped by the CLI's update
+ * prompt gets its own line; any other error goes to the detail line.
  */
 export function spawnFailedCopy(
   cli: CliKind,
@@ -309,6 +311,11 @@ export function spawnFailedCopy(
 ): { message: string; detail: string | null } {
   const generic = `Failed to launch ${cli} — is it on PATH?`;
   if (error === null || error === "") return { message: generic, detail: null };
+  // The launch found the CLI on its own update screen (`AgentUpdatePrompt: <cli>`).
+  const prompted = updatePromptCliOf(error);
+  if (prompted !== null) {
+    return { message: `${cliTitle(prompted)} wants to update before it starts`, detail: null };
+  }
   if (error.startsWith(`${cli} did not start`)) return { message: error, detail: null };
   return { message: generic, detail: error };
 }

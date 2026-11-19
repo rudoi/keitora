@@ -20,7 +20,8 @@ use super::cli::{
 };
 use super::env::{ExeDiscovery, HerdrEnv};
 use super::ops::{
-    BridgeChild, BridgeProcess, ExitInfo, HerdrError, HerdrOps, Op, ServerInstance, ServerProcess,
+    AgentStart, BridgeChild, BridgeProcess, ExitInfo, HerdrError, HerdrOps, Op, ServerInstance,
+    ServerProcess,
 };
 
 /// How the next [`HerdrOps::spawn_server`] restores the panes of the previous
@@ -43,7 +44,8 @@ pub enum AgentStartScript {
     EarlyExit,
     /// herdr lost the agent name (`agent_name_not_found`).
     NameLost,
-    /// Launched but not ready yet (folded to `Ok`, as the real client does).
+    /// Launched but not ready yet (`Ok(AgentStart::NotReady)`, as the real client
+    /// reports it).
     NotReady,
     /// Fail with this error.
     Err(HerdrError),
@@ -98,8 +100,13 @@ struct FakeState {
     /// What `pane_process_info` answers, by pane id; a pane without an entry is
     /// not found.
     process_info: HashMap<String, PaneProcessInfo>,
-    /// What `pane_read` answers, by pane id; a pane without an entry reads empty.
+    /// What `process_name` answers, by pid; a pid without an entry has no name.
+    process_names: HashMap<u32, String>,
+    /// What `pane_read` answers, by pane id; a pane without an entry reads
+    /// [`Self::default_pane_text`].
     pane_text: HashMap<String, String>,
+    /// What `pane_read` answers for a pane with no text of its own (empty if unset).
+    default_pane_text: String,
     next_workspace: u32,
     next_terminal: u32,
     next_session: u32,
@@ -366,7 +373,9 @@ impl FakeHerdr {
                     panes: Vec::new(),
                     closed: Vec::new(),
                     process_info: HashMap::new(),
+                    process_names: HashMap::new(),
                     pane_text: HashMap::new(),
+                    default_pane_text: String::new(),
                     next_workspace: 0,
                     next_terminal: 0,
                     next_session: 0,
@@ -435,11 +444,24 @@ impl FakeHerdr {
         }
     }
 
+    /// Move `pane_id` to `cwd` (as if herdr had reused its id for another pane).
+    pub fn set_pane_cwd(&self, pane_id: &str, cwd: &str) {
+        if let Ok(p) = self.state().pane_mut(pane_id) {
+            p.cwd = Some(cwd.to_string());
+        }
+    }
+
     /// Set the text `pane_read` answers for `pane_id`.
     pub fn set_pane_text(&self, pane_id: &str, text: &str) {
         self.state()
             .pane_text
             .insert(pane_id.to_string(), text.to_string());
+    }
+
+    /// Set the text `pane_read` answers for every pane without its own text,
+    /// including panes a launch creates later.
+    pub fn set_default_pane_text(&self, text: &str) {
+        self.state().default_pane_text = text.to_string();
     }
 
     /// Set (or clear) the row count herdr reports for `pane_id`'s viewport.
@@ -452,6 +474,11 @@ impl FakeHerdr {
     /// What `pane_process_info` answers for `pane_id` from now on.
     pub fn set_process_info(&self, pane_id: &str, info: PaneProcessInfo) {
         self.state().process_info.insert(pane_id.to_string(), info);
+    }
+
+    /// What `process_name` answers for `pid` from now on.
+    pub fn set_process_name(&self, pid: u32, name: &str) {
+        self.state().process_names.insert(pid, name.to_string());
     }
 
     /// Simulate the agent exiting in (or returning to) its shell.
@@ -889,7 +916,11 @@ impl HerdrOps for FakeHerdr {
         };
         st.control(Op::PaneRead, detail)?;
         st.pane_mut(pane_id)?;
-        Ok(st.pane_text.get(pane_id).cloned().unwrap_or_default())
+        Ok(st
+            .pane_text
+            .get(pane_id)
+            .unwrap_or(&st.default_pane_text)
+            .clone())
     }
 
     fn pane_list(&self) -> Result<Vec<PaneInfo>, HerdrError> {
@@ -960,7 +991,7 @@ impl HerdrOps for FakeHerdr {
         pane_id: &str,
         args: &[String],
         timeout_ms: u64,
-    ) -> Result<(), HerdrError> {
+    ) -> Result<AgentStart, HerdrError> {
         let mut st = self.state();
         st.control(
             Op::AgentStart,
@@ -982,6 +1013,7 @@ impl HerdrOps for FakeHerdr {
         }
         let script = st.agent_scripts.pop_front().unwrap_or(AgentStartScript::Ok);
         let timed_out = script == AgentStartScript::TimedOutLaunched;
+        let not_ready = script == AgentStartScript::NotReady;
         match script {
             AgentStartScript::Ok
             | AgentStartScript::NotReady
@@ -1008,7 +1040,11 @@ impl HerdrOps for FakeHerdr {
                 if timed_out {
                     return Err(api("timeout", "timed out waiting for agent startup"));
                 }
-                Ok(())
+                Ok(if not_ready {
+                    AgentStart::NotReady
+                } else {
+                    AgentStart::Ready
+                })
             }
             AgentStartScript::EarlyExit => {
                 Err(api("agent_start_failed", "agent exited during startup"))
@@ -1167,6 +1203,14 @@ impl HerdrOps for FakeHerdr {
             return None;
         }
         st.instance
+    }
+
+    /// The name scripted with [`FakeHerdr::set_process_name`]. An OS read, not a
+    /// herdr call: it answers whether or not the server runs.
+    fn process_name(&self, pid: u32) -> Option<String> {
+        let mut st = self.state();
+        st.record(Op::ProcessName, pid.to_string());
+        st.process_names.get(&pid).cloned()
     }
 }
 
@@ -1339,6 +1383,22 @@ mod tests {
             "a bare shell"
         );
         assert_eq!(fake.pane_list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn agent_start_reports_ready_or_not_ready() {
+        let fake = FakeHerdr::new();
+        let p = fake.workspace_create("/w", &[]).unwrap();
+        fake.script_agent_start(vec![AgentStartScript::NotReady]);
+        assert_eq!(
+            fake.agent_start("n", "codex", &p.pane_id, &[], 5000),
+            Ok(AgentStart::NotReady)
+        );
+        assert_eq!(
+            fake.agent_start("n", "codex", &p.pane_id, &[], 5000),
+            Ok(AgentStart::Ready),
+            "an unscripted start is ready"
+        );
     }
 
     #[test]

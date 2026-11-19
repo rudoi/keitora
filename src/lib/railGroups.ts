@@ -90,6 +90,9 @@ export interface BuildGroupsInput {
   /** Every registered project in display order, from `list_projects`. */
   projects: ProjectSummary[];
   activeResolvedName: string | null;
+  /** The active project's registry key. Two registered projects can resolve to the same
+   *  name; only this one renders the active project's live lanes. */
+  activeKey: string | null;
   /** The active project's rich sources below belong to it (the warm registry shows it). */
   activeReady: boolean;
   activeWorktrees: WorktreeInfo[];
@@ -198,6 +201,19 @@ export function summarize(
   };
 }
 
+/**
+ * The registry key of the active project, given its resolved name. When several
+ * entries resolve to that name, the one the registry marks active wins; with no match
+ * the resolved name stands in for the key.
+ */
+export function activeRegistryKey(
+  projects: readonly ProjectSummary[],
+  resolvedName: string | null,
+): string | null {
+  const named = projects.filter((p) => p.resolved_name === resolvedName);
+  return (named.find((p) => p.active) ?? named[0])?.name ?? resolvedName;
+}
+
 /** One GroupModel per project, in `projects` order. */
 export function buildGroups(i: BuildGroupsInput): GroupModel[] {
   const view = effectiveView(i.view ?? DEFAULT_RAIL_VIEW);
@@ -208,7 +224,9 @@ export function buildGroups(i: BuildGroupsInput): GroupModel[] {
     // The active group renders from the rich active-only sources once they belong to it;
     // until then (a cold switch) it falls back to the overview like every other group, so
     // it never shows the previous project's lanes.
-    const rich = isActive && i.activeReady;
+    // Matched by registry key too: another entry resolving to the same name would
+    // otherwise render this project's worktrees as its own.
+    const rich = isActive && i.activeReady && key === i.activeKey;
 
     let lanes: LaneModel[];
     if (rich) {

@@ -140,6 +140,15 @@ impl From<HerdrError> for PtyBackendError {
     }
 }
 
+/// How a successful `agent start` ended: herdr saw the agent ready, or it launched
+/// but herdr reported it not ready yet (`agent_not_ready` / "blocked during
+/// startup"), which is also what a CLI parked on an interactive screen looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStart {
+    Ready,
+    NotReady,
+}
+
 /// Everything the backend needs from herdr. Object-safe; shared across threads as
 /// `Arc<dyn HerdrOps>`.
 pub trait HerdrOps: Send + Sync {
@@ -177,8 +186,8 @@ pub trait HerdrOps: Send + Sync {
     fn pane_get(&self, pane_id: &str) -> Result<Option<PaneInfo>, HerdrError>;
     /// The pane's shell pid and foreground pids (`pane process-info`).
     fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError>;
-    /// `agent_not_ready` / "blocked during startup" are folded to `Ok` (the agent
-    /// launched but is not ready yet).
+    /// `agent_not_ready` / "blocked during startup" are folded to
+    /// `Ok(AgentStart::NotReady)` (the agent launched but is not ready yet).
     fn agent_start(
         &self,
         name: &str,
@@ -186,7 +195,7 @@ pub trait HerdrOps: Send + Sync {
         pane_id: &str,
         args: &[String],
         timeout_ms: u64,
-    ) -> Result<(), HerdrError>;
+    ) -> Result<AgentStart, HerdrError>;
     fn agent_prompt(&self, pane_id: &str, text: &str) -> Result<(), HerdrError>;
     fn agent_list(&self) -> Result<Vec<AgentInfo>, HerdrError>;
     fn integration_status(&self, target: &str) -> Result<IntegrationStatus, HerdrError>;
@@ -211,6 +220,9 @@ pub trait HerdrOps: Send + Sync {
     /// Pid + start time of the running server; changes whenever the server
     /// process is replaced.
     fn server_instance(&self) -> Option<ServerInstance>;
+    /// The name of process `pid` (a pane's shell: `pwsh.exe`, `bash`, `zsh`, …);
+    /// `None` when it cannot be read or the process is gone.
+    fn process_name(&self, pid: u32) -> Option<String>;
 }
 
 /// How a process exited. `code` is `ExitStatus::code()` (on Windows an NTSTATUS
@@ -309,6 +321,7 @@ pub enum Op {
     SpawnBridge,
     ServerPid,
     ServerInstance,
+    ProcessName,
 }
 
 #[cfg(test)]

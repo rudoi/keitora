@@ -22,7 +22,9 @@ describe("openTerminalFile", () => {
   });
 
   it("preserves native failure feedback", async () => {
-    transport.invoke.mockRejectedValue(new Error("File is outside this terminal's worktree"));
-    await expect(openTerminalFile("keitora", "epsilon", "../file.ts")).rejects.toThrow("outside");
+    transport.invoke.mockRejectedValue(new Error("File does not exist"));
+    await expect(openTerminalFile("keitora", "epsilon", "../file.ts")).rejects.toThrow(
+      "File does not exist",
+    );
   });
 });

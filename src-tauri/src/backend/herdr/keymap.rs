@@ -108,6 +108,11 @@ struct PersistedFile {
     should_be_running: Vec<PersistedKey>,
     #[serde(default)]
     entries: Vec<PersistedEntry>,
+    /// The reserved utility panes, kept apart from `entries` so they never reach
+    /// reconciliation or recovery: only so a pane left behind by a quit or crash can
+    /// be closed before the next one opens.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reserved: Vec<PersistedEntry>,
 }
 
 /// Server lineage and the recovery set, kept beside the entry map.
@@ -123,6 +128,9 @@ struct KeyMapMeta {
     /// the key's next entry still gets a newer `gen` (a late kill of the old
     /// session must not match the new one).
     retired_gens: HashMap<SessionKey, u64>,
+    /// Reserved utility panes loaded from disk: a previous run's, possibly still open
+    /// in herdr. Never resolved by [`KeyMap::get`]; only taken to be closed.
+    leftover_reserved: HashMap<SessionKey, HerdrPane>,
 }
 
 impl KeyMapMeta {
@@ -259,7 +267,16 @@ impl KeyMap {
             }
             meta.should_be_running.clear();
             meta.instance = None;
+            meta.leftover_reserved.clear();
         });
+    }
+
+    /// Take (and forget) the pane a previous run left mapped to the reserved `key`,
+    /// so it can be closed before a new one opens. `None` when there is none.
+    pub fn take_leftover_reserved(&self, key: &SessionKey) -> Option<HerdrPane> {
+        let mut taken = None;
+        self.mutate(|_, meta| taken = meta.leftover_reserved.remove(key));
+        taken
     }
 
     /// The server instance the entries were last reconciled against.
@@ -303,10 +320,11 @@ impl KeyMap {
             .contains(&(key.project.clone(), key.worktree.clone()))
     }
 
-    /// Add `keys` to the recovery set (a union) and persist.
+    /// Add `keys` to the recovery set (a union) and persist. A reserved utility key is
+    /// never recovered, so it is skipped.
     pub fn begin_recovery(&self, keys: &[SessionKey]) {
         self.mutate(|_, meta| {
-            for k in keys {
+            for k in keys.iter().filter(|k| !k.is_reserved()) {
                 meta.should_be_running
                     .insert((k.project.clone(), k.worktree.clone()));
             }
@@ -370,6 +388,7 @@ impl KeyMap {
                 })
                 .collect(),
             entries: snapshot_entries(map),
+            reserved: reserved_entries(map, &meta.leftover_reserved),
         }
     }
 
@@ -409,12 +428,15 @@ impl KeyMap {
         });
     }
 
-    /// Every `(key, pane)` currently mapped (clone; for reconciliation/listing).
+    /// Every `(key, pane)` currently mapped (clone; for reconciliation/listing). The
+    /// reserved utility key is left out so it never reaches recovery, session
+    /// listings, activity or perf sampling; [`Self::get`] still resolves it.
     pub fn entries(&self) -> Vec<(SessionKey, HerdrPane)> {
         self.inner
             .lock()
             .unwrap()
             .iter()
+            .filter(|(k, _)| !k.is_reserved())
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
@@ -462,21 +484,62 @@ impl KeyMap {
     }
 }
 
+/// The on-disk rows of the reserved utility panes: the mapped ones, plus any leftover
+/// from a previous run not yet closed (a mapped pane wins for its key).
+fn reserved_entries(
+    map: &HashMap<SessionKey, HerdrPane>,
+    leftover: &HashMap<SessionKey, HerdrPane>,
+) -> Vec<PersistedEntry> {
+    let mut rows: HashMap<&SessionKey, &HerdrPane> = leftover.iter().collect();
+    rows.extend(map.iter().filter(|(k, _)| k.is_reserved()));
+    let mut out: Vec<PersistedEntry> = rows
+        .into_iter()
+        .map(|(k, v)| persisted_entry(k, v))
+        .collect();
+    out.sort_by(|a, b| (&a.project, &a.worktree).cmp(&(&b.project, &b.worktree)));
+    out
+}
+
 /// Build the on-disk row set from the in-memory map. Called under the `inner` lock so
 /// the snapshot is a consistent point-in-time copy, then written outside the lock.
+/// The reserved utility key is not persisted: after a restart it is simply forgotten.
 fn snapshot_entries(map: &HashMap<SessionKey, HerdrPane>) -> Vec<PersistedEntry> {
     map.iter()
-        .map(|(k, v)| PersistedEntry {
-            project: k.project.clone(),
-            worktree: k.worktree.clone(),
-            workspace_id: v.workspace_id.clone(),
-            pane_id: v.pane_id.clone(),
-            terminal_id: v.terminal_id.clone(),
-            gen: v.gen,
-            cwd: v.cwd.clone(),
-            server_generation: v.server_generation.0,
-        })
+        .filter(|(k, _)| !k.is_reserved())
+        .map(|(k, v)| persisted_entry(k, v))
         .collect()
+}
+
+/// One on-disk row.
+fn persisted_entry(k: &SessionKey, v: &HerdrPane) -> PersistedEntry {
+    PersistedEntry {
+        project: k.project.clone(),
+        worktree: k.worktree.clone(),
+        workspace_id: v.workspace_id.clone(),
+        pane_id: v.pane_id.clone(),
+        terminal_id: v.terminal_id.clone(),
+        gen: v.gen,
+        cwd: v.cwd.clone(),
+        server_generation: v.server_generation.0,
+    }
+}
+
+/// The in-memory key and pane of an on-disk row.
+fn loaded_entry(e: PersistedEntry) -> (SessionKey, HerdrPane) {
+    (
+        SessionKey {
+            project: e.project,
+            worktree: e.worktree,
+        },
+        HerdrPane {
+            workspace_id: e.workspace_id,
+            pane_id: e.pane_id,
+            terminal_id: e.terminal_id,
+            gen: e.gen,
+            cwd: e.cwd,
+            server_generation: Generation(e.server_generation),
+        },
+    )
 }
 
 /// Read + parse the persisted keymap: the v2 object first, then the legacy bare
@@ -495,6 +558,7 @@ fn load_file(path: &Path) -> (HashMap<SessionKey, HerdrPane>, KeyMapMeta) {
                 instance: None,
                 generation: Generation::default(),
                 should_be_running: Vec::new(),
+                reserved: Vec::new(),
                 entries: entries
                     .into_iter()
                     .map(|e| PersistedEntry {
@@ -522,27 +586,14 @@ fn load_file(path: &Path) -> (HashMap<SessionKey, HerdrPane>, KeyMapMeta) {
             .collect(),
         death_bumped: false,
         retired_gens: HashMap::new(),
+        leftover_reserved: file
+            .reserved
+            .into_iter()
+            .map(loaded_entry)
+            .filter(|(k, _)| k.is_reserved())
+            .collect(),
     };
-    let entries = file
-        .entries
-        .into_iter()
-        .map(|e| {
-            (
-                SessionKey {
-                    project: e.project,
-                    worktree: e.worktree,
-                },
-                HerdrPane {
-                    workspace_id: e.workspace_id,
-                    pane_id: e.pane_id,
-                    terminal_id: e.terminal_id,
-                    gen: e.gen,
-                    cwd: e.cwd,
-                    server_generation: Generation(e.server_generation),
-                },
-            )
-        })
-        .collect();
+    let entries = file.entries.into_iter().map(loaded_entry).collect();
     (entries, meta)
 }
 
@@ -999,6 +1050,98 @@ mod tests {
             ),
             2
         );
+    }
+
+    fn record_reserved_and_real(m: &KeyMap) {
+        m.record(
+            SessionKey::agent_update(),
+            "w9".into(),
+            "w9:p1".into(),
+            "t9".into(),
+            "/home/me".into(),
+        );
+        m.record(
+            key("proj", "alpha"),
+            "w1".into(),
+            "w1:p1".into(),
+            "t1".into(),
+            "/repos/alpha".into(),
+        );
+    }
+
+    #[test]
+    fn entries_hide_the_reserved_key_but_get_resolves_it() {
+        let m = KeyMap::new();
+        record_reserved_and_real(&m);
+        let keys: Vec<SessionKey> = m.entries().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec![key("proj", "alpha")]);
+        let reserved = SessionKey::agent_update();
+        assert_eq!(m.get(&reserved).expect("mapped").pane_id, "w9:p1");
+        assert_eq!(m.pane_owner("w9:p1"), Some(reserved));
+    }
+
+    #[test]
+    fn begin_recovery_skips_the_reserved_key() {
+        let m = KeyMap::new();
+        m.begin_recovery(&[SessionKey::agent_update(), key("proj", "alpha")]);
+        assert_eq!(m.should_be_running(), vec![key("proj", "alpha")]);
+        assert!(!m.is_pending_recovery(&SessionKey::agent_update()));
+    }
+
+    #[test]
+    fn snapshot_entries_omit_the_reserved_key() {
+        let root = temp_root();
+        let path = root.join("keymap.json");
+        let m = KeyMap::with_path(path.clone());
+        record_reserved_and_real(&m);
+        let reloaded = KeyMap::with_path(path);
+        assert!(reloaded.get(&SessionKey::agent_update()).is_none());
+        assert!(reloaded.get(&key("proj", "alpha")).is_some());
+        assert_eq!(reloaded.entries().len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A reserved pane survives a restart only as a leftover to close: taken once,
+    /// then gone from memory and disk.
+    #[test]
+    fn a_reserved_pane_reloads_as_a_leftover_taken_once() {
+        let root = temp_root();
+        let path = root.join("keymap.json");
+        let m = KeyMap::with_path(path.clone());
+        record_reserved_and_real(&m);
+        drop(m);
+
+        let reloaded = KeyMap::with_path(path.clone());
+        let reserved = SessionKey::agent_update();
+        // Rewriting the file (any mutation) keeps the leftover.
+        reloaded.set_generation(reloaded.generation());
+        let again = KeyMap::with_path(path.clone());
+        let left = again.take_leftover_reserved(&reserved).expect("leftover");
+        assert_eq!(
+            (left.pane_id.as_str(), left.cwd.as_str()),
+            ("w9:p1", "/home/me")
+        );
+        assert!(
+            again.take_leftover_reserved(&reserved).is_none(),
+            "taken once"
+        );
+        assert!(again.get(&reserved).is_none(), "never resolvable");
+        assert!(KeyMap::with_path(path)
+            .take_leftover_reserved(&reserved)
+            .is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_shutdown_forgets_the_reserved_leftover() {
+        let root = temp_root();
+        let path = root.join("keymap.json");
+        record_reserved_and_real(&KeyMap::with_path(path.clone()));
+        KeyMap::with_path(path.clone()).clear_for_shutdown();
+        assert!(KeyMap::with_path(path)
+            .take_leftover_reserved(&SessionKey::agent_update())
+            .is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

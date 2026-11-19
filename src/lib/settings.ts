@@ -63,6 +63,8 @@ export interface SettingsUser {
   auto_check_updates: boolean;
   /** Whether per-worktree sticky notes are available (`[sticky_notes] enabled`). */
   sticky_notes_enabled: boolean;
+  /** Hours between agent CLI update checks (`[updates] agent_check_hours`); 0 = app start only. */
+  agent_update_check_hours: number;
 }
 
 /** Everything the settings drawer needs in one round-trip. */
@@ -129,6 +131,14 @@ export function setSkipPermissions(cli: CliKind, enabled: boolean): Promise<void
  */
 export function setUpdateAutoCheck(enabled: boolean): Promise<void> {
   return invoke("set_update_auto_check", { enabled });
+}
+
+/**
+ * Persist the user-level `[updates] agent_check_hours` (0 = app start only; the backend
+ * clamps other values to 1..=168). Persist-only; the scheduler reads it at its next tick.
+ */
+export function setAgentUpdateCheckHours(hours: number): Promise<void> {
+  return invoke("set_agent_update_check_hours", { hours });
 }
 
 /**

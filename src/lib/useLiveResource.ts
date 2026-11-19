@@ -8,7 +8,7 @@
 // tested without React/jsdom; `useLiveResource` is a thin wrapper over it.
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 export interface LiveResource<T> {
   data: T | null;
@@ -60,15 +60,46 @@ export const DEFAULT_RESYNC_MS = 30_000;
 
 export type SubscribeResult<T> = { data: T } | { error: string };
 
+/**
+ * Orders overlapping async loads: call `begin()` as a load starts, then the returned
+ * `settle()` once it has its result; `settle()` is true when the result should be
+ * applied, false when a later-started load has already settled (so this one is stale).
+ * A later load that is merely still in flight does not hold an earlier one back.
+ */
+export function newestSettledGate(): { begin: () => () => boolean } {
+  let next = 0;
+  let settled = -1;
+  return {
+    begin: () => {
+      const ticket = next++;
+      return () => {
+        if (ticket < settled) return false;
+        settled = ticket;
+        return true;
+      };
+    },
+  };
+}
+
+/** The teardown `subscribeLive` returns, plus a manual reload ordered with its loads. */
+export type LiveSubscription = (() => void) & { reload: () => Promise<void> };
+
 // Keep a backend resource live: attach the change listener FIRST, then run the
 // initial load (so an event arriving during setup can't be missed), and re-sync on
-// an interval as a fallback for dropped events. Returns a synchronous teardown.
+// an interval as a fallback for dropped events. Returns a synchronous teardown that
+// also carries `reload`, a manual refetch ordered with the subscription's own loads.
+//
+// Loads can overlap (an event lands while the tick's load is in flight, a manual
+// reload races both) and a slow backend can settle them out of order. Each load takes
+// an increasing ticket, and a result is applied only when no later-started load has
+// already settled, so an older response can never overwrite a newer one. A later load
+// that is merely still in flight does not hold an earlier result back.
 export function subscribeLive<T>(
   load: () => Promise<T>,
   eventName: string,
   onResult: (r: SubscribeResult<T>) => void,
   options: SubscribeOptions = {},
-): () => void {
+): LiveSubscription {
   const intervalMs = options.intervalMs ?? DEFAULT_RESYNC_MS;
   const listenFn = options.listen ?? listen;
   const revisionFn = options.revision;
@@ -85,22 +116,27 @@ export function subscribeLive<T>(
   // the periodic tick so a redundant refetch is skipped when nothing changed. A
   // `null`/unit payload (no revision) never sets or gates on it.
   let lastRevision: string | undefined;
+  // Drops a load's result when a later-started load has already settled.
+  const gate = newestSettledGate();
 
   // Run the load and, on SUCCESS ONLY, commit `pendingRevision` into `lastRevision`.
   // Advancing the gate only after a successful reload is what keeps a transient load
   // failure from poisoning it: a failed load leaves `lastRevision` untouched, so the
   // next same-revision event/tick retries instead of being gated out (the safety-net
   // poll must self-heal). `undefined` pending (unit payload / blind tick) never gates.
+  // A result superseded by a newer settled load is dropped without touching
+  // `lastRevision`, so the revision it carried is still reloaded later.
   const run = async (pendingRevision?: string) => {
+    const settle = gate.begin();
+    let result: SubscribeResult<T>;
     try {
-      const v = await load();
-      if (!cancelled) {
-        if (pendingRevision !== undefined) lastRevision = pendingRevision;
-        onResult({ data: v });
-      }
+      result = { data: await load() };
     } catch (e) {
-      if (!cancelled) onResult({ error: String(e) });
+      result = { error: String(e) };
     }
+    if (cancelled || !settle()) return;
+    if ("data" in result && pendingRevision !== undefined) lastRevision = pendingRevision;
+    onResult(result);
   };
 
   // Listen first, then load — any event after attach triggers a reload, and the
@@ -165,11 +201,12 @@ export function subscribeLive<T>(
     }, intervalMs);
   }
 
-  return () => {
+  const teardown = () => {
     cancelled = true;
     if (timer !== undefined) clearInterval(timer);
     un?.();
   };
+  return Object.assign(teardown, { reload: () => run() });
 }
 
 export function useLiveResource<T>(
@@ -189,10 +226,15 @@ export function useLiveResource<T>(
     }
   }, []);
 
+  // The live subscription, so a manual reload is ordered with its loads.
+  const subRef = useRef<LiveSubscription | null>(null);
+
   // Manual refresh, retained for consumers that call it directly (e.g. reloadWorktrees).
-  // Delegates to the same `apply` path as the subscription so there is one place that
-  // maps a load result to state.
+  // Goes through the subscription so a slow manual load can't overwrite a newer event
+  // or tick result (or vice versa); before the subscription exists it loads directly.
   const reload = useCallback(async () => {
+    const sub = subRef.current;
+    if (sub) return sub.reload();
     try {
       apply({ data: await load() });
     } catch (e) {
@@ -203,15 +245,18 @@ export function useLiveResource<T>(
   const intervalMs = options?.intervalMs;
   const listenOpt = options?.listen;
   const revisionOpt = options?.revision;
-  useEffect(
-    () =>
-      subscribeLive(load, eventName, apply, {
-        intervalMs,
-        listen: listenOpt,
-        revision: revisionOpt,
-      }),
-    [load, eventName, apply, intervalMs, listenOpt, revisionOpt],
-  );
+  useEffect(() => {
+    const sub = subscribeLive(load, eventName, apply, {
+      intervalMs,
+      listen: listenOpt,
+      revision: revisionOpt,
+    });
+    subRef.current = sub;
+    return () => {
+      if (subRef.current === sub) subRef.current = null;
+      sub();
+    };
+  }, [load, eventName, apply, intervalMs, listenOpt, revisionOpt]);
 
   return { data, error, reload };
 }

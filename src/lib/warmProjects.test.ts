@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { View } from "../components/TopBar";
-import type { ProjectSummary, WorktreeInfo } from "./ipc";
+import type { ProjectSummary, ProjectWorktrees, WorktreeInfo } from "./ipc";
 import {
   activeProject,
   emptyWarmState,
@@ -9,7 +9,9 @@ import {
   rememberView,
   sameWorktrees,
   setActive,
+  warmDecision,
   warmProject,
+  worktreesFor,
 } from "./warmProjects";
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -420,5 +422,60 @@ describe("view type coverage", () => {
       state = rememberView(state, "projectA", v);
       expect(state.projects["projectA"].view).toBe(v);
     }
+  });
+});
+
+// ── Tagged worktree lists ─────────────────────────────────────────────────────
+
+const tagged = (project: string | null, names: string[] = ["alpha"]): ProjectWorktrees => ({
+  project,
+  worktrees: names.map(wtAvailable),
+});
+
+describe("worktreesFor", () => {
+  it("returns the list read for the named project", () => {
+    const t = tagged("proj", ["alpha", "bravo"]);
+    expect(worktreesFor("proj", t)).toBe(t.worktrees);
+  });
+
+  it("refuses a list read for another project", () => {
+    expect(worktreesFor("proj", tagged("other-proj"))).toBeNull();
+  });
+
+  it("refuses a list read with no active project", () => {
+    expect(worktreesFor("proj", tagged(null, []))).toBeNull();
+  });
+
+  it("is null without a project or a list", () => {
+    expect(worktreesFor(null, tagged("proj"))).toBeNull();
+    expect(worktreesFor("proj", null)).toBeNull();
+  });
+});
+
+describe("warmDecision", () => {
+  it("warms when the list was read for the active project", () => {
+    const t = tagged("proj");
+    expect(warmDecision("proj", t, false)).toEqual({ kind: "warm", worktrees: t.worktrees });
+  });
+
+  it("resyncs when the list was read for a different project", () => {
+    expect(warmDecision("proj", tagged("other-proj"), false)).toEqual({
+      kind: "resync",
+      listProject: "other-proj",
+    });
+  });
+
+  it("skips a list read for no project (a brief resolve failure, not a switch)", () => {
+    expect(warmDecision("proj", tagged(null, []), false)).toEqual({ kind: "skip" });
+  });
+
+  it("skips while a switch is in flight, even on a mismatch", () => {
+    expect(warmDecision("proj", tagged("other-proj"), true)).toEqual({ kind: "skip" });
+    expect(warmDecision("proj", tagged("proj"), true)).toEqual({ kind: "skip" });
+  });
+
+  it("skips without a project or a list", () => {
+    expect(warmDecision(null, tagged("proj"), false)).toEqual({ kind: "skip" });
+    expect(warmDecision("proj", null, false)).toEqual({ kind: "skip" });
   });
 });

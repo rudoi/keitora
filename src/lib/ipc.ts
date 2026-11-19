@@ -598,9 +598,16 @@ export interface WorktreeInfo {
   dispatch?: boolean;
 }
 
+/** The active project's worktrees, tagged with the resolved project name they were read
+ *  for (`null` with no active project). */
+export interface ProjectWorktrees {
+  project: string | null;
+  worktrees: WorktreeInfo[];
+}
+
 /** List configured worktrees, each resolved to a path + filesystem status. */
-export function listWorktrees(): Promise<WorktreeInfo[]> {
-  return invoke<WorktreeInfo[]>("worktrees");
+export function listWorktrees(): Promise<ProjectWorktrees> {
+  return invoke<ProjectWorktrees>("worktrees");
 }
 
 /**
@@ -1332,4 +1339,157 @@ export function onUpdaterStatus(cb: (e: UpdateStatusEvent) => void): Promise<Unl
 
 export function onUpdaterProgress(cb: (e: UpdateProgressEvent) => void): Promise<UnlistenFn> {
   return listen<UpdateProgressEvent>("updater://progress", cb);
+}
+
+// ── Agent CLI updates ──────────────────────────────────────────────────────────
+
+/** How a CLI was installed, judged from its executable's path. */
+export type InstallKind = "npm" | "brew" | "native" | "unknown";
+
+/** Mirrors the backend's `AgentUpdateState` (tagged by `type`). */
+export type AgentUpdateState =
+  | { type: "unchecked" }
+  | { type: "not_installed" }
+  | { type: "unknown" }
+  | { type: "up_to_date" }
+  | { type: "available"; installed: string; latest: string; command: string | null }
+  | { type: "skipped"; latest: string };
+
+/** One CLI's update picture. */
+export interface AgentUpdateEntry {
+  cli: CliKind;
+  state: AgentUpdateState;
+  installed: string | null;
+  latest: string | null;
+  /** The executable checked (`null` when not found). */
+  exe: string | null;
+  install_kind: InstallKind | null;
+  /** What Keitora runs to update; `null` means there is no Update button. */
+  command: string | null;
+  /** The command to show the user: the run command, or a suggestion for their own terminal. */
+  guidance: string | null;
+}
+
+/** A session by name, as panes are keyed. */
+export interface UpdateSession {
+  project: string;
+  worktree: string;
+}
+
+/** A session stopped so its CLI could be updated. */
+export interface StoppedSession extends UpdateSession {
+  cli: CliKind;
+}
+
+/** `agent_updates_status` reply and the `agent-updates://status` payload. */
+export interface AgentUpdatesSnapshot {
+  codex: AgentUpdateEntry;
+  claude: AgentUpdateEntry;
+  /** RFC 3339 time of the last completed check. */
+  checked_at: string | null;
+  stopped: StoppedSession[];
+  /** The CLI whose update is running in the update pane, if any. */
+  running: CliKind | null;
+}
+
+/** A started update run. The backend has already opened the update pane and typed
+ *  the update into it (written for the pane's own shell); the dialog's pane attaches to
+ *  it. `command` is the update as shown to the user, never typed; `cwd` is where the
+ *  pane runs. */
+export interface RunPlan {
+  command: string;
+  cwd: string;
+}
+
+/** How an update run ended. */
+export type RunOutcome =
+  | { type: "updated"; from: string | null; to: string }
+  | { type: "unchanged"; version: string | null }
+  | { type: "failed"; code: number; hint: string | null }
+  | { type: "timed_out" };
+
+/** `agent-updates://run` payload. */
+export interface AgentRunEvent {
+  cli: CliKind;
+  outcome: RunOutcome;
+}
+
+/** `agent-updates://stop` / `agent-updates://restart` payload. */
+export interface AgentSessionsEvent {
+  cli: CliKind;
+  keys: UpdateSession[];
+}
+
+/** `agent-updates://prompt` payload: a launched pane is parked on its CLI's update screen. */
+export interface AgentPromptEvent {
+  project: string;
+  worktree: string;
+  cli: CliKind;
+}
+
+/** The pane key the update dialog runs in; hidden from every session listing. */
+export const AGENT_UPDATE_PROJECT = "__keitora";
+export const AGENT_UPDATE_WORKTREE = "agent-update";
+
+export function agentUpdatesStatus(): Promise<AgentUpdatesSnapshot> {
+  return invoke("agent_updates_status");
+}
+
+/** Check both CLIs. Unless `force`, a check right after another answers with its result.
+ *  A probing check's result also arrives as an `agent-updates://status` event. */
+export function agentUpdatesCheck(force: boolean): Promise<AgentUpdatesSnapshot> {
+  return invoke("agent_updates_check", { force });
+}
+
+/** Skip `version` of `cli` (persisted); a newer release shows the banner again. */
+export function agentUpdateSkip(cli: CliKind, version: string): Promise<AgentUpdatesSnapshot> {
+  return invoke("agent_update_skip", { cli, version });
+}
+
+/** Start updating `cli`: opens the update pane and starts the update in it, then returns
+ *  what is running and where. Rejects when Keitora has no command for this install, or
+ *  the pane could not be opened or typed into. */
+export function agentUpdateRun(cli: CliKind): Promise<RunPlan> {
+  return invoke("agent_update_run", { cli });
+}
+
+/** Close the update pane and stop watching it. Safe when there is none. */
+export function agentUpdateClose(): Promise<void> {
+  return invoke("agent_update_close");
+}
+
+/** The live sessions running `cli`. */
+export function agentUpdateLiveSessions(cli: CliKind): Promise<UpdateSession[]> {
+  return invoke("agent_update_live_sessions", { cli });
+}
+
+/** Stop every live session running `cli` (emits `agent-updates://stop` first). */
+export function agentUpdateStop(cli: CliKind): Promise<UpdateSession[]> {
+  return invoke("agent_update_stop", { cli });
+}
+
+/** Ask the panes of `cli`'s stopped and running sessions to restart
+ *  (via `agent-updates://restart`). */
+export function agentUpdateRestart(cli: CliKind): Promise<UpdateSession[]> {
+  return invoke("agent_update_restart", { cli });
+}
+
+export function onAgentUpdatesStatus(cb: (e: AgentUpdatesSnapshot) => void): Promise<UnlistenFn> {
+  return listen<AgentUpdatesSnapshot>("agent-updates://status", cb);
+}
+
+export function onAgentUpdateRun(cb: (e: AgentRunEvent) => void): Promise<UnlistenFn> {
+  return listen<AgentRunEvent>("agent-updates://run", cb);
+}
+
+export function onAgentUpdateStop(cb: (e: AgentSessionsEvent) => void): Promise<UnlistenFn> {
+  return listen<AgentSessionsEvent>("agent-updates://stop", cb);
+}
+
+export function onAgentUpdateRestart(cb: (e: AgentSessionsEvent) => void): Promise<UnlistenFn> {
+  return listen<AgentSessionsEvent>("agent-updates://restart", cb);
+}
+
+export function onAgentUpdatePrompt(cb: (e: AgentPromptEvent) => void): Promise<UnlistenFn> {
+  return listen<AgentPromptEvent>("agent-updates://prompt", cb);
 }

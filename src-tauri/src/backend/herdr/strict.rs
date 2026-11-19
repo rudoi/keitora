@@ -106,6 +106,8 @@ enum StepError {
     NameTaken(HerdrError),
     /// Any other failure, as the trail and final error quote it.
     Failed(String),
+    /// The pane shows codex's startup update screen; every later step would too.
+    UpdatePrompt,
 }
 
 impl StepError {
@@ -115,6 +117,7 @@ impl StepError {
         match self {
             StepError::NameTaken(e) => e.code().unwrap_or("agent_name_taken").to_string(),
             StepError::Failed(reason) => reason,
+            StepError::UpdatePrompt => "agent update prompt".to_string(),
         }
     }
 }
@@ -204,6 +207,13 @@ pub(super) enum Verdict {
 }
 
 impl Verdict {
+    /// Whether the pane may be parked on codex's update screen, so it is worth reading:
+    /// anything but a confirmed codex (already past that screen) or a pane that is
+    /// gone (nothing to read).
+    pub(super) fn may_be_update_screen(&self) -> bool {
+        !matches!(self, Verdict::Confirmed | Verdict::Gone)
+    }
+
     /// The step's failure reason; `None` when the verdict is a success.
     pub(super) fn failure(&self) -> Option<String> {
         match self {
@@ -356,11 +366,12 @@ pub(super) fn classify_never_appeared(info: &Result<PaneProcessInfo, HerdrError>
     }
 }
 
-/// Lowercase the two exact tokens the pane reads as spawn-error kinds
-/// (`Recovering`, `Terminated`), so free text can never be mistaken for them.
+/// Lowercase the exact tokens the pane reads as spawn-error kinds (`Recovering`,
+/// `Terminated`, `AgentUpdatePrompt`), so free text can never be mistaken for them.
 pub(super) fn sanitize_ui_tokens(text: &str) -> String {
     text.replace("Recovering", "recovering")
         .replace("Terminated", "terminated")
+        .replace("AgentUpdatePrompt", "agentupdateprompt")
 }
 
 /// The error a strict launch returns once every step failed:
@@ -554,6 +565,7 @@ impl Spawner {
                 }
                 Err(failure) => {
                     let name_taken = matches!(failure, StepError::NameTaken(_));
+                    let update_prompt = matches!(failure, StepError::UpdatePrompt);
                     let reason = failure.reason();
                     let tail = self
                         .ops
@@ -583,6 +595,9 @@ impl Spawner {
                     // Every later step would start under the same name.
                     if name_taken {
                         break;
+                    }
+                    if update_prompt {
+                        return Err(PtyBackendError::AgentUpdatePrompt(STRICT_CLI));
                     }
                 }
             }
@@ -615,7 +630,7 @@ impl Spawner {
                 .ops
                 .agent_start(name, kind, pane_id, args, AGENT_START_TIMEOUT_MS)
             {
-                Ok(()) => break (Instant::now() + timing.verify_window).min(step_deadline),
+                Ok(_) => break (Instant::now() + timing.verify_window).min(step_deadline),
                 Err(e) if agent::is_early_exit(&e) => {
                     return Err(StepError::Failed(early_exit_reason(&e)))
                 }
@@ -653,6 +668,15 @@ impl Spawner {
             timing,
             window_end,
         );
+        // A codex parked on its update screen still has a foreground process, so a
+        // launch herdr never confirmed may be sitting on it: check the visible screen
+        // before accepting it (or before reporting an ordinary failure). A confirmed
+        // codex is past that screen, and its transcript is never read.
+        if verdict.may_be_update_screen()
+            && self.codex_update_screen_shown(pane_id, "visible", None)
+        {
+            return Err(StepError::UpdatePrompt);
+        }
         match verdict.failure() {
             None => Ok(()),
             Some(reason) => Err(StepError::Failed(reason)),
@@ -901,6 +925,10 @@ mod tests {
             "recovering then terminated, recovering ok"
         );
         assert_eq!(sanitize_ui_tokens("RECOVERING"), "RECOVERING");
+        assert_eq!(
+            sanitize_ui_tokens("AgentUpdatePrompt: codex"),
+            "agentupdateprompt: codex"
+        );
     }
 
     #[test]

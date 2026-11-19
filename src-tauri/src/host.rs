@@ -36,6 +36,18 @@ struct WorktreeView {
     terminated: bool,
 }
 
+/// The active project's worktrees, tagged with the project they were resolved for.
+/// The tag lets the frontend refuse a list that doesn't belong to the project it
+/// thinks is active (a stale response, or the registry's active project changed
+/// underneath it) instead of filing it under the wrong rail group.
+#[derive(Serialize, Default)]
+struct ProjectWorktrees {
+    /// The resolved `[project].name` (what the frontend's `project.name` holds);
+    /// `None` with no active project.
+    project: Option<String>,
+    worktrees: Vec<WorktreeView>,
+}
+
 /// List the configured worktrees, each resolved to a path and classified.
 /// `ResolvedWorktree` serializes `path` as a string, which is what the UI wants.
 ///
@@ -43,7 +55,7 @@ struct WorktreeView {
 /// fails (e.g. `NeedsOnboarding`) yields an empty list rather than an error, so
 /// the rail renders empty until onboarding completes.
 #[tauri::command(async)]
-fn worktrees(client: State<SharedBackend>) -> Result<Vec<WorktreeView>, String> {
+fn worktrees(client: State<SharedBackend>) -> Result<ProjectWorktrees, String> {
     worktrees_in(
         client.inner().as_ref(),
         keitora_tasks::resolve_active().ok(),
@@ -51,19 +63,24 @@ fn worktrees(client: State<SharedBackend>) -> Result<Vec<WorktreeView>, String> 
 }
 
 /// [`worktrees`] for the active project `active` (`None`: no active project yet,
-/// an empty rail).
+/// an empty rail). The tag and the list come from the same resolution, so they
+/// can't disagree.
 fn worktrees_in(
     client: &dyn PtyBackend,
     active: Option<keitora_tasks::ProjectConfig>,
-) -> Result<Vec<WorktreeView>, String> {
+) -> Result<ProjectWorktrees, String> {
     let Some(pc) = active else {
-        return Ok(Vec::new());
+        return Ok(ProjectWorktrees::default());
     };
     let project = pc.project.name.clone();
     let resolved = keitora_tasks::Config::from_project(pc)
         .resolved_worktrees()
         .map_err(|e| e.to_string())?;
-    Ok(worktree_views(client, &project, resolved))
+    let worktrees = worktree_views(client, &project, resolved);
+    Ok(ProjectWorktrees {
+        project: Some(project),
+        worktrees,
+    })
 }
 
 /// Resolved worktrees for `project` with the backend's terminated flag attached.
@@ -358,10 +375,9 @@ fn set_rail_view(
 }
 
 /// Switch the active project by registry name. Emits the project/worktrees/tasks/
-/// sessions change events directly so the frontend reseeds immediately, instead of
-/// waiting on the config-file watcher's ~200 ms debounce (the source of the visible
-/// switch lag). The config watcher still fires shortly after — the duplicate reload
-/// is idempotent.
+/// sessions change events directly so the frontend reseeds immediately. The user
+/// registry watcher sees this write too, but `restart_project_watchers` has recorded
+/// the new active project by then, so it treats the write as already handled.
 #[tauri::command(async)]
 fn set_active_project(app: AppHandle, name: String) -> Result<(), String> {
     {
@@ -373,6 +389,13 @@ fn set_active_project(app: AppHandle, name: String) -> Result<(), String> {
         user_cfg.set_active(&name);
         user_cfg.save().map_err(|e| e.to_string())?;
     }
+    activate_resolved(&app)
+}
+
+/// Reseed everything project-scoped for the registry's (already saved) active
+/// project: hooks, repair pass, watchers, and the frontend's change events. Shared
+/// by an in-app switch and an out-of-app one the registry watcher picks up.
+fn activate_resolved(app: &AppHandle) -> Result<(), String> {
     // The active project changed: drop the cached `(name, db_path)` so the next
     // PTY command re-resolves against the new project, (re)install its worktrees'
     // session hooks off-thread, and kick off the repair pass off-thread. Pass the
@@ -385,13 +408,22 @@ fn set_active_project(app: AppHandle, name: String) -> Result<(), String> {
     // AFTER invalidate + save so `resolve_active()` (read inside the calls) returns
     // the new project. Stops the old watchers (no stale events from the old project)
     // and removes the 30 s poll lag for the new one.
-    restart_project_watchers(&app);
+    restart_project_watchers(app);
     // Reseed the whole project-scoped UI now — don't wait for the fs watcher.
-    let _ = app.emit("project://changed", ());
-    let _ = app.emit("worktrees://changed", ());
-    let _ = app.emit("tasks://changed", ());
-    let _ = app.emit("sessions://changed", ());
+    emit_project_reseed(app);
     Ok(())
+}
+
+/// Tell the frontend that everything project-scoped may have changed.
+fn emit_project_reseed(app: &AppHandle) {
+    for event in [
+        "project://changed",
+        "worktrees://changed",
+        "tasks://changed",
+        "sessions://changed",
+    ] {
+        let _ = app.emit(event, ());
+    }
 }
 
 /// Onboard a folder as a Keitora project: validate it is a git repo, scaffold a
@@ -419,10 +451,12 @@ fn onboard_project(app: AppHandle, path: String) -> Result<ProjectSummary, Strin
     //         preserving worktrees/db pointer) then use the resulting name.
     //      c. neither → register file-less; the name is the root basename.
     // The folder basename — the file-less project name, and the fallback when a
-    // committed file isn't where we expect.
+    // committed file isn't where we expect. Like a committed name (which
+    // `ProjectConfig::load` already maps), never the name Keitora reserves for its
+    // own sessions.
     let basename = || {
         root.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
+            .map(|n| keitora_tasks::unreserved_project_name(&n.to_string_lossy(), root))
             .ok_or_else(|| format!("cannot derive a project name from path: {path}"))
     };
     let toml_path = root.join("keitora.toml");
@@ -702,6 +736,9 @@ pub struct SettingsUser {
     /// Whether per-worktree sticky notes are available (`[sticky_notes] enabled`;
     /// off unless explicitly enabled).
     pub sticky_notes_enabled: bool,
+    /// Effective agent CLI update-check interval in hours
+    /// (`[updates] agent_check_hours`: unset → 6, `0` = app start only).
+    pub agent_update_check_hours: u32,
 }
 
 /// Everything the settings drawer needs in one round-trip.
@@ -759,6 +796,7 @@ fn get_settings() -> Result<SettingsSnapshot, String> {
             codex_available: keitora_tasks::discover_cli(keitora_tasks::CliKind::Codex).is_some(),
             auto_check_updates: user_cfg.updates.auto_check(),
             sticky_notes_enabled: user_cfg.sticky_notes.enabled(),
+            agent_update_check_hours: user_cfg.updates.agent_check_hours(),
         },
     })
 }
@@ -1022,10 +1060,16 @@ fn set_skip_permissions(cli: keitora_tasks::CliKind, enabled: bool) -> Result<()
 /// update check reading it.
 #[tauri::command(async)]
 fn set_update_auto_check(enabled: bool) -> Result<(), String> {
-    let _registry = keitora_tasks::UserConfig::write_lock();
-    let mut user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
-    user_cfg.updates.auto_check = Some(enabled);
-    user_cfg.save().map_err(|e| e.to_string())
+    keitora_tasks::UserConfig::update(|c| c.updates.auto_check = Some(enabled))
+        .map_err(|e| e.to_string())
+}
+
+/// Persist the user-level `[updates] agent_check_hours` interval. Persist-only:
+/// the agent update scheduler re-reads it on its next tick.
+#[tauri::command(async)]
+fn set_agent_update_check_hours(hours: u32) -> Result<(), String> {
+    keitora_tasks::UserConfig::update(|c| c.updates.agent_check_hours = Some(hours))
+        .map_err(|e| e.to_string())
 }
 
 /// Persist the user-level `[sticky_notes] enabled` flag and tell the UI, which shows
@@ -1452,13 +1496,13 @@ pub(crate) fn spawn_pty(
     transfer: bool,
 ) -> Result<u64, String> {
     let size = requested_size(cols, rows);
-    // The PTY identity is the explicit `project` param; `active_project()` is kept
-    // only for the `db_path` the daemon needs to mark the worktree offline on exit.
-    let (_, db_path) = active_project()?;
     let key = SessionKey {
         project,
         worktree: id,
     };
+    // The PTY identity is the explicit `project` param; `active_project()` is kept
+    // only for the `db_path` the daemon needs to mark the worktree offline on exit.
+    let db_path = spawn_db_path(&key, active_project)?;
     // Re-derive the default launch from persisted state on EVERY spawn.
     // This runs on first launch, hard-restart, daemon-crash re-attach, and
     // app relaunch alike — the frontend's `ptySpawn` never carries a command — so
@@ -1479,6 +1523,20 @@ pub(crate) fn spawn_pty(
     spawn_pty_with(
         client, key, cwd, db_path, size, command, fresh, transfer, resolve,
     )
+}
+
+/// The task DB a spawn of `key` marks the worktree offline in: the active project's,
+/// so a spawn needs an active project. Keitora's reserved utility pane belongs to no
+/// project (its cwd comes from the update's run plan), so it has no DB and spawns
+/// with no project active.
+fn spawn_db_path(
+    key: &SessionKey,
+    active: impl FnOnce() -> Result<(String, String), String>,
+) -> Result<String, String> {
+    if key.is_reserved() {
+        return Ok(String::new());
+    }
+    active().map(|(_, db_path)| db_path)
 }
 
 /// [`spawn_pty`] once the key, size and `db_path` are known, with the launch
@@ -1504,6 +1562,11 @@ fn spawn_pty_with(
         return client
             .spawn(key, cwd, db_path, size, Some(command))
             .map_err(spawn_err_kind);
+    }
+    // The reserved update pane is opened by the update run itself, never by a pane
+    // spawn: one asked for here means the run's pane has gone.
+    if key.is_reserved() {
+        return Err("the update pane has closed; start the update again".to_string());
     }
     let launch = launch_for_spawn(resolve(&key), fresh, transfer);
     client
@@ -1627,7 +1690,10 @@ pub(crate) fn resolve_agent_launch(key: &SessionKey) -> Option<(String, AgentLau
 /// [`resolve_agent_launch`] over a loaded registry: the project is matched by
 /// its resolved name (`[project].name`, the name session keys carry), not the
 /// registry map key; the launch uses that project's own settings.
-fn launch_for(user: &keitora_tasks::UserConfig, key: &SessionKey) -> Option<(String, AgentLaunch)> {
+pub(crate) fn launch_for(
+    user: &keitora_tasks::UserConfig,
+    key: &SessionKey,
+) -> Option<(String, AgentLaunch)> {
     for pref in user.projects.values() {
         let Ok(pc) = keitora_tasks::effective_config(pref) else {
             continue;
@@ -2288,6 +2354,72 @@ fn start_config_watcher(app: AppHandle) {
     });
 }
 
+/// The registry's active project as of the last activation this process handled.
+/// Recorded by [`restart_project_watchers`], which every activation path (in-app
+/// switch, onboarding, migration, removal, startup, and the registry watcher's own
+/// reseed) runs, so the watcher only reacts to changes made outside the app.
+static LAST_ACTIVE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Record `now` as the handled active project; true when it differs from the last one.
+fn take_active_change(last: &mut Option<String>, now: Option<String>) -> bool {
+    std::mem::replace(last, now.clone()) != now
+}
+
+/// Watch the user registry for an active-project change made outside this app's own
+/// switch paths: `keitora config use`, `keitora init`, or a second Keitora instance.
+/// Without it the frontend keeps the old project while every worktree reload returns
+/// the new one. Started once at setup, after the first [`restart_project_watchers`]
+/// recorded the launch-time project; lives for the app's lifetime. Skipped under
+/// `KEITORA_PROJECT`, where the registry's `active` doesn't pick the project.
+fn start_registry_watcher(app: AppHandle) {
+    if std::env::var_os("KEITORA_PROJECT").is_some() {
+        return;
+    }
+    let Ok(path) = keitora_tasks::user_config_path() else {
+        return;
+    };
+    let (Some(dir), Some(file)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let (dir, file) = (dir.to_path_buf(), file.to_string_lossy().into_owned());
+    // Never signalled: the watcher lives as long as the app.
+    let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(0);
+    thread::spawn(move || {
+        let _keep_alive = stop_tx;
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        crate::db_watch::watch_dir(dir, file, Duration::from_millis(200), stop_rx, || {
+            on_registry_change(&app)
+        });
+    });
+}
+
+/// The registry file changed: reseed if its active project moved; otherwise refresh
+/// just the project list (a project registered or removed from the CLI).
+fn on_registry_change(app: &AppHandle) {
+    // A failed load (a read racing a writer) is skipped; the next write fires again.
+    let Ok(reg) = keitora_tasks::UserConfig::load() else {
+        return;
+    };
+    let changed = {
+        let mut last = LAST_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        take_active_change(&mut last, reg.active.clone())
+    };
+    if !changed {
+        let _ = app.emit("projects://reordered", ());
+        return;
+    }
+    log::info!("[registry] active project changed outside the app; reseeding");
+    if reg.active.is_none() || activate_resolved(app).is_err() {
+        // No (resolvable) active project: tear down the project watchers and let the
+        // frontend reload into its empty / onboarding state.
+        invalidate_active_project();
+        restart_project_watchers(app);
+        emit_project_reseed(app);
+    }
+}
+
 /// (Re)point the project-scoped filesystem watchers (tasks/sessions + config) at the
 /// currently-active project. Called from every project-activation path so live
 /// updates follow the active project without an app restart, and from `remove_project`
@@ -2295,6 +2427,9 @@ fn start_config_watcher(app: AppHandle) {
 /// supersedes its previous watcher thread via the stop-sender swap (no leak); with no
 /// active project both calls stop the prior watcher and start nothing.
 fn restart_project_watchers(app: &AppHandle) {
+    if let Ok(reg) = keitora_tasks::UserConfig::load() {
+        *LAST_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = reg.active;
+    }
     start_tasks_watcher(app.clone());
     start_config_watcher(app.clone());
 }
@@ -2457,6 +2592,8 @@ pub fn run() {
             // In-app updates: managed state, leftover cleanup, and the background schedule
             // (release builds on supported platforms only).
             crate::updater::startup(app.handle().clone());
+            // Agent CLI update checks: managed state and the background schedule.
+            crate::agent_updates::startup(app.handle().clone());
             #[cfg(target_os = "macos")]
             if crate::updater::release::Platform::current().is_some() {
                 if let Err(e) = crate::updater::commands::install_app_menu(app.handle()) {
@@ -2465,6 +2602,8 @@ pub fn run() {
             }
             // Point the tasks + config watchers at the launch-time active project.
             restart_project_watchers(app.handle());
+            // Follow active-project changes made outside the app (CLI, another instance).
+            start_registry_watcher(app.handle().clone());
             // Background-project notifications: one watcher per
             // registered project DB, fires OS notifications for non-active
             // projects' sessions that need input.
@@ -2576,10 +2715,19 @@ pub fn run() {
             set_sticky_notes_enabled,
             get_sticky_note,
             save_sticky_note,
+            set_agent_update_check_hours,
             crate::updater::commands::update_status,
             crate::updater::commands::update_check,
             crate::updater::commands::update_download,
             crate::updater::commands::update_apply,
+            crate::agent_updates::commands::agent_updates_status,
+            crate::agent_updates::commands::agent_updates_check,
+            crate::agent_updates::commands::agent_update_skip,
+            crate::agent_updates::commands::agent_update_run,
+            crate::agent_updates::commands::agent_update_close,
+            crate::agent_updates::commands::agent_update_live_sessions,
+            crate::agent_updates::commands::agent_update_stop,
+            crate::agent_updates::commands::agent_update_restart,
             remove_project,
             tasks::task_actor,
             tasks::sessions_list,
@@ -2673,6 +2821,12 @@ mod tests {
         assert_eq!(kind(PtyBackendError::NotConnected), "herdr unreachable");
         assert_eq!(kind(PtyBackendError::NoSuchSession), "no live session");
         assert_eq!(kind(PtyBackendError::Other("boom".into())), "boom");
+        assert_eq!(
+            kind(PtyBackendError::AgentUpdatePrompt(
+                keitora_tasks::CliKind::Codex
+            )),
+            "AgentUpdatePrompt: codex"
+        );
     }
 
     #[test]
@@ -2897,7 +3051,10 @@ mod tests {
                 worktree: "beta".into(),
             });
             let views = worktrees_in(&fake, Some(pc)).unwrap();
-            let json = serde_json::to_value(&views).unwrap();
+            let tagged = serde_json::to_value(&views).unwrap();
+            // The list is tagged with the resolved project it was read for.
+            assert_eq!(tagged["project"], "proj");
+            let json = &tagged["worktrees"];
             let flags: Vec<(String, bool)> = json
                 .as_array()
                 .unwrap()
@@ -2919,7 +3076,43 @@ mod tests {
         fn worktrees_without_an_active_project_are_empty() {
             let fake = FakeBackend::new();
             fake.insert_terminated(key());
-            assert!(worktrees_in(&fake, None).unwrap().is_empty());
+            let views = worktrees_in(&fake, None).unwrap();
+            assert!(views.worktrees.is_empty());
+            assert_eq!(views.project, None);
+            let json = serde_json::to_value(&views).unwrap();
+            assert!(json["project"].is_null());
+        }
+    }
+
+    mod registry_watch {
+        use super::super::take_active_change;
+
+        fn some(s: &str) -> Option<String> {
+            Some(s.to_string())
+        }
+
+        #[test]
+        fn the_same_active_project_is_not_a_change() {
+            let mut last = some("proj");
+            assert!(!take_active_change(&mut last, some("proj")));
+            let mut none = None;
+            assert!(!take_active_change(&mut none, None));
+        }
+
+        #[test]
+        fn a_different_active_project_is_a_change_and_is_recorded() {
+            let mut last = some("proj");
+            assert!(take_active_change(&mut last, some("other-proj")));
+            assert_eq!(last, some("other-proj"));
+            assert!(!take_active_change(&mut last, some("other-proj")));
+        }
+
+        #[test]
+        fn gaining_or_losing_an_active_project_is_a_change() {
+            let mut last = None;
+            assert!(take_active_change(&mut last, some("proj")));
+            assert!(take_active_change(&mut last, None));
+            assert_eq!(last, None);
         }
     }
 
@@ -3784,6 +3977,69 @@ mod tests {
             let got = spawned_launch(&spawn(CliKind::Claude, None, false, true));
             assert_eq!(got.policy, LaunchPolicy::Default);
             assert_eq!(got.cli, CliKind::Claude);
+        }
+
+        /// The reserved update pane needs no active project: it has no task DB.
+        #[test]
+        fn the_reserved_key_spawns_with_no_active_project() {
+            use super::super::spawn_db_path;
+            let no_project =
+                || -> Result<(String, String), String> { Err("no active project".into()) };
+            assert_eq!(
+                spawn_db_path(&SessionKey::agent_update(), no_project).as_deref(),
+                Ok("")
+            );
+            assert_eq!(
+                spawn_db_path(&key(), no_project),
+                Err("no active project".to_string())
+            );
+            assert_eq!(
+                spawn_db_path(&key(), || Ok(("proj-a".into(), "/db".into()))).as_deref(),
+                Ok("/db")
+            );
+
+            let fake = FakeBackend::new();
+            spawn_pty_with(
+                &fake,
+                SessionKey::agent_update(),
+                "/home/me".into(),
+                String::new(),
+                Some((80, 24)),
+                Some("echo hi".into()),
+                false,
+                false,
+                |_: &SessionKey| panic!("no launch is resolved"),
+            )
+            .unwrap();
+            assert_eq!(
+                fake.calls(),
+                vec![Call::Spawn {
+                    key: SessionKey::agent_update(),
+                    cwd: "/home/me".into(),
+                    db_path: String::new(),
+                    size: Some((80, 24)),
+                    command: Some("echo hi".into()),
+                }]
+            );
+        }
+
+        #[test]
+        fn the_reserved_key_never_spawns_an_agent() {
+            let fake = FakeBackend::new();
+            let err = spawn_pty_with(
+                &fake,
+                SessionKey::agent_update(),
+                "/home/me".into(),
+                String::new(),
+                None,
+                None,
+                false,
+                false,
+                |_: &SessionKey| panic!("no launch is resolved"),
+            )
+            .unwrap_err();
+            assert!(err.contains("update pane has closed"), "{err}");
+            assert!(fake.calls().is_empty());
         }
 
         #[test]
