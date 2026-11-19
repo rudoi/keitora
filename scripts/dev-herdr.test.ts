@@ -5,6 +5,7 @@ import { isAbsolute, join, resolve } from "node:path";
 
 import {
   checkSocketPath,
+  claudeDevConfig,
   demoProjectCount,
   demoProjects,
   devHomeFor,
@@ -16,8 +17,10 @@ import {
   mayStopOnTeardown,
   parseReleaseVersion,
   seedDemoRegistryToml,
+  seedProjectToml,
   seedRegistryToml,
   sortReleasesNewestFirst,
+  trustedClaudeConfig,
 } from "./dev-herdr.mjs";
 
 describe("devHomeFor", () => {
@@ -63,7 +66,68 @@ describe("herdrDevPaths", () => {
     // state + registry + throwaway repo are all under the dev home (so purging is safe).
     expect(p.herdrStateDir.replace(/\\/g, "/")).toBe("/dev/home-herdr/herdr");
     expect(p.configHome.replace(/\\/g, "/")).toBe("/dev/home-herdr/config");
-    expect(p.repoPath.replace(/\\/g, "/")).toBe("/dev/home-herdr/test-repo");
+    // The repo directory is named like its worktree: hooks report by basename.
+    expect(p.repoPath.replace(/\\/g, "/")).toBe("/dev/home-herdr/herdr-test-repo");
+    expect(p.tasksDir.replace(/\\/g, "/")).toBe("/dev/home-herdr/tasks");
+  });
+
+  it("names the throwaway repo directory after its registered worktree", () => {
+    const p = herdrDevPaths("C:\\scratch\\dev");
+    expect(seedRegistryToml(p.repoPath)).toContain('name = "herdr-test-repo"');
+    expect(p.repoPath.replace(/\\/g, "/").split("/").pop()).toBe("herdr-test-repo");
+  });
+});
+
+describe("seedProjectToml", () => {
+  it("pins the task DB and the hook CLI to the given (dev home) paths", () => {
+    const toml = seedProjectToml(
+      "herdr-test-repo",
+      "C:\\scratch\\dev\\tasks\\herdr-test-repo\\tasks.db",
+      "D:\\repos\\proj\\target\\debug\\keitora.exe",
+    );
+    expect(toml).toContain('name = "herdr-test-repo"');
+    expect(toml).toContain("db_path = 'C:/scratch/dev/tasks/herdr-test-repo/tasks.db'");
+    expect(toml).toContain("[cli]\npath = 'D:/repos/proj/target/debug/keitora.exe'");
+    // Never the default `~/.keitora/...` DB.
+    expect(toml).not.toContain("~");
+  });
+});
+
+describe("claudeDevConfig", () => {
+  it("stays on the real Claude config without a credential that needs no login", () => {
+    expect(claudeDevConfig({}, "/dev/home-herdr")).toBeNull();
+    expect(claudeDevConfig({ CLAUDE_CODE_OAUTH_TOKEN: "" }, "/dev/home-herdr")).toBeNull();
+  });
+
+  it("isolates Claude under the dev home when a token or API key is set", () => {
+    for (const env of [{ CLAUDE_CODE_OAUTH_TOKEN: "x" }, { ANTHROPIC_API_KEY: "x" }]) {
+      const c = claudeDevConfig(env, "/dev/home-herdr");
+      expect(c.configDir.replace(/\\/g, "/")).toBe("/dev/home-herdr/claude");
+      expect(c.configFile.replace(/\\/g, "/")).toBe("/dev/home-herdr/claude/.claude.json");
+      expect(c.env).toEqual({ CLAUDE_CONFIG_DIR: c.configDir });
+    }
+  });
+});
+
+describe("trustedClaudeConfig", () => {
+  it("trusts every repo, native and forward-slashed, and skips onboarding", () => {
+    const cfg = trustedClaudeConfig(null, ["C:\\scratch\\dev\\herdr-test-repo"]);
+    expect(cfg.hasCompletedOnboarding).toBe(true);
+    expect(cfg.projects["C:\\scratch\\dev\\herdr-test-repo"].hasTrustDialogAccepted).toBe(true);
+    expect(cfg.projects["C:/scratch/dev/herdr-test-repo"].hasTrustDialogAccepted).toBe(true);
+  });
+
+  it("keeps whatever Claude itself stored there", () => {
+    const existing = {
+      numStartups: 3,
+      projects: { "/dev/repo": { allowedTools: ["Bash"], hasTrustDialogAccepted: false } },
+    };
+    const cfg = trustedClaudeConfig(existing, ["/dev/repo", "/dev/other"]);
+    expect(cfg.numStartups).toBe(3);
+    expect(cfg.projects["/dev/repo"]).toEqual({ allowedTools: ["Bash"], hasTrustDialogAccepted: true });
+    expect(cfg.projects["/dev/other"].hasTrustDialogAccepted).toBe(true);
+    // Pure: the input is not modified.
+    expect(existing.projects["/dev/repo"].hasTrustDialogAccepted).toBe(false);
   });
 });
 
