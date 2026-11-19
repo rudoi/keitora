@@ -22,6 +22,7 @@ import { useDispatchActions } from "../lib/useDispatchActions";
 import { decideLane, useDispatchTargets } from "../lib/useDispatchTargets";
 import { useLocalStorageState } from "../lib/useLocalStorageState";
 import { LaneLayout } from "./board/LaneLayout";
+import { availableTags } from "./board/tagFilter";
 import { useBoardLanes } from "./board/useBoardLanes";
 import { TaskFormDialog } from "./TaskFormDialog";
 import { useToast } from "./Toast";
@@ -93,6 +94,8 @@ export function Board({
   const boardLanes = useBoardLanes(tasks, worktreeNames, sessions);
   const frontReserved = useMemo(() => frontReservedByWorktree(boardLanes), [boardLanes]);
   const byId = useMemo(() => new Map(tasks.map((t) => [t.id, t])), [tasks]);
+  // Every tag in use on the project's tasks, suggested by the New task form.
+  const projectTags = useMemo(() => availableTags(tasks), [tasks]);
 
   // Stable lookup: "taskId:worktree" → already dispatched.
   const dispatchedSet = useMemo(
@@ -259,6 +262,7 @@ export function Board({
         open={newOpen}
         onOpenChange={setNewOpen}
         mode="new"
+        tagOptions={projectTags}
         onSubmit={async (v) => {
           await newTask(v.title, v.description, v.priority, v.tags);
           await reload();

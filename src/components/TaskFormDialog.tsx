@@ -3,9 +3,11 @@
 // no tags field, so edit covers title/priority/description.
 
 import * as Dialog from "@radix-ui/react-dialog";
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { LAYER_MODAL, MODAL_OVERLAY_CLS } from "../lib/layers";
 import type { Priority } from "../lib/tasks";
+import { TagInput } from "./TagInput";
+import { parseTags } from "./tagEntry";
 
 const PRIORITIES: Priority[] = ["low", "normal", "high", "urgent"];
 
@@ -21,18 +23,22 @@ export function TaskFormDialog({
   onOpenChange,
   mode,
   initial,
+  tagOptions = [],
   onSubmit,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   mode: "new" | "edit";
   initial?: Partial<TaskFormValues>;
+  /** The project's tags, suggested when the Tags field is focused. */
+  tagOptions?: string[];
   onSubmit: (values: TaskFormValues) => Promise<void>;
 }) {
   const [title, setTitle] = useState(initial?.title ?? "");
   const [priority, setPriority] = useState<Priority>(initial?.priority ?? "normal");
   const [description, setDescription] = useState(initial?.description ?? "");
   const [tags, setTags] = useState((initial?.tags ?? []).join(", "));
+  const tagsId = useId();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -63,10 +69,7 @@ export function TaskFormDialog({
         title: title.trim(),
         priority,
         description: description.trim(),
-        tags: tags
-          .split(",")
-          .map((t) => t.trim())
-          .filter(Boolean),
+        tags: parseTags(tags),
       });
       onOpenChange(false);
     } catch (e) {
@@ -110,14 +113,16 @@ export function TaskFormDialog({
       </label>
 
       {mode === "new" && (
-        <label className="flex flex-col gap-1.5">
+        <label className="flex flex-col gap-1.5" htmlFor={tagsId}>
           <span className={labelText}>
             Tags <span className="normal-case text-tx-3/70">(comma-separated)</span>
           </span>
-          <input
+          <TagInput
+            id={tagsId}
             className={field}
             value={tags}
-            onChange={(e) => setTags(e.target.value)}
+            onChange={setTags}
+            tags={tagOptions}
             placeholder="ui, backend"
           />
         </label>
@@ -148,6 +153,12 @@ export function TaskFormDialog({
       <Dialog.Portal>
         <Dialog.Overlay className={MODAL_OVERLAY_CLS} />
         <Dialog.Content
+          // Escape in the Tags field closes its suggestion list, not the dialog.
+          onEscapeKeyDown={(e) => {
+            if ((e.target as HTMLElement | null)?.dataset?.suggestOpen === "true") {
+              e.preventDefault();
+            }
+          }}
           className={`fixed left-1/2 top-1/2 ${LAYER_MODAL} w-[460px] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 rounded-card border border-line bg-bg-1 p-5 shadow-[0_8px_30px_rgba(0,0,0,.4)]`}
         >
           <Dialog.Title className="text-[15px] font-semibold text-tx-1">{title_}</Dialog.Title>
