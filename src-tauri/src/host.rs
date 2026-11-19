@@ -606,6 +606,9 @@ pub struct SettingsUser {
     /// Whether the app checks for updates by itself (`[updates] auto_check`;
     /// on unless explicitly disabled).
     pub auto_check_updates: bool,
+    /// Whether per-worktree sticky notes are available (`[sticky_notes] enabled`;
+    /// off unless explicitly enabled).
+    pub sticky_notes_enabled: bool,
 }
 
 /// Everything the settings drawer needs in one round-trip.
@@ -662,6 +665,7 @@ fn get_settings() -> Result<SettingsSnapshot, String> {
             default_cli: user_cfg.default_cli.unwrap_or_default(),
             codex_available: keitora_tasks::discover_cli(keitora_tasks::CliKind::Codex).is_some(),
             auto_check_updates: user_cfg.updates.auto_check(),
+            sticky_notes_enabled: user_cfg.sticky_notes.enabled(),
         },
     })
 }
@@ -929,6 +933,53 @@ fn set_update_auto_check(enabled: bool) -> Result<(), String> {
     let mut user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
     user_cfg.updates.auto_check = Some(enabled);
     user_cfg.save().map_err(|e| e.to_string())
+}
+
+/// Persist the user-level `[sticky_notes] enabled` flag and tell the UI, which shows
+/// or hides the sticky-note toggle and any open note at once.
+#[tauri::command(async)]
+fn set_sticky_notes_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
+    {
+        let _registry = keitora_tasks::UserConfig::write_lock();
+        let mut user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
+        user_cfg.sticky_notes.enabled = Some(enabled);
+        user_cfg.save().map_err(|e| e.to_string())?;
+    }
+    let _ = app.emit("sticky-notes://enabled", enabled);
+    Ok(())
+}
+
+/// The sticky-notes file of the registered project `project` (registry key), beside
+/// its task DB.
+fn sticky_notes_path(project: &str) -> Result<std::path::PathBuf, String> {
+    let user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
+    let pref = user_cfg
+        .projects
+        .get(project)
+        .ok_or_else(|| format!("unknown project: {project}"))?;
+    let pc = keitora_tasks::effective_config(pref).map_err(|e| e.to_string())?;
+    Ok(keitora_tasks::sticky_notes::notes_path(&pc.tasks.db_path))
+}
+
+/// The sticky note for `worktree` of `project`, or `None` when it has none.
+#[tauri::command(async)]
+fn get_sticky_note(
+    project: String,
+    worktree: String,
+) -> Result<Option<keitora_tasks::sticky_notes::StickyNote>, String> {
+    let path = sticky_notes_path(&project)?;
+    keitora_tasks::sticky_notes::get(&path, &worktree).map_err(|e| e.to_string())
+}
+
+/// Store the sticky note for `worktree` of `project` (a hidden, empty note is removed).
+#[tauri::command(async)]
+fn save_sticky_note(
+    project: String,
+    worktree: String,
+    note: keitora_tasks::sticky_notes::StickyNote,
+) -> Result<(), String> {
+    let path = sticky_notes_path(&project)?;
+    keitora_tasks::sticky_notes::put(&path, &worktree, note).map_err(|e| e.to_string())
 }
 
 /// Remove a project from the user registry (clearing `active` if it pointed at
@@ -2425,6 +2476,9 @@ pub fn run() {
             save_user_settings,
             set_skip_permissions,
             set_update_auto_check,
+            set_sticky_notes_enabled,
+            get_sticky_note,
+            save_sticky_note,
             crate::updater::commands::update_status,
             crate::updater::commands::update_check,
             crate::updater::commands::update_download,
