@@ -526,6 +526,34 @@ Status: **Phase 0 ✅ done** · **Phase 1 ✅ done (PR #1)** · **Phase 2 ✅ do
   Follow-ups:
   - One command returning `{summary, worktrees}`, which would remove the frontend reconciliation.
   - Switching to a twin registry entry (two entries with one resolved name).
+- **#0073 — Agent CLI updates. ✅ done (PR #29).** Codex's interactive "Update available" startup
+  screen blocked herdr `agent start`, so fresh launches failed with a PATH error, recovery resumes
+  failed and went serial, and transfers could accept a pane parked on the prompt. Changes:
+  - Every codex launch passes `-c check_for_update_on_startup=false`. Claude's own background
+    updater is left alone.
+  - A backup check reads the screen when a launch still lands on the prompt. It returns a distinct
+    `AgentUpdatePrompt` error, which skips the fallback chain and is not load-related.
+  - `src-tauri/src/agent_updates/` tracks installed vs latest versions for codex and claude, using
+    codex `version.json` or the npm registry, and classifies the install from the symlink-resolved
+    path.
+    - Checks run on app start (after recovery settles), then every `[updates] agent_check_hours`
+      (default 6; 0 = app start only).
+  - A banner offers update / skip this version / later. Update runs the install's own command in a
+    visible pane on a reserved `__keitora` session key, with a sentinel marking completion.
+    - Windows offers to stop live sessions first.
+    - Restarting sessions is always a button.
+  - A guided overlay replaces the PATH error with Update / Retry.
+
+  Still owed:
+  - A live smoke test with an outdated codex.
+  - The Windows stop-first flow.
+  - The macOS brew and native update paths.
+  - `codex update` for native codex installs and the brew cask names are unverified.
+
+  Follow-ups:
+  - Typed IPC error kinds.
+  - A pane-lifetime attribute instead of reserved-key filters.
+  - Move the TerminalPane wiring onto the launch nonce.
 - **Phase 5 — Polish & packaging. ✅ done (PR #7).** Scrollback search (xterm search addon + Cmd+F
   overlay); central keymap (`src/lib/keybindings.ts`: Cmd+↑/↓ worktree cycle, Cmd+F
   search, Cmd+K dispatch, `?` cheatsheet, `d` board dispatch; nav chords fire over a focused terminal;
