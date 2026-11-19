@@ -55,6 +55,7 @@ export function Board({
   worktreeNames,
   pool,
   currentWorktree,
+  onSelectWorktree,
   sessions,
   actor,
   selectedId,
@@ -75,6 +76,8 @@ export function Board({
   /** The worktree the rail and terminal views are on; its row is marked and scrolled
    *  into view when the board opens. */
   currentWorktree: string | null;
+  /** Make a worktree current (a click on its row). */
+  onSelectWorktree: (worktree: string) => void;
   sessions: Map<string, WorktreeSession>;
   actor: string | null;
   selectedId: number | null;
@@ -296,6 +299,7 @@ export function Board({
       dragging={activeId !== null}
       env={env}
       currentWorktree={currentWorktree}
+      onSelectWorktree={onSelectWorktree}
       showDone={showDone}
       backlog={{
         shown: showBacklog,

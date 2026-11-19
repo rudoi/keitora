@@ -40,6 +40,7 @@ function currentRows(currentWorktree: string | null): string[] {
         dragging={false}
         env={env}
         currentWorktree={currentWorktree}
+        onSelectWorktree={noop}
         showDone={false}
         backlog={{ shown: false, count: 0, onToggle: noop }}
       />
