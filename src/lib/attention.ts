@@ -1,11 +1,8 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import {
-  isPermissionGranted,
-  requestPermission,
-  sendNotification,
-} from "@tauri-apps/plugin-notification";
+import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import { useEffect, useRef, useState } from "react";
 import type { View } from "../components/TopBar";
+import { notifySession } from "./ipc";
 import type { SessionState, WorktreeSession } from "./sessions";
 import type { TaskWithDeps } from "./tasks";
 
@@ -269,7 +266,12 @@ export function useAttention(
       }
 
       if (!(await ensurePermission())) return;
-      sendNotification({ title: `Keitora — ${worktreeName}`, body });
+      // Through the backend so a click on the notification lands on this worktree.
+      await notifySession(
+        { project: activeProject ?? "", worktree: worktreeName },
+        `Keitora — ${worktreeName}`,
+        body,
+      ).catch(() => {});
     };
 
     // ── Detect transitions ───────────────────────────────────────────────────
