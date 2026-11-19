@@ -532,6 +532,25 @@ describe("transfer helpers", () => {
       detail: claudeStrict,
     });
   });
+
+  it("spawnFailedCopy names an update prompt instead of blaming PATH", () => {
+    expect(spawnFailedCopy("codex", "AgentUpdatePrompt: codex")).toEqual({
+      message: "Codex wants to update before it starts",
+      detail: null,
+    });
+    expect(spawnFailedCopy("claude", "AgentUpdatePrompt: claude")).toEqual({
+      message: "Claude wants to update before it starts",
+      detail: null,
+    });
+    // The token names the CLI that launched, whatever the worktree's default.
+    expect(spawnFailedCopy("claude", "AgentUpdatePrompt: codex").message).toBe(
+      "Codex wants to update before it starts",
+    );
+    // Echoed pane text is lower-cased by the backend, so it can't pose as the token.
+    expect(spawnFailedCopy("codex", "agentupdateprompt: x").message).toBe(
+      "Failed to launch codex — is it on PATH?",
+    );
+  });
 });
 
 describe("createTransferController", () => {

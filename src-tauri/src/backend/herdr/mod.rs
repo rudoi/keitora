@@ -85,7 +85,7 @@ use exe_missing::ExeMissing;
 use gate::ServerGate;
 use input::HerdrInput;
 use keymap::KeyMap;
-use ops::HerdrOps;
+use ops::{AgentStart, HerdrOps};
 use real::RealHerdr;
 use reconcile::{ReconcileCtx, ReconcileOutcome};
 use recovery::driver::{Executor, ResumeReport, ResumeRunner};
@@ -111,6 +111,10 @@ const AGENT_START_TIMEOUT_MS: u64 = 10_000;
 /// gated test records the actual `agent.start` error code to tighten it (per the plan
 /// a bounded re-issue retry is the fallback).
 const SHELL_READY_DELAY_MS: u64 = 300;
+
+/// Emitted when a launch left a codex pane open on the codex update screen:
+/// `{project, worktree, cli}`.
+const UPDATE_PROMPT_EVENT: &str = "agent-updates://prompt";
 
 /// How often a reconcile asks for the running server's identity before giving up
 /// and only re-adopting the live panes.
@@ -804,6 +808,21 @@ impl Spawner {
         )
     }
 
+    /// Whether `pane_id` shows codex's startup update screen. A failed read counts as
+    /// no screen.
+    fn codex_update_screen_shown(&self, pane_id: &str, source: &str, lines: Option<u32>) -> bool {
+        self.ops
+            .pane_read(pane_id, source, "text", lines)
+            .is_ok_and(|t| agent::is_codex_update_screen(&t))
+    }
+
+    /// Whether a codex launch in `pane_id` is parked on the codex update screen.
+    /// Only codex has one, so other CLIs are never read.
+    fn codex_update_prompt(&self, launch: &AgentLaunch, pane_id: &str) -> bool {
+        launch.cli == keitora_tasks::CliKind::Codex
+            && self.codex_update_screen_shown(pane_id, "visible", None)
+    }
+
     /// Close `pane_id`, warning on any failure but not-found (already gone).
     fn close_quietly(&self, key: &SessionKey, pane_id: &str) {
         if let Err(e) = self.ops.pane_close(pane_id) {
@@ -968,7 +987,7 @@ impl Spawner {
                 .ops
                 .agent_start(&name, kind, &id.pane_id, &args, AGENT_START_TIMEOUT_MS)
             {
-                Ok(()) => {
+                Ok(started) => {
                     // Keep the worktree path for restore reconciliation: herdr
                     // reassigns pane ids on a restore, so cwd is the stable key.
                     let gen = self.keymap.record(
@@ -978,6 +997,21 @@ impl Spawner {
                         id.terminal_id.clone(),
                         cwd.clone(),
                     );
+                    // A codex herdr reports as not ready may be sitting on its update
+                    // screen. The pane is kept so the user can answer it in place;
+                    // the app is told so it can offer its own updater.
+                    if started == AgentStart::NotReady
+                        && self.codex_update_prompt(launch, &id.pane_id)
+                    {
+                        self.sink.emit(
+                            UPDATE_PROMPT_EVENT,
+                            serde_json::json!({
+                                "project": key.project,
+                                "worktree": key.worktree,
+                                "cli": agent::herdr_kind(launch.cli),
+                            }),
+                        );
+                    }
                     break (id, gen);
                 }
                 // A failed start is not known to leave the shell clean, so the
@@ -995,7 +1029,12 @@ impl Spawner {
                     return Err(name_taken_error(&e));
                 }
                 Err(e) if agent::is_early_exit(&e) => {
+                    // Every weaker launch would stop at the same update screen.
+                    let update_prompt = self.codex_update_prompt(launch, &id.pane_id);
                     self.close_quietly(key, &id.pane_id);
+                    if update_prompt {
+                        return Err(PtyBackendError::AgentUpdatePrompt(launch.cli));
+                    }
                     let Some(next) = agent::next_fallback(&decision) else {
                         return Err(e.into());
                     };
@@ -1011,8 +1050,15 @@ impl Spawner {
                     decision = next;
                 }
                 Err(e) => {
+                    // Only herdr's own startup timeout can mean codex sat on its update
+                    // screen; a transport failure leaves nothing worth reading.
+                    let update_prompt = agent::start_error_may_show_update_screen(&e)
+                        && self.codex_update_prompt(launch, &id.pane_id);
                     // Close the leaked pane before returning the error.
                     self.close_quietly(key, &id.pane_id);
+                    if update_prompt {
+                        return Err(PtyBackendError::AgentUpdatePrompt(launch.cli));
+                    }
                     return Err(e.into());
                 }
             }
@@ -1862,6 +1908,34 @@ fn sample_process_stats(sys: &mut sysinfo::System, pid: Option<u32>) -> DaemonSt
 }
 
 impl HerdrBackend {
+    /// Close the reserved pane a previous run left behind (a quit or crash while an
+    /// update ran), so update runs never stack panes in herdr. Only a pane of the
+    /// current server generation that no session owns and that is still in the cwd it
+    /// was opened in is closed: a restore reassigns ids, so an old id may now name
+    /// someone else's pane.
+    fn close_leftover_reserved(&self, key: &SessionKey) {
+        let Some(left) = self.keymap.take_leftover_reserved(key) else {
+            return;
+        };
+        if left.server_generation != self.keymap.generation()
+            || self.keymap.pane_owner(&left.pane_id).is_some()
+        {
+            return;
+        }
+        let same_cwd = |c: &str| keymap::normalize_cwd(c) == keymap::normalize_cwd(&left.cwd);
+        match self.ops.pane_get(&left.pane_id) {
+            Ok(Some(p)) if p.cwd.as_deref().is_none_or(same_cwd) => {
+                log::info!("herdr: closing the {key} pane a previous run left open");
+                if let Err(e) = self.ops.pane_close(&left.pane_id) {
+                    if !e.is_not_found() {
+                        log::warn!("herdr: closing the leftover {key} pane failed: {e}");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Construct from the app handle: load the user config, resolve the herdr exe +
     /// isolated env. Fails (so the caller can fall back to `UnavailableBackend`)
     /// when the user config cannot be loaded or the isolated env cannot be set up
@@ -2392,6 +2466,9 @@ impl PtyBackend for HerdrBackend {
             self.stop_bridge(&key);
             let _ = self.ops.pane_close(&old.pane_id);
         }
+        if key.is_reserved() {
+            self.close_leftover_reserved(&key);
+        }
 
         let id = self.ops.workspace_create(
             &cwd,
@@ -2409,7 +2486,11 @@ impl PtyBackend for HerdrBackend {
             id.terminal_id,
             cwd,
         );
-        self.live.lock().unwrap().insert(key.clone());
+        // Keitora's own utility pane is not a user session: it stays out of the live
+        // set so the quit prompt and session counts ignore it.
+        if !key.is_reserved() {
+            self.live.lock().unwrap().insert(key.clone());
+        }
         // Running again: nothing is owed a resume any more.
         self.keymap.resolve_recovered(&key);
         // Start the output bridge NOW so output streams immediately after spawn to a
@@ -3483,6 +3564,103 @@ mod tests {
                 1,
             )
             .unwrap();
+    }
+
+    /// The reserved utility pane spawns and stays reachable through the keymap, but
+    /// it never joins the live set or the session listing.
+    #[test]
+    fn spawning_the_reserved_key_stays_out_of_live_and_listings() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let key = SessionKey::agent_update();
+        backend
+            .spawn(
+                key.clone(),
+                "/home/me".into(),
+                String::new(),
+                Some((80, 24)),
+                Some("echo hi".into()),
+            )
+            .unwrap();
+        assert!(backend.live_set_snapshot().is_empty());
+        assert!(
+            backend.keymap.get(&key).is_some(),
+            "still mapped for attach"
+        );
+        assert!(backend.keymap.entries().is_empty());
+        assert!(backend
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .all(|s| !s.key.is_reserved()));
+    }
+
+    /// A reserved pane left open by a quit or crash is closed before the next run's
+    /// pane opens, so runs never stack panes.
+    #[test]
+    fn spawning_the_reserved_key_closes_a_previous_runs_leftover() {
+        let fake = fake::FakeHerdr::new();
+        let key = SessionKey::agent_update();
+        let spawn = |backend: &HerdrBackend| {
+            backend
+                .spawn(
+                    key.clone(),
+                    "/home/me".into(),
+                    String::new(),
+                    Some((80, 24)),
+                    Some("echo hi".into()),
+                )
+                .unwrap()
+        };
+        let (first, _) = fake_backend(&fake);
+        spawn(&first);
+        let old = first.keymap.get(&key).unwrap().pane_id;
+        // The app goes away without closing the pane.
+        drop(first);
+
+        let (second, _) = fake_backend(&fake);
+        assert!(
+            second.keymap.get(&key).is_none(),
+            "not resolvable after a restart"
+        );
+        spawn(&second);
+        assert_eq!(fake.closed_pane_ids(), vec![old]);
+        assert_eq!(fake.panes().len(), 1, "only the new run's pane");
+
+        // The leftover is closed once: a third backend finds the second's pane.
+        let (third, _) = fake_backend(&fake);
+        let second_pane = second.keymap.get(&key).unwrap().pane_id;
+        drop(second);
+        spawn(&third);
+        assert_eq!(fake.panes().len(), 1);
+        assert!(fake.closed_pane_ids().contains(&second_pane));
+    }
+
+    /// A leftover id that now names another cwd's pane (or a session's) is not closed.
+    #[test]
+    fn a_reserved_leftover_in_another_cwd_is_left_alone() {
+        let fake = fake::FakeHerdr::new();
+        let key = SessionKey::agent_update();
+        let (first, _) = fake_backend(&fake);
+        first
+            .spawn(
+                key.clone(),
+                "/home/me".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
+            .unwrap();
+        let old = first.keymap.get(&key).unwrap().pane_id;
+        drop(first);
+        // herdr reused the id for a pane elsewhere.
+        fake.set_pane_cwd(&old, "/repos/proj");
+
+        let (second, _) = fake_backend(&fake);
+        second
+            .spawn(key, "/home/me".into(), String::new(), Some((80, 24)), None)
+            .unwrap();
+        assert!(fake.panes().iter().any(|p| p.pane_id == old));
     }
 
     #[test]
@@ -6993,12 +7171,39 @@ mod tests {
             .unwrap();
     }
 
-    /// The extra args of every `agent start` call, joined by spaces.
-    fn agent_start_args(fake: &fake::FakeHerdr) -> Vec<String> {
+    /// The extra args of every `agent start` call, joined by spaces, as herdr
+    /// received them.
+    fn raw_agent_start_args(fake: &fake::FakeHerdr) -> Vec<String> {
         fake.calls()
             .into_iter()
             .filter(|c| c.op == ops::Op::AgentStart)
             .map(|c| c.args.splitn(5, ' ').nth(4).unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// [`raw_agent_start_args`] without the codex update-check prefix, which every
+    /// codex start must lead with (asserted here); the tests using this check the
+    /// resume/fallback shape that follows it.
+    fn agent_start_args(fake: &fake::FakeHerdr) -> Vec<String> {
+        let prefix = agent::CODEX_NO_UPDATE_CHECK.join(" ");
+        let codex_starts: Vec<bool> = fake
+            .calls()
+            .into_iter()
+            .filter(|c| c.op == ops::Op::AgentStart)
+            .map(|c| c.args.split(' ').nth(1) == Some("codex"))
+            .collect();
+        raw_agent_start_args(fake)
+            .into_iter()
+            .zip(codex_starts)
+            .map(|(args, codex)| {
+                if !codex {
+                    return args;
+                }
+                let rest = args
+                    .strip_prefix(prefix.as_str())
+                    .unwrap_or_else(|| panic!("codex start without the prefix: {args}"));
+                rest.trim_start().to_string()
+            })
             .collect()
     }
 
@@ -7561,7 +7766,160 @@ mod tests {
         assert_eq!(count(&fake, ops::Op::AgentStart), 1);
         assert_eq!(count(&fake, ops::Op::PaneClose), 1);
         assert_eq!(count(&fake, ops::Op::PaneGet), 0);
+        assert_eq!(count(&fake, ops::Op::PaneRead), 1, "the screen is checked");
         assert!(fake.panes().is_empty());
+    }
+
+    /// The codex startup update screen as a pane reads it (scrubbed).
+    const UPDATE_SCREEN: &str = "  Update available! 0.160.0 -> 0.163.0\n\
+        1. Update now (runs `npm install -g @openai/codex`)\n\
+        2. Skip\n\
+        3. Skip until next version\n";
+
+    fn timeout_script() -> fake::AgentStartScript {
+        fake::AgentStartScript::Err(ops::HerdrError::Api {
+            code: "timeout".into(),
+            message: "timed out waiting for agent startup".into(),
+        })
+    }
+
+    fn prompt_events(events: &Events) -> Vec<Value> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| name == UPDATE_PROMPT_EVENT)
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    #[test]
+    fn default_policy_timeout_on_the_update_screen_is_an_update_prompt() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        fake.set_default_pane_text(UPDATE_SCREEN);
+        fake.script_agent_start(vec![timeout_script()]);
+        let err = codex_spawn(&fake, &backend, codex_launch()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PtyBackendError::AgentUpdatePrompt(keitora_tasks::CliKind::Codex)
+            ),
+            "{err:?}"
+        );
+        assert_eq!(count(&fake, ops::Op::AgentStart), 1, "no fallback steps");
+        assert_eq!(count(&fake, ops::Op::PaneClose), 1);
+        assert!(fake.panes().is_empty(), "the pane is closed");
+        assert!(!backend.is_live(&skey("wt")));
+    }
+
+    #[test]
+    fn default_policy_early_exit_on_the_update_screen_skips_the_fallbacks() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        fake.set_default_pane_text(UPDATE_SCREEN);
+        fake.script_agent_start(vec![
+            fake::AgentStartScript::EarlyExit,
+            fake::AgentStartScript::EarlyExit,
+            fake::AgentStartScript::Ok,
+        ]);
+        let err = codex_spawn(&fake, &backend, codex_launch()).unwrap_err();
+        assert!(
+            matches!(err, PtyBackendError::AgentUpdatePrompt(_)),
+            "{err:?}"
+        );
+        assert_eq!(
+            agent_start_args(&fake),
+            vec![format!("resume thr-1 {HOOK}")],
+            "no fallback steps"
+        );
+        assert!(fake.panes().is_empty());
+    }
+
+    #[test]
+    fn default_policy_not_ready_on_the_update_screen_keeps_the_pane_and_emits() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, events) = fake_backend(&fake);
+        fake.set_default_pane_text(UPDATE_SCREEN);
+        fake.script_agent_start(vec![fake::AgentStartScript::NotReady]);
+        codex_spawn(&fake, &backend, codex_launch()).unwrap();
+        assert_eq!(fake.panes().len(), 1, "the pane is kept");
+        assert!(backend.is_live(&skey("wt")));
+        assert_eq!(
+            prompt_events(&events),
+            vec![serde_json::json!({ "project": "p", "worktree": "wt", "cli": "codex" })]
+        );
+    }
+
+    #[test]
+    fn default_policy_not_ready_elsewhere_or_ready_emits_nothing() {
+        // Not ready on an ordinary screen: launched, no prompt event.
+        let fake = fake::FakeHerdr::new();
+        let (backend, events) = fake_backend(&fake);
+        fake.set_default_pane_text("OpenAI Codex\n> ");
+        fake.script_agent_start(vec![fake::AgentStartScript::NotReady]);
+        codex_spawn(&fake, &backend, codex_launch()).unwrap();
+        assert!(prompt_events(&events).is_empty());
+        assert_eq!(count(&fake, ops::Op::PaneRead), 1);
+
+        // Ready: the screen is never read.
+        let fake = fake::FakeHerdr::new();
+        let (backend, events) = fake_backend(&fake);
+        fake.set_default_pane_text(UPDATE_SCREEN);
+        codex_spawn(&fake, &backend, codex_launch()).unwrap();
+        assert!(prompt_events(&events).is_empty());
+        assert_eq!(count(&fake, ops::Op::PaneRead), 0);
+    }
+
+    /// Only codex has an update screen: a claude launch never reads the pane and
+    /// keeps its ordinary error.
+    #[test]
+    fn default_policy_claude_timeout_is_never_an_update_prompt() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        fake.set_default_pane_text(UPDATE_SCREEN);
+        fake.script_agent_start(vec![timeout_script()]);
+        let launch = AgentLaunch {
+            cli: keitora_tasks::CliKind::Claude,
+            path: "claude".into(),
+            resume_target: None,
+            ..codex_launch()
+        };
+        let err = codex_spawn(&fake, &backend, launch).unwrap_err();
+        assert!(matches!(err, PtyBackendError::Other(_)), "{err:?}");
+        assert_eq!(count(&fake, ops::Op::PaneRead), 0);
+    }
+
+    /// A transport failure says nothing about the pane: it is closed unread and the
+    /// error is returned as is, even if the screen would match.
+    #[test]
+    fn default_policy_transport_error_does_not_read_the_pane() {
+        for script_err in [
+            ops::HerdrError::Timeout,
+            ops::HerdrError::SpawnFailed {
+                os_error: Some(2),
+                message: "not found".into(),
+            },
+        ] {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            fake.set_default_pane_text(UPDATE_SCREEN);
+            fake.script_agent_start(vec![fake::AgentStartScript::Err(script_err)]);
+            let err = codex_spawn(&fake, &backend, codex_launch()).unwrap_err();
+            assert!(
+                !matches!(err, PtyBackendError::AgentUpdatePrompt(_)),
+                "{err:?}"
+            );
+            assert_eq!(count(&fake, ops::Op::PaneRead), 0, "no pane read");
+            assert!(fake.panes().is_empty(), "the pane is still closed");
+        }
+    }
+
+    #[test]
+    fn an_update_prompt_is_not_load_related() {
+        let err = PtyBackendError::AgentUpdatePrompt(keitora_tasks::CliKind::Codex);
+        assert!(!is_load_related_error(&err, false));
+        assert!(!is_load_related_error(&err, true));
     }
 
     #[test]
@@ -9247,6 +9605,71 @@ mod tests {
         }
 
         #[test]
+        fn strict_update_screen_ends_the_chain_after_one_step() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            fake.script_pane_get(endless(codex_agent(None)));
+            fake.set_default_pane_text(UPDATE_SCREEN);
+            let err = codex_spawn(&fake, &backend, strict()).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    PtyBackendError::AgentUpdatePrompt(keitora_tasks::CliKind::Codex)
+                ),
+                "{err:?}"
+            );
+            assert_eq!(count(&fake, ops::Op::AgentStart), 1, "one step only");
+            assert_eq!(fake.closed_pane_ids(), vec!["w1:p1".to_string()]);
+            assert!(!backend.is_live(&skey("wt")));
+            assert!(resume_events(&events).is_empty());
+        }
+
+        /// A resume herdr confirmed is past the update screen: its pane is never read,
+        /// so a transcript quoting the screen's text cannot fail the launch.
+        #[test]
+        fn strict_confirmed_resume_ignores_update_text_on_screen() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            fake.set_default_pane_text(UPDATE_SCREEN);
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            assert_eq!(count(&fake, ops::Op::AgentStart), 1);
+            assert_eq!(resume_events(&events), event("resumed", false));
+            assert!(backend.is_live(&skey("wt")));
+            assert_eq!(count(&fake, ops::Op::PaneRead), 0, "never read");
+        }
+
+        /// The unconfirmed check reads the visible screen, not recent scrollback.
+        #[test]
+        fn strict_unconfirmed_check_reads_the_visible_screen() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            fake.script_pane_get(endless(codex_agent(None)));
+            fake.set_default_pane_text(UPDATE_SCREEN);
+            codex_spawn(&fake, &backend, strict()).unwrap_err();
+            let reads: Vec<String> = fake
+                .calls()
+                .into_iter()
+                .filter(|c| c.op == ops::Op::PaneRead)
+                .map(|c| c.args)
+                .collect();
+            assert_eq!(
+                reads.first().map(String::as_str),
+                Some("w1:p1 visible text")
+            );
+        }
+
+        #[test]
+        fn strict_ordinary_screen_is_still_accepted() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            fake.script_pane_get(endless(codex_agent(None)));
+            fake.set_default_pane_text("OpenAI Codex\n> ");
+            codex_spawn(&fake, &backend, strict()).unwrap();
+            assert_eq!(count(&fake, ops::Op::AgentStart), 1);
+            assert_eq!(resume_events(&events), event("resumed", false));
+        }
+
+        #[test]
         fn strict_agent_never_appeared_with_foreground_process_is_accepted() {
             let fake = fake::FakeHerdr::new();
             let (backend, events) = fake_backend(&fake);
@@ -9555,9 +9978,18 @@ mod tests {
             assert_eq!(launches[0].detail["label"], "resume thr-1");
             assert_eq!(
                 launches[0].detail["args"],
-                serde_json::json!(["resume", "thr-1", HOOK])
+                serde_json::json!([
+                    "-c",
+                    "check_for_update_on_startup=false",
+                    "resume",
+                    "thr-1",
+                    HOOK
+                ])
             );
-            assert_eq!(launches[2].detail["args"], serde_json::json!([]));
+            assert_eq!(
+                launches[2].detail["args"],
+                serde_json::json!(["-c", "check_for_update_on_startup=false"])
+            );
             // One observation entry per step, not one per poll.
             assert!(count(&fake, ops::Op::PaneGet) > 6);
             assert_eq!(has(&entries, TrailStage::Verify, "agent"), 3);

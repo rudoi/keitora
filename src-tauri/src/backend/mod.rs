@@ -75,6 +75,29 @@ pub struct SessionKey {
     pub worktree: String,
 }
 
+impl SessionKey {
+    /// Project half of the key reserved for Keitora's own utility pane.
+    /// No project resolves to it (see [`keitora_tasks::unreserved_project_name`]).
+    pub const RESERVED_PROJECT: &'static str = keitora_tasks::RESERVED_PROJECT_NAME;
+    /// Worktree half of the key reserved for Keitora's own utility pane.
+    pub const RESERVED_WORKTREE: &'static str = "agent-update";
+
+    /// The reserved key of the pane that runs an agent CLI update.
+    pub fn agent_update() -> Self {
+        SessionKey {
+            project: Self::RESERVED_PROJECT.to_string(),
+            worktree: Self::RESERVED_WORKTREE.to_string(),
+        }
+    }
+
+    /// Whether this is one of Keitora's reserved utility keys: any worktree of the
+    /// reserved project, which no real project can be named. Reserved panes are kept
+    /// out of recovery, session listings and the live set.
+    pub fn is_reserved(&self) -> bool {
+        self.project == Self::RESERVED_PROJECT
+    }
+}
+
 impl fmt::Display for SessionKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.project, self.worktree)
@@ -460,6 +483,8 @@ pub enum PtyBackendError {
     Terminated,
     /// A paste of `bytes` was refused: it is over the backend's `limit`.
     PasteTooLarge { bytes: usize, limit: usize },
+    /// The agent CLI stopped at its own startup update screen instead of starting.
+    AgentUpdatePrompt(keitora_tasks::CliKind),
     /// Any other error (protocol / IO / implementation-specific), message verbatim.
     Other(String),
 }
@@ -483,6 +508,9 @@ impl fmt::Display for PtyBackendError {
             PtyBackendError::Terminated => write!(f, "Terminated: the session was terminated"),
             PtyBackendError::PasteTooLarge { bytes, limit } => {
                 write!(f, "PasteTooLarge: {bytes} > {limit}")
+            }
+            PtyBackendError::AgentUpdatePrompt(cli) => {
+                write!(f, "AgentUpdatePrompt: {}", herdr::agent::herdr_kind(*cli))
             }
             PtyBackendError::Other(m) => write!(f, "{m}"),
         }
@@ -845,6 +873,20 @@ mod tests {
     // ── Error Display ─────────────────────────────────────────────────────────
 
     #[test]
+    fn is_reserved_matches_the_reserved_project_alone() {
+        let k = |p: &str, w: &str| SessionKey {
+            project: p.into(),
+            worktree: w.into(),
+        };
+        assert!(SessionKey::agent_update().is_reserved());
+        assert!(k("__keitora", "agent-update").is_reserved());
+        assert!(k("__keitora", "main").is_reserved(), "any worktree of it");
+        assert!(!k("proj", "agent-update").is_reserved());
+        assert!(!k("__Keitora", "agent-update").is_reserved());
+        assert!(!k("", "").is_reserved());
+    }
+
+    #[test]
     fn backend_error_display_strings() {
         assert_eq!(
             PtyBackendError::NotConnected.to_string(),
@@ -882,6 +924,14 @@ mod tests {
             }
             .to_string(),
             "PasteTooLarge: 1048577 > 1048576"
+        );
+        assert_eq!(
+            PtyBackendError::AgentUpdatePrompt(keitora_tasks::CliKind::Codex).to_string(),
+            "AgentUpdatePrompt: codex"
+        );
+        assert_eq!(
+            PtyBackendError::AgentUpdatePrompt(keitora_tasks::CliKind::Claude).to_string(),
+            "AgentUpdatePrompt: claude"
         );
     }
 

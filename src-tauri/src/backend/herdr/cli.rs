@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::backend::PtyBackendError;
 
-use super::ops::HerdrError;
+use super::ops::{AgentStart, HerdrError};
 
 /// The herdr identity returned by `workspace create` / observed in `pane list`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -220,13 +220,14 @@ pub fn parse_pane_process_info(value: &Value) -> Option<PaneProcessInfo> {
 }
 
 /// Pure decision for `agent start` failures: `agent_not_ready` / "blocked during
-/// startup" means the agent launched (→ `Ok`); everything else stays an error.
-pub fn agent_start_result_from(err: HerdrError) -> Result<(), HerdrError> {
+/// startup" means the agent launched but is not ready (→ `Ok(NotReady)`); everything
+/// else stays an error.
+pub fn agent_start_result_from(err: HerdrError) -> Result<AgentStart, HerdrError> {
     let blocked_msg = PtyBackendError::from(err.clone())
         .to_string()
         .contains("blocked during startup");
     if err.code() == Some("agent_not_ready") || blocked_msg {
-        Ok(())
+        Ok(AgentStart::NotReady)
     } else {
         Err(err)
     }
@@ -574,10 +575,12 @@ mod tests {
     #[test]
     fn agent_start_not_ready_is_ok() {
         let err = coded("agent_not_ready", "agent blocked during startup");
-        assert!(agent_start_result_from(err).is_ok());
+        assert_eq!(agent_start_result_from(err), Ok(AgentStart::NotReady));
         // Message-only signal (no recognised code) also counts as launched.
         let err = coded("", "blocked during startup");
-        assert!(agent_start_result_from(err).is_ok());
+        assert_eq!(agent_start_result_from(err), Ok(AgentStart::NotReady));
+        let err = coded("agent_not_ready", "not ready");
+        assert_eq!(agent_start_result_from(err), Ok(AgentStart::NotReady));
     }
 
     #[test]

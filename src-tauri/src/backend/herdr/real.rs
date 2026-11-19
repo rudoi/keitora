@@ -24,6 +24,7 @@ use super::cli::{
 };
 use super::env::{discover_exe, ExeDiscovery, HerdrEnv, LoginSearch};
 use super::exec::{run_with_deadline, CallClass};
+use super::ops::AgentStart;
 use super::ops::{
     BridgeChild, BridgeProcess, ExitInfo, HerdrError, HerdrOps, ServerInstance, ServerProcess,
 };
@@ -371,7 +372,7 @@ impl HerdrOps for RealHerdr {
         pane_id: &str,
         args: &[String],
         timeout_ms: u64,
-    ) -> Result<(), HerdrError> {
+    ) -> Result<AgentStart, HerdrError> {
         let timeout = timeout_ms.to_string();
         let mut argv: Vec<&str> = vec![
             "agent",
@@ -389,7 +390,7 @@ impl HerdrOps for RealHerdr {
             argv.extend(args.iter().map(String::as_str));
         }
         match self.run(CallClass::AgentStart, &argv) {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(AgentStart::Ready),
             Err(err) => agent_start_result_from(err),
         }
     }

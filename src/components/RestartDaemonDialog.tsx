@@ -3,12 +3,8 @@
 // they all ask the same question in the same words before interrupting sessions.
 
 import * as Dialog from "@radix-ui/react-dialog";
+import { btnGhost, btnPrimary } from "../lib/buttonStyles";
 import { LAYER_MODAL, MODAL_OVERLAY_CLS } from "../lib/layers";
-
-const btnPrimary =
-  "rounded-chip border border-accent bg-accent px-3.5 py-1.5 text-[11.5px] font-semibold text-[var(--color-on-accent)] disabled:opacity-60";
-const btnGhost =
-  "rounded-chip border border-line bg-bg-3 px-3 py-1.5 text-[11.5px] text-tx-1 disabled:opacity-50";
 
 /** "1 running session" / "N running sessions". */
 export function runningSessionsLabel(sessionCount: number): string {

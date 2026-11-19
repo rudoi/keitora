@@ -23,6 +23,12 @@ pub fn herdr_kind(cli: CliKind) -> &'static str {
     }
 }
 
+/// Global codex flags that turn off its startup update check. Without them a codex
+/// that finds a newer release parks on an interactive "Update available" screen and
+/// never becomes ready, which a launch would read as a failure. Unknown `-c` keys
+/// are accepted silently, so a codex without this key is unaffected.
+pub const CODEX_NO_UPDATE_CHECK: [&str; 2] = ["-c", "check_for_update_on_startup=false"];
+
 /// Extra args herdr appends to the agent's canonical executable (`agent.start … -- <args>`).
 ///
 /// The normal launch flags plus the resume choice (there is no shell `||` fallback:
@@ -30,7 +36,8 @@ pub fn herdr_kind(cli: CliKind) -> &'static str {
 /// caller with [`next_fallback`]):
 /// - claude: `--dangerously-skip-permissions` when `autonomy`, then `--resume <id>`
 ///   / `--continue` / nothing.
-/// - codex: the subcommand first (`resume <id>` / `resume --last` / nothing), then
+/// - codex: [`CODEX_NO_UPDATE_CHECK`] first (global flags precede any subcommand),
+///   then the subcommand (`resume <id>` / `resume --last` / nothing), then
 ///   `--dangerously-bypass-approvals-and-sandbox` when `autonomy`, and ALWAYS
 ///   `--dangerously-bypass-hook-trust` last (trusts Keitora's `.codex/hooks.json`).
 ///
@@ -74,6 +81,7 @@ pub fn build_agent_args_opts(
             }
         }
         CliKind::Codex => {
+            args.extend(CODEX_NO_UPDATE_CHECK.map(String::from));
             match resume {
                 Some(Some(id)) => args.extend(["resume".into(), id.to_string()]),
                 Some(None) => args.extend(["resume".into(), "--last".into()]),
@@ -107,6 +115,28 @@ pub fn is_early_exit(e: &HerdrError) -> bool {
         e.code(),
         Some("agent_start_failed" | "agent_name_not_found")
     )
+}
+
+/// Whether `screen` is codex's startup update screen (the only CLI with one): an
+/// "Update available!" heading over "Update now" / "Skip" / "Skip until next
+/// version" choices. The heading and both distinctive choices must all be present,
+/// so transcript text that merely mentions an update rarely matches.
+pub fn is_codex_update_screen(screen: &str) -> bool {
+    screen.contains("Update available")
+        && screen.contains("Skip until next version")
+        && screen.contains("Update now")
+}
+
+/// Whether a failed `agent start` may have left codex on its update screen: herdr's
+/// own agent-startup timeout, answered by herdr. A transport failure (the CLI call
+/// itself timing out, herdr unreachable, output that would not parse) says nothing
+/// about the pane, so the pane is not read for one.
+pub fn start_error_may_show_update_screen(e: &HerdrError) -> bool {
+    match e {
+        HerdrError::Api { code, .. } if code == "timeout" => true,
+        HerdrError::Api { .. } | HerdrError::Exit { .. } => super::is_timeout_text(&e.to_string()),
+        HerdrError::Timeout | HerdrError::SpawnFailed { .. } | HerdrError::Parse { .. } => false,
+    }
 }
 
 /// Did `agent start` fail because another pane still holds the agent's name?
@@ -188,11 +218,17 @@ mod tests {
         // Hook-trust bypass is unconditional; approvals/sandbox bypass is autonomy-gated.
         assert_eq!(
             build_agent_args(CliKind::Codex, false, &FRESH),
-            vec!["--dangerously-bypass-hook-trust"]
+            vec![
+                "-c",
+                "check_for_update_on_startup=false",
+                "--dangerously-bypass-hook-trust",
+            ]
         );
         assert_eq!(
             build_agent_args(CliKind::Codex, true, &FRESH),
             vec![
+                "-c",
+                "check_for_update_on_startup=false",
                 "--dangerously-bypass-approvals-and-sandbox",
                 "--dangerously-bypass-hook-trust",
             ]
@@ -226,6 +262,8 @@ mod tests {
                 true,
                 resume(codex, id),
                 vec![
+                    "-c",
+                    "check_for_update_on_startup=false",
                     "resume",
                     id,
                     "--dangerously-bypass-approvals-and-sandbox",
@@ -236,13 +274,21 @@ mod tests {
                 codex,
                 false,
                 resume(codex, id),
-                vec!["resume", id, "--dangerously-bypass-hook-trust"],
+                vec![
+                    "-c",
+                    "check_for_update_on_startup=false",
+                    "resume",
+                    id,
+                    "--dangerously-bypass-hook-trust",
+                ],
             ),
             (
                 codex,
                 true,
                 ResumeDecision::Continue,
                 vec![
+                    "-c",
+                    "check_for_update_on_startup=false",
                     "resume",
                     "--last",
                     "--dangerously-bypass-approvals-and-sandbox",
@@ -253,18 +299,35 @@ mod tests {
                 codex,
                 false,
                 ResumeDecision::Continue,
-                vec!["resume", "--last", "--dangerously-bypass-hook-trust"],
+                vec![
+                    "-c",
+                    "check_for_update_on_startup=false",
+                    "resume",
+                    "--last",
+                    "--dangerously-bypass-hook-trust",
+                ],
             ),
             (
                 codex,
                 true,
                 FRESH,
                 vec![
+                    "-c",
+                    "check_for_update_on_startup=false",
                     "--dangerously-bypass-approvals-and-sandbox",
                     "--dangerously-bypass-hook-trust",
                 ],
             ),
-            (codex, false, FRESH, vec!["--dangerously-bypass-hook-trust"]),
+            (
+                codex,
+                false,
+                FRESH,
+                vec![
+                    "-c",
+                    "check_for_update_on_startup=false",
+                    "--dangerously-bypass-hook-trust",
+                ],
+            ),
         ];
         for (cli, autonomy, decision, want) in cases {
             assert_eq!(
@@ -354,8 +417,134 @@ mod tests {
         );
         assert_eq!(
             build_agent_args(CliKind::Codex, false, &resume(CliKind::Codex, "--last")),
-            vec!["resume", "--last", "--dangerously-bypass-hook-trust"]
+            vec![
+                "-c",
+                "check_for_update_on_startup=false",
+                "resume",
+                "--last",
+                "--dangerously-bypass-hook-trust",
+            ]
         );
+    }
+
+    /// For every codex launch the update-check override leads (global flags must
+    /// precede `resume`) and hook trust stays last; claude never carries it.
+    #[test]
+    fn codex_update_check_prefix_leads_and_hook_trust_stays_last() {
+        for autonomy in [false, true] {
+            for d in all_decisions() {
+                if decision_cli(&d, CliKind::Codex) == CliKind::Codex {
+                    let args = build_agent_args(CliKind::Codex, autonomy, &d);
+                    assert_eq!(&args[..2], CODEX_NO_UPDATE_CHECK, "{autonomy} {d:?}");
+                    assert_eq!(
+                        args.last().map(String::as_str),
+                        Some("--dangerously-bypass-hook-trust"),
+                        "{autonomy} {d:?}"
+                    );
+                    let without = build_agent_args_opts(CliKind::Codex, autonomy, &d, false);
+                    assert_eq!(&without[..2], CODEX_NO_UPDATE_CHECK, "{autonomy} {d:?}");
+                }
+                if decision_cli(&d, CliKind::Claude) == CliKind::Claude {
+                    let args = build_agent_args(CliKind::Claude, autonomy, &d);
+                    assert!(!args.iter().any(|a| a.contains("check_for_update")));
+                }
+            }
+        }
+    }
+
+    /// The codex startup update screen, as `pane read` returns it (scrubbed).
+    const CODEX_UPDATE_SCREEN: &str = "  \u{2728} Update available! 0.160.0 -> 0.163.0
+
+  Release notes: https://example.com/releases/latest
+
+\u{203a} 1. Update now (runs `npm install -g @openai/codex`)
+  2. Skip
+  3. Skip until next version
+
+  Press enter to continue
+";
+
+    /// An ordinary codex start screen.
+    const CODEX_NORMAL_SCREEN: &str = ">_ OpenAI Codex (v0.160.0)
+
+ model:     gpt-5   /model to change
+ directory: ~/repos/proj
+
+ To get started, describe a task or try one of these commands:
+\u{203a}
+";
+
+    #[test]
+    fn codex_update_screen_table() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("update screen", CODEX_UPDATE_SCREEN, true),
+            (
+                "heading and skip-until only",
+                "Update available!\n3. Skip until next version",
+                false,
+            ),
+            (
+                "heading and update-now only",
+                "Update available!\n1. Update now",
+                false,
+            ),
+            (
+                "all three, anywhere on the screen",
+                "Update available! 0.1.0 -> 0.2.0\n1. Update now\n3. Skip until next version",
+                true,
+            ),
+            (
+                "partial: heading only",
+                "  Update available! 0.160.0 -> 0.163.0",
+                false,
+            ),
+            (
+                "partial: choices only",
+                "1. Update now\n2. Skip\n3. Skip until next version",
+                false,
+            ),
+            ("normal codex screen", CODEX_NORMAL_SCREEN, false),
+            (
+                "unrelated",
+                "$ cargo build\n   Compiling proj v0.1.0",
+                false,
+            ),
+            ("empty", "", false),
+        ];
+        for (label, screen, want) in cases {
+            assert_eq!(is_codex_update_screen(screen), *want, "{label}");
+        }
+    }
+
+    #[test]
+    fn only_herdrs_startup_timeout_may_show_the_update_screen() {
+        let api = |code: &str, message: &str| HerdrError::Api {
+            code: code.into(),
+            message: message.into(),
+        };
+        assert!(start_error_may_show_update_screen(&api("timeout", "")));
+        assert!(start_error_may_show_update_screen(&api(
+            "",
+            "timed out waiting for agent startup"
+        )));
+        assert!(!start_error_may_show_update_screen(&api(
+            "pane_not_found",
+            "gone"
+        )));
+        assert!(!start_error_may_show_update_screen(&HerdrError::Timeout));
+        assert!(!start_error_may_show_update_screen(
+            &HerdrError::SpawnFailed {
+                os_error: Some(2),
+                message: "not found".into(),
+            }
+        ));
+        assert!(!start_error_may_show_update_screen(&HerdrError::Parse {
+            message: "bad".into(),
+        }));
+        assert!(!start_error_may_show_update_screen(&HerdrError::Exit {
+            code: Some(1),
+            stderr: "connection refused".into(),
+        }));
     }
 
     #[test]

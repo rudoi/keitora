@@ -284,13 +284,44 @@ pub struct UpdatesConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_check: Option<bool>,
+    /// How often, in hours, the agent CLIs (Claude Code, Codex) are checked for
+    /// a newer release. Unset means 6; `0` means only at app start; any other
+    /// value is clamped to `1..=168`. Read through [`Self::agent_check_hours`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_check_hours: Option<u32>,
+    /// A Codex version the user chose to skip. A newer release shows the update
+    /// banner again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_skip_codex: Option<String>,
+    /// A Claude Code version the user chose to skip. Same rule as
+    /// `agent_skip_codex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_skip_claude: Option<String>,
 }
 
 impl UpdatesConfig {
+    /// Default agent CLI check interval, in hours.
+    pub const DEFAULT_AGENT_CHECK_HOURS: u32 = 6;
+    /// Longest allowed agent CLI check interval (one week), in hours.
+    pub const MAX_AGENT_CHECK_HOURS: u32 = 168;
+
     /// True when nothing is configured, so the whole `[updates]` table can be
     /// omitted from serialized TOML.
     pub fn is_empty(&self) -> bool {
         self.auto_check.is_none()
+            && self.agent_check_hours.is_none()
+            && self.agent_skip_codex.is_none()
+            && self.agent_skip_claude.is_none()
+    }
+
+    /// The effective agent CLI check interval in hours: unset → 6, `0` stays
+    /// `0` (check at app start only), anything else clamped to `1..=168`.
+    pub fn agent_check_hours(&self) -> u32 {
+        match self.agent_check_hours {
+            None => Self::DEFAULT_AGENT_CHECK_HOURS,
+            Some(0) => 0,
+            Some(h) => h.clamp(1, Self::MAX_AGENT_CHECK_HOURS),
+        }
     }
 
     /// Whether automatic update checks are enabled (unset → true).
@@ -832,6 +863,15 @@ impl UserConfig {
     pub fn write_lock() -> std::sync::MutexGuard<'static, ()> {
         // The guarded data is `()`: a panic mid-write leaves nothing to repair.
         REGISTRY_WRITE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Load, change with `f`, and save the registry, all under [`Self::write_lock`].
+    /// Not reentrant: `f` must not call another registry writer.
+    pub fn update(f: impl FnOnce(&mut UserConfig)) -> Result<(), ResolveError> {
+        let _registry = Self::write_lock();
+        let mut cfg = Self::load()?;
+        f(&mut cfg);
+        cfg.save()
     }
 
     /// Load the registry from the OS path. Returns the default (empty) registry
@@ -1403,6 +1443,14 @@ impl ProjectConfig {
             .ok_or_else(|| ResolveError::Io("keitora.toml has no parent dir".to_string()))?;
         cfg.root = canonicalize_root(&root);
         cfg.tasks.db_path = normalize_db_path(&cfg.tasks.db_path, &cfg.root);
+        if cfg.project.name == RESERVED_PROJECT_NAME {
+            let name = unreserved_project_name(&cfg.project.name, &cfg.root);
+            log::warn!(
+                "{}: the project name \"{RESERVED_PROJECT_NAME}\" is reserved; using \"{name}\"",
+                toml_path.display()
+            );
+            cfg.project.name = name;
+        }
 
         Ok(cfg)
     }
@@ -1504,6 +1552,7 @@ impl ProjectConfig {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "project".to_string());
+        let name = unreserved_project_name(&name, root);
         let worktrees_dir = format!("~/.keitora/{name}");
         let db_path = PathBuf::from(format!("~/.keitora/{name}/shared/tasks.db"));
         ProjectConfig {
@@ -1751,6 +1800,23 @@ pub fn stamp_from_registry(cfg: &mut ProjectConfig, registry: &UserConfig) {
         apply_registry_overrides(cfg, pref);
         cfg.apply_registry_worktrees(pref);
     }
+}
+
+/// The project name Keitora reserves for its own utility sessions: no project may
+/// resolve to it, so a project's sessions can never alias them.
+pub const RESERVED_PROJECT_NAME: &str = "__keitora";
+
+/// `name` as a project name: unchanged unless it is [`RESERVED_PROJECT_NAME`], which
+/// becomes `root`'s folder name, or (when that is the reserved name too, or there is
+/// none) the reserved name with a `-project` suffix.
+pub fn unreserved_project_name(name: &str, root: &Path) -> String {
+    if name != RESERVED_PROJECT_NAME {
+        return name.to_string();
+    }
+    root.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty() && n != RESERVED_PROJECT_NAME)
+        .unwrap_or_else(|| format!("{RESERVED_PROJECT_NAME}-project"))
 }
 
 /// Build the effective [`ProjectConfig`] for a registered project: load its
@@ -4168,6 +4234,67 @@ backoff_secs = [0, 10]
     }
 
     #[test]
+    fn agent_check_hours_effective_value() {
+        let cases: &[(Option<u32>, u32)] = &[
+            (None, 6),
+            (Some(0), 0),
+            (Some(1), 1),
+            (Some(6), 6),
+            (Some(24), 24),
+            (Some(168), 168),
+            (Some(169), 168),
+            (Some(u32::MAX), 168),
+        ];
+        for (raw, want) in cases {
+            let cfg = UpdatesConfig {
+                agent_check_hours: *raw,
+                ..Default::default()
+            };
+            assert_eq!(cfg.agent_check_hours(), *want, "raw {raw:?}");
+        }
+    }
+
+    #[test]
+    fn updates_is_empty_covers_agent_fields() {
+        assert!(UpdatesConfig::default().is_empty());
+        let with = |f: fn(&mut UpdatesConfig)| {
+            let mut c = UpdatesConfig::default();
+            f(&mut c);
+            c
+        };
+        assert!(!with(|c| c.auto_check = Some(true)).is_empty());
+        assert!(!with(|c| c.agent_check_hours = Some(0)).is_empty());
+        assert!(!with(|c| c.agent_skip_codex = Some("0.163.0".into())).is_empty());
+        assert!(!with(|c| c.agent_skip_claude = Some("2.1.328".into())).is_empty());
+    }
+
+    #[test]
+    fn updates_agent_fields_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("keitora/keitora.toml");
+
+        let mut cfg = UserConfig::default();
+        cfg.updates.agent_check_hours = Some(0);
+        cfg.updates.agent_skip_codex = Some("0.163.0".into());
+        cfg.updates.agent_skip_claude = Some("2.1.328".into());
+        cfg.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[updates]"), "got: {text}");
+        assert!(text.contains("agent_check_hours = 0"), "got: {text}");
+        assert!(
+            text.contains("agent_skip_codex = \"0.163.0\""),
+            "got: {text}"
+        );
+        assert!(!text.contains("auto_check ="), "got: {text}");
+
+        let loaded = UserConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.updates, cfg.updates);
+        assert_eq!(loaded.updates.agent_check_hours(), 0);
+        assert!(loaded.updates.auto_check());
+    }
+
+    #[test]
     fn updates_table_omitted_when_unset() {
         let toml = toml::to_string(&UserConfig::default()).unwrap();
         assert!(!toml.contains("[updates]"), "got: {toml}");
@@ -4216,6 +4343,25 @@ backoff_secs = [0, 10]
 
         let loaded = UserConfig::load_from(&path).unwrap();
         assert!(loaded.skip_permissions());
+    }
+
+    #[test]
+    fn update_loads_mutates_and_saves() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("KEITORA_CONFIG_HOME", tmp.path().join("user_config"));
+
+        UserConfig::update(|c| c.updates.agent_check_hours = Some(12)).unwrap();
+        UserConfig::update(|c| c.updates.agent_skip_codex = Some("0.163.0".into())).unwrap();
+        let loaded = UserConfig::load().unwrap();
+        assert_eq!(
+            loaded.updates.agent_check_hours,
+            Some(12),
+            "an earlier update survives a later one"
+        );
+        assert_eq!(loaded.updates.agent_skip_codex.as_deref(), Some("0.163.0"));
+
+        std::env::remove_var("KEITORA_CONFIG_HOME");
     }
 
     #[test]
@@ -5068,6 +5214,51 @@ relay_url = \"https://relay.example\"
     }
 
     // --- effective_config: keitora.toml optional + registry overlay ---
+
+    #[test]
+    fn unreserved_project_name_falls_back_to_the_folder() {
+        let root = Path::new("/repos/proj");
+        assert_eq!(unreserved_project_name("proj", root), "proj");
+        assert_eq!(unreserved_project_name("__keitora2", root), "__keitora2");
+        assert_eq!(unreserved_project_name("__keitora", root), "proj");
+        assert_eq!(
+            unreserved_project_name("__keitora", Path::new("/repos/__keitora")),
+            "__keitora-project"
+        );
+        assert_eq!(
+            unreserved_project_name("__keitora", Path::new("/")),
+            "__keitora-project"
+        );
+    }
+
+    #[test]
+    fn a_committed_reserved_name_resolves_to_the_folder_name() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("keitora.toml"),
+            "[project]
+name = \"__keitora\"
+
+[tasks]
+db_path = \"tasks.db\"
+",
+        )
+        .unwrap();
+        assert_eq!(ProjectConfig::load(&root).unwrap().project.name, "proj");
+        let pref = ProjectRef::new(root.clone());
+        assert_eq!(effective_config(&pref).unwrap().project.name, "proj");
+    }
+
+    #[test]
+    fn a_fileless_reserved_folder_never_resolves_to_the_reserved_name() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("__keitora");
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg = effective_config(&ProjectRef::new(root)).unwrap();
+        assert_eq!(cfg.project.name, "__keitora-project");
+    }
 
     #[test]
     fn effective_config_fileless_uses_scaffold_defaults() {
