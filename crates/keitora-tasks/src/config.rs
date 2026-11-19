@@ -267,9 +267,83 @@ pub struct UserConfig {
     /// Sticky-note settings. Omitted from TOML when unset.
     #[serde(default, skip_serializing_if = "StickyNotesConfig::is_empty")]
     pub sticky_notes: StickyNotesConfig,
+    /// How the rail lists worktrees (sort, emoji). Omitted from TOML when unset.
+    #[serde(default, skip_serializing_if = "RailConfig::is_empty")]
+    pub rail: RailConfig,
     /// Registered projects, keyed by name.
     #[serde(default)]
     pub projects: BTreeMap<String, ProjectRef>,
+}
+
+/// How the rail sorts each project's worktrees.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeSort {
+    /// The project's `worktree_order` (what a drag sets), then registry order.
+    #[default]
+    Custom,
+    /// By worktree name.
+    Alpha,
+    /// Grouped by emoji (worktrees without one last), custom order within a group.
+    Emoji,
+}
+
+/// The optional `[rail]` table in the user registry.
+///
+/// Example (user config `keitora.toml`):
+/// ```toml
+/// [rail]
+/// emoji = true
+/// worktree_sort = "emoji"
+/// hidden_emoji = ["💤"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct RailConfig {
+    /// Whether worktrees show (and can be given) an emoji. `None` (unset) means off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<bool>,
+    /// How worktrees are sorted. `None` (unset) means custom order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_sort: Option<WorktreeSort>,
+    /// Emoji whose worktrees are filtered out of the rail. Only applies with `emoji` on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_emoji: Vec<String>,
+}
+
+impl RailConfig {
+    /// True when nothing is configured, so the whole `[rail]` table can be omitted.
+    pub fn is_empty(&self) -> bool {
+        self.emoji.is_none() && self.worktree_sort.is_none() && self.hidden_emoji.is_empty()
+    }
+
+    /// Whether worktree emoji are on (unset → false).
+    pub fn emoji(&self) -> bool {
+        self.emoji.unwrap_or(false)
+    }
+
+    /// The worktree sort (unset → custom).
+    pub fn worktree_sort(&self) -> WorktreeSort {
+        self.worktree_sort.unwrap_or_default()
+    }
+
+    /// Replace the hidden emoji, dropping blanks and repeats (first occurrence wins).
+    pub fn set_hidden_emoji(&mut self, emoji: Vec<String>) {
+        let mut seen = std::collections::HashSet::new();
+        self.hidden_emoji = emoji
+            .into_iter()
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty() && seen.insert(e.clone()))
+            .collect();
+    }
+}
+
+/// Whether `s` is acceptable as a worktree's emoji: one short, single-line, non-blank
+/// token. Not a strict emoji check (sequences and flags vary too much); the UI offers a
+/// palette, this only keeps junk out of the registry.
+pub fn is_valid_worktree_emoji(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().count() <= 16
+        && !s.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// The optional `[updates]` table in the user registry: how the app checks for
@@ -797,6 +871,13 @@ pub struct ProjectRef {
     /// Per-machine `[project].diff_base` override (diff-view comparison base).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_base: Option<DiffBase>,
+    /// The rail's custom worktree order (names). Worktrees missing from it follow in
+    /// registry order. Omitted from TOML when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worktree_order: Vec<String>,
+    /// Each worktree's emoji, by worktree name. Last, being a table. Omitted when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub worktree_emoji: BTreeMap<String, String>,
 }
 
 impl ProjectRef {
@@ -804,6 +885,8 @@ impl ProjectRef {
     /// committed file / scaffold defaults).
     pub fn new(path: PathBuf) -> Self {
         ProjectRef {
+            worktree_order: Vec::new(),
+            worktree_emoji: BTreeMap::new(),
             path,
             worktrees: None,
             db_path: None,
@@ -925,6 +1008,8 @@ impl UserConfig {
                     entry.dispatch_steps = None;
                     entry.codex_dispatch_steps = None;
                     entry.diff_base = None;
+                    entry.worktree_order.clear();
+                    entry.worktree_emoji.clear();
                 }
                 entry.path = path;
             }
@@ -1176,6 +1261,47 @@ impl UserConfig {
             .collect();
         next.extend(rest);
         self.project_order = next;
+    }
+
+    /// Replace the custom worktree order of the project registered as `key`. Blank
+    /// names and repeats are dropped (first occurrence wins). Returns `false` when no
+    /// project has that key.
+    pub fn set_worktree_order(&mut self, key: &str, order: Vec<String>) -> bool {
+        let Some(pref) = self.projects.get_mut(key) else {
+            return false;
+        };
+        let mut seen = std::collections::HashSet::new();
+        pref.worktree_order = order
+            .into_iter()
+            .filter(|w| !w.is_empty() && seen.insert(w.clone()))
+            .collect();
+        true
+    }
+
+    /// Set (`Some`) or clear (`None`) one worktree's emoji in the project registered as
+    /// `key`. Errors when no project has that key or the emoji is not acceptable (see
+    /// [`is_valid_worktree_emoji`]).
+    pub fn set_worktree_emoji(
+        &mut self,
+        key: &str,
+        worktree: &str,
+        emoji: Option<String>,
+    ) -> Result<(), String> {
+        let pref = self
+            .projects
+            .get_mut(key)
+            .ok_or_else(|| format!("no project named {key}"))?;
+        match emoji.map(|e| e.trim().to_string()) {
+            Some(e) if !is_valid_worktree_emoji(&e) => Err(format!("not an emoji: {e:?}")),
+            Some(e) => {
+                pref.worktree_emoji.insert(worktree.to_string(), e);
+                Ok(())
+            }
+            None => {
+                pref.worktree_emoji.remove(worktree);
+                Ok(())
+            }
+        }
     }
 
     /// Record the user-level `claude` path (from discovery or an explicit set).
@@ -3908,6 +4034,110 @@ mod tests {
         assert_eq!(loaded.project_order, strings(&["c", "a", "b"]));
         assert_eq!(loaded.ordered_project_names(), strings(&["c", "a", "b"]));
         assert_eq!(loaded.projects.len(), 3);
+    }
+
+    // --- rail: worktree order, emoji, [rail] table ---
+
+    #[test]
+    fn set_worktree_order_drops_blanks_and_repeats() {
+        let mut cfg = registry_of(&["proj"]);
+        assert!(cfg.set_worktree_order("proj", strings(&["bravo", "", "alpha", "bravo"])));
+        assert_eq!(
+            cfg.projects["proj"].worktree_order,
+            strings(&["bravo", "alpha"])
+        );
+        assert!(!cfg.set_worktree_order("gone", strings(&["alpha"])));
+    }
+
+    #[test]
+    fn set_worktree_emoji_sets_replaces_and_clears() {
+        let mut cfg = registry_of(&["proj"]);
+        cfg.set_worktree_emoji("proj", "alpha", Some("🔥".into()))
+            .unwrap();
+        cfg.set_worktree_emoji("proj", "alpha", Some(" 🧪 ".into()))
+            .unwrap();
+        assert_eq!(cfg.projects["proj"].worktree_emoji["alpha"], "🧪");
+        cfg.set_worktree_emoji("proj", "alpha", None).unwrap();
+        assert!(cfg.projects["proj"].worktree_emoji.is_empty());
+    }
+
+    #[test]
+    fn set_worktree_emoji_rejects_junk_and_unknown_projects() {
+        let mut cfg = registry_of(&["proj"]);
+        assert!(cfg
+            .set_worktree_emoji("proj", "alpha", Some("two words".into()))
+            .is_err());
+        assert!(cfg
+            .set_worktree_emoji("proj", "alpha", Some("  ".into()))
+            .is_err());
+        assert!(cfg
+            .set_worktree_emoji("gone", "alpha", Some("🔥".into()))
+            .is_err());
+        assert!(cfg.projects["proj"].worktree_emoji.is_empty());
+    }
+
+    #[test]
+    fn emoji_validation_accepts_sequences_and_flags() {
+        assert!(is_valid_worktree_emoji("👩‍💻"));
+        assert!(is_valid_worktree_emoji("🇯🇵"));
+        assert!(is_valid_worktree_emoji("❤️"));
+        assert!(!is_valid_worktree_emoji(""));
+        assert!(!is_valid_worktree_emoji("a\nb"));
+    }
+
+    #[test]
+    fn reregistering_a_name_at_a_new_path_drops_worktree_order_and_emoji() {
+        let mut cfg = registry_of(&["proj"]);
+        cfg.set_worktree_order("proj", strings(&["alpha"]));
+        cfg.set_worktree_emoji("proj", "alpha", Some("🔥".into()))
+            .unwrap();
+        cfg.register("proj", PathBuf::from("/code/proj"));
+        assert_eq!(cfg.projects["proj"].worktree_order, strings(&["alpha"]));
+        cfg.register("proj", PathBuf::from("/code/other-proj"));
+        assert!(cfg.projects["proj"].worktree_order.is_empty());
+        assert!(cfg.projects["proj"].worktree_emoji.is_empty());
+    }
+
+    #[test]
+    fn rail_config_defaults_to_off_and_custom_and_is_omitted() {
+        let cfg = UserConfig::default();
+        assert!(!cfg.rail.emoji());
+        assert_eq!(cfg.rail.worktree_sort(), WorktreeSort::Custom);
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(!text.contains("[rail]"), "got: {text}");
+    }
+
+    #[test]
+    fn set_hidden_emoji_trims_and_dedupes() {
+        let mut rail = RailConfig::default();
+        rail.set_hidden_emoji(strings(&["💤", " 🔥 ", "", "💤"]));
+        assert_eq!(rail.hidden_emoji, strings(&["💤", "🔥"]));
+    }
+
+    #[test]
+    fn rail_settings_round_trip_through_toml() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("keitora/keitora.toml");
+        let mut cfg = registry_of(&["proj", "other-proj"]);
+        cfg.rail.emoji = Some(true);
+        cfg.rail.worktree_sort = Some(WorktreeSort::Emoji);
+        cfg.rail.set_hidden_emoji(strings(&["💤"]));
+        cfg.set_worktree_order("proj", strings(&["bravo", "alpha"]));
+        cfg.set_worktree_emoji("proj", "alpha", Some("🔥".into()))
+            .unwrap();
+        cfg.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("worktree_sort = \"emoji\""), "got: {text}");
+
+        let loaded = UserConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.rail, cfg.rail);
+        assert_eq!(
+            loaded.projects["proj"].worktree_order,
+            strings(&["bravo", "alpha"])
+        );
+        assert_eq!(loaded.projects["proj"].worktree_emoji["alpha"], "🔥");
+        assert!(loaded.projects["other-proj"].worktree_order.is_empty());
     }
 
     #[test]

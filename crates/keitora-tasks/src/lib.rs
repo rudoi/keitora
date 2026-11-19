@@ -38,13 +38,14 @@ pub use config::{
     cached_login_path, classify_worktree, config_path, current_worktree, discover_claude,
     discover_cli, discover_cli_cached, dispatch_pool_default, effective_config, git_toplevel,
     herdr_bin_candidates, herdr_on_path, herdr_release_paths, herdr_well_known_paths,
-    in_agent_session, is_executable_file, is_safe_claude_session_id, keitora_on_path, login_path,
-    resolve, resolve_active, resolve_autonomy, resolve_claude_path, resolve_cli,
-    resolve_keitora_path, resolve_provider_path, resolve_skip_permissions, short_path,
+    in_agent_session, is_executable_file, is_safe_claude_session_id, is_valid_worktree_emoji,
+    keitora_on_path, login_path, resolve, resolve_active, resolve_autonomy, resolve_claude_path,
+    resolve_cli, resolve_keitora_path, resolve_provider_path, resolve_skip_permissions, short_path,
     stamp_from_registry, strip_extended_prefix_str, CliConfig, CliKind, Config, DiffBase,
     DispatchConfig, FieldIntent, HerdrPtyConfig, ProjectConfig, ProjectMeta, ProjectRef,
-    ProjectSettingsPatch, ProviderConfig, PtyConfig, RecoveryConfig, ResolveError,
-    StickyNotesConfig, TaskConfig, UserConfig, WorktreeEntry, AGENT_ENV, DISCOVER_NONE_TTL,
+    ProjectSettingsPatch, ProviderConfig, PtyConfig, RailConfig, RecoveryConfig, ResolveError,
+    StickyNotesConfig, TaskConfig, UserConfig, WorktreeEntry, WorktreeSort, AGENT_ENV,
+    DISCOVER_NONE_TTL,
 };
 // Windows-only: expose the bundled `keitora` CLI on spawned terminals' PATH.
 #[cfg(unix)]

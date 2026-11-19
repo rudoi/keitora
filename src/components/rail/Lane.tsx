@@ -1,8 +1,8 @@
 // One lane row of the rail: a worktree's status block, name, task, stage, branch and build
 // bar. Available lanes are selectable; others render muted with their status.
 
-import { FileDiff, FolderOpen, SquareTerminal } from "lucide-react";
-import type { CSSProperties } from "react";
+import { FileDiff, FolderOpen, SmilePlus, SquareTerminal } from "lucide-react";
+import type { CSSProperties, MouseEvent } from "react";
 import { memo, useEffect, useRef, useState } from "react";
 import {
   formatActions,
@@ -155,19 +155,25 @@ export const Lane = memo(function Lane({
   isSelected,
   hintBadge,
   hintVisible,
+  emojiOn,
   onSelect,
   onOpenDiff,
   onOpen,
   onContextMenu,
+  onEmoji,
 }: {
   lane: LaneModel;
   isSelected: boolean;
   hintBadge?: number;
   hintVisible: boolean;
+  /** Show the lane's emoji (or, without one, a button to set it). */
+  emojiOn: boolean;
   onSelect: (worktree: string) => void;
   onOpenDiff: (worktree: string) => void;
   onOpen: (worktree: string, target: LaneOpenTarget) => void;
   onContextMenu: (worktree: string, x: number, y: number) => void;
+  /** Open the emoji picker below the clicked element. */
+  onEmoji: (worktree: string, x: number, y: number) => void;
 }) {
   const reduceMotion = usePrefersReducedMotion();
   const { activity: act, task, building, attn, terminated } = lane;
@@ -207,6 +213,11 @@ export const Lane = memo(function Lane({
   const workDotCls = ["lane-work-dot", building ? "working" : "busy", reduceMotion ? "" : "live"]
     .filter(Boolean)
     .join(" ");
+  const pickEmoji = (e: MouseEvent<HTMLButtonElement>) => {
+    e.stopPropagation();
+    const r = e.currentTarget.getBoundingClientRect();
+    onEmoji(lane.name, r.left, r.bottom);
+  };
   return (
     <div
       className={rowCls}
@@ -229,6 +240,17 @@ export const Lane = memo(function Lane({
       <span className={blockCls} title={terminated ? TERMINATED_LABEL : undefined} />
       <div className="lane">
         <div className="lane-head">
+          {emojiOn && lane.emoji !== null && (
+            <button
+              type="button"
+              className="lane-emoji"
+              title="Change emoji"
+              aria-label={`Change emoji for ${lane.name} (${lane.emoji})`}
+              onClick={pickEmoji}
+            >
+              {lane.emoji}
+            </button>
+          )}
           <ProviderGlyph cli={lane.cli} />
           <span className="lane-name" title={nameTitle}>
             {lane.name}
@@ -246,6 +268,17 @@ export const Lane = memo(function Lane({
           )}
           {ok && (
             <span className="lane-actions">
+              {emojiOn && lane.emoji === null && (
+                <button
+                  type="button"
+                  className="lane-diff-btn"
+                  title="Set emoji"
+                  aria-label={`Set emoji for ${lane.name}`}
+                  onClick={pickEmoji}
+                >
+                  <SmilePlus size={13} aria-hidden="true" />
+                </button>
+              )}
               <button
                 type="button"
                 className="lane-diff-btn"

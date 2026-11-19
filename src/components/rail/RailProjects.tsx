@@ -57,11 +57,14 @@ export function RailProjects({
   selected,
   hintVisible,
   reduceMotion,
+  emojiOn,
   onToggle,
   onSelectLane,
   onOpenDiff,
   onOpenLane,
   onLaneContextMenu,
+  onLaneEmoji,
+  onReorderLanes,
   onNewWorktree,
   onOpenMenu,
   onReorder,
@@ -74,11 +77,15 @@ export function RailProjects({
   selected: string | null;
   hintVisible: boolean;
   reduceMotion: boolean;
+  /** Lanes show their emoji and offer to set one. */
+  emojiOn: boolean;
   onToggle: (key: string) => void;
   onSelectLane: (g: GroupModel, worktree: string) => void;
   onOpenDiff: (g: GroupModel, worktree: string) => void;
   onOpenLane: (g: GroupModel, worktree: string, target: LaneOpenTarget) => void;
   onLaneContextMenu: (g: GroupModel, worktree: string, x: number, y: number) => void;
+  onLaneEmoji: (g: GroupModel, worktree: string, x: number, y: number) => void;
+  onReorderLanes: (g: GroupModel, order: string[]) => void;
   onNewWorktree: (g: GroupModel) => void;
   onOpenMenu: (g: GroupModel, x: number, y: number, from: HTMLElement | null) => void;
   onReorder: (keys: string[]) => Promise<void>;
@@ -275,6 +282,7 @@ export function RailProjects({
             selected={g.isActive ? selected : null}
             hintVisible={hintVisible}
             reduceMotion={reduceMotion}
+            emojiOn={emojiOn}
             home={home}
             now={now}
             onToggle={onToggle}
@@ -282,6 +290,8 @@ export function RailProjects({
             onOpenDiff={onOpenDiff}
             onOpenLane={onOpenLane}
             onLaneContextMenu={onLaneContextMenu}
+            onLaneEmoji={onLaneEmoji}
+            onReorderLanes={onReorderLanes}
             onNewWorktree={onNewWorktree}
             onOpenMenu={onOpenMenu}
           />

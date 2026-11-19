@@ -13,13 +13,16 @@ import { parseUtc } from "./format";
 import type {
   CliKind,
   ProjectSummary,
+  RailView,
   WorktreeActivity,
   WorktreeInfo,
   WorktreeStatus,
 } from "./ipc";
 import { blockStateCls, type DotState } from "./laneState";
 import type { ProjectOverview } from "./projectsOverview";
+import { sameOrder } from "./railOrder";
 import type { SessionState, WorktreeSession } from "./sessions";
+import { DEFAULT_RAIL_VIEW, effectiveView, isHidden, sortWorktrees } from "./worktreeOrder";
 
 export interface LaneModel {
   name: string;
@@ -42,6 +45,8 @@ export interface LaneModel {
   building: boolean;
   working: boolean;
   blockState: DotState;
+  /** The worktree's emoji; always null while emoji are off. */
+  emoji: string | null;
 }
 
 export interface SummaryStats {
@@ -71,7 +76,13 @@ export interface GroupModel {
   isActive: boolean;
   /** Built from the overview, which has not loaded yet. */
   loading: boolean;
+  /** The lanes the rail shows, sorted; the filtered-out ones are left out. */
   lanes: LaneModel[];
+  /** Every lane's name in sort order, filtered-out ones included: what a drag reorders. */
+  order: string[];
+  /** Lanes left out by the emoji filter. */
+  hiddenLanes: number;
+  /** Over every lane, filtered-out ones included, so a hidden lane still raises its flag. */
   summaryStats: SummaryStats;
 }
 
@@ -94,6 +105,10 @@ export interface BuildGroupsInput {
   /** The active project's selected worktree. */
   selected: string | null;
   maxDots: number;
+  /** How lanes are sorted and filtered; defaults to registry order, no emoji. */
+  view?: RailView;
+  /** Dropped worktree orders by registry key, not yet reported by the project list. */
+  worktreeOrders?: Readonly<Record<string, readonly string[]>>;
 }
 
 /** One lane's model. `attention` applies only to an available worktree. */
@@ -125,6 +140,7 @@ export function buildLane(
     building,
     working: activity?.working === true,
     blockState: blockStateCls(attn, session, ok, building, terminated),
+    emoji: null,
   };
 }
 
@@ -184,6 +200,7 @@ export function summarize(
 
 /** One GroupModel per project, in `projects` order. */
 export function buildGroups(i: BuildGroupsInput): GroupModel[] {
+  const view = effectiveView(i.view ?? DEFAULT_RAIL_VIEW);
   return i.projects.map((p) => {
     const key = p.name;
     const resolvedName = p.resolved_name;
@@ -224,15 +241,29 @@ export function buildGroups(i: BuildGroupsInput): GroupModel[] {
       });
     }
 
+    const emojiOf = (name: string) => (view.emoji ? (p.worktree_emoji?.[name] ?? null) : null);
+    const sorted = sortWorktrees(
+      lanes,
+      view.worktree_sort,
+      i.worktreeOrders?.[key] ?? p.worktree_order ?? [],
+      emojiOf,
+    ).map((l) => {
+      const emoji = emojiOf(l.name);
+      return emoji === l.emoji ? l : { ...l, emoji };
+    });
+    const shown = sorted.filter((l) => !isHidden(l.emoji, view.hidden_emoji));
+
     return {
       key,
       resolvedName,
       summary: p,
       isActive,
       loading: !rich && i.overview === null,
-      lanes,
+      lanes: shown,
+      order: sorted.map((l) => l.name),
+      hiddenLanes: sorted.length - shown.length,
       summaryStats: summarize(
-        lanes,
+        sorted,
         i.liveCounts.get(resolvedName) ?? 0,
         rich ? i.selected : null,
         i.maxDots,
@@ -288,10 +319,13 @@ export function shareGroups(prev: readonly GroupModel[] | null, next: GroupModel
       ...g,
       summary: keep(p.summary, g.summary),
       lanes: sameLanes ? p.lanes : lanes,
+      order: sameOrder(p.order, g.order) ? p.order : g.order,
       summaryStats: keep(p.summaryStats, g.summaryStats),
     };
     const unchanged =
       sameLanes &&
+      shared.order === p.order &&
+      g.hiddenLanes === p.hiddenLanes &&
       shared.summary === p.summary &&
       shared.summaryStats === p.summaryStats &&
       g.resolvedName === p.resolvedName &&

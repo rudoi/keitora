@@ -392,6 +392,76 @@ describe("buildGroups", () => {
   });
 });
 
+// ── buildGroups: worktree sort and emoji filter ───────────────────────────────
+
+describe("buildGroups sorting and filtering", () => {
+  const withRail = {
+    ...alpha,
+    worktree_order: ["a3", "a1"],
+    worktree_emoji: { a1: "🔥", a3: "💤" },
+  };
+  const rail = (over: Partial<BuildGroupsInput> = {}) =>
+    input({
+      projects: [withRail, beta],
+      activeWorktrees: [wt("a1"), wt("a2"), wt("a3")],
+      ...over,
+    });
+  const lanes = (g: { lanes: { name: string }[] }) => g.lanes.map((l) => l.name);
+
+  it("keeps registry order and shows no emoji by default", () => {
+    const [a] = buildGroups(rail());
+    expect(lanes(a)).toEqual(["a3", "a1", "a2"]);
+    expect(a.lanes.every((l) => l.emoji === null)).toBe(true);
+  });
+
+  it("sorts by the custom order, a dropped one winning over the registry's", () => {
+    const view = { emoji: false, worktree_sort: "custom" as const, hidden_emoji: [] };
+    expect(lanes(buildGroups(rail({ view }))[0])).toEqual(["a3", "a1", "a2"]);
+    const [a] = buildGroups(rail({ view, worktreeOrders: { alpha: ["a2", "a1", "a3"] } }));
+    expect(lanes(a)).toEqual(["a2", "a1", "a3"]);
+    expect(a.order).toEqual(["a2", "a1", "a3"]);
+  });
+
+  it("sorts alphabetically", () => {
+    const view = { emoji: false, worktree_sort: "alpha" as const, hidden_emoji: [] };
+    expect(lanes(buildGroups(rail({ view }))[0])).toEqual(["a1", "a2", "a3"]);
+  });
+
+  it("with emoji on, carries each lane's emoji, sorts by it and hides toggled-off ones", () => {
+    const view = { emoji: true, worktree_sort: "emoji" as const, hidden_emoji: ["💤"] };
+    const [a] = buildGroups(rail({ view }));
+    expect(lanes(a)).toEqual(["a1", "a2"]);
+    expect(a.lanes[0].emoji).toBe("🔥");
+    expect(a.order).toEqual(["a1", "a3", "a2"]);
+    expect(a.hiddenLanes).toBe(1);
+  });
+
+  it("ignores the emoji sort and filter while emoji are off", () => {
+    const view = { emoji: false, worktree_sort: "emoji" as const, hidden_emoji: ["💤"] };
+    const [a] = buildGroups(rail({ view }));
+    expect(lanes(a)).toEqual(["a3", "a1", "a2"]);
+    expect(a.hiddenLanes).toBe(0);
+  });
+
+  it("still counts a hidden lane's waiting state on the header", () => {
+    const view = { emoji: true, worktree_sort: "custom" as const, hidden_emoji: ["💤"] };
+    const [a] = buildGroups(
+      rail({ view, attention: new Map<string, AttentionKind>([["a3", "waiting"]]) }),
+    );
+    expect(lanes(a)).not.toContain("a3");
+    expect(a.summaryStats.waiting).toBe(1);
+  });
+
+  it("shareGroups does not keep a group whose filter changed", () => {
+    const view = { emoji: true, worktree_sort: "custom" as const, hidden_emoji: [] as string[] };
+    const prev = buildGroups(rail({ view }));
+    const next = shareGroups(prev, buildGroups(rail({ view: { ...view, hidden_emoji: ["💤"] } })));
+    expect(next[0]).not.toBe(prev[0]);
+    expect(next[0].hiddenLanes).toBe(1);
+    expect(next[1]).toBe(prev[1]);
+  });
+});
+
 // ── summarize ─────────────────────────────────────────────────────────────────
 
 describe("summarize", () => {
