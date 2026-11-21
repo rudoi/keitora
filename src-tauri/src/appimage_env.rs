@@ -10,6 +10,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Variables the AppImage runtime sets that only describe the image itself.
@@ -20,6 +21,31 @@ const RUNTIME_VARS: &[&str] = &["APPDIR", "APPIMAGE", "ARGV0", "OWD"];
 pub enum EnvChange {
     Remove(OsString),
     Set(OsString, OsString),
+}
+
+/// Whether this process is itself running from an AppImage. `$APPIMAGE` alone is not enough:
+/// another AppImage app leaks it (and `$APPDIR`) to everything it starts, so the running binary
+/// must also sit inside `$APPDIR`, the same test Tauri applies before trusting the variables.
+pub fn running_as_appimage() -> bool {
+    is_appimage(
+        std::env::var_os("APPIMAGE").as_deref(),
+        std::env::var_os("APPDIR").as_deref(),
+        std::env::current_exe().ok().as_deref(),
+    )
+}
+
+/// [`running_as_appimage`] from its inputs.
+pub fn is_appimage(appimage: Option<&OsStr>, appdir: Option<&OsStr>, exe: Option<&Path>) -> bool {
+    let (Some(appimage), Some(appdir), Some(exe)) = (appimage, appdir, exe) else {
+        return false;
+    };
+    if appimage.is_empty() || appdir.is_empty() {
+        return false;
+    }
+    // `current_exe` resolves symlinks, so compare against the resolved mount point too.
+    let appdir = Path::new(appdir);
+    let resolved = std::fs::canonicalize(appdir).unwrap_or_else(|_| PathBuf::from(appdir));
+    exe.starts_with(appdir) || exe.starts_with(resolved)
 }
 
 /// Strip the AppImage's environment from `cmd` when Keitora runs as an AppImage.
@@ -93,6 +119,27 @@ mod tests {
 
     fn plan_of(vars: &[(&str, &str)]) -> Vec<EnvChange> {
         plan(vars.iter().map(|(k, v)| (os(k), os(v))), OsStr::new(APPDIR))
+    }
+
+    #[test]
+    fn appimage_needs_both_variables_and_the_binary_inside_the_mount() {
+        let image = Some(OsStr::new("/home/me/Keitora_0.5.0_amd64.AppImage"));
+        let dir = Some(OsStr::new(APPDIR));
+        let inside = Path::new("/tmp/.mount_KeitoX/usr/bin/keitora-app");
+        assert!(is_appimage(image, dir, Some(inside)));
+        // Variables leaked by another AppImage app into an rpm/deb install.
+        assert!(!is_appimage(
+            image,
+            dir,
+            Some(Path::new("/usr/bin/keitora-app"))
+        ));
+        // A sibling mount whose name merely starts with the same characters.
+        let sibling = Path::new("/tmp/.mount_KeitoXY/usr/bin/keitora-app");
+        assert!(!is_appimage(image, dir, Some(sibling)));
+        assert!(!is_appimage(None, dir, Some(inside)));
+        assert!(!is_appimage(image, None, Some(inside)));
+        assert!(!is_appimage(Some(OsStr::new("")), dir, Some(inside)));
+        assert!(!is_appimage(image, dir, None));
     }
 
     #[test]

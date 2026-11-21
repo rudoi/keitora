@@ -21,15 +21,15 @@ pub enum Platform {
 impl Platform {
     /// The running build's platform, or `None` where no update artifacts are published.
     pub fn current() -> Option<Platform> {
-        Self::detect(
-            std::env::consts::OS,
-            std::env::consts::ARCH,
-            std::env::var_os("APPIMAGE").is_some_and(|p| !p.is_empty()),
-        )
+        #[cfg(target_os = "linux")]
+        let appimage = crate::appimage_env::running_as_appimage();
+        #[cfg(not(target_os = "linux"))]
+        let appimage = false;
+        Self::detect(std::env::consts::OS, std::env::consts::ARCH, appimage)
     }
 
-    /// [`Platform::current`] from its inputs: the target os and arch, and whether the AppImage
-    /// runtime set `$APPIMAGE`.
+    /// [`Platform::current`] from its inputs: the target os and arch, and whether this process
+    /// runs from an AppImage.
     pub fn detect(os: &str, arch: &str, appimage: bool) -> Option<Platform> {
         match (os, arch) {
             ("windows", "x86_64") => Some(Platform::WindowsX64),
