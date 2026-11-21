@@ -9,6 +9,19 @@ You need Rust (`rust-toolchain.toml` pins the version, and rustup installs it au
 Tools (`xcode-select --install`). On Windows you need Git for Windows and the MSVC Rust toolchain;
 [docs/windows-backend.md](docs/windows-backend.md) has the Windows specifics.
 
+On Linux, install Tauri's system libraries. Fedora:
+
+```sh
+sudo dnf install webkit2gtk4.1-devel openssl-devel libappindicator-gtk3-devel librsvg2-devel \
+  libxdo-devel dbus-devel gcc gcc-c++ make pkgconf-pkg-config file
+```
+
+Debian/Ubuntu: `libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev
+libxdo-dev libssl-dev build-essential pkg-config file`. On an immutable Fedora (Silverblue, Kinoite,
+Sway Atomic), install them in a `toolbox` and build from there. `yarn tauri:bundle` builds an
+AppImage, a `.deb` and an `.rpm` (targets in `src-tauri/tauri.linux.conf.json`) under
+`target/release/bundle/`.
+
 ```sh
 yarn install    # frontend deps, and installs the pre-commit hook
 ```
@@ -169,10 +182,12 @@ It then commits `chore(release): vX.Y.Z`, tags it and pushes `main` and the tag 
 If the push fails nothing reaches the remote, and the script undoes the local commit and tag. Only
 admins can run it: `main`'s ruleset requires pull requests from everyone else.
 
-`release.yml` builds a Windows NSIS `setup.exe` and an Apple Silicon `.dmg` signed with a
-Developer ID Application identity and notarized (see [Notarization](#notarization)). Tag builds also publish the in-app
-updater's files: `Keitora_<v>_x64-setup.exe.sig`, `Keitora.app.tar.gz` and `Keitora.app.tar.gz.sig`
-(see [Updater signing](#updater-signing)). The result appears on the repo's
+`release.yml` builds a Windows NSIS `setup.exe`, an Apple Silicon `.dmg` signed with a
+Developer ID Application identity and notarized (see [Notarization](#notarization)), and a Linux x64
+AppImage, `.deb` and `.rpm` (built on Ubuntu 22.04, so they run on glibc 2.35 and later). Tag builds
+also publish the in-app updater's files: `Keitora_<v>_x64-setup.exe.sig`, `Keitora.app.tar.gz`,
+`Keitora.app.tar.gz.sig` and `Keitora_<v>_amd64.AppImage.sig` (see [Updater signing](#updater-signing)).
+On Linux only the AppImage updates itself; deb and rpm installs update through the package manager. The result appears on the repo's
 [Releases page](https://github.com/rudoi/keitora/releases). Pull requests that touch the release
 files run the same builds without publishing, and a weekly scheduled run keeps the build cache warm
 and catches runner drift.

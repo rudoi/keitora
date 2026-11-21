@@ -13,17 +13,29 @@ pub const NOTES_LIMIT: usize = 4000;
 pub enum Platform {
     WindowsX64,
     MacArm64,
+    /// Only a copy running as an AppImage: a deb or rpm install is owned by the system
+    /// package manager, and the plugin can only replace the file `$APPIMAGE` names.
+    LinuxX64AppImage,
 }
 
 impl Platform {
     /// The running build's platform, or `None` where no update artifacts are published.
     pub fn current() -> Option<Platform> {
-        if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-            Some(Platform::WindowsX64)
-        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            Some(Platform::MacArm64)
-        } else {
-            None
+        Self::detect(
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            std::env::var_os("APPIMAGE").is_some_and(|p| !p.is_empty()),
+        )
+    }
+
+    /// [`Platform::current`] from its inputs: the target os and arch, and whether the AppImage
+    /// runtime set `$APPIMAGE`.
+    pub fn detect(os: &str, arch: &str, appimage: bool) -> Option<Platform> {
+        match (os, arch) {
+            ("windows", "x86_64") => Some(Platform::WindowsX64),
+            ("macos", "aarch64") => Some(Platform::MacArm64),
+            ("linux", "x86_64") if appimage => Some(Platform::LinuxX64AppImage),
+            _ => None,
         }
     }
 
@@ -31,6 +43,7 @@ impl Platform {
         match self {
             Platform::WindowsX64 => "Windows x64",
             Platform::MacArm64 => "macOS arm64",
+            Platform::LinuxX64AppImage => "Linux x64 AppImage",
         }
     }
 }
@@ -79,11 +92,13 @@ pub fn tag_version(tag: &str) -> Option<Version> {
 }
 
 /// The updater artifact name the release pipeline publishes for `platform`. The macOS
-/// tarball is named after the `.app`, with no version or arch.
+/// tarball is named after the `.app`, with no version or arch; the AppImage is its own
+/// updater artifact.
 pub fn installer_name(platform: Platform, version: &Version) -> String {
     match platform {
         Platform::WindowsX64 => format!("Keitora_{version}_x64-setup.exe"),
         Platform::MacArm64 => "Keitora.app.tar.gz".to_string(),
+        Platform::LinuxX64AppImage => format!("Keitora_{version}_amd64.AppImage"),
     }
 }
 
@@ -179,6 +194,10 @@ mod tests {
                 "Keitora.app.tar.gz",
                 "Keitora.app.tar.gz.sig",
                 &format!("Keitora_{ver}_aarch64.dmg"),
+                &format!("Keitora_{ver}_amd64.AppImage"),
+                &format!("Keitora_{ver}_amd64.AppImage.sig"),
+                &format!("Keitora_{ver}_amd64.deb"),
+                &format!("Keitora-{ver}-1.x86_64.rpm"),
             ],
         )
     }
@@ -346,6 +365,52 @@ mod tests {
         };
         assert_eq!(c.asset_url, MAC_URL);
         assert_eq!(c.sig_url, format!("{MAC_URL}.sig"));
+
+        assert_eq!(
+            installer_name(Platform::LinuxX64AppImage, &v("0.4.1")),
+            "Keitora_0.4.1_amd64.AppImage"
+        );
+        let a = assess(
+            &full_release("v0.4.1", "0.4.1"),
+            &v("0.4.0"),
+            Platform::LinuxX64AppImage,
+        );
+        let Assessment::Available(c) = a else {
+            panic!("expected available, got {a:?}")
+        };
+        assert_eq!(
+            c.asset_url,
+            "https://example.com/dl/Keitora_0.4.1_amd64.AppImage"
+        );
+        assert_eq!(
+            c.sig_url,
+            "https://example.com/dl/Keitora_0.4.1_amd64.AppImage.sig"
+        );
+    }
+
+    #[test]
+    fn linux_updates_only_when_running_as_an_appimage() {
+        assert_eq!(
+            Platform::detect("linux", "x86_64", true),
+            Some(Platform::LinuxX64AppImage)
+        );
+        // A deb or rpm install updates through the package manager.
+        assert_eq!(Platform::detect("linux", "x86_64", false), None);
+        assert_eq!(Platform::detect("linux", "aarch64", true), None);
+    }
+
+    #[test]
+    fn detect_maps_the_published_platforms() {
+        assert_eq!(
+            Platform::detect("windows", "x86_64", false),
+            Some(Platform::WindowsX64)
+        );
+        assert_eq!(
+            Platform::detect("macos", "aarch64", false),
+            Some(Platform::MacArm64)
+        );
+        assert_eq!(Platform::detect("macos", "x86_64", false), None);
+        assert_eq!(Platform::detect("windows", "aarch64", false), None);
     }
 
     #[test]

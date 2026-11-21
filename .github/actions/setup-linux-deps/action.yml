@@ -1,0 +1,14 @@
+name: Install Linux build prerequisites
+description: >
+  The system libraries Tauri links against on Debian/Ubuntu runners (WebKitGTK, appindicator, librsvg, xdo, dbus,
+  OpenSSL), plus `file`, which the AppImage bundler shells out to. Only apt is used.
+
+runs:
+  using: composite
+  steps:
+    - run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev libxdo-dev libssl-dev \
+          build-essential pkg-config file
+      shell: bash

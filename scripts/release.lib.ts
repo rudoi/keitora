@@ -651,7 +651,9 @@ export class UpdaterSigningError extends Error {
   }
 }
 
-export type BundleTarget = "windows" | "macos";
+export type BundleTarget = "windows" | "macos" | "linux";
+
+export const BUNDLE_TARGETS: readonly BundleTarget[] = ["windows", "macos", "linux"];
 
 export interface BundleOverlayInput {
   target: BundleTarget;
@@ -683,7 +685,8 @@ function placeholderPubkeyError(): UpdaterSigningError {
  * The tauri `--config` overlay (as JSON text) that turns on signed updater artifacts. With the key
  * it sets `bundle.createUpdaterArtifacts`; on macOS it also adds the `app` target, because the
  * bundler only makes `Keitora.app.tar.gz` when `app` is a target (arrays replace on merge, so this
- * overrides the base targets on the macOS runner only). Without the key it is `{}`. A release tag
+ * overrides the base targets on the macOS runner only). Linux needs no extra target: the AppImage
+ * that tauri.linux.conf.json already builds is its own updater artifact. Without the key it is `{}`. A release tag
  * must ship updater artifacts, so a tag without the key, or with the placeholder pubkey, throws.
  */
 export function bundleOverlay(input: BundleOverlayInput): string {

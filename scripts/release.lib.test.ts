@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   APP_CRATE,
+  BUNDLE_TARGETS,
+  type BundleTarget,
   bundleOverlay,
   formatKeyId,
   isReleaseTagRef,
@@ -886,7 +888,7 @@ const BRANCH_REF = "refs/heads/main";
 const PR_REF = "refs/pull/7/merge";
 
 function overlay(
-  target: "windows" | "macos",
+  target: BundleTarget,
   updaterKey: string | undefined,
   ref: string | undefined,
   pubkey = FIXTURE_PUBKEY,
@@ -923,16 +925,18 @@ describe("bundleOverlay", () => {
       bundle: { createUpdaterArtifacts: true, targets: ["app", "dmg"] },
     });
   });
+  it("only turns on updater artifacts on Linux, where the AppImage is the updater artifact", () => {
+    expect(overlay("linux", "true", TAG_REF)).toEqual({ bundle: { createUpdaterArtifacts: true } });
+  });
   it("is empty without the key off a tag", () => {
     for (const ref of [BRANCH_REF, PR_REF, undefined]) {
       for (const key of ["false", undefined, ""]) {
-        expect(overlay("windows", key, ref)).toEqual({});
-        expect(overlay("macos", key, ref)).toEqual({});
+        for (const target of BUNDLE_TARGETS) expect(overlay(target, key, ref)).toEqual({});
       }
     }
   });
   it("throws UPDATER_KEY_MISSING on a tag without the key", () => {
-    for (const target of ["windows", "macos"] as const) {
+    for (const target of BUNDLE_TARGETS) {
       for (const updaterKey of ["false", undefined]) {
         const e = overlayError({ target, updaterKey, ref: TAG_REF, pubkey: FIXTURE_PUBKEY });
         expect(e.code).toBe("UPDATER_KEY_MISSING");
@@ -964,7 +968,7 @@ describe("bundleOverlay", () => {
       ["false", PR_REF],
       [undefined, undefined],
     ] as const;
-    for (const target of ["windows", "macos"] as const) {
+    for (const target of BUNDLE_TARGETS) {
       for (const [updaterKey, ref] of cases) {
         const text = bundleOverlay({ target, updaterKey, ref, pubkey: FIXTURE_PUBKEY });
         const parsed: unknown = JSON.parse(text);
