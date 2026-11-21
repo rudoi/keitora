@@ -6,6 +6,8 @@
 
 mod activity;
 mod agent_updates;
+#[cfg(target_os = "linux")]
+mod appimage_env;
 mod backend;
 mod bg_notifier;
 mod cli_install;

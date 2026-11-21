@@ -1,5 +1,6 @@
 //! Rail affordances that hand a worktree to the OS: open its folder in the file manager,
-//! or start a shell (PowerShell on Windows) rooted there.
+//! or start a shell rooted there: PowerShell on Windows, Terminal on macOS, and on Linux the
+//! user's terminal emulator (see [`terminal_candidates`]).
 //!
 //! The frontend names a worktree by registry key + worktree name, never by path; the
 //! directory is resolved here from the project registry, so neither command can be pointed
@@ -95,10 +96,188 @@ fn spawn_shell(dir: &Path) -> std::io::Result<()> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn spawn_shell(dir: &Path) -> std::io::Result<()> {
-    Command::new("x-terminal-emulator")
-        .current_dir(dir)
-        .spawn()
-        .map(|_| ())
+    let terminal = std::env::var("TERMINAL").ok();
+    let mut tried = Vec::new();
+    for (program, args) in terminal_candidates(terminal.as_deref(), dir) {
+        let mut cmd = Command::new(&program);
+        // Detached stdio: the terminal's own logging would otherwise land in Keitora's log.
+        cmd.args(&args)
+            .current_dir(dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(target_os = "linux")]
+        crate::appimage_env::scrub(&mut cmd);
+        match cmd.spawn() {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => tried.push(program),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "no terminal emulator found (tried {}); set $TERMINAL to yours",
+        tried.join(", ")
+    )))
+}
+
+/// Terminals tried after `$TERMINAL`, in order: the freedesktop default-terminal launcher, the
+/// Debian alternative, then common emulators, each with its flag for the starting directory.
+/// The directory is also the child's working directory, which covers the launchers and xterm.
+#[cfg(all(unix, not(target_os = "macos")))]
+const KNOWN_TERMINALS: &[&str] = &[
+    "xdg-terminal-exec",
+    "x-terminal-emulator",
+    "ghostty",
+    "foot",
+    "kitty",
+    "alacritty",
+    "wezterm",
+    "ptyxis",
+    "gnome-terminal",
+    "kgx",
+    "konsole",
+    "xfce4-terminal",
+    "tilix",
+    "xterm",
+];
+
+/// The arguments that open `program` in `dir`, by the program's file name. Unknown programs get
+/// none and rely on inheriting the working directory.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn working_dir_args(program: &str, dir: &Path) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program);
+    let joined = |flag: &str| {
+        let mut arg = OsString::from(flag);
+        arg.push(dir.as_os_str());
+        vec![arg]
+    };
+    let split = |flags: &[&str]| {
+        let mut args: Vec<OsString> = flags.iter().map(OsString::from).collect();
+        args.push(dir.as_os_str().to_owned());
+        args
+    };
+    match name {
+        "ghostty" | "foot" | "gnome-terminal" | "kgx" | "xfce4-terminal" | "tilix" => {
+            joined("--working-directory=")
+        }
+        "ptyxis" => {
+            let mut args = vec![OsString::from("--new-window")];
+            args.extend(joined("--working-directory="));
+            args
+        }
+        "kitty" => split(&["--directory"]),
+        "alacritty" => split(&["--working-directory"]),
+        "wezterm" => split(&["start", "--cwd"]),
+        "konsole" => split(&["--workdir"]),
+        _ => Vec::new(),
+    }
+}
+
+/// Every `(program, args)` to try, in order: `$TERMINAL` (a program, optionally with its own
+/// arguments) when set, then [`KNOWN_TERMINALS`] without repeating it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn terminal_candidates(
+    terminal: Option<&str>,
+    dir: &Path,
+) -> Vec<(String, Vec<std::ffi::OsString>)> {
+    let mut out: Vec<(String, Vec<std::ffi::OsString>)> = Vec::new();
+    if let Some(mut words) = terminal.map(str::split_whitespace) {
+        if let Some(program) = words.next() {
+            let own: Vec<std::ffi::OsString> = words.map(Into::into).collect();
+            // A user's own arguments may already choose a directory; only add ours without them.
+            let args = if own.is_empty() {
+                working_dir_args(program, dir)
+            } else {
+                own
+            };
+            out.push((program.to_string(), args));
+        }
+    }
+    for &program in KNOWN_TERMINALS {
+        if !out.iter().any(|(p, _)| p == program) {
+            out.push((program.to_string(), working_dir_args(program, dir)));
+        }
+    }
+    out
+}
+
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod terminal_tests {
+    use super::{terminal_candidates, KNOWN_TERMINALS};
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    const DIR: &str = "/repos/proj-wt/alpha";
+
+    fn args(v: &[&str]) -> Vec<OsString> {
+        v.iter().map(OsString::from).collect()
+    }
+
+    fn candidates(terminal: Option<&str>) -> Vec<(String, Vec<OsString>)> {
+        terminal_candidates(terminal, Path::new(DIR))
+    }
+
+    #[test]
+    fn without_terminal_env_tries_the_launchers_then_known_emulators() {
+        let c = candidates(None);
+        let names: Vec<&str> = c.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(names, KNOWN_TERMINALS);
+        assert_eq!(c[0], ("xdg-terminal-exec".into(), vec![]));
+        assert_eq!(c[1], ("x-terminal-emulator".into(), vec![]));
+    }
+
+    #[test]
+    fn each_emulator_gets_its_working_directory_flag() {
+        let c = candidates(None);
+        let find = |name: &str| c.iter().find(|(p, _)| p == name).unwrap().1.clone();
+        assert_eq!(
+            find("ghostty"),
+            args(&["--working-directory=/repos/proj-wt/alpha"])
+        );
+        assert_eq!(
+            find("foot"),
+            args(&["--working-directory=/repos/proj-wt/alpha"])
+        );
+        assert_eq!(find("kitty"), args(&["--directory", DIR]));
+        assert_eq!(find("alacritty"), args(&["--working-directory", DIR]));
+        assert_eq!(find("wezterm"), args(&["start", "--cwd", DIR]));
+        assert_eq!(find("konsole"), args(&["--workdir", DIR]));
+        assert_eq!(
+            find("ptyxis"),
+            args(&["--new-window", "--working-directory=/repos/proj-wt/alpha"])
+        );
+        assert_eq!(find("xterm"), args(&[]));
+    }
+
+    #[test]
+    fn terminal_env_comes_first_and_is_not_repeated() {
+        let c = candidates(Some("/usr/bin/foot"));
+        assert_eq!(
+            c[0],
+            (
+                "/usr/bin/foot".into(),
+                args(&["--working-directory=/repos/proj-wt/alpha"])
+            )
+        );
+        let c = candidates(Some("kitty"));
+        assert_eq!(c[0].0, "kitty");
+        assert_eq!(c.iter().filter(|(p, _)| p == "kitty").count(), 1);
+    }
+
+    #[test]
+    fn terminal_env_with_its_own_arguments_keeps_them() {
+        let c = candidates(Some("kitty --single-instance"));
+        assert_eq!(c[0], ("kitty".into(), args(&["--single-instance"])));
+    }
+
+    #[test]
+    fn blank_terminal_env_is_ignored() {
+        assert_eq!(candidates(Some("  ")), candidates(None));
+    }
 }
 
 #[cfg(test)]
