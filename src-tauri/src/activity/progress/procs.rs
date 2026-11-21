@@ -153,7 +153,11 @@ fn scan(sys: &mut sysinfo::System) -> Option<Vec<UbtProc>> {
     if !sysinfo::IS_SUPPORTED_SYSTEM {
         return None;
     }
-    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().without_tasks(),
+    );
     if sys.processes().is_empty() {
         return None; // a readable process list is never empty (we are in it)
     }
@@ -169,7 +173,9 @@ fn scan(sys: &mut sysinfo::System) -> Option<Vec<UbtProc>> {
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&pids),
         false,
-        ProcessRefreshKind::nothing().with_cmd(UpdateKind::OnlyIfNotSet),
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_cmd(UpdateKind::OnlyIfNotSet),
     );
     Some(
         candidates

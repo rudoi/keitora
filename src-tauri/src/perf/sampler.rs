@@ -312,6 +312,7 @@ fn unix_ms() -> u64 {
 /// What a full refresh reads for every process.
 fn sample_kind() -> ProcessRefreshKind {
     ProcessRefreshKind::nothing()
+        .without_tasks()
         .with_cpu()
         .with_memory()
         .with_disk_usage()
@@ -346,6 +347,7 @@ fn infer(
         ProcessesToUpdate::Some(&pids),
         false,
         ProcessRefreshKind::nothing()
+            .without_tasks()
             .with_cmd(UpdateKind::OnlyIfNotSet)
             .with_cwd(UpdateKind::OnlyIfNotSet),
     );
@@ -479,6 +481,30 @@ pub fn run(job: Sampler) {
 
 #[cfg(test)]
 mod tests {
+    /// Linux lists every thread as a process unless the refresh opts out; a thread would then
+    /// look like a second copy of its process (a second `herdr server`, double-counted memory).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refresh_lists_processes_without_their_threads() {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _ = stop_rx.recv();
+        });
+        let mut sys = super::System::new();
+        super::refresh(&mut sys);
+        let threads = sys
+            .processes()
+            .values()
+            // Kernel threads are real `/proc` entries; only a process's own threads are dupes.
+            .filter(|p| p.thread_kind() == Some(sysinfo::ThreadKind::Userland))
+            .count();
+        drop(stop_tx);
+        worker.join().unwrap();
+        let me = sysinfo::Pid::from_u32(std::process::id());
+        assert!(sys.process(me).is_some());
+        assert_eq!(threads, 0);
+    }
+
     use super::*;
     use crate::backend::SessionKey;
     use crate::perf::{PerfHistory, PerfProc, PerfRow, PerfRowKind, HISTORY_LEN};

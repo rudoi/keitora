@@ -1884,6 +1884,7 @@ fn sample_process_stats(sys: &mut sysinfo::System, pid: Option<u32>) -> DaemonSt
         sysinfo::ProcessesToUpdate::Some(&[spid]),
         true, // remove dead
         sysinfo::ProcessRefreshKind::nothing()
+            .without_tasks()
             .with_cpu()
             .with_memory(),
     );

@@ -538,6 +538,7 @@ impl HerdrOps for RealHerdr {
         // Canonicalize our own exe once, not per candidate process.
         let target = self.server_exe();
         let ident = sysinfo::ProcessRefreshKind::nothing()
+            .without_tasks()
             .with_cmd(sysinfo::UpdateKind::OnlyIfNotSet)
             .with_exe(sysinfo::UpdateKind::OnlyIfNotSet);
 
@@ -600,7 +601,9 @@ impl HerdrOps for RealHerdr {
         sys.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::Some(&[spid]),
             true,
-            sysinfo::ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::OnlyIfNotSet),
+            sysinfo::ProcessRefreshKind::nothing()
+                .without_tasks()
+                .with_exe(sysinfo::UpdateKind::OnlyIfNotSet),
         );
         let p = sys.process(spid)?;
         let name = p.name().to_string_lossy().into_owned();
