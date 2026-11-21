@@ -48,9 +48,14 @@ pub fn is_appimage(appimage: Option<&OsStr>, appdir: Option<&OsStr>, exe: Option
     exe.starts_with(appdir) || exe.starts_with(resolved)
 }
 
+/// `$APPDIR`, when set and non-empty.
+fn current_appdir() -> Option<OsString> {
+    std::env::var_os("APPDIR").filter(|d| !d.is_empty())
+}
+
 /// Strip the AppImage's environment from `cmd` when Keitora runs as an AppImage.
 pub fn scrub(cmd: &mut Command) {
-    let Some(appdir) = std::env::var_os("APPDIR").filter(|d| !d.is_empty()) else {
+    let Some(appdir) = current_appdir() else {
         return;
     };
     for change in plan(std::env::vars_os(), &appdir) {
@@ -65,6 +70,20 @@ pub fn scrub(cmd: &mut Command) {
     }
 }
 
+/// `value` (a `:`-separated path list) without its entries under `$APPDIR`; `None` when nothing
+/// is left. For a list Keitora derived itself, such as a login shell's `PATH` probed from inside
+/// the image. Outside an AppImage it is returned unchanged.
+pub fn clean_path_list(value: &OsStr) -> Option<OsString> {
+    let Some(appdir) = current_appdir() else {
+        return Some(value.to_owned());
+    };
+    match strip_list(value, trim_dir(&appdir)) {
+        Stripped::Unchanged => Some(value.to_owned()),
+        Stripped::Kept(v) => Some(v),
+        Stripped::Empty => None,
+    }
+}
+
 /// The changes that remove every trace of `appdir` from `vars`: the runtime's own variables go,
 /// path lists lose their entries under `appdir` (and go entirely if nothing is left), and the
 /// empty `GTK_THEME` the GTK hook exports (which forces GTK's fallback theme) goes.
@@ -72,33 +91,52 @@ pub fn plan(
     vars: impl IntoIterator<Item = (OsString, OsString)>,
     appdir: &OsStr,
 ) -> Vec<EnvChange> {
-    let appdir = appdir.as_bytes();
-    let appdir = appdir.strip_suffix(b"/").unwrap_or(appdir);
+    let appdir = trim_dir(appdir);
     let mut changes = Vec::new();
     for (key, value) in vars {
         let k = key.as_bytes();
         let runtime_var = RUNTIME_VARS.iter().any(|r| r.as_bytes() == k);
         if runtime_var || (k == b"GTK_THEME" && value.is_empty()) {
             changes.push(EnvChange::Remove(key));
-        } else if value
-            .as_bytes()
-            .split(|&b| b == b':')
-            .any(|entry| under(entry, appdir))
-        {
-            let kept: Vec<&[u8]> = value
-                .as_bytes()
-                .split(|&b| b == b':')
-                .filter(|entry| !entry.is_empty() && !under(entry, appdir))
-                .collect();
-            if kept.is_empty() {
-                changes.push(EnvChange::Remove(key));
-            } else {
-                let joined = kept.join(&b':');
-                changes.push(EnvChange::Set(key, OsStr::from_bytes(&joined).to_owned()));
-            }
+            continue;
+        }
+        match strip_list(&value, appdir) {
+            Stripped::Unchanged => {}
+            Stripped::Kept(v) => changes.push(EnvChange::Set(key, v)),
+            Stripped::Empty => changes.push(EnvChange::Remove(key)),
         }
     }
     changes
+}
+
+/// What [`strip_list`] left of a path list.
+enum Stripped {
+    /// No entry was under the directory.
+    Unchanged,
+    Kept(OsString),
+    Empty,
+}
+
+/// `value` split on `:` without the entries under `appdir` (and without empty entries, which
+/// AppRun's `%s/usr/lib:%s` leaves behind when the variable was unset).
+fn strip_list(value: &OsStr, appdir: &[u8]) -> Stripped {
+    let entries = || value.as_bytes().split(|&b| b == b':');
+    if !entries().any(|entry| under(entry, appdir)) {
+        return Stripped::Unchanged;
+    }
+    let kept: Vec<&[u8]> = entries()
+        .filter(|entry| !entry.is_empty() && !under(entry, appdir))
+        .collect();
+    if kept.is_empty() {
+        Stripped::Empty
+    } else {
+        Stripped::Kept(OsStr::from_bytes(&kept.join(&b':')).to_owned())
+    }
+}
+
+fn trim_dir(dir: &OsStr) -> &[u8] {
+    let dir = dir.as_bytes();
+    dir.strip_suffix(b"/").unwrap_or(dir)
 }
 
 /// Whether `path` is `dir` or inside it.
@@ -140,6 +178,36 @@ mod tests {
         assert!(!is_appimage(image, None, Some(inside)));
         assert!(!is_appimage(Some(OsStr::new("")), dir, Some(inside)));
         assert!(!is_appimage(image, dir, None));
+    }
+
+    fn strip(value: &str, appdir: &str) -> Option<String> {
+        match strip_list(OsStr::new(value), trim_dir(OsStr::new(appdir))) {
+            Stripped::Unchanged => Some(value.to_string()),
+            Stripped::Kept(v) => Some(v.into_string().unwrap()),
+            Stripped::Empty => None,
+        }
+    }
+
+    #[test]
+    fn a_probed_login_path_loses_the_image_entries() {
+        // A login shell started from inside the image prints the image's dirs first.
+        let login =
+            "/tmp/.mount_KeitoX/usr/bin/:/tmp/.mount_KeitoX/usr/sbin/:/home/me/.local/bin:/usr/bin";
+        assert_eq!(
+            strip(login, APPDIR).as_deref(),
+            Some("/home/me/.local/bin:/usr/bin")
+        );
+        // A trailing slash on $APPDIR matches the same entries.
+        assert_eq!(
+            strip(login, "/tmp/.mount_KeitoX/").as_deref(),
+            Some("/home/me/.local/bin:/usr/bin")
+        );
+        assert_eq!(strip("/tmp/.mount_KeitoX/usr/bin", APPDIR), None);
+        // Untouched lists keep their exact text, empty entries included.
+        assert_eq!(
+            strip("/usr/bin::/bin", APPDIR).as_deref(),
+            Some("/usr/bin::/bin")
+        );
     }
 
     #[test]
