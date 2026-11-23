@@ -29,8 +29,8 @@ export function firstAvailable(worktrees: WorktreeInfo[]): string | null {
 }
 
 /**
- * Content equality for two worktree lists (name + path + status + cli + terminated, in
- * order). Used to skip a re-warm when a live `worktrees` reload hands back a fresh array
+ * Content equality for two worktree lists (name + path + status + cli + terminated +
+ * dispatch, in order). Used to skip a re-warm when a live `worktrees` reload hands back a fresh array
  * with identical contents (the 30s resync), avoiding a needless render cascade.
  */
 export function sameWorktrees(a: WorktreeInfo[], b: WorktreeInfo[]): boolean {
@@ -42,7 +42,8 @@ export function sameWorktrees(a: WorktreeInfo[], b: WorktreeInfo[]): boolean {
       a[i].path !== b[i].path ||
       a[i].status !== b[i].status ||
       a[i].cli !== b[i].cli ||
-      a[i].terminated !== b[i].terminated
+      a[i].terminated !== b[i].terminated ||
+      (a[i].dispatch !== false) !== (b[i].dispatch !== false)
     ) {
       return false;
     }
