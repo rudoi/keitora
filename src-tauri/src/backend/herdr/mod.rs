@@ -77,6 +77,7 @@ pub mod supervisor;
 pub mod watchdog;
 pub mod writer;
 
+use crate::deps::floor::FloorSlot;
 use boot::BootClass;
 use bridge::{Bridge, BridgeStdin, ExitAuthority};
 use cli::{PaneInfo, ServerStatus};
@@ -311,6 +312,9 @@ pub struct HerdrBackend {
     /// The launch trail of each key's last strict spawn, until the caller
     /// drains it.
     trails: LaunchTrails,
+    /// The running server's version/protocol judgement, written by the status
+    /// loop; a protocol mismatch refuses pane binding.
+    floor: Arc<FloorSlot>,
 }
 
 /// Per-key launch trails of strict spawns (see [`PtyBackend::take_launch_trail`]).
@@ -2021,6 +2025,7 @@ impl HerdrBackend {
             writers: Writers::default(),
             sizes: SizeMemory::default(),
             trails: Arc::default(),
+            floor: Arc::default(),
         }
     }
 
@@ -2079,6 +2084,43 @@ impl HerdrBackend {
         let (handle, rx) = recovery::recording_handle();
         self.recovery = handle;
         (self, rx)
+    }
+
+    /// A backend over `fake` as it is after `start` has booted: readiness latch
+    /// set and the recovery controller running, but no status loop (tests set
+    /// the floor slot themselves). `launcher` resolves what a resume launches.
+    /// For tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn booted_over_fake(
+        fake: &Arc<fake::FakeHerdr>,
+        launcher: Option<LaunchResolver>,
+    ) -> Self {
+        struct Quiet;
+        impl EmitSink for Quiet {
+            fn emit(&self, _event: &str, _payload: serde_json::Value) {}
+        }
+        let backend = HerdrBackend::with_ops(
+            Arc::clone(fake) as Arc<dyn HerdrOps>,
+            Arc::new(Quiet),
+            Arc::new(ResumeStore::open(&fake.env().resume_db_path()).unwrap()),
+            launcher,
+        );
+        drop(ReadySignal(Arc::clone(&backend.ready)));
+        backend.start_recovery_driver();
+        backend
+    }
+
+    /// Remember `fake`'s running server as the one the live sessions run on, as a
+    /// boot or a restart does. For tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn note_server_for_test(&self, fake: &fake::FakeHerdr) {
+        self.keymap.set_instance(fake.server_instance());
+    }
+
+    /// The sessions still owed a resume. For tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn owed_resume_for_test(&self) -> Vec<SessionKey> {
+        self.keymap.should_be_running()
     }
 
     /// Adjust the supervisor (timings, killer). Call before anything shares it.
@@ -2204,6 +2246,7 @@ impl HerdrBackend {
                 let ready = Arc::clone(&self.ready);
                 Arc::new(move || latch_is_set(&ready))
             },
+            floor: Arc::clone(&self.floor),
         })
     }
 
@@ -2263,6 +2306,16 @@ impl HerdrBackend {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn reconcile_current(&self) -> Result<ReconcileOutcome, String> {
         self.reconciler().reconcile_current()
+    }
+
+    /// Refuse to bind a pane to a server whose protocol Keitora can't speak. The
+    /// message tells the user how to fix it; an old-but-compatible or unknown
+    /// server is never refused.
+    fn require_protocol(&self) -> Result<(), PtyBackendError> {
+        match self.floor.blocks_panes() {
+            Some(message) => Err(PtyBackendError::Other(message)),
+            None => Ok(()),
+        }
     }
 
     /// Whether `start`'s background thread has brought the server up + run the first
@@ -2451,6 +2504,7 @@ impl PtyBackend for HerdrBackend {
         if !self.is_ready() {
             return Err(PtyBackendError::NotConnected);
         }
+        self.require_protocol()?;
         self.gate.admit(None)?;
         // A terminated session stays down until it is launched again.
         if self.store.is_terminated(&key) {
@@ -2517,6 +2571,7 @@ impl PtyBackend for HerdrBackend {
         if !self.is_ready() {
             return Err(PtyBackendError::NotConnected);
         }
+        self.require_protocol()?;
         self.gate.admit(None)?;
         // A terminated session stays down until it is launched again.
         if self.store.is_terminated(&key) {
@@ -2561,7 +2616,10 @@ impl PtyBackend for HerdrBackend {
         if let Some(measured) = size {
             self.sizes.record(&key, measured);
         }
-        // First: during recovery the pane must hear "recovering", not
+        // A server speaking another protocol can't host the pane at all; say so
+        // before anything else so the pane fails with the remedy instead of retrying.
+        self.require_protocol()?;
+        // Then: during recovery the pane must hear "recovering", not
         // `NotConnected` (which the frontend eventually answers with a spawn),
         // unless its session already resumed this episode.
         self.gate.admit_session(&key)?;
@@ -2995,6 +3053,14 @@ impl PtyBackend for HerdrBackend {
         Some(self.recovery.clone())
     }
 
+    fn floor_slot(&self) -> Option<Arc<FloorSlot>> {
+        Some(Arc::clone(&self.floor))
+    }
+
+    fn refresh_integration(&self) {
+        self.supervisor.refresh_integration(&*self.ops);
+    }
+
     fn daemon_stats(&self) -> DaemonStats {
         // Only the herdr backend fills the rail card, from
         // what the status loop last sampled (no herdr call, no process scan). An
@@ -3019,6 +3085,9 @@ impl PtyBackend for HerdrBackend {
         // Nothing is owed a resume after a stop the user asked for.
         self.recovery.explicit_stop();
         self.explicit_stop.store(true, Ordering::SeqCst);
+        // The judgement described the server being stopped; whatever starts next
+        // (maybe another binary) is judged by its own probe, not refused by this one.
+        self.floor.reset();
         self.stop_all_bridges();
         let r = self.supervisor.stop(&*self.ops);
         // The server (and every pane) is gone: clear the live set and key map so
@@ -3077,6 +3146,9 @@ impl PtyBackend for HerdrBackend {
             parts.emit_recovery();
         }
         let generation = parts.mark_owed();
+        // The server is about to be replaced (maybe by another binary): its
+        // judgement must not keep refusing panes on the new one until a probe.
+        self.floor.reset();
         // Stop, start, reconcile and resume on the controller's thread; the
         // breaker and the memory check do not apply to the user's own restart.
         self.recovery.user_restart(generation);
@@ -5568,6 +5640,147 @@ mod tests {
         assert!(pending(backend.kill(&skey("a"), gen)));
         assert!(backend.keymap.get(&skey("a")).is_some(), "kill was refused");
         assert_eq!(count(&fake, ops::Op::SpawnServer), 0);
+    }
+
+    /// A server speaking another protocol refuses spawn, agent spawn and attach
+    /// with the remedy, ahead of the recovery gate (a down gate would otherwise
+    /// answer "recovering"), and makes no herdr call.
+    #[test]
+    fn a_protocol_mismatch_refuses_pane_binding_before_the_gate() {
+        use crate::deps::floor::FloorState;
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        backend.floor.set(FloorState::ProtocolMismatch {
+            found: 21,
+            want: 22,
+            newer: false,
+        });
+        backend.gate.set_view(
+            recovery::RecoveryPhase::Down,
+            HashSet::new(),
+            HashSet::new(),
+        );
+        let want = "herdr speaks protocol 21; Keitora needs protocol 22. Upgrade herdr from \
+                    Settings > Dependencies.";
+        let refused = |r: Result<(), PtyBackendError>| match r {
+            Err(PtyBackendError::Other(m)) => m == want,
+            _ => false,
+        };
+        assert!(refused(
+            backend
+                .spawn(
+                    skey("a"),
+                    "/repos/a".into(),
+                    String::new(),
+                    Some((80, 24)),
+                    None
+                )
+                .map(|_| ())
+        ));
+        assert!(refused(
+            backend
+                .spawn_agent(
+                    skey("a"),
+                    "/repos/a".into(),
+                    String::new(),
+                    Some((80, 24)),
+                    claude_launch()
+                )
+                .map(|_| ())
+        ));
+        assert!(refused(
+            backend
+                .attach(skey("a"), Some((80, 24)), output())
+                .map(|_| ())
+        ));
+        assert!(fake.calls().is_empty(), "no herdr call: {:?}", fake.calls());
+    }
+
+    /// An old-but-compatible or unknown server never blocks pane binding.
+    #[test]
+    fn too_old_and_unknown_floors_do_not_block_pane_binding() {
+        use crate::deps::floor::FloorState;
+        for state in [
+            FloorState::TooOld {
+                found: "0.9.3".into(),
+            },
+            FloorState::Unknown,
+        ] {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            backend.floor.set(state.clone());
+            backend
+                .spawn(
+                    skey("a"),
+                    "/repos/a".into(),
+                    String::new(),
+                    Some((80, 24)),
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("{state:?}: spawn refused: {e}"));
+            backend
+                .spawn_agent(
+                    skey("b"),
+                    "/repos/b".into(),
+                    String::new(),
+                    Some((80, 24)),
+                    claude_launch(),
+                )
+                .unwrap_or_else(|e| panic!("{state:?}: spawn_agent refused: {e}"));
+            backend
+                .attach(skey("a"), Some((80, 24)), output())
+                .unwrap_or_else(|e| panic!("{state:?}: attach refused: {e}"));
+        }
+    }
+
+    /// A stop or restart forgets the old server's mismatch: the next server (maybe a
+    /// different binary) is not refused panes until its own probe.
+    #[test]
+    fn shutdown_and_restart_reset_a_stale_protocol_mismatch() {
+        use crate::deps::floor::FloorState;
+        let mismatch = FloorState::ProtocolMismatch {
+            found: 23,
+            want: 22,
+            newer: true,
+        };
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        backend.floor.set(mismatch.clone());
+        backend.shutdown().unwrap();
+        assert_eq!(backend.floor.get(), FloorState::Unknown);
+        assert_eq!(backend.floor.blocks_panes(), None);
+
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        backend.floor.set(mismatch);
+        backend.start_recovery_driver();
+        backend.restart().unwrap();
+        assert_eq!(backend.floor.get(), FloorState::Unknown);
+        wait_recovered(&backend);
+        backend
+            .spawn(
+                skey("a"),
+                "/repos/a".into(),
+                String::new(),
+                Some((80, 24)),
+                None,
+            )
+            .expect("the restarted server takes panes");
+    }
+
+    #[test]
+    fn the_backend_exposes_its_floor_slot_and_refreshes_the_integration() {
+        use crate::deps::floor::FloorState;
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let slot = backend.floor_slot().expect("the herdr backend has a floor");
+        assert!(Arc::ptr_eq(&slot, &backend.floor));
+        slot.set(FloorState::Ok);
+        assert_eq!(backend.floor.get(), FloorState::Ok);
+        backend.supervisor.ensure_ready(&*fake);
+        let before = backend.supervisor.ready_runs();
+        backend.refresh_integration();
+        assert_eq!(backend.supervisor.ready_runs(), before + 1);
     }
 
     /// While the rest of the queue resumes, a session whose resume already

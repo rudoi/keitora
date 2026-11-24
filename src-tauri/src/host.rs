@@ -2382,6 +2382,8 @@ pub fn run() {
             crate::updater::startup(app.handle().clone());
             // Agent CLI update checks: managed state and the background schedule.
             crate::agent_updates::startup(app.handle().clone());
+            // Dependency setup: herdr install/upgrade state, prompt and doctor.
+            crate::deps::startup(app.handle().clone());
             #[cfg(target_os = "macos")]
             if crate::updater::release::Platform::current().is_some() {
                 if let Err(e) = crate::updater::commands::install_app_menu(app.handle()) {
@@ -2507,6 +2509,14 @@ pub fn run() {
             crate::agent_updates::commands::agent_update_live_sessions,
             crate::agent_updates::commands::agent_update_stop,
             crate::agent_updates::commands::agent_update_restart,
+            crate::deps::commands::deps_status,
+            crate::deps::commands::deps_recheck,
+            crate::deps::commands::deps_doctor,
+            crate::deps::commands::deps_install,
+            crate::deps::commands::deps_snooze_upgrade,
+            crate::deps::commands::deps_set_herdr_bin,
+            crate::deps::commands::deps_details,
+            crate::deps::commands::deps_restart_to_finish,
             remove_project,
             tasks::task_actor,
             tasks::sessions_list,

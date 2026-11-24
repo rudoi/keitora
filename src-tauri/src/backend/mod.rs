@@ -767,6 +767,16 @@ pub trait PtyBackend: Send + Sync + 'static {
     fn recovery(&self) -> Option<herdr::recovery::RecoveryHandle> {
         None
     }
+
+    /// The running server's version/protocol judgement, kept current by the
+    /// backend's status probes. Backends without a versioned server have none.
+    fn floor_slot(&self) -> Option<Arc<crate::deps::floor::FloorSlot>> {
+        None
+    }
+
+    /// Re-run the agent integration install against the current server (after an
+    /// upgrade replaced the binary). Inert for backends without one.
+    fn refresh_integration(&self) {}
 }
 
 /// Shared, type-erased backend handle managed in Tauri state.

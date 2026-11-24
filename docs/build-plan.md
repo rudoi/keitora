@@ -205,6 +205,12 @@ de-risks "beautiful" before any Rust/PTY work.
   `KEITORA_HERDR_BIN`, the process `PATH`, the Homebrew / `/usr/local` / `~/.local` bin dirs, the newest
   standalone release, then the login-shell `PATH`, and a missing herdr shows a not-found message on the rail with a Restart
   button instead of an unavailable backend.
+  **2026-11-24 note (dependency setup):** Keitora installs and upgrades herdr itself (onboarding step, rail
+  daemon card, Settings ▸ Dependencies): herdr's install script, else a sha256-verified download from
+  `herdr.dev/latest.json` into `<KEITORA_HOME>/bin/herdr/<ver>/`, else manual steps / Browse. Every install pins
+  `[pty] herdr_bin`. Floor is herdr 0.9.5 / protocol 22: an older herdr gets an upgrade prompt, a protocol
+  mismatch refuses panes. An upgrade installs side by side and restarts once, so live sessions resume. git,
+  claude and codex are reported, not installed. Code: `src-tauri/src/deps/`.
   **2026-10-11 note:** when herdr is recovered, sessions are resumed up to `[recovery] resume_concurrency`
   (default 3) at a time, and each pane unlocks as soon as its own session is back. The run drops to one at a
   time after the first agent-startup timeout or early exit. A session can be **terminated** from the rail's

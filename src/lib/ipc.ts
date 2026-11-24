@@ -1284,6 +1284,168 @@ export function onUpdaterProgress(cb: (e: UpdateProgressEvent) => void): Promise
   return listen<UpdateProgressEvent>("updater://progress", cb);
 }
 
+// ── Dependencies ───────────────────────────────────────────────────────────────
+
+/** How herdr gets installed: the vendor script, a direct download, or by hand. */
+export type DepsTier = "script" | "direct" | "manual";
+
+/** Install run stages, forward-only; `done` / `failed` are terminal. */
+export type DepsStage =
+  | "checking"
+  | "downloading"
+  | "installing"
+  | "verifying"
+  | "restarting"
+  | "done"
+  | "failed";
+
+export type DepsFailureKind =
+  | "offline"
+  | "network"
+  | "policy_blocked"
+  | "checksum"
+  | "blocked_by_av"
+  | "timeout"
+  | "incomplete"
+  | "too_old_after_install"
+  | "no_compatible_release"
+  | "other";
+
+/** What to offer after a failed run. */
+export type DepsNextStep = "try_direct" | "manual";
+
+/** How the herdr in use compares with what Keitora needs (tagged by `type`). */
+export type FloorState =
+  | { type: "ok" }
+  | { type: "too_old"; found: string }
+  /** `newer`: herdr speaks a newer protocol than Keitora (`found > want`); upgrading herdr
+   *  can't help, so Keitora needs updating or a compatible managed herdr installed. */
+  | { type: "protocol_mismatch"; found: number; want: number; newer: boolean }
+  | { type: "restart_to_finish"; binary: string; server: string }
+  | { type: "unknown" };
+
+/** Where the current (or last) install run stands (tagged by `type`). */
+export type DepsRunState =
+  | { type: "idle" }
+  | { type: "running"; run_id: number; tier: DepsTier; stage: DepsStage; upgrade: boolean }
+  | { type: "done"; run_id: number; path: string; restart_pending: boolean }
+  | { type: "failed"; run_id: number; kind: DepsFailureKind; message: string; next: DepsNextStep };
+
+/** How an upgrade of the herdr in use would go (tagged by `type`). */
+export type UpgradeRoute =
+  | { type: "direct" }
+  | { type: "script_then_direct" }
+  | { type: "external"; instruction: string };
+
+/** The upgrade dialog to show. `hard` prompts have no "Later". */
+export interface UpgradePrompt {
+  kind: "too_old" | "protocol_mismatch";
+  found: string;
+  hard: boolean;
+}
+
+export type ManualReason =
+  | "unsupported_platform"
+  | "offline"
+  | "manifest_unavailable"
+  | "no_compatible_release";
+
+/** Copyable install commands and the guide link for installing herdr by hand. */
+export interface ManualRoute {
+  reason: ManualReason | null;
+  commands: { shell: string; command: string }[];
+  link: string;
+}
+
+/** `deps_status` reply and the whole `deps://status` payload (replaces, never merges). */
+export interface DepsSnapshot {
+  herdr_installed: boolean;
+  floor: FloorState;
+  /** `[pty] herdr_bin`, when set. */
+  pinned_bin: string | null;
+  /** `null` on a platform Keitora can't install herdr on. */
+  platform: string | null;
+  run: DepsRunState;
+  prompt: UpgradePrompt | null;
+  /** Live sessions an upgrade would restart. */
+  live_sessions: number;
+  route: UpgradeRoute | null;
+  /** A herdr Keitora didn't install that the vendor script would overwrite. */
+  overwrite_target: string | null;
+  manual: ManualRoute;
+}
+
+/** `deps://progress` payload. Byte counts are best effort. */
+export interface DepsProgressEvent {
+  run_id: number;
+  stage: DepsStage;
+  downloaded: number;
+  total: number | null;
+  line: string | null;
+}
+
+export type DoctorStatus = "ok" | "missing" | "too_old" | "unknown";
+export type DoctorAction = "install" | "upgrade" | "browse";
+
+/** One row of `deps_doctor`. */
+export interface DoctorRow {
+  tool: "herdr" | "git" | "claude" | "codex";
+  path: string | null;
+  version: string | null;
+  /** Minimum version (herdr only). */
+  floor: string | null;
+  status: DoctorStatus;
+  action: DoctorAction | null;
+}
+
+export function depsStatus(): Promise<DepsSnapshot> {
+  return invoke("deps_status");
+}
+
+/** Re-read the pinned herdr and its version; also emits `deps://status`. */
+export function depsRecheck(): Promise<DepsSnapshot> {
+  return invoke("deps_recheck");
+}
+
+export function depsDoctor(): Promise<DoctorRow[]> {
+  return invoke("deps_doctor");
+}
+
+/** Start (or attach to) an install or upgrade; progress arrives as events. `tier: "direct"`
+ *  installs a Keitora-managed copy. `confirmOverwrite` agrees to replace `overwrite_target`. */
+export function depsInstall(tier: DepsTier | null = null, confirmOverwrite = false): Promise<void> {
+  return invoke("deps_install", { tier, confirmOverwrite });
+}
+
+/** "Later" on a soft upgrade prompt. */
+export function depsSnoozeUpgrade(): Promise<void> {
+  return invoke("deps_snooze_upgrade");
+}
+
+/** Pin the herdr at `path` (validated first), or clear the pin with `null`. */
+export function depsSetHerdrBin(path: string | null): Promise<DepsSnapshot> {
+  return invoke("deps_set_herdr_bin", { path });
+}
+
+/** "Restart to finish": restart herdr onto the pinned binary and refresh the agent
+ *  integration (unlike `daemonRestart`); also emits `deps://status`. */
+export function depsRestartToFinish(): Promise<DepsSnapshot> {
+  return invoke("deps_restart_to_finish");
+}
+
+/** The plain-text "Copy details" report. */
+export function depsDetails(): Promise<string> {
+  return invoke("deps_details");
+}
+
+export function onDepsStatus(cb: (s: DepsSnapshot) => void): Promise<UnlistenFn> {
+  return listen<DepsSnapshot>("deps://status", cb);
+}
+
+export function onDepsProgress(cb: (e: DepsProgressEvent) => void): Promise<UnlistenFn> {
+  return listen<DepsProgressEvent>("deps://progress", cb);
+}
+
 // ── Agent CLI updates ──────────────────────────────────────────────────────────
 
 /** How a CLI was installed, judged from its executable's path. */

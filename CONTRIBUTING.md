@@ -80,7 +80,21 @@ Panes get your login-shell `PATH` first (so asdf, mise, nvm or pyenv shims still
 step 4 directories, then Keitora's own `PATH`.
 
 If herdr can't be found, the app still opens and the sidebar shows where it looked (the full list is
-in `keitora.log`). Install herdr or set `herdr_bin`, then press **Restart** on that card.
+in `keitora.log`). Install herdr (the card's **Install herdr** does it for you) or set `herdr_bin`,
+then press **Restart** on that card.
+
+Every install or upgrade Keitora runs, and every herdr picked with **Browse**, writes the binary's
+path to `[pty] herdr_bin`. That is step 1 above, so the new herdr wins over an older one still on
+`PATH`. **Settings > Dependencies > Clear (use discovery)** removes the pin and goes back to steps 2
+to 6. If the herdr server is still running the old version when the pin changes, the sidebar offers
+**Restart to finish**.
+
+Keitora picks how to install herdr itself: the vendor script (which installs into `~/.herdr` and
+`~/.local/bin`) when it can, which is only ever on a release build, otherwise a direct download of
+a checksummed release into `<KEITORA_HOME>/bin/herdr/<version>/`. A dev home (`KEITORA_HOME` or `KEITORA_HERDR_BIN` set, as
+`yarn dev:isolated` does) never runs the vendor script, so it never touches your real herdr. The
+dependency tests use fakes and temp directories only: they never touch the real home directory,
+spawn a shell, download anything, or talk to a running herdr.
 
 On macOS and Linux herdr's sockets live under `$KEITORA_HOME/herdr/config/herdr/`, and unix socket
 paths are capped at 103 bytes on macOS (107 on Linux). A `KEITORA_HOME` or `KEITORA_DEV_HOME` long

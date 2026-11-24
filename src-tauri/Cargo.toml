@@ -43,6 +43,13 @@ dirs = "6"
 keitora-tasks = { path = "../crates/keitora-tasks" }
 log = "0.4"
 env_logger = "0.11"
+# herdr install: sha256 verification of downloaded release assets and safe unpacking of
+# the Windows release zip. Both are already in the lock through tauri; `deflate-flate2`
+# reads the zip's deflated entries, with flate2's pure-Rust backend chosen explicitly
+# because nothing else in the runtime graph enables one on Windows.
+sha2 = "0.10"
+zip = { version = "9.5", default-features = false, features = ["deflate-flate2"] }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 # Random suffix for uniquely-named clipboard-paste temp files.
 # Was dev-only; `clipboard_image::save_image_to_temp` needs it at runtime, not just
 # under test, so it moves up from [dev-dependencies] (removed below).
