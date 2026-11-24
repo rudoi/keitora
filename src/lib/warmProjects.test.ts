@@ -107,6 +107,19 @@ describe("sameWorktrees", () => {
     ];
     expect(sameWorktrees(worktreesA, terminated)).toBe(false);
   });
+
+  it("differs when only the dispatch flag changed (drives the rail menu and board pool)", () => {
+    const out: WorktreeInfo[] = [
+      { ...wtAvailable("alpha"), dispatch: false },
+      wtAvailable("bravo"),
+    ];
+    expect(sameWorktrees(worktreesA, out)).toBe(false);
+  });
+
+  it("treats a missing dispatch flag as in the pool", () => {
+    const explicit: WorktreeInfo[] = worktreesA.map((w) => ({ ...w, dispatch: true }));
+    expect(sameWorktrees(worktreesA, explicit)).toBe(true);
+  });
 });
 
 // ── firstAvailable ────────────────────────────────────────────────────────────
