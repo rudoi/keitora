@@ -1,0 +1,100 @@
+{
+  "version": "0.10.0",
+  "protocol": 23,
+  "endpoint_generation": 4,
+  "published_at": "2026-11-20T10:00:00Z",
+  "assets": {
+    "windows-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.10.0/herdr-x86_64-pc-windows-msvc.zip",
+    "macos-aarch64": "https://github.com/herdrdev/herdr/releases/download/v0.10.0/herdr-aarch64-apple-darwin",
+    "macos-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.10.0/herdr-x86_64-apple-darwin"
+  },
+  "sha256": {
+    "windows-x86_64": "1010101010101010101010101010101010101010101010101010101010101010",
+    "macos-aarch64": "2020202020202020202020202020202020202020202020202020202020202020",
+    "macos-x86_64": "3030303030303030303030303030303030303030303030303030303030303030"
+  },
+  "releases": {
+    "0.10.0": {
+      "protocol": 23,
+      "endpoint_generation": 4,
+      "assets": {
+        "windows-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.10.0/herdr-x86_64-pc-windows-msvc.zip",
+        "macos-aarch64": "https://github.com/herdrdev/herdr/releases/download/v0.10.0/herdr-aarch64-apple-darwin",
+        "macos-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.10.0/herdr-x86_64-apple-darwin"
+      },
+      "sha256": {
+        "windows-x86_64": "1010101010101010101010101010101010101010101010101010101010101010",
+        "macos-aarch64": "2020202020202020202020202020202020202020202020202020202020202020",
+        "macos-x86_64": "3030303030303030303030303030303030303030303030303030303030303030"
+      }
+    },
+    "0.9.7": {
+      "protocol": 22,
+      "endpoint_generation": 3,
+      "assets": {
+        "macos-aarch64": "https://github.com/herdrdev/herdr/releases/download/v0.9.7/herdr-aarch64-apple-darwin",
+        "macos-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.9.7/herdr-x86_64-apple-darwin"
+      },
+      "sha256": {
+        "macos-aarch64": "4040404040404040404040404040404040404040404040404040404040404040",
+        "macos-x86_64": "5050505050505050505050505050505050505050505050505050505050505050"
+      }
+    },
+    "0.9.6": {
+      "protocol": 22,
+      "endpoint_generation": 3,
+      "assets": {
+        "windows-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.9.6/herdr-x86_64-pc-windows-msvc.zip",
+        "macos-aarch64": "https://github.com/herdrdev/herdr/releases/download/v0.9.6/herdr-aarch64-apple-darwin",
+        "macos-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.9.6/herdr-x86_64-apple-darwin"
+      },
+      "sha256": {
+        "windows-x86_64": "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789",
+        "macos-aarch64": "6060606060606060606060606060606060606060606060606060606060606060",
+        "macos-x86_64": "7070707070707070707070707070707070707070707070707070707070707070"
+      }
+    },
+    "0.9.5": {
+      "protocol": 22,
+      "endpoint_generation": 3,
+      "assets": {
+        "windows-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-x86_64-pc-windows-msvc.zip",
+        "macos-aarch64": "https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-aarch64-apple-darwin",
+        "macos-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-x86_64-apple-darwin"
+      },
+      "sha256": {
+        "windows-x86_64": "8080808080808080808080808080808080808080808080808080808080808080",
+        "macos-aarch64": "9090909090909090909090909090909090909090909090909090909090909090",
+        "macos-x86_64": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+      }
+    },
+    "0.9.4": {
+      "protocol": 22,
+      "endpoint_generation": 3,
+      "assets": {
+        "windows-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.9.4/herdr-x86_64-pc-windows-msvc.zip",
+        "macos-aarch64": "https://github.com/herdrdev/herdr/releases/download/v0.9.4/herdr-aarch64-apple-darwin",
+        "macos-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.9.4/herdr-x86_64-apple-darwin"
+      },
+      "sha256": {
+        "windows-x86_64": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+        "macos-aarch64": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+        "macos-x86_64": "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0"
+      }
+    },
+    "0.9.3": {
+      "protocol": 21,
+      "endpoint_generation": 2,
+      "assets": {
+        "windows-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.9.3/herdr-x86_64-pc-windows-msvc.zip",
+        "macos-aarch64": "https://github.com/herdrdev/herdr/releases/download/v0.9.3/herdr-aarch64-apple-darwin",
+        "macos-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.9.3/herdr-x86_64-apple-darwin"
+      },
+      "sha256": {
+        "windows-x86_64": "e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0",
+        "macos-aarch64": "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0",
+        "macos-x86_64": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+      }
+    }
+  }
+}

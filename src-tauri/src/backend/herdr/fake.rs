@@ -155,6 +155,8 @@ struct FakeState {
     hooks: HashMap<Op, CallHook>,
     /// Run when a bridge child is killed (outside the fake's lock).
     bridge_kill_hook: Option<CallHook>,
+    /// What `status_server` reports as the running server's version and protocol.
+    server_version: (Option<String>, Option<u64>),
 }
 
 /// A test callback attached to one op.
@@ -402,6 +404,10 @@ impl FakeHerdr {
                     names: HashMap::new(),
                     hooks: HashMap::new(),
                     bridge_kill_hook: None,
+                    server_version: (
+                        Some(crate::deps::floor::HERDR_FLOOR.to_string()),
+                        Some(crate::deps::floor::HERDR_PROTOCOL),
+                    ),
                 }),
                 exited: Condvar::new(),
                 input: Condvar::new(),
@@ -592,6 +598,12 @@ impl FakeHerdr {
     /// cannot be read, and [`HerdrOps::rediscover`] finds nothing.
     pub fn set_exe_missing(&self, on: bool) {
         self.state().exe_missing = on;
+    }
+
+    /// What a running server reports from `status server` (default the floor version
+    /// and protocol: a supported herdr).
+    pub fn set_server_version(&self, version: Option<&str>, protocol: Option<u64>) {
+        self.state().server_version = (version.map(str::to_string), protocol);
     }
 
     /// How many times [`HerdrOps::rediscover`] ran (it is not a recorded call).
@@ -1114,8 +1126,8 @@ impl HerdrOps for FakeHerdr {
         }
         Ok(ServerStatus {
             running: st.running,
-            version: st.running.then(|| "fake".to_string()),
-            protocol: st.running.then_some(1),
+            version: st.running.then(|| st.server_version.0.clone()).flatten(),
+            protocol: st.running.then_some(st.server_version.1).flatten(),
             socket: None,
         })
     }
