@@ -141,3 +141,16 @@ export function settleWorktreeOrders(
   }
   return out ?? overrides;
 }
+
+/**
+ * The board's worktree rows: `names` in the rail's `railOrder` (the active group's
+ * `order`, sort applied, filtered-out worktrees included so their cards stay on the
+ * board). Worktrees the rail has not listed yet follow in their incoming order; with no
+ * rail order, `names` as given.
+ */
+export function boardWorktreeOrder(
+  names: readonly string[],
+  railOrder: readonly string[] | undefined,
+): string[] {
+  return applyOrder(names, railOrder ?? null, (n) => n);
+}

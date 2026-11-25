@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ProjectSummary } from "./ipc";
 import {
+  boardWorktreeOrder,
   DEFAULT_RAIL_VIEW,
   EMOJI_PALETTE,
   effectiveView,
@@ -124,5 +125,27 @@ describe("settleWorktreeOrders", () => {
   it("drops an override whose project is gone, keeping the others", () => {
     const o = { gone: ["a"], proj: ["b", "a"] };
     expect(settleWorktreeOrders(o, [proj("proj")])).toEqual({ proj: ["b", "a"] });
+  });
+});
+
+describe("boardWorktreeOrder", () => {
+  it("follows the rail's order, unlisted worktrees after in incoming order", () => {
+    expect(boardWorktreeOrder(["main", "alpha", "bravo", "wt"], ["bravo", "main"])).toEqual([
+      "bravo",
+      "main",
+      "alpha",
+      "wt",
+    ]);
+  });
+
+  it("skips rail names the board has no worktree for", () => {
+    expect(boardWorktreeOrder(["main", "alpha"], ["gone", "alpha", "main"])).toEqual([
+      "alpha",
+      "main",
+    ]);
+  });
+
+  it("keeps the incoming order when the rail has none yet", () => {
+    expect(boardWorktreeOrder(["bravo", "alpha"], undefined)).toEqual(["bravo", "alpha"]);
   });
 });

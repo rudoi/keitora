@@ -128,7 +128,7 @@ import {
   warmProject,
   worktreesFor,
 } from "./lib/warmProjects";
-import { settleWorktreeOrders } from "./lib/worktreeOrder";
+import { boardWorktreeOrder, settleWorktreeOrders } from "./lib/worktreeOrder";
 import { xdgLeakNoticeBody } from "./lib/xdgNotice";
 import "./App.css";
 import "./themes.css";
@@ -1091,6 +1091,17 @@ function AppInner() {
     [activeGroupLanes, activeWorktrees],
   );
   availableRef.current = availableWorktrees;
+  // The board's rows follow the rail: its sort and custom order, with worktrees the emoji
+  // filter hides kept (their cards stay on the board).
+  const activeGroupOrder = activeReady ? railGroups.find((g) => g.isActive)?.order : undefined;
+  const worktreeNames = useMemo(
+    () =>
+      boardWorktreeOrder(
+        activeWorktrees.map((w) => w.name),
+        activeGroupOrder,
+      ),
+    [activeWorktrees, activeGroupOrder],
+  );
   // Ordered project names for the cycle chords. Memoized so the keymap ctx stays
   // stable across project-list refreshes that don't change the names.
   const projectNames = useMemo(() => registryProjects.map((p) => p.name), [registryProjects]);
@@ -1342,7 +1353,6 @@ function AppInner() {
   // Done/Unclaim buttons won't appear until the user picks a lane.
   const actor = selected;
 
-  const worktreeNames = activeWorktrees.map((w) => w.name);
   // The dispatch pool: worktrees that may receive tasks (every worktree is in by
   // default). A missing flag (an older backend) counts as in.
   const dispatchPool = activeWorktrees.filter((w) => w.dispatch !== false).map((w) => w.name);
