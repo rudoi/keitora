@@ -10,11 +10,13 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { Activity, ArrowDownUp, HelpCircle, Settings } from "lucide-react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { cardModel } from "../lib/deps";
 import { formatBytes, formatCpu, formatUptime } from "../lib/format";
 import type { CliKind, DaemonInfo, RailView, WorktreeSort } from "../lib/ipc";
 import {
   daemonRestart,
   daemonStatus,
+  depsRestartToFinish,
   openWorktreeFolder,
   openWorktreeShell,
   setWorktreeDispatch,
@@ -46,6 +48,7 @@ import { useLocalStorageJson } from "../lib/useLocalStorageState";
 import { usePrefersReducedMotion } from "../lib/usePrefersReducedMotion";
 import { EMOJI_PALETTE, effectiveView, emojiChoices, SORT_LABEL } from "../lib/worktreeOrder";
 import { useConfirmDialog } from "./ConfirmDialog";
+import { useDeps, useDepsInstall } from "./DepsProvider";
 import { RestartDaemonDialog } from "./RestartDaemonDialog";
 import type { LaneOpenTarget } from "./rail/Lane";
 import { RailProjects } from "./rail/RailProjects";
@@ -150,7 +153,12 @@ export function DaemonStatusBadge({ daemonInfo }: { daemonInfo: DaemonInfo }) {
       : "—";
 
     // Connected: the daemon info card. Mounted only on this branch, so its 2s stats poll is scoped to the Connected state.
-    return <DaemonCard daemonInfo={daemonInfo} fallbackUptime={uptime} />;
+    return (
+      <>
+        <DaemonCard daemonInfo={daemonInfo} fallbackUptime={uptime} />
+        <DepsRailLine sessionCount={daemonInfo.session_count} withText />
+      </>
+    );
   }
 
   // Disconnected: herdr is unreachable. The backend's reason (why it is unavailable and how to
@@ -163,14 +171,12 @@ export function DaemonStatusBadge({ daemonInfo }: { daemonInfo: DaemonInfo }) {
 }
 
 /**
- * The offline card: the click-to-retry-status badge with the reason, and a Restart button
- * beside it (a sibling, so no control is nested in another) when a restart can help. The
- * button asks first, with the dialog Settings uses: "offline" can also be a status probe that
- * timed out over a server whose agents are still working. It stays disabled ("Restarting…")
- * for as long as the restart runs, which recovery reports, not just for the request. A failed
- * restart toasts like Settings does; the card keeps the reason, which the backend re-emits.
+ * The rail's daemon restart flow: the confirmation's open state, whether a restart can start
+ * now (not while one runs, which recovery reports), and the restart itself, which toasts on
+ * failure. `action` is the restart to make: the plain daemon restart, or "Restart to
+ * finish" (which also refreshes the agent integration, as an upgrade does).
  */
-function OfflineCard({ daemonInfo }: { daemonInfo: DaemonInfo }) {
+function useRestartDaemon(action: () => Promise<unknown> = daemonRestart) {
   const { showToast } = useToast();
   const recovery = useRecovery();
   const [confirming, setConfirming] = useState(false);
@@ -182,21 +188,33 @@ function OfflineCard({ daemonInfo }: { daemonInfo: DaemonInfo }) {
     },
     [],
   );
-  const reason = daemonInfo.reason;
-
-  const canRestart = canRestartNow(recovery, restarting);
 
   const restart = async () => {
     setConfirming(false);
     setRestarting(true);
     try {
-      await daemonRestart();
+      await action();
     } catch (e) {
       showToast(`Could not restart daemon: ${String(e)}`);
     } finally {
       if (mounted.current) setRestarting(false);
     }
   };
+
+  return { confirming, setConfirming, canRestart: canRestartNow(recovery, restarting), restart };
+}
+
+/**
+ * The offline card: the click-to-retry-status badge with the reason, and a Restart button
+ * beside it (a sibling, so no control is nested in another) when a restart can help. The
+ * button asks first, with the dialog Settings uses: "offline" can also be a status probe that
+ * timed out over a server whose agents are still working. It stays disabled ("Restarting…")
+ * for as long as the restart runs, which recovery reports, not just for the request. A failed
+ * restart toasts like Settings does; the card keeps the reason, which the backend re-emits.
+ */
+function OfflineCard({ daemonInfo }: { daemonInfo: DaemonInfo }) {
+  const { confirming, setConfirming, canRestart, restart } = useRestartDaemon();
+  const reason = daemonInfo.reason;
 
   return (
     <div className="rail-daemon-offline">
@@ -217,20 +235,85 @@ function OfflineCard({ daemonInfo }: { daemonInfo: DaemonInfo }) {
         <span className="dot offline" />
         <span className="rail-daemon-label">{reason ?? "Daemon offline"}</span>
       </div>
-      {showRailRestart(daemonInfo) && (
+      <div className="rail-daemon-actions">
+        <DepsRailLine sessionCount={daemonInfo.session_count} withText={false} />
+        {showRailRestart(daemonInfo) && (
+          <button
+            type="button"
+            className="rail-daemon-restart"
+            disabled={!canRestart}
+            onClick={() => setConfirming(true)}
+          >
+            {canRestart ? "Restart" : "Restarting…"}
+          </button>
+        )}
+      </div>
+      <RestartDaemonDialog
+        open={confirming && canRestart}
+        onOpenChange={setConfirming}
+        sessionCount={daemonInfo.session_count}
+        onConfirm={() => void restart()}
+      />
+    </div>
+  );
+}
+
+/**
+ * The rail's dependency line: Install (herdr missing), Upgrade (too old or a protocol
+ * mismatch; opens the upgrade dialog), "Restart to finish" (the new herdr is on disk but the
+ * old server still runs), "Try direct download" after a failed script install, or the
+ * running install's progress. `withText` adds the explanation; the offline card already
+ * shows the backend's reason, so it shows only the button there (and progress or failure
+ * text, which the reason doesn't cover).
+ */
+function DepsRailLine({ sessionCount, withText }: { sessionCount: number; withText: boolean }) {
+  const { state, setUpgradeOpen } = useDeps();
+  const install = useDepsInstall();
+  const { confirming, setConfirming, canRestart, restart } = useRestartDaemon(depsRestartToFinish);
+  const model = cardModel(state.snapshot, state.progress);
+  if (model === null) return null;
+
+  const onAction = () => {
+    switch (model.action?.kind) {
+      case "install":
+        void install();
+        break;
+      case "try_direct":
+        void install("direct");
+        break;
+      case "upgrade":
+        setUpgradeOpen(true);
+        break;
+      case "restart_to_finish":
+        if (sessionCount > 0) setConfirming(true);
+        else void restart();
+        break;
+    }
+  };
+
+  const showText =
+    withText || model.busy || (model.tone === "error" && model.action?.kind !== "install");
+  return (
+    <div className={`rail-deps rail-deps-${model.tone}`}>
+      {showText && <span className="rail-deps-text">{model.text}</span>}
+      {model.action && (
         <button
           type="button"
           className="rail-daemon-restart"
-          disabled={!canRestart}
-          onClick={() => setConfirming(true)}
+          disabled={model.action.kind === "restart_to_finish" && !canRestart}
+          onClick={onAction}
         >
-          {canRestart ? "Restart" : "Restarting…"}
+          {model.action.kind === "restart_to_finish" && !canRestart
+            ? "Restarting…"
+            : model.action.label}
         </button>
       )}
       <RestartDaemonDialog
         open={confirming && canRestart}
         onOpenChange={setConfirming}
-        sessionCount={daemonInfo.session_count}
+        sessionCount={sessionCount}
+        title="Restart herdr to finish?"
+        confirmLabel="Restart"
         onConfirm={() => void restart()}
       />
     </div>

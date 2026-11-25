@@ -73,8 +73,11 @@ pub struct Supervisor {
     spawned: Mutex<Option<SpawnedServer>>,
     /// Monotonic (re)start counter — the surrogate restart signal.
     instance: AtomicU32,
-    /// `ensure_ready` runs at most once per process.
+    /// `ensure_ready` runs at most once per process (until `refresh_integration`
+    /// resets it).
     ready_done: AtomicBool,
+    /// How many times `ensure_ready` got past its once-latch.
+    ready_runs: AtomicU32,
     /// Memory probe sampled into each server-start record.
     headroom: Arc<dyn Headroom>,
     /// The adopted-server start record is written at most once per process.
@@ -112,6 +115,7 @@ impl Supervisor {
             spawned: Mutex::new(None),
             instance: AtomicU32::new(0),
             ready_done: AtomicBool::new(false),
+            ready_runs: AtomicU32::new(0),
             headroom,
             adopted_logged: AtomicBool::new(false),
             start_timeout: START_TIMEOUT,
@@ -224,6 +228,7 @@ impl Supervisor {
         if self.ready_done.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.ready_runs.fetch_add(1, Ordering::SeqCst);
         let from_cli = ops
             .env()
             .env
@@ -255,6 +260,20 @@ impl Supervisor {
                 ),
             }
         }
+    }
+
+    /// Run the integration install again even though it already ran this
+    /// process: a new herdr binary may ship changed hooks. Skipped under the same
+    /// conditions as [`Self::ensure_ready`] (test builds, the opt-out env var).
+    pub fn refresh_integration(&self, ops: &dyn HerdrOps) {
+        self.ready_done.store(false, Ordering::SeqCst);
+        self.ensure_ready(ops);
+    }
+
+    /// How many times [`Self::ensure_ready`] got past its once-latch.
+    #[cfg(test)]
+    pub fn ready_runs(&self) -> u32 {
+        self.ready_runs.load(Ordering::SeqCst)
     }
 
     /// Spawn `herdr server` detached and wait for it to answer. An exit before it
@@ -733,6 +752,24 @@ mod tests {
         assert!(
             fake.calls().is_empty(),
             "no integration status/install under cfg(test): {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    fn refresh_integration_resets_the_once_latch() {
+        let fake = FakeHerdr::new();
+        let sup = quiet_supervisor();
+        sup.ensure_ready(&*fake);
+        sup.ensure_ready(&*fake);
+        assert_eq!(sup.ready_runs(), 1, "once per process");
+        sup.refresh_integration(&*fake);
+        assert_eq!(sup.ready_runs(), 2, "the refresh runs it again");
+        sup.ensure_ready(&*fake);
+        assert_eq!(sup.ready_runs(), 2, "and latches again");
+        assert!(
+            fake.calls().is_empty(),
+            "still no integration status/install under cfg(test): {:?}",
             fake.calls()
         );
     }

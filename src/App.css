@@ -1226,6 +1226,48 @@ body {
   cursor: default;
 }
 
+/* Offline card buttons: dependency action and Restart share one wrapping row. */
+.rail-daemon-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 6px;
+}
+.rail-daemon-actions:empty {
+  display: none;
+}
+/* Rail dependency line (install / upgrade / restart to finish / progress). */
+.rail-deps {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  padding: 0 6px 2px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.rail-dock .rail-deps {
+  padding: 0 6px 2px;
+}
+.rail-daemon-actions .rail-deps {
+  display: contents;
+}
+.rail-daemon-actions .rail-deps-text {
+  padding: 0 2px;
+}
+.rail-deps-text {
+  flex-basis: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--tx-3);
+}
+.rail-deps-warn .rail-deps-text {
+  color: var(--busy);
+}
+.rail-deps-error .rail-deps-text {
+  color: var(--urgent);
+}
+
 /* ---- rail daemon info card (Connected state) ---- */
 .rail-daemon-card {
   display: flex;
