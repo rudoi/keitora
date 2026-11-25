@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::backend::EmitSink;
 use crate::backend::{DaemonStats, SessionKey, StatusPayload, HINT_BUSY};
+use crate::deps::floor::FloorSlot;
 use crate::headroom::{Headroom, HeadroomSnapshot, PHYS_MARGIN_BYTES};
 
 use super::cli::{PaneInfo, ServerStatus};
@@ -287,6 +288,8 @@ pub struct StatusLoopDeps {
     /// Whether the launch decision about herdr has been made (the keymap is
     /// reconciled, or recovery owns the server). Nothing is observed before.
     pub boot_ready: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Where each running probe's version/protocol judgement goes.
+    pub floor: Arc<FloorSlot>,
 }
 
 /// The merged status loop. See the module docs.
@@ -470,6 +473,13 @@ impl StatusLoop {
         super::observe_exe(self.deps.sink.as_ref(), &self.deps.exe_missing, &r, &|| {
             self.deps.recovery.snapshot()
         });
+        // Only a running server says which herdr Keitora is talking to; a failed
+        // or not-running probe keeps the last judgement.
+        if let Ok(s) = &r {
+            if s.running {
+                self.deps.floor.observe(s);
+            }
+        }
         let mut cache = self.deps.cache.lock().unwrap();
         match r {
             Ok(s) => {
@@ -600,6 +610,7 @@ mod tests {
     use crate::backend::herdr::recovery::machine::Event;
     use crate::backend::herdr::recovery::recording_handle;
     use crate::backend::herdr::watchdog::DeathEvent;
+    use crate::deps::floor;
     use crate::headroom::{FakeHeadroom, MIB};
     use serde_json::Value;
     use std::sync::mpsc::Receiver;
@@ -779,6 +790,7 @@ mod tests {
         pid: Arc<Mutex<Option<u32>>>,
         ready: Arc<AtomicBool>,
         exe_missing: Arc<ExeMissing>,
+        floor: Arc<FloorSlot>,
         t0: Instant,
         status_loop: StatusLoop,
     }
@@ -811,6 +823,7 @@ mod tests {
             let ready = Arc::new(AtomicBool::new(true));
             let ready_in = Arc::clone(&ready);
             let exe_missing = Arc::new(ExeMissing::new(fake.env().discovery.clone()));
+            let floor: Arc<FloorSlot> = Arc::default();
             let status_loop = StatusLoop::new(StatusLoopDeps {
                 ops: Arc::clone(&fake) as Arc<dyn HerdrOps>,
                 gate: Arc::clone(&gate) as Arc<dyn ServerGate>,
@@ -830,6 +843,7 @@ mod tests {
                 })),
                 exe_missing: Arc::clone(&exe_missing),
                 boot_ready: Arc::new(move || ready_in.load(Ordering::SeqCst)),
+                floor: Arc::clone(&floor),
             });
             Rig {
                 fake,
@@ -845,6 +859,7 @@ mod tests {
                 pid,
                 ready,
                 exe_missing,
+                floor,
                 t0: Instant::now(),
                 status_loop,
             }
@@ -1453,6 +1468,88 @@ mod tests {
             .filter(|c| c.op == Op::StatusServer)
             .count();
         assert_eq!(probes, 2, "at 0 s and 10 s");
+    }
+
+    // ── Floor ────────────────────────────────────────────────────────────────
+
+    /// Count the floor slot's observer calls.
+    fn count_floor_changes(r: &Rig) -> Arc<std::sync::atomic::AtomicUsize> {
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n_in = Arc::clone(&n);
+        r.floor.on_change(Box::new(move |_| {
+            n_in.fetch_add(1, Ordering::SeqCst);
+        }));
+        n
+    }
+
+    #[test]
+    fn a_running_probe_judges_the_floor() {
+        let mut r = Rig::new();
+        r.fake.set_server_version(Some("0.9.5"), Some(22));
+        r.at(0);
+        assert_eq!(r.floor.get(), floor::FloorState::Ok);
+
+        r.fake.set_server_version(Some("0.9.5"), Some(23));
+        r.at(10);
+        assert_eq!(
+            r.floor.get(),
+            floor::FloorState::ProtocolMismatch {
+                found: 23,
+                want: 22,
+                newer: true
+            }
+        );
+
+        r.fake.set_server_version(Some("0.9.3"), Some(22));
+        r.at(20);
+        assert_eq!(
+            r.floor.get(),
+            floor::FloorState::TooOld {
+                found: "0.9.3".into()
+            }
+        );
+    }
+
+    #[test]
+    fn failed_and_not_running_probes_leave_the_floor_alone() {
+        let mut r = Rig::new();
+        r.fake.set_server_version(Some("0.9.3"), Some(22));
+        r.at(0);
+        let too_old = floor::FloorState::TooOld {
+            found: "0.9.3".into(),
+        };
+        assert_eq!(r.floor.get(), too_old);
+
+        r.fake.set_server_version(Some("0.9.5"), Some(22));
+        r.fake.fail_next(Op::StatusServer, HerdrError::Timeout);
+        r.at(10);
+        assert_eq!(r.count(Op::StatusServer), 2);
+        assert_eq!(r.floor.get(), too_old, "a failed probe changes nothing");
+
+        r.fake.kill_server(Some(1));
+        r.at(12);
+        assert_eq!(r.count(Op::StatusServer), 3);
+        assert_eq!(r.floor.get(), too_old, "nor does a stopped server");
+    }
+
+    #[test]
+    fn the_floor_observer_fires_only_on_change() {
+        let mut r = Rig::new();
+        let changes = count_floor_changes(&r);
+        r.fake.set_server_version(Some("0.9.5"), Some(22));
+        r.at(0);
+        r.at(10);
+        r.at(20);
+        assert_eq!(r.count(Op::StatusServer), 3);
+        assert_eq!(
+            changes.load(Ordering::SeqCst),
+            1,
+            "Unknown -> Ok, then same"
+        );
+        r.fake.set_server_version(Some("0.9.5"), Some(23));
+        r.at(30);
+        r.at(40);
+        assert_eq!(changes.load(Ordering::SeqCst), 2);
     }
 
     // ── Pulled snapshot ──────────────────────────────────────────────────────

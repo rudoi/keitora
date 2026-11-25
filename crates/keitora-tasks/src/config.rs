@@ -1366,6 +1366,25 @@ impl UserConfig {
         cfg.save()
     }
 
+    /// Pin (`Some`) or clear (`None`) the global `[pty] herdr_bin` and persist the
+    /// registry. The pin must be an absolute path: a relative or `~`-prefixed one is
+    /// rejected rather than written, so the stored value never depends on the
+    /// process's working directory or home.
+    pub fn set_herdr_bin(path: Option<PathBuf>) -> Result<(), ResolveError> {
+        if let Some(p) = &path {
+            if !p.is_absolute() {
+                return Err(ResolveError::Io(format!(
+                    "herdr_bin must be an absolute path, got {}",
+                    p.display()
+                )));
+            }
+        }
+        let _registry = UserConfig::write_lock();
+        let mut cfg = UserConfig::load()?;
+        cfg.pty.herdr_bin = path;
+        cfg.save()
+    }
+
     /// The active project `(name, ref)` if `active` names a registered project.
     pub fn active_project(&self) -> Option<(&str, &ProjectRef)> {
         let name = self.active.as_deref()?;
@@ -2585,17 +2604,32 @@ pub fn herdr_on_path(path: &str) -> Option<PathBuf> {
     }
 }
 
+/// Orders version strings newest first: numeric compare of the leading
+/// `major.minor.patch`, names that do not parse after every parsed one, ties broken
+/// by name (descending) so the order is total and stable. Never panics.
+pub fn compare_versions_desc(a: &str, b: &str) -> std::cmp::Ordering {
+    // `None` (unparsable) sorts below every parsed version, so it lands last.
+    parse_release_version(b)
+        .cmp(&parse_release_version(a))
+        .then_with(|| b.cmp(a))
+}
+
+/// Sorts version-like names newest first using [`compare_versions_desc`].
+pub fn sort_versions_desc<T: AsRef<str>>(names: &mut [T]) {
+    names.sort_by(|a, b| compare_versions_desc(a.as_ref(), b.as_ref()));
+}
+
 /// `<release>/exe_name` for each of `release_dirs`, newest version first (numeric
 /// compare of the leading `major.minor.patch`; unparsable names last). Pure.
 fn herdr_release_order(release_dirs: &[PathBuf], exe_name: &str) -> Vec<PathBuf> {
     let mut releases: Vec<&PathBuf> = release_dirs.iter().collect();
-    let version = |p: &PathBuf| {
+    let name = |p: &PathBuf| {
         p.file_name()
             .and_then(|n| n.to_str())
-            .and_then(parse_release_version)
+            .unwrap_or("")
+            .to_owned()
     };
-    // Newest first; unparsable (`None`) sorts after every parsed version.
-    releases.sort_by(|a, b| version(b).cmp(&version(a)).then_with(|| b.cmp(a)));
+    releases.sort_by(|a, b| compare_versions_desc(&name(a), &name(b)).then_with(|| b.cmp(a)));
     let mut out: Vec<PathBuf> = Vec::new();
     for dir in releases {
         let p = dir.join(exe_name);
@@ -2606,23 +2640,17 @@ fn herdr_release_order(release_dirs: &[PathBuf], exe_name: &str) -> Vec<PathBuf>
     out
 }
 
-/// Where the standalone herdr installer unpacks releases:
-/// `~/.herdr/packages/standalone/releases`.
-fn herdr_releases_dir() -> Option<PathBuf> {
-    Some(
-        dirs::home_dir()?
-            .join(".herdr")
-            .join("packages")
-            .join("standalone")
-            .join("releases"),
-    )
+/// Where the standalone herdr installer unpacks releases under `home`:
+/// `<home>/.herdr/packages/standalone/releases`.
+pub fn herdr_releases_dir_with_home(home: &Path) -> PathBuf {
+    home.join(".herdr")
+        .join("packages")
+        .join("standalone")
+        .join("releases")
 }
 
-/// The release dirs (`releases/<version>`) that exist on disk.
-fn herdr_release_dirs() -> Vec<PathBuf> {
-    let Some(root) = herdr_releases_dir() else {
-        return Vec::new();
-    };
+/// The release dirs (`<root>/<version>`) that exist on disk.
+fn herdr_release_dirs_in(root: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
@@ -2633,11 +2661,35 @@ fn herdr_release_dirs() -> Vec<PathBuf> {
         .collect()
 }
 
-/// Where the herdr executable of each standalone release would be, newest
-/// version first, whether or not a file is there. Reads the releases directory
-/// once.
+/// The herdr executables that exist under `root` (a standalone `releases` dir:
+/// `<root>/<ver>-<triple>/herdr[.exe]`), newest version first. A missing root or a
+/// release dir without the executable contributes nothing.
+pub fn herdr_release_paths_in(root: &Path) -> Vec<PathBuf> {
+    herdr_release_exes_in(root, HERDR_EXE_NAME)
+}
+
+/// [`herdr_release_paths_in`] for an explicit executable file name, for callers that
+/// reason about a platform other than the one this build targets (`herdr.exe` for a
+/// Windows layout, `herdr` for a unix one).
+pub fn herdr_release_exes_in(root: &Path, exe_name: &str) -> Vec<PathBuf> {
+    herdr_release_order(&herdr_release_dirs_in(root), exe_name)
+        .into_iter()
+        .filter(|p| p.is_file())
+        .collect()
+}
+
+/// [`herdr_release_paths_in`] for the standalone root under an explicit `home`.
+pub fn herdr_release_paths_with_home(home: &Path) -> Vec<PathBuf> {
+    herdr_release_paths_in(&herdr_releases_dir_with_home(home))
+}
+
+/// The herdr executable of each installed standalone release under the real home
+/// directory, newest version first.
 pub fn herdr_release_paths() -> Vec<PathBuf> {
-    herdr_release_order(&herdr_release_dirs(), HERDR_EXE_NAME)
+    match dirs::home_dir() {
+        Some(home) => herdr_release_paths_with_home(&home),
+        None => Vec::new(),
+    }
 }
 
 /// The usual install locations a GUI launch's minimal `PATH` misses: `herdr` in
@@ -4947,6 +4999,149 @@ backoff_secs = [0, 10]
         assert!(!UserConfig::load().unwrap().skip_permissions());
 
         std::env::remove_var("KEITORA_CONFIG_HOME");
+    }
+
+    #[test]
+    fn set_herdr_bin_writes_preserves_and_clears() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("KEITORA_CONFIG_HOME", tmp.path().join("user_config"));
+
+        UserConfig::set_skip_permissions(true).unwrap();
+        let bin = tmp.path().join("bin").join("herdr");
+        UserConfig::set_herdr_bin(Some(bin.clone())).unwrap();
+        let loaded = UserConfig::load().unwrap();
+        assert_eq!(loaded.pty.herdr_bin, Some(bin));
+        assert!(loaded.skip_permissions(), "unrelated keys survive");
+        let text = std::fs::read_to_string(user_config_path().unwrap()).unwrap();
+        assert!(text.contains("herdr_bin"), "got: {text}");
+
+        UserConfig::set_herdr_bin(None).unwrap();
+        let cleared = UserConfig::load().unwrap();
+        assert!(cleared.pty.herdr_bin.is_none());
+        assert!(cleared.skip_permissions());
+        let text = std::fs::read_to_string(user_config_path().unwrap()).unwrap();
+        assert!(!text.contains("herdr_bin"), "got: {text}");
+
+        std::env::remove_var("KEITORA_CONFIG_HOME");
+    }
+
+    #[test]
+    fn set_herdr_bin_rejects_relative_and_tilde_paths() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("KEITORA_CONFIG_HOME", tmp.path().join("user_config"));
+
+        for bad in ["herdr", "bin/herdr", "~/.herdr/herdr"] {
+            let err = UserConfig::set_herdr_bin(Some(PathBuf::from(bad))).unwrap_err();
+            assert!(matches!(err, ResolveError::Io(_)), "got {err:?}");
+        }
+        assert!(UserConfig::load().unwrap().pty.herdr_bin.is_none());
+        assert!(!user_config_path().unwrap().exists(), "nothing written");
+
+        std::env::remove_var("KEITORA_CONFIG_HOME");
+    }
+
+    fn fake_release(root: &Path, dir: &str, with_exe: bool) -> PathBuf {
+        let d = root.join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        let exe = d.join(HERDR_EXE_NAME);
+        if with_exe {
+            std::fs::write(&exe, b"x").unwrap();
+        }
+        exe
+    }
+
+    #[test]
+    fn release_lister_is_newest_first_and_skips_dirs_without_the_exe() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let a = fake_release(root, "0.9.3-x86_64-unknown-linux-gnu", true);
+        let b = fake_release(root, "0.9.10-x86_64-unknown-linux-gnu", true);
+        let c = fake_release(root, "0.10.0-x86_64-unknown-linux-gnu", true);
+        fake_release(root, "1.0.0-x86_64-unknown-linux-gnu", false);
+        assert_eq!(herdr_release_paths_in(root), vec![c, b, a]);
+    }
+
+    #[test]
+    fn release_lister_missing_root_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        assert!(herdr_release_paths_in(&tmp.path().join("nope")).is_empty());
+    }
+
+    #[test]
+    fn release_lister_takes_an_explicit_exe_name() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        for (dir, name) in [
+            ("0.9.5-a", "herdr.exe"),
+            ("0.9.3-b", "herdr.exe"),
+            ("0.9.4-c", "herdr"),
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join(name), b"x").unwrap();
+        }
+        assert_eq!(
+            herdr_release_exes_in(root, "herdr.exe"),
+            vec![
+                root.join("0.9.5-a").join("herdr.exe"),
+                root.join("0.9.3-b").join("herdr.exe")
+            ]
+        );
+        assert_eq!(
+            herdr_release_exes_in(root, "herdr"),
+            vec![root.join("0.9.4-c").join("herdr")]
+        );
+    }
+
+    #[test]
+    fn release_lister_tolerates_non_semver_dir_names() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let good = fake_release(root, "0.9.3-x", true);
+        let junk = fake_release(root, "latest", true);
+        let weird = fake_release(root, "1.x.y-q", true);
+        std::fs::write(root.join("stray-file"), b"x").unwrap();
+        let got = herdr_release_paths_in(root);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], good, "a parsed version sorts before junk");
+        assert!(got.contains(&junk) && got.contains(&weird));
+    }
+
+    #[test]
+    fn release_lister_with_home_reads_the_standalone_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = herdr_releases_dir_with_home(tmp.path());
+        let exe = fake_release(&root, "0.9.3-x", true);
+        assert_eq!(herdr_release_paths_with_home(tmp.path()), vec![exe]);
+        let other = TempDir::new().unwrap();
+        assert!(herdr_release_paths_with_home(other.path()).is_empty());
+    }
+
+    #[test]
+    fn sort_versions_desc_orders_numerically_newest_first() {
+        let mut v = vec!["0.9.3", "0.10.0", "0.9.10", "1.0.0", "v0.9.4"];
+        sort_versions_desc(&mut v);
+        assert_eq!(v, vec!["1.0.0", "0.10.0", "0.9.10", "v0.9.4", "0.9.3"]);
+    }
+
+    #[test]
+    fn sort_versions_desc_handles_prerelease_and_garbage() {
+        let mut v = vec![
+            "".to_string(),
+            "garbage".to_string(),
+            "1.2.3-beta.1".to_string(),
+            "1.2".to_string(),
+            "1.2.4".to_string(),
+            "1.2.3-x86_64".to_string(),
+        ];
+        sort_versions_desc(&mut v);
+        assert_eq!(v[0], "1.2.4");
+        // Suffixed names compare by their leading triple.
+        assert!(v[1].starts_with("1.2.3") && v[2].starts_with("1.2.3"));
+        // Unparsable names come last.
+        let tail: Vec<&str> = v[3..].iter().map(String::as_str).collect();
+        assert_eq!(tail, vec!["garbage", "1.2", ""]);
     }
 
     // --- legacy [remote] table ---

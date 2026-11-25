@@ -60,6 +60,13 @@ powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 Open a new terminal and run `herdr --version` to check it's on your `PATH`. You don't need to start
 herdr yourself: Keitora starts its server when it opens.
 
+You can also let Keitora do it. When herdr is missing or too old, Keitora offers to install or
+upgrade it from the first-run screen, the sidebar card, and **Settings > Dependencies**. That works
+on Windows (x86_64) and macOS (Apple Silicon and Intel); elsewhere Keitora shows the commands to run
+yourself. Keitora needs herdr 0.9.5 or newer (protocol 22). A herdr that came from a package manager
+is left alone: Keitora shows that manager's upgrade command and offers to install its own copy
+instead.
+
 ### 3. Install the build tools
 
 You need:

@@ -326,6 +326,14 @@ mod tests {
     }
 
     #[test]
+    fn floor_and_integration_refresh_are_inert() {
+        let (b, sink) = backend();
+        assert!(b.floor_slot().is_none());
+        b.refresh_integration();
+        assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn restart_and_shutdown_are_no_ops_that_emit_nothing() {
         let (b, sink) = backend();
         assert!(b.restart().is_ok());

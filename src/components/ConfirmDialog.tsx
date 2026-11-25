@@ -6,6 +6,10 @@
 // callers `await` it and bail out on `false` before any side effect
 // (a transfer flow makes no backend call until the user confirms).
 //
+// `choiceDialog(opts)` adds a second action (`altLabel`) and resolves which of
+// "confirm" / "alt" / "cancel" was picked; dismissing it (Esc, outside click,
+// Cancel) is always "cancel", never one of the actions.
+//
 // One dialog at a time: a second call while one is open queues behind it (FIFO)
 // rather than clobbering the pending promise, since the transfer flow can't
 // currently open two at once but a queued handler is a much smaller foot-gun than
@@ -25,16 +29,26 @@ export interface ConfirmOptions {
   danger?: boolean;
 }
 
+export interface ChoiceOptions extends ConfirmOptions {
+  /** A second action beside confirm (rendered between Cancel and confirm). */
+  altLabel: string;
+}
+
+export type Choice = "confirm" | "alt" | "cancel";
+
 interface PendingConfirm extends ConfirmOptions {
-  resolve: (ok: boolean) => void;
+  altLabel?: string;
+  resolve: (choice: Choice) => void;
 }
 
 interface ConfirmCtx {
   confirmDialog: (opts: ConfirmOptions) => Promise<boolean>;
+  choiceDialog: (opts: ChoiceOptions) => Promise<Choice>;
 }
 
 const Ctx = createContext<ConfirmCtx>({
   confirmDialog: () => Promise.resolve(false),
+  choiceDialog: () => Promise.resolve("cancel"),
 });
 
 export function useConfirmDialog(): ConfirmCtx {
@@ -53,16 +67,16 @@ export function ConfirmDialogProvider({ children }: { children: React.ReactNode 
   const currentRef = useRef<PendingConfirm | null>(null);
   currentRef.current = current;
 
-  const settle = useCallback((ok: boolean) => {
+  const settle = useCallback((choice: Choice) => {
     // Side effects OUTSIDE the updater; `setCurrent(next)` is a pure value.
-    currentRef.current?.resolve(ok);
+    currentRef.current?.resolve(choice);
     const next = queueRef.current.shift() ?? null;
     currentRef.current = next;
     setCurrent(next);
   }, []);
 
-  const confirmDialog = useCallback((opts: ConfirmOptions): Promise<boolean> => {
-    return new Promise<boolean>((resolve) => {
+  const choiceDialog = useCallback((opts: ChoiceOptions | ConfirmOptions): Promise<Choice> => {
+    return new Promise<Choice>((resolve) => {
       const pending: PendingConfirm = { ...opts, resolve };
       // Decide queue-vs-show OUTSIDE any updater. Eagerly sync `currentRef` so a
       // second call in the same tick (before the re-render) still sees a dialog
@@ -76,10 +90,16 @@ export function ConfirmDialogProvider({ children }: { children: React.ReactNode 
     });
   }, []);
 
+  const confirmDialog = useCallback(
+    (opts: ConfirmOptions): Promise<boolean> =>
+      choiceDialog(opts).then((choice) => choice === "confirm"),
+    [choiceDialog],
+  );
+
   return (
-    <Ctx.Provider value={{ confirmDialog }}>
+    <Ctx.Provider value={{ confirmDialog, choiceDialog }}>
       {children}
-      <Dialog.Root open={current !== null} onOpenChange={(open) => !open && settle(false)}>
+      <Dialog.Root open={current !== null} onOpenChange={(open) => !open && settle("cancel")}>
         <Dialog.Portal>
           <Dialog.Overlay className={MODAL_OVERLAY_CLS} />
           <Dialog.Content
@@ -94,17 +114,25 @@ export function ConfirmDialogProvider({ children }: { children: React.ReactNode 
             <div className="mt-5 flex justify-end gap-2">
               <button
                 className="rounded-chip border border-line bg-bg-3 px-3.5 py-1.5 text-[11.5px] text-tx-1"
-                onClick={() => settle(false)}
+                onClick={() => settle("cancel")}
               >
                 {current?.cancelLabel ?? "Cancel"}
               </button>
+              {current?.altLabel && (
+                <button
+                  className="rounded-chip border border-line bg-bg-3 px-3.5 py-1.5 text-[11.5px] font-semibold text-tx-1"
+                  onClick={() => settle("alt")}
+                >
+                  {current.altLabel}
+                </button>
+              )}
               <button
                 className={
                   current?.danger
                     ? "rounded-chip border border-urgent/60 bg-bg-3 px-3.5 py-1.5 text-[11.5px] font-semibold text-urgent"
                     : "rounded-chip border border-accent/60 bg-bg-3 px-3.5 py-1.5 text-[11.5px] font-semibold text-accent-text"
                 }
-                onClick={() => settle(true)}
+                onClick={() => settle("confirm")}
               >
                 {current?.confirmLabel}
               </button>

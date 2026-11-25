@@ -16,6 +16,9 @@ export function RestartDaemonDialog({
   onOpenChange,
   sessionCount,
   onConfirm,
+  title = "Restart daemon?",
+  description,
+  confirmLabel = "Restart",
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -23,6 +26,10 @@ export function RestartDaemonDialog({
   sessionCount: number;
   /** The user confirmed. The caller closes the dialog and starts the restart. */
   onConfirm: () => void;
+  /** Overrides for callers that restart herdr for another reason (e.g. an upgrade). */
+  title?: string;
+  description?: string;
+  confirmLabel?: string;
 }) {
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
@@ -31,19 +38,17 @@ export function RestartDaemonDialog({
         <Dialog.Content
           className={`fixed left-1/2 top-1/2 ${LAYER_MODAL} w-[420px] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 rounded-card border border-line bg-bg-1 p-5 shadow-[0_8px_30px_rgba(0,0,0,.4)]`}
         >
-          <Dialog.Title className="text-[15px] font-semibold text-tx-1">
-            Restart daemon?
-          </Dialog.Title>
+          <Dialog.Title className="text-[15px] font-semibold text-tx-1">{title}</Dialog.Title>
           <Dialog.Description className="mt-1 text-[12px] text-tx-3">
-            This interrupts {runningSessionsLabel(sessionCount)} in this project mid-turn. Their
-            agents resume afterwards with their conversation transcript kept.
+            {description ??
+              `This interrupts ${runningSessionsLabel(sessionCount)} in this project mid-turn. Their agents resume afterwards with their conversation transcript kept.`}
           </Dialog.Description>
           <div className="mt-5 flex justify-end gap-2">
             <button className={btnGhost} onClick={() => onOpenChange(false)}>
               Cancel
             </button>
             <button className={btnPrimary} onClick={onConfirm}>
-              Restart
+              {confirmLabel}
             </button>
           </div>
         </Dialog.Content>

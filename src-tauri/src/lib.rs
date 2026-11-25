@@ -14,6 +14,7 @@ mod codex_env;
 mod codex_hooks;
 
 mod db_watch;
+mod deps;
 mod diff;
 mod dispatch;
 mod headroom;

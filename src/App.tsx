@@ -15,6 +15,8 @@ import { Board } from "./components/Board";
 import { availableTags } from "./components/board/tagFilter";
 import { ConfirmDialogProvider, useConfirmDialog } from "./components/ConfirmDialog";
 import { CreateWorktreeDialog } from "./components/CreateWorktreeDialog";
+import { DepsProvider } from "./components/DepsProvider";
+import { DepsUpgradeDialog } from "./components/DepsUpgradeDialog";
 import { DiffView } from "./components/DiffView";
 import { DispatchStepsEditor } from "./components/DispatchStepsEditor";
 import { FontSizeHud, type FontSizeHudHandle } from "./components/FontSizeHud";
@@ -1360,6 +1362,7 @@ function AppInner() {
       <AgentUpdateBanner recovery={recovery} />
       {/* Hosts a terminal pane, so it gets the daemon and recovery state every pane gets. */}
       <AgentUpdateDialogHost daemonInfo={daemonInfo} recovery={recovery} />
+      <DepsUpgradeDialog />
       <div className="body" style={{ position: "relative" }}>
         <Rail
           groups={railGroups}
@@ -1542,18 +1545,20 @@ function AppInner() {
 function App() {
   return (
     <ToastProvider>
-      <UpdatesProvider>
-        <AgentUpdatesProvider>
-          <ConfirmDialogProvider>
-            <AttentionBannersProvider>
-              <Tooltip.Provider>
-                <AppInner />
-                <QuitConfirmModal />
-              </Tooltip.Provider>
-            </AttentionBannersProvider>
-          </ConfirmDialogProvider>
-        </AgentUpdatesProvider>
-      </UpdatesProvider>
+      <DepsProvider>
+        <UpdatesProvider>
+          <AgentUpdatesProvider>
+            <ConfirmDialogProvider>
+              <AttentionBannersProvider>
+                <Tooltip.Provider>
+                  <AppInner />
+                  <QuitConfirmModal />
+                </Tooltip.Provider>
+              </AttentionBannersProvider>
+            </ConfirmDialogProvider>
+          </AgentUpdatesProvider>
+        </UpdatesProvider>
+      </DepsProvider>
     </ToastProvider>
   );
 }

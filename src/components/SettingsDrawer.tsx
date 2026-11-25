@@ -36,6 +36,7 @@ import { isThemeMode, THEME_MODES, themeLabel, useTheme } from "../lib/theme";
 import { errorText, installLabel, isBusy, statusLine } from "../lib/updates";
 import { useRailView } from "../lib/useRailView";
 import { useAgentUpdates } from "./AgentUpdatesProvider";
+import { DepsSection } from "./DepsSection";
 import { RestartDaemonDialog } from "./RestartDaemonDialog";
 import { useToast } from "./Toast";
 import { useUpdates } from "./UpdatesProvider";
@@ -1299,6 +1300,9 @@ export function SettingsDrawer({
 
                 {/* ── Agent CLI updates ───────────────────────────────────── */}
                 <AgentUpdatesSection hours={snap?.user.agent_update_check_hours ?? 6} />
+
+                {/* ── Dependencies ────────────────────────────────────────── */}
+                <DepsSection />
               </div>
             )}
           </div>

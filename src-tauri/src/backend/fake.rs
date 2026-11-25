@@ -11,7 +11,7 @@
 //! consumed from `VecDeque`s rather than cloned.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::{
     AgentLaunch, AttachResult, OutputSink, PtyBackend, PtyBackendError, SessionKey, SessionSummary,
@@ -85,6 +85,7 @@ pub enum Call {
     StatusPayloadSnapshot,
     Shutdown,
     Restart,
+    RefreshIntegration,
 }
 
 #[derive(Default)]
@@ -107,6 +108,13 @@ struct FakeState {
     live_flip_key: Option<SessionKey>,
     terminated: HashSet<SessionKey>,
     set_terminated_fails: bool,
+    /// `status_payload_snapshot` reports `Connected` while set.
+    connected: bool,
+    /// What `recovery_snapshot` answers (the trait default while `None`).
+    recovery: Option<super::herdr::gate::RecoveryPayload>,
+    /// `restart` answers `Ok(())` once this is empty.
+    restart_results: VecDeque<Result<(), PtyBackendError>>,
+    floor: Option<Arc<crate::deps::floor::FloorSlot>>,
 }
 
 /// A scriptable, call-logging [`PtyBackend`] for tests.
@@ -191,6 +199,26 @@ impl FakeBackend {
     /// Make every later `set_terminated` fail (a store that cannot persist).
     pub fn fail_set_terminated(&self) {
         self.state.lock().unwrap().set_terminated_fails = true;
+    }
+
+    /// Report the server as `Connected` (or not) from `status_payload_snapshot`.
+    pub fn set_connected(&self, on: bool) {
+        self.state.lock().unwrap().connected = on;
+    }
+
+    /// What `recovery_snapshot` answers from now on.
+    pub fn set_recovery(&self, payload: super::herdr::gate::RecoveryPayload) {
+        self.state.lock().unwrap().recovery = Some(payload);
+    }
+
+    /// Script the next `restart` result.
+    pub fn push_restart(&self, r: Result<(), PtyBackendError>) {
+        self.state.lock().unwrap().restart_results.push_back(r);
+    }
+
+    /// Expose `slot` as the backend's floor slot.
+    pub fn set_floor_slot(&self, slot: Arc<crate::deps::floor::FloorSlot>) {
+        self.state.lock().unwrap().floor = Some(slot);
     }
 
     /// Snapshot of the recorded call log.
@@ -405,8 +433,13 @@ impl PtyBackend for FakeBackend {
             .unwrap()
             .calls
             .push(Call::StatusPayloadSnapshot);
+        let connected = self.state.lock().unwrap().connected;
         StatusPayload {
-            state: "Disconnected",
+            state: if connected {
+                "Connected"
+            } else {
+                "Disconnected"
+            },
             pid: None,
             started_at: None,
             daemon_version: None,
@@ -423,8 +456,30 @@ impl PtyBackend for FakeBackend {
     }
 
     fn restart(&self) -> Result<(), PtyBackendError> {
-        self.state.lock().unwrap().calls.push(Call::Restart);
-        Ok(())
+        let mut st = self.state.lock().unwrap();
+        st.calls.push(Call::Restart);
+        st.restart_results.pop_front().unwrap_or(Ok(()))
+    }
+
+    fn recovery_snapshot(&self) -> super::herdr::gate::RecoveryPayload {
+        self.state
+            .lock()
+            .unwrap()
+            .recovery
+            .clone()
+            .unwrap_or_else(super::herdr::gate::RecoveryPayload::healthy)
+    }
+
+    fn floor_slot(&self) -> Option<Arc<crate::deps::floor::FloorSlot>> {
+        self.state.lock().unwrap().floor.clone()
+    }
+
+    fn refresh_integration(&self) {
+        self.state
+            .lock()
+            .unwrap()
+            .calls
+            .push(Call::RefreshIntegration);
     }
 }
 
