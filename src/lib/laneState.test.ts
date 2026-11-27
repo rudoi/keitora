@@ -1,12 +1,17 @@
 import { describe, expect, it } from "vitest";
+import type { CliKind } from "./ipc";
 import {
+  actionDisabledReason,
   blockAnimates,
   blockStateCls,
   laneMenuAction,
+  menuItemKey,
   sessionItemDisabledReason,
-  transferDisabledReason,
+  type WorktreeMenuItem,
   worktreeMenuItems,
 } from "./laneState";
+import type { PendingAction } from "./pendingIntent";
+import { CLI_KINDS } from "./providers";
 import type { SessionState, WorktreeSession } from "./sessions";
 
 // Minimal session fixture — blockStateCls only reads `state` (and whether a session exists).
@@ -93,85 +98,185 @@ describe("blockAnimates", () => {
   });
 });
 
+const restart = { kind: "restart" } as const;
+const fresh = { kind: "fresh" } as const;
+const terminate = { kind: "terminate" } as const;
+const launch = { kind: "launch" } as const;
+const launchFresh = { kind: "launch-fresh" } as const;
+const focus = { kind: "focus" } as const;
+
 describe("worktreeMenuItems", () => {
-  it("offers restart, fresh, transfer, then terminate for a live session", () => {
-    expect(worktreeMenuItems(false)).toEqual(["restart", "fresh", "transfer", "terminate"]);
+  it("offers a transfer to Codex and a switch to Antigravity from Claude", () => {
+    expect(worktreeMenuItems("claude", false)).toEqual([
+      restart,
+      fresh,
+      { kind: "transfer", to: "codex" },
+      { kind: "switch", to: "antigravity" },
+      terminate,
+    ]);
   });
 
-  it("offers only launch and launch fresh for a terminated session", () => {
-    expect(worktreeMenuItems(true)).toEqual(["launch", "launch-fresh"]);
+  it("offers a transfer to Claude and a switch to Antigravity from Codex", () => {
+    expect(worktreeMenuItems("codex", false)).toEqual([
+      restart,
+      fresh,
+      { kind: "transfer", to: "claude" },
+      { kind: "switch", to: "antigravity" },
+      terminate,
+    ]);
+  });
+
+  it("offers only switches from Antigravity", () => {
+    expect(worktreeMenuItems("antigravity", false)).toEqual([
+      restart,
+      fresh,
+      { kind: "switch", to: "claude" },
+      { kind: "switch", to: "codex" },
+      terminate,
+    ]);
+  });
+
+  it("offers only launch and launch fresh for a terminated session of any provider", () => {
+    for (const cli of CLI_KINDS) {
+      expect(worktreeMenuItems(cli, true)).toEqual([launch, launchFresh]);
+    }
   });
 
   it("leads with focus for a live session in an inactive project", () => {
-    expect(worktreeMenuItems(false, { inactive: true })).toEqual([
-      "focus",
-      "restart",
-      "fresh",
-      "transfer",
-      "terminate",
+    expect(worktreeMenuItems("claude", false, { inactive: true })).toEqual([
+      focus,
+      restart,
+      fresh,
+      { kind: "transfer", to: "codex" },
+      { kind: "switch", to: "antigravity" },
+      terminate,
     ]);
   });
 
   it("leads with focus for a terminated session in an inactive project", () => {
-    expect(worktreeMenuItems(true, { inactive: true })).toEqual([
-      "focus",
-      "launch",
-      "launch-fresh",
+    expect(worktreeMenuItems("claude", true, { inactive: true })).toEqual([
+      focus,
+      launch,
+      launchFresh,
     ]);
   });
 
   it("omits focus when the project is active", () => {
-    expect(worktreeMenuItems(false, { inactive: false })).toEqual([
-      "restart",
-      "fresh",
-      "transfer",
-      "terminate",
-    ]);
-    expect(worktreeMenuItems(true, {})).toEqual(["launch", "launch-fresh"]);
+    expect(worktreeMenuItems("codex", false, { inactive: false })[0]).toEqual(restart);
+    expect(worktreeMenuItems("claude", true, {})).toEqual([launch, launchFresh]);
+  });
+});
+
+describe("menuItemKey", () => {
+  it("names transfer and switch entries by target and others by kind", () => {
+    expect(menuItemKey({ kind: "switch", to: "claude" })).toBe("switch:claude");
+    expect(menuItemKey({ kind: "transfer", to: "codex" })).toBe("transfer:codex");
+    expect(menuItemKey(restart)).toBe("restart");
+  });
+
+  it("is unique within every provider's menu", () => {
+    for (const cli of CLI_KINDS) {
+      for (const terminated of [false, true]) {
+        const keys = worktreeMenuItems(cli, terminated, { inactive: true }).map(menuItemKey);
+        expect(new Set(keys).size).toBe(keys.length);
+      }
+    }
   });
 });
 
 describe("laneMenuAction", () => {
   it("maps each menu entry to its lane action", () => {
-    expect(laneMenuAction("restart", "codex")).toEqual({ kind: "restart", fresh: false });
-    expect(laneMenuAction("fresh", "codex")).toEqual({ kind: "restart", fresh: true });
-    expect(laneMenuAction("terminate", "codex")).toEqual({ kind: "terminate" });
-    expect(laneMenuAction("launch", "codex")).toEqual({ kind: "launch", fresh: false });
-    expect(laneMenuAction("launch-fresh", "codex")).toEqual({ kind: "launch", fresh: true });
+    expect(laneMenuAction(restart)).toEqual({ kind: "restart", fresh: false });
+    expect(laneMenuAction(fresh)).toEqual({ kind: "restart", fresh: true });
+    expect(laneMenuAction(terminate)).toEqual({ kind: "terminate" });
+    expect(laneMenuAction(launch)).toEqual({ kind: "launch", fresh: false });
+    expect(laneMenuAction(launchFresh)).toEqual({ kind: "launch", fresh: true });
   });
 
   it("transfers to the given CLI", () => {
-    expect(laneMenuAction("transfer", "codex")).toEqual({ kind: "transfer", to: "codex" });
-    expect(laneMenuAction("transfer", "claude")).toEqual({ kind: "transfer", to: "claude" });
+    expect(laneMenuAction({ kind: "transfer", to: "codex" })).toEqual({
+      kind: "transfer",
+      to: "codex",
+    });
+    expect(laneMenuAction({ kind: "transfer", to: "claude" })).toEqual({
+      kind: "transfer",
+      to: "claude",
+    });
+  });
+
+  it("switches to the given CLI", () => {
+    expect(laneMenuAction({ kind: "switch", to: "antigravity" })).toEqual({
+      kind: "switch",
+      to: "antigravity",
+    });
   });
 
   it("runs nothing for focus", () => {
-    expect(laneMenuAction("focus", "codex")).toBeNull();
+    expect(laneMenuAction(focus)).toBeNull();
+  });
+
+  it("only produces pending-action kinds", () => {
+    const kinds: PendingAction["kind"][] = [
+      "restart",
+      "transfer",
+      "switch",
+      "terminate",
+      "launch",
+      "diff",
+      "new-worktree",
+    ];
+    for (const cli of CLI_KINDS) {
+      for (const terminated of [false, true]) {
+        for (const item of worktreeMenuItems(cli, terminated, { inactive: true })) {
+          const action = laneMenuAction(item);
+          if (action !== null) expect(kinds).toContain(action.kind);
+        }
+      }
+    }
   });
 });
 
-describe("transferDisabledReason", () => {
-  it("is null when enabled, names a missing Codex, and lets a busy transfer win", () => {
-    expect(transferDisabledReason({ codexMissing: false, busy: false })).toBeNull();
-    expect(transferDisabledReason({ codexMissing: true, busy: false })).toBe(
-      "Codex isn't installed",
-    );
-    expect(transferDisabledReason({ codexMissing: false, busy: true })).toBe(
+describe("actionDisabledReason", () => {
+  const all: Record<CliKind, boolean> = { claude: true, codex: true, antigravity: true };
+
+  it("lets a busy action win over a missing install and names the action", () => {
+    expect(actionDisabledReason("transfer", "codex", { ...all, codex: false }, true)).toBe(
       "A transfer is already in progress",
     );
-    expect(transferDisabledReason({ codexMissing: true, busy: true })).toBe(
-      "A transfer is already in progress",
+    expect(actionDisabledReason("switch", "antigravity", all, true)).toBe(
+      "A switch is already in progress",
     );
+  });
+
+  it("names a missing target, Claude included", () => {
+    expect(
+      actionDisabledReason("switch", "antigravity", { ...all, antigravity: false }, false),
+    ).toBe("Antigravity isn't installed");
+    expect(actionDisabledReason("transfer", "claude", { ...all, claude: false }, false)).toBe(
+      "Claude isn't installed",
+    );
+  });
+
+  it("is null when the target is installed and nothing is in flight", () => {
+    expect(actionDisabledReason("transfer", "codex", all, false)).toBeNull();
+    expect(actionDisabledReason("switch", "antigravity", all, false)).toBeNull();
   });
 });
 
 describe("sessionItemDisabledReason", () => {
-  it("disables restart, start fresh and terminate only while a transfer is in flight", () => {
-    for (const item of ["restart", "fresh", "terminate"] as const) {
+  it("disables restart, start fresh and terminate only while a transfer or switch is in flight", () => {
+    for (const item of [restart, fresh, terminate]) {
       expect(sessionItemDisabledReason(item, false)).toBeNull();
-      expect(sessionItemDisabledReason(item, true)).toBe("A transfer is in progress");
+      expect(sessionItemDisabledReason(item, true)).toBe("A transfer or switch is in progress");
     }
-    for (const item of ["focus", "transfer", "launch", "launch-fresh"] as const) {
+    const others: WorktreeMenuItem[] = [
+      focus,
+      { kind: "transfer", to: "codex" },
+      { kind: "switch", to: "antigravity" },
+      launch,
+      launchFresh,
+    ];
+    for (const item of others) {
       expect(sessionItemDisabledReason(item, true)).toBeNull();
     }
   });

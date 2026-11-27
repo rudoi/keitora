@@ -411,9 +411,26 @@ describe("settingsModel", () => {
       floor: "0.9.5",
       status: "too_old",
       action: "upgrade",
+      hint: null,
     },
-    { tool: "git", path: null, version: "2.43.0", floor: null, status: "ok", action: null },
-    { tool: "claude", path: null, version: null, floor: null, status: "missing", action: null },
+    {
+      tool: "git",
+      path: null,
+      version: "2.43.0",
+      floor: null,
+      status: "ok",
+      action: null,
+      hint: null,
+    },
+    {
+      tool: "claude",
+      path: null,
+      version: null,
+      floor: null,
+      status: "missing",
+      action: null,
+      hint: null,
+    },
     {
       tool: "codex",
       path: "/Users/me/bin/codex",
@@ -421,6 +438,7 @@ describe("settingsModel", () => {
       floor: null,
       status: "unknown",
       action: null,
+      hint: null,
     },
   ];
 
@@ -439,6 +457,27 @@ describe("settingsModel", () => {
     expect(m.running).toBeNull();
     expect(m.failure).toBeNull();
     expect(m.manual).toBeNull();
+  });
+
+  it("carries the install hint on a missing antigravity row", () => {
+    const hint = "curl -fsSL https://example.com/install.sh | bash";
+    const agy: DoctorRow = {
+      tool: "antigravity",
+      path: null,
+      version: null,
+      floor: null,
+      status: "missing",
+      action: null,
+      hint,
+    };
+    const m = settingsModel(snap(), [...rows, agy]);
+    expect(m.rows[4]).toMatchObject({
+      tool: "antigravity",
+      detail: "not found",
+      tone: "muted",
+      hint,
+    });
+    expect(m.rows[2].hint).toBeNull();
   });
 
   it("shows Restart to finish and the protocol on the herdr row", () => {
@@ -508,6 +547,7 @@ describe("a herdr newer than Keitora", () => {
         floor: "0.9.5",
         status: "ok",
         action: null,
+        hint: null,
       },
     ]);
     expect(settings.rows[0]).toMatchObject({

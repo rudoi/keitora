@@ -108,8 +108,12 @@ impl fmt::Display for SessionKey {
 /// work running in the session. The app matches this string; the backend sets it.
 pub const HINT_BUSY: &str = "busy";
 
+/// [`SessionSummary::state_hint`] value meaning the agent is blocked on the user.
+pub const HINT_WAITING: &str = "waiting";
+
 /// Per-session summary returned by [`PtyBackend::list_sessions`]. Mirrors the real
-/// proto shape; `state_hint` carries [`HINT_BUSY`] for a background-running session.
+/// proto shape; `state_hint` carries [`HINT_BUSY`] for a background-running session
+/// and [`HINT_WAITING`] for an agent blocked on the user.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionSummary {
     pub key: SessionKey,
@@ -784,15 +788,20 @@ pub type SharedBackend = std::sync::Arc<dyn PtyBackend>;
 
 // ── Reconciliation (pure) ────────────────────────────────────────────────────
 
+/// The agent hint per session key: [`HINT_BUSY`] or [`HINT_WAITING`].
+pub type HintMap = HashMap<SessionKey, String>;
+
 /// Downgrade non-offline sessions absent from the live-set to `offline` (in-memory
-/// only). Then any session still `idle` whose key appears in `bg` (the backend's
-/// background-work hint set) is upgraded to `busy`. Offline wins over `bg`.
+/// only); offline wins over every hint. Then, for a live session, a
+/// [`HINT_WAITING`] hint turns `idle` or `busy` into `waiting`, and a [`HINT_BUSY`]
+/// hint upgrades `idle` to `busy`. A session already `waiting` or `offline` is
+/// never changed by a hint.
 ///
-/// Pure: `(&[WorktreeSession], &HashSet<SessionKey>, &HashSet<SessionKey>, project) -> Vec<…>`.
+/// Pure: `(&[WorktreeSession], &HashSet<SessionKey>, &HintMap, project) -> Vec<…>`.
 pub fn apply_reconcile(
     sessions: &[WorktreeSession],
     live_set: &HashSet<SessionKey>,
-    bg: &HashSet<SessionKey>,
+    hints: &HintMap,
     project: &str,
 ) -> Vec<WorktreeSession> {
     sessions
@@ -804,41 +813,51 @@ pub fn apply_reconcile(
                 worktree: s.worktree.clone(),
             };
             // Offline downgrade first — a session with no live PTY cannot have
-            // background work (offline wins over bg).
+            // background work or be blocked (offline wins over every hint).
             if s.state != "offline" && !live_set.contains(&key) {
                 s.state = "offline".to_string();
                 s.current_task_id = None;
                 s.pid = None;
             }
-            // Background-work override: upgrade hook-reported idle -> busy.
-            if s.state == "idle" && bg.contains(&key) {
-                s.state = "busy".to_string();
+            match hints.get(&key).map(String::as_str) {
+                // Blocked on the user: idle or busy -> waiting.
+                Some(HINT_WAITING) if s.state == "idle" || s.state == "busy" => {
+                    s.state = "waiting".to_string();
+                }
+                // Background work: upgrade hook-reported idle -> busy.
+                Some(HINT_BUSY) if s.state == "idle" => {
+                    s.state = "busy".to_string();
+                }
+                _ => {}
             }
             s
         })
         .collect()
 }
 
-/// Keys the backend currently reports as background-running. Degrades gracefully to
-/// an empty set on any error — never blocks the UI or dispatch on a flaky backend.
-pub fn background_set(backend: &dyn PtyBackend) -> HashSet<SessionKey> {
-    busy_keys(backend.list_sessions())
+/// The agent hint (busy or waiting) per session key the backend currently reports.
+/// Degrades gracefully to an empty map on any error — never blocks the UI or
+/// dispatch on a flaky backend.
+pub fn agent_hints(backend: &dyn PtyBackend) -> HintMap {
+    hint_map(backend.list_sessions())
 }
 
-fn busy_keys(r: Result<Vec<SessionSummary>, PtyBackendError>) -> HashSet<SessionKey> {
+fn hint_map(r: Result<Vec<SessionSummary>, PtyBackendError>) -> HintMap {
     r.map(|v| {
         v.into_iter()
-            .filter(|s| s.state_hint.as_deref() == Some(HINT_BUSY))
-            .map(|s| s.key)
+            .filter_map(|s| match s.state_hint {
+                Some(h) if h == HINT_BUSY || h == HINT_WAITING => Some((s.key, h)),
+                _ => None,
+            })
             .collect()
     })
     .unwrap_or_default()
 }
 
-/// [`background_set`] over [`PtyBackend::cached_sessions`]: the busy keys as
-/// last listed, never asking the server. Empty on any error.
-pub fn cached_background_set(backend: &dyn PtyBackend) -> HashSet<SessionKey> {
-    busy_keys(backend.cached_sessions())
+/// [`agent_hints`] over [`PtyBackend::cached_sessions`]: the hints as last
+/// listed, never asking the server. Empty on any error.
+pub fn cached_agent_hints(backend: &dyn PtyBackend) -> HintMap {
+    hint_map(backend.cached_sessions())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1140,7 +1159,7 @@ mod tests {
     fn reconciled_sessions_downgrades_non_offline_when_absent_from_live_set() {
         let live = HashSet::new();
         let sessions = vec![session("sayo", "idle")];
-        let result = apply_reconcile(&sessions, &live, &HashSet::new(), "proj");
+        let result = apply_reconcile(&sessions, &live, &HintMap::new(), "proj");
         assert_eq!(result[0].state, "offline");
         assert_eq!(result[0].current_task_id, None);
         assert_eq!(result[0].pid, None);
@@ -1151,7 +1170,7 @@ mod tests {
         let mut live = HashSet::new();
         live.insert(key("proj", "sayo"));
         let sessions = vec![session("sayo", "idle")];
-        let result = apply_reconcile(&sessions, &live, &HashSet::new(), "proj");
+        let result = apply_reconcile(&sessions, &live, &HintMap::new(), "proj");
         assert_eq!(result[0].state, "idle");
         assert_eq!(result[0].current_task_id, Some(7));
     }
@@ -1160,18 +1179,81 @@ mod tests {
     fn reconciled_sessions_leaves_already_offline_untouched() {
         let live = HashSet::new();
         let sessions = vec![session("sayo", "offline")];
-        let result = apply_reconcile(&sessions, &live, &HashSet::new(), "proj");
+        let result = apply_reconcile(&sessions, &live, &HintMap::new(), "proj");
         assert_eq!(result[0].state, "offline");
     }
 
-    // ── Background-set override ────────────────────────────────────────
+    // ── Agent-hint override ────────────────────────────────────────────
+
+    fn busy_hint(k: SessionKey) -> HintMap {
+        HintMap::from([(k, HINT_BUSY.to_string())])
+    }
+
+    #[test]
+    fn reconcile_table() {
+        let states = ["idle", "busy", "waiting", "offline"];
+        let hints = [None, Some(HINT_BUSY), Some(HINT_WAITING)];
+        for live in [false, true] {
+            for state in states {
+                for hint in hints {
+                    let k = key("proj", "sayo");
+                    let live_set: HashSet<SessionKey> = if live {
+                        HashSet::from([k.clone()])
+                    } else {
+                        HashSet::new()
+                    };
+                    let map: HintMap = hint
+                        .map(|h| HintMap::from([(k.clone(), h.to_string())]))
+                        .unwrap_or_default();
+                    let expected = match (live, state, hint) {
+                        (false, _, _) => "offline",
+                        (true, "offline", _) => "offline",
+                        (true, "waiting", _) => "waiting",
+                        (true, "idle" | "busy", Some(HINT_WAITING)) => "waiting",
+                        (true, "idle", Some(HINT_BUSY)) => "busy",
+                        (true, s, _) => s,
+                    };
+                    let out = apply_reconcile(&[session("sayo", state)], &live_set, &map, "proj");
+                    assert_eq!(
+                        out[0].state, expected,
+                        "live={live} state={state} hint={hint:?}"
+                    );
+                    if !live && state != "offline" {
+                        assert_eq!(out[0].current_task_id, None);
+                        assert_eq!(out[0].pid, None);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hint_map_keeps_busy_and_waiting_only() {
+        let summary = |w: &str, hint: Option<&str>| SessionSummary {
+            key: key("proj", w),
+            gen: 1,
+            state_hint: hint.map(str::to_string),
+        };
+        let map = hint_map(Ok(vec![
+            summary("a", Some(HINT_BUSY)),
+            summary("b", Some(HINT_WAITING)),
+            summary("c", None),
+            summary("d", Some("bogus")),
+        ]));
+        assert_eq!(
+            map,
+            HintMap::from([
+                (key("proj", "a"), HINT_BUSY.to_string()),
+                (key("proj", "b"), HINT_WAITING.to_string()),
+            ])
+        );
+    }
 
     #[test]
     fn bg_override_idle_in_bg_and_live_becomes_busy() {
         let mut live = HashSet::new();
         live.insert(key("proj", "sayo"));
-        let mut bg = HashSet::new();
-        bg.insert(key("proj", "sayo"));
+        let bg = busy_hint(key("proj", "sayo"));
         let sessions = vec![session("sayo", "idle")];
         let result = apply_reconcile(&sessions, &live, &bg, "proj");
         assert_eq!(result[0].state, "busy");
@@ -1181,7 +1263,7 @@ mod tests {
     fn bg_override_idle_not_in_bg_stays_idle() {
         let mut live = HashSet::new();
         live.insert(key("proj", "sayo"));
-        let bg = HashSet::new();
+        let bg = HintMap::new();
         let sessions = vec![session("sayo", "idle")];
         let result = apply_reconcile(&sessions, &live, &bg, "proj");
         assert_eq!(result[0].state, "idle");
@@ -1191,8 +1273,7 @@ mod tests {
     fn bg_override_already_busy_in_bg_stays_busy() {
         let mut live = HashSet::new();
         live.insert(key("proj", "sayo"));
-        let mut bg = HashSet::new();
-        bg.insert(key("proj", "sayo"));
+        let bg = busy_hint(key("proj", "sayo"));
         let sessions = vec![session("sayo", "busy")];
         let result = apply_reconcile(&sessions, &live, &bg, "proj");
         assert_eq!(result[0].state, "busy");
@@ -1202,8 +1283,7 @@ mod tests {
     fn bg_override_waiting_in_bg_stays_waiting() {
         let mut live = HashSet::new();
         live.insert(key("proj", "sayo"));
-        let mut bg = HashSet::new();
-        bg.insert(key("proj", "sayo"));
+        let bg = busy_hint(key("proj", "sayo"));
         let sessions = vec![session("sayo", "waiting")];
         let result = apply_reconcile(&sessions, &live, &bg, "proj");
         assert_eq!(result[0].state, "waiting");
@@ -1212,8 +1292,7 @@ mod tests {
     #[test]
     fn bg_override_offline_wins_over_bg() {
         let live = HashSet::new();
-        let mut bg = HashSet::new();
-        bg.insert(key("proj", "sayo"));
+        let bg = busy_hint(key("proj", "sayo"));
         let sessions = vec![session("sayo", "idle")];
         let result = apply_reconcile(&sessions, &live, &bg, "proj");
         assert_eq!(result[0].state, "offline");
@@ -1221,10 +1300,10 @@ mod tests {
         assert_eq!(result[0].pid, None);
     }
 
-    // ── background_set over a FakeBackend ──────────────────────────────────────
+    // ── agent_hints over a FakeBackend ─────────────────────────────────────────
 
     #[test]
-    fn background_set_filters_busy_and_degrades_to_empty_on_error() {
+    fn agent_hints_filters_busy_and_degrades_to_empty_on_error() {
         let busy = key("proj", "sayo");
         let idle = key("proj", "umbra");
         let fake = FakeBackend::new();
@@ -1244,18 +1323,18 @@ mod tests {
         fake.push_list_sessions(Err(PtyBackendError::NotConnected));
 
         // First call: only the busy key is reported.
-        let set = background_set(&fake);
+        let set = agent_hints(&fake);
         assert_eq!(set.len(), 1);
-        assert!(set.contains(&busy));
-        assert!(!set.contains(&idle));
+        assert!(set.contains_key(&busy));
+        assert!(!set.contains_key(&idle));
 
         // Second call errors -> degrade to an empty set (never block dispatch).
-        let set = background_set(&fake);
+        let set = agent_hints(&fake);
         assert!(set.is_empty(), "an RPC error degrades to an empty set");
     }
 
     #[test]
-    fn cached_background_set_defaults_to_the_listed_sessions() {
+    fn cached_agent_hints_defaults_to_the_listed_sessions() {
         let busy = key("proj", "sayo");
         let fake = FakeBackend::new();
         fake.push_list_sessions(Ok(vec![SessionSummary {
@@ -1265,8 +1344,8 @@ mod tests {
         }]));
         fake.push_list_sessions(Err(PtyBackendError::NotConnected));
 
-        assert_eq!(cached_background_set(&fake), HashSet::from([busy]));
-        assert!(cached_background_set(&fake).is_empty());
+        assert_eq!(cached_agent_hints(&fake), busy_hint(busy));
+        assert!(cached_agent_hints(&fake).is_empty());
     }
 
     /// A sink that only counts what it got.

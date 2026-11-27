@@ -3,8 +3,9 @@
 // first: while it shows, this renders nothing.
 
 import { Copy } from "lucide-react";
-import { bannerRows, cliTitle, runOutcomeCopy, updateDisabledReason } from "../lib/agentUpdates";
+import { bannerRows, runOutcomeCopy, updateDisabledReason } from "../lib/agentUpdates";
 import type { RecoveryInfo } from "../lib/ipc";
+import { cliTitle } from "../lib/providers";
 import { bannerOf, errorText } from "../lib/updates";
 import { useAgentUpdates } from "./AgentUpdatesProvider";
 import { useToast } from "./Toast";

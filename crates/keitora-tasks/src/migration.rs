@@ -255,6 +255,7 @@ pub fn migrate_legacy_inner(legacy_path: &Path, project_root: &Path) -> Result<O
         },
         claude: ProviderConfig::default(),
         codex: ProviderConfig::default(),
+        antigravity: ProviderConfig::default(),
         cli: CliConfig::default(),
         dispatch: DispatchConfig::default(),
     };

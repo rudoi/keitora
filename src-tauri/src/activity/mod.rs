@@ -25,7 +25,7 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::backend::herdr::keymap::normalize_either_separator;
-use crate::backend::{SharedBackend, HINT_BUSY};
+use crate::backend::{SessionSummary, SharedBackend, HINT_BUSY, HINT_WAITING};
 use progress::BuildProgress;
 use workflow::{WorkflowSlot, WorkflowState};
 
@@ -158,6 +158,21 @@ fn enumerate_worktrees() -> Vec<WtRef> {
     out
 }
 
+/// Composite keys of the sessions that light the working dot: a busy agent, or one
+/// blocked on the user (a waiting lane keeps its dot; its colour comes from the state).
+fn working_keys(sessions: Vec<SessionSummary>) -> HashSet<String> {
+    sessions
+        .into_iter()
+        .filter(|s| {
+            matches!(
+                s.state_hint.as_deref(),
+                Some(HINT_BUSY) | Some(HINT_WAITING)
+            )
+        })
+        .map(|s| composite(&s.key.project, &s.key.worktree))
+        .collect()
+}
+
 /// Composite `"project/worktree"` key — unique across projects (worktree names can collide).
 fn composite(project: &str, worktree: &str) -> String {
     format!("{project}/{worktree}")
@@ -202,13 +217,7 @@ impl ActivityState {
         let build = self.ubt.tick(&wt_paths, now_ms); // Option<(composite, BuildProgress)>
 
         // Busy worktrees from herdr (all projects, one call). Failure → nobody busy.
-        let busy: HashSet<String> = client
-            .list_sessions()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|s| s.state_hint.as_deref() == Some(HINT_BUSY))
-            .map(|s| composite(&s.key.project, &s.key.worktree))
-            .collect();
+        let busy = working_keys(client.list_sessions().unwrap_or_default());
 
         prepared
             .into_iter()
@@ -274,5 +283,26 @@ mod tests {
         // UBT-build and busy-session joins from cross-attributing between them.
         assert_eq!(composite("proj", "alpha"), "proj/alpha");
         assert_ne!(composite("proj", "alpha"), composite("keitora", "alpha"));
+    }
+
+    #[test]
+    fn activity_working_dot_counts_waiting() {
+        let summary = |w: &str, hint: Option<&str>| SessionSummary {
+            key: crate::backend::SessionKey {
+                project: "proj".into(),
+                worktree: w.into(),
+            },
+            gen: 1,
+            state_hint: hint.map(str::to_string),
+        };
+        let keys = working_keys(vec![
+            summary("alpha", Some(HINT_BUSY)),
+            summary("bravo", Some(HINT_WAITING)),
+            summary("charlie", None),
+        ]);
+        assert_eq!(
+            keys,
+            HashSet::from(["proj/alpha".to_string(), "proj/bravo".to_string()])
+        );
     }
 }

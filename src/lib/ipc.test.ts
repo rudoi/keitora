@@ -6,7 +6,9 @@ vi.mock("./transport", () => ({
 }));
 
 import {
+  type AgentUpdatesSnapshot,
   cancelTransfer,
+  cliAvailability,
   daemonStatus,
   injectHandoffSummary,
   type OutputMsg,
@@ -469,5 +471,37 @@ describe("onPtyPasteRefused", () => {
     });
     const un2 = await onPtyPasteRefused("keitora", "epsilon", () => {});
     expect(() => un2()).not.toThrow();
+  });
+});
+
+describe("AgentUpdatesSnapshot", () => {
+  it("accepts the backend's provider-keyed wire shape", () => {
+    const entry = (cli: "claude" | "codex" | "antigravity") => ({
+      cli,
+      state: { type: "unchecked" as const },
+      installed: null,
+      latest: null,
+      exe: null,
+      install_kind: null,
+      command: null,
+      guidance: null,
+    });
+    const wire = {
+      agents: { claude: entry("claude"), codex: entry("codex"), antigravity: entry("antigravity") },
+      checked_at: null,
+      stopped: [],
+      running: null,
+    } satisfies AgentUpdatesSnapshot;
+    expect(Object.keys(wire.agents)).toEqual(["claude", "codex", "antigravity"]);
+    for (const [key, value] of Object.entries(wire.agents)) expect(value.cli).toBe(key);
+  });
+});
+
+describe("cliAvailability", () => {
+  it("invokes cli_availability with no arguments and returns the record", async () => {
+    const record = { claude: true, codex: false, antigravity: true };
+    transport.invoke.mockReset().mockResolvedValue(record);
+    expect(await cliAvailability()).toEqual(record);
+    expect(transport.invoke).toHaveBeenCalledWith("cli_availability", undefined);
   });
 });

@@ -1475,7 +1475,7 @@ fn doctor_reports_each_tool() {
     r.floor.set(too_old("0.9.3"));
     let rows = r.svc.doctor();
     let tools: Vec<&str> = rows.iter().map(|r| r.tool.as_str()).collect();
-    assert_eq!(tools, ["herdr", "git", "claude", "codex"]);
+    assert_eq!(tools, ["herdr", "git", "claude", "codex", "antigravity"]);
     assert_eq!(rows[0].status, DoctorStatus::TooOld);
     assert_eq!(rows[0].action, Some(DoctorAction::Upgrade));
     assert_eq!(rows[0].version.as_deref(), Some("0.9.3"));
@@ -1497,6 +1497,23 @@ fn doctor_reports_each_tool() {
         .cloned()
         .unwrap();
     assert_eq!(spec.args, ["--version"]);
+}
+
+#[test]
+fn doctor_antigravity_row_missing_has_a_hint() {
+    let (r, _) = Rig::new(Opts::default());
+    let rows = r.svc.doctor();
+    let agy = &rows[4];
+    assert_eq!(agy.tool, "antigravity");
+    assert_eq!(agy.status, DoctorStatus::Missing);
+    assert_eq!(agy.path, None);
+    assert_eq!(
+        agy.hint.as_deref(),
+        crate::agent_updates::model::install_hint(CliKind::Antigravity)
+    );
+    assert!(agy.hint.is_some());
+    assert_eq!(rows[2].hint, None, "claude");
+    assert_eq!(rows[3].hint, None, "codex");
 }
 
 #[test]

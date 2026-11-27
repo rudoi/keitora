@@ -118,20 +118,6 @@ pub(crate) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
           last_heartbeat  TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
-        -- The agent conversation each (project, worktree) should resume. Only the
-        -- global resume DB uses it; project DBs carry it empty.
-        CREATE TABLE IF NOT EXISTS resume_sessions (
-          project        TEXT NOT NULL,
-          worktree       TEXT NOT NULL,
-          cli            TEXT NOT NULL CHECK(cli IN ('claude','codex')),
-          session_id     TEXT,
-          source         TEXT NOT NULL DEFAULT '',
-          agent_present  INTEGER NOT NULL DEFAULT 1,
-          cleared_id     TEXT,
-          observed_at    INTEGER NOT NULL,
-          PRIMARY KEY (project, worktree)
-        );
-
         -- Whether the user terminated a (project, worktree) session. Kept apart from
         -- resume_sessions so a flag survives resume rows being rewritten. Only the
         -- global resume DB uses it; project DBs carry it empty.
@@ -166,7 +152,78 @@ pub(crate) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     // GitHub sidecar so the two schemas can never drift .
     conn.execute_batch(crate::github::sidecar::DISPATCH_LOG_DDL)?;
 
+    conn.execute_batch(&resume_sessions_ddl("resume_sessions"))?;
+    upgrade_resume_sessions_check(conn)?;
+
     Ok(())
+}
+
+/// The agent conversation each (project, worktree) should resume. Only the
+/// global resume DB uses it; project DBs carry it empty. `{name}` is the table
+/// name, so the upgrade's replacement table is built from the same text.
+const RESUME_SESSIONS_DDL: &str = "
+        CREATE TABLE IF NOT EXISTS {name} (
+          project        TEXT NOT NULL,
+          worktree       TEXT NOT NULL,
+          cli            TEXT NOT NULL CHECK(cli IN ('claude','codex','antigravity')),
+          session_id     TEXT,
+          source         TEXT NOT NULL DEFAULT '',
+          agent_present  INTEGER NOT NULL DEFAULT 1,
+          cleared_id     TEXT,
+          observed_at    INTEGER NOT NULL,
+          PRIMARY KEY (project, worktree)
+        );
+";
+
+fn resume_sessions_ddl(name: &str) -> String {
+    RESUME_SESSIONS_DDL.replace("{name}", name)
+}
+
+/// Rebuild a `resume_sessions` table created with an older CHECK constraint
+/// (which rejects `'antigravity'`), keeping every row. SQLite cannot alter a
+/// CHECK in place, so the table is copied into a replacement and renamed, all
+/// in one transaction. A table that already allows `'antigravity'` is left alone,
+/// so running this on every open is cheap and idempotent.
+fn upgrade_resume_sessions_check(conn: &Connection) -> rusqlite::Result<()> {
+    if !resume_sessions_needs_upgrade(conn)? {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> rusqlite::Result<()> {
+        // Another connection may have upgraded between the check and the lock.
+        if !resume_sessions_needs_upgrade(conn)? {
+            return Ok(());
+        }
+        conn.execute_batch("DROP TABLE IF EXISTS resume_sessions_new")?;
+        conn.execute_batch(&resume_sessions_ddl("resume_sessions_new"))?;
+        conn.execute_batch(
+            "INSERT INTO resume_sessions_new \
+               (project, worktree, cli, session_id, source, agent_present, cleared_id, observed_at) \
+             SELECT project, worktree, cli, session_id, source, agent_present, cleared_id, observed_at \
+             FROM resume_sessions; \
+             DROP TABLE resume_sessions; \
+             ALTER TABLE resume_sessions_new RENAME TO resume_sessions;",
+        )
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT"),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+/// True when `resume_sessions` exists and its CHECK does not allow `'antigravity'`.
+fn resume_sessions_needs_upgrade(conn: &Connection) -> rusqlite::Result<bool> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'resume_sessions'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(sql.is_some_and(|s| !s.contains("'antigravity'")))
 }
 
 /// Map an arbitrary `rusqlite::Error` to a `BackendError`, classifying SQLITE_BUSY /

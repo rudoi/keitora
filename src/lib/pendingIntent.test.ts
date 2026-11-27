@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   canConsume,
   intentForSwitch,
+  type PendingAction,
   type PendingIntent,
   type SettleState,
   shouldDrop,
@@ -66,6 +67,13 @@ describe("shouldDrop", () => {
 });
 
 describe("intentForSwitch", () => {
+  it("parks a switch action like any other", () => {
+    const action: PendingAction = { kind: "switch", to: "antigravity" };
+    const parked = intentForSwitch("beta", { select: "w1", action }, true);
+    expect(parked).toEqual({ project: "beta", worktree: "w1", action });
+    expect(parked !== null && canConsume(parked, settled)).toBe(true);
+  });
+
   it("parks nothing for a plain switch", () => {
     expect(intentForSwitch("beta", undefined, false)).toBeNull();
     expect(intentForSwitch("beta", { silent: true }, false)).toBeNull();

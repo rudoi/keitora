@@ -878,7 +878,7 @@ mod tests {
         // A restore left a plain shell and the session's named agent in one cwd,
         // the shell listed first; the keymap still holds a pane that is gone.
         let shell = s.fake.add_pane(cwd, None);
-        let [name, _] = crate::backend::herdr::agent::agent_names_for(&key("a"));
+        let [name, ..] = crate::backend::herdr::agent::agent_names_for(&key("a"));
         let agent = s.fake.seed_named_agent(&name, "claude", cwd);
         s.keymap.record(
             key("a"),

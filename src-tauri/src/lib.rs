@@ -5,7 +5,10 @@
 // (+ `dispatch`, `tasks`, `hooks`).
 
 mod activity;
+mod agent_switch;
 mod agent_updates;
+mod antigravity_hooks;
+mod antigravity_trust;
 mod backend;
 mod bg_notifier;
 mod cli_install;
@@ -17,6 +20,7 @@ mod db_watch;
 mod deps;
 mod diff;
 mod dispatch;
+mod global_writes;
 mod headroom;
 mod hooks;
 mod host;

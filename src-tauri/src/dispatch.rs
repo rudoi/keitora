@@ -25,7 +25,7 @@ use keitora_tasks::dispatch::{interpolate, DispatchContext};
 use keitora_tasks::{CliKind, DispatchConfig, ReserveOutcome};
 
 use crate::backend::{
-    background_set, map_write_line_result, PtyBackend, PtyBackendError, SessionKey, SharedBackend,
+    agent_hints, map_write_line_result, PtyBackend, PtyBackendError, SessionKey, SharedBackend,
     WriteLineOutcome,
 };
 use crate::transfer_registry::TransferRegistry;
@@ -231,10 +231,7 @@ fn render_steps(steps: &[String], ctx: &DispatchContext) -> Vec<String> {
 /// worktree gets `claude_steps`, a Codex worktree gets `codex_steps`. This is the
 /// ONE place the per-CLI branch lives; `render_steps` stays CLI-agnostic.
 fn select_ritual_steps(cfg: &DispatchConfig, cli: CliKind) -> &[String] {
-    match cli {
-        CliKind::Claude => &cfg.claude_steps,
-        CliKind::Codex => &cfg.codex_steps,
-    }
+    cfg.steps_for(cli)
 }
 
 /// Who is asking for a dispatch, which decides how strict the apply is.
@@ -318,8 +315,8 @@ async fn apply(
     // name and the LocalStore open inside `reconciled_sessions` (FIX 6).
     let project = config.project.name.clone();
     let live = client.live_set_snapshot();
-    let bg = background_set(client.as_ref()); // on-demand, exact; empty on RPC error
-    let sessions = crate::tasks::reconciled_sessions(&live, &bg, &project, &config)?;
+    let hints = agent_hints(client.as_ref()); // on-demand, exact; empty on RPC error
+    let sessions = crate::tasks::reconciled_sessions(&live, &hints, &project, &config)?;
     let state = sessions
         .iter()
         .find(|s| s.worktree == worktree)
@@ -383,10 +380,7 @@ async fn apply(
             // so this injection path was effectively unreachable for Codex until
             // that liveness signal landed.
             let user = keitora_tasks::UserConfig::load().unwrap_or_default();
-            let entry = config
-                .worktree_entries()
-                .into_iter()
-                .find(|e| e.name == worktree);
+            let entry = config.worktree_entry(&worktree);
             let resolved_cli = keitora_tasks::resolve_cli(entry.as_ref(), &user);
             let steps = render_steps(select_ritual_steps(&config.dispatch, resolved_cli), &ctx);
             let key = SessionKey {
@@ -626,11 +620,13 @@ pub(crate) async fn run_dispatch_requests<R: tauri::Runtime>(
     }
 }
 
-/// `Some(error)` when `worktree` of `project` is mid-transfer; dispatch must not
-/// inject into it.
+/// `Some(error)` when `worktree` of `project` is mid-transfer or mid-switch;
+/// dispatch must not inject into it.
 fn transfer_refusal(registry: &TransferRegistry, project: &str, worktree: &str) -> Option<String> {
     registry.is_transferring(project, worktree).then(|| {
-        format!("a transfer is in progress for worktree `{worktree}`; try again when it finishes")
+        format!(
+            "a transfer or switch is in progress for worktree `{worktree}`; try again when it finishes"
+        )
     })
 }
 
@@ -672,12 +668,27 @@ mod tests {
     }
 
     #[test]
+    fn switch_refuses_while_a_transfer_is_running() {
+        let r = TransferRegistry::new();
+        let _guard = r.begin("proj-a", "alpha").unwrap();
+        assert!(r.begin("proj-a", "alpha").is_err(), "a switch cannot begin");
+        assert_eq!(
+            transfer_refusal(&r, "proj-a", "alpha").as_deref(),
+            Some(
+                "a transfer or switch is in progress for worktree `alpha`; try again when it finishes"
+            )
+        );
+    }
+
+    #[test]
     fn transfer_refusal_message_is_exact() {
         let r = TransferRegistry::new();
         let _guard = r.begin("proj-a", "alpha").unwrap();
         assert_eq!(
             transfer_refusal(&r, "proj-a", "alpha").as_deref(),
-            Some("a transfer is in progress for worktree `alpha`; try again when it finishes")
+            Some(
+                "a transfer or switch is in progress for worktree `alpha`; try again when it finishes"
+            )
         );
     }
 
@@ -796,12 +807,12 @@ mod tests {
         assert_eq!(decide("offline", false), Decision::Queued);
     }
 
-    /// Gate test: a session that is `idle` per the DB but present in the background
-    /// set reconciles to `busy`, and `decide("busy", true)` returns `Queued` — so
+    /// Gate test: a session that is `idle` per the DB but carrying a busy agent
+    /// hint reconciles to `busy`, and `decide("busy", true)` returns `Queued` — so
     /// the dispatcher never injects into a session running background work.
     #[test]
     fn idle_with_background_task_gates_dispatch() {
-        use crate::backend::{apply_reconcile, SessionKey};
+        use crate::backend::{apply_reconcile, HintMap, SessionKey, HINT_BUSY};
         use keitora_tasks::WorktreeSession;
         use std::collections::HashSet;
 
@@ -825,22 +836,49 @@ mod tests {
         live.insert(key.clone());
 
         // … and the daemon reports it is running a background task.
-        let mut bg: HashSet<SessionKey> = HashSet::new();
-        bg.insert(key.clone());
+        let hints = HintMap::from([(key.clone(), HINT_BUSY.to_string())]);
 
-        // Stage-003 override: idle + bg in live-set → busy.
-        let reconciled = apply_reconcile(&[session], &live, &bg, "proj");
+        // Override: idle + busy hint in live-set → busy.
+        let reconciled = apply_reconcile(&[session], &live, &hints, "proj");
         assert_eq!(
             reconciled[0].state, "busy",
             "idle+bg session must reconcile to busy"
         );
 
-        // Stage-004 gate: busy → Queued, so the dispatcher never injects.
+        // Gate: busy → Queued, so the dispatcher never injects.
         assert_eq!(
             decide("busy", true),
             Decision::Queued,
             "decide must queue a busy session even with a live PTY"
         );
+    }
+
+    /// A session `idle` in the DB whose agent herdr reports `blocked` (a waiting
+    /// hint) reconciles to `waiting`, which `decide` treats as not idle.
+    #[test]
+    fn dispatch_refuses_a_blocked_lane() {
+        use crate::backend::{apply_reconcile, HintMap, SessionKey, HINT_WAITING};
+        use keitora_tasks::WorktreeSession;
+        use std::collections::HashSet;
+
+        let session = WorktreeSession {
+            project: String::new(),
+            worktree: "alpha".to_string(),
+            state: "idle".to_string(),
+            current_task_id: None,
+            pid: Some(9999),
+            last_heartbeat: "2026-06-22T00:00:00Z".to_string(),
+        };
+        let key = SessionKey {
+            project: "proj".to_string(),
+            worktree: "alpha".to_string(),
+        };
+        let live: HashSet<SessionKey> = HashSet::from([key.clone()]);
+        let hints = HintMap::from([(key, HINT_WAITING.to_string())]);
+
+        let reconciled = apply_reconcile(&[session], &live, &hints, "proj");
+        assert_eq!(reconciled[0].state, "waiting");
+        assert_eq!(decide(&reconciled[0].state, true), Decision::Queued);
     }
 
     fn task_fixture(id: i64, title: &str, desc: &str) -> keitora_tasks::Task {
@@ -932,6 +970,7 @@ mod tests {
                 "/workflow pick up #{task_number}: {task_title}".to_string(),
             ],
             codex_steps: vec![],
+            antigravity_steps: vec![],
         };
         let steps = render_steps(&cfg.claude_steps, &ctx);
         assert_eq!(
@@ -954,6 +993,7 @@ mod tests {
         let cfg = DispatchConfig {
             claude_steps: vec!["/clear".to_string(), "   ".to_string(), "/park".to_string()],
             codex_steps: vec![],
+            antigravity_steps: vec![],
         };
         let steps = render_steps(&cfg.claude_steps, &ctx);
         assert_eq!(steps, vec!["/clear".to_string(), "/park".to_string()]);
@@ -972,6 +1012,7 @@ mod tests {
         let cfg = DispatchConfig {
             claude_steps: vec!["   ".to_string(), "\t".to_string()],
             codex_steps: vec![],
+            antigravity_steps: vec![],
         };
         let steps = render_steps(&cfg.claude_steps, &ctx);
         assert_eq!(steps.len(), 1, "must fall back to one default line");
@@ -994,6 +1035,7 @@ mod tests {
         let cfg = DispatchConfig {
             claude_steps: vec!["go {task_title}".to_string()],
             codex_steps: vec![],
+            antigravity_steps: vec![],
         };
         let line = &render_steps(&cfg.claude_steps, &ctx)[0];
         assert!(
@@ -1012,6 +1054,7 @@ mod tests {
         let cfg = DispatchConfig {
             claude_steps: vec!["/clear".to_string(), "/park".to_string()],
             codex_steps: vec!["/codex-step".to_string()],
+            antigravity_steps: vec![],
         };
         assert_eq!(
             select_ritual_steps(&cfg, CliKind::Claude),
@@ -1024,6 +1067,7 @@ mod tests {
         let cfg = DispatchConfig {
             claude_steps: vec!["/clear".to_string()],
             codex_steps: vec!["/codex-step".to_string(), "/codex-step-2".to_string()],
+            antigravity_steps: vec![],
         };
         assert_eq!(
             select_ritual_steps(&cfg, CliKind::Codex),
@@ -1046,6 +1090,7 @@ mod tests {
         let cfg = DispatchConfig {
             claude_steps: vec!["/clear".to_string()],
             codex_steps: vec![],
+            antigravity_steps: vec![],
         };
         let steps = render_steps(select_ritual_steps(&cfg, CliKind::Codex), &ctx);
         assert_eq!(

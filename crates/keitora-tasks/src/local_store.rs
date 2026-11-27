@@ -43,22 +43,20 @@ pub struct ResumeRow {
 }
 
 fn cli_to_sql(cli: CliKind) -> &'static str {
-    match cli {
-        CliKind::Claude => "claude",
-        CliKind::Codex => "codex",
-    }
+    cli.spec().config_key
 }
 
 fn cli_from_sql(s: &str) -> rusqlite::Result<CliKind> {
-    match s {
-        "claude" => Ok(CliKind::Claude),
-        "codex" => Ok(CliKind::Codex),
-        other => Err(rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            format!("unknown cli {other:?}").into(),
-        )),
-    }
+    CliKind::ALL
+        .into_iter()
+        .find(|c| c.spec().config_key == s)
+        .ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("unknown cli {s:?}").into(),
+            )
+        })
 }
 
 impl LocalStore {
@@ -1371,5 +1369,139 @@ mod tests {
         assert!(ls.sessions_list().is_ok(), "existing data still readable");
         observe(&ls, CliKind::Claude, Some("A"), true, 1);
         assert_eq!(row(&ls).unwrap().session_id.as_deref(), Some("A"));
+    }
+
+    // ---- resume_sessions CHECK upgrade ----
+
+    /// A DB whose `resume_sessions` predates the Antigravity provider, holding one
+    /// Claude row (`p`/`a`) and one cleared Codex row (`p`/`b`).
+    fn old_resume_db(db: &TempDb) {
+        let conn = rusqlite::Connection::open(&db.path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE resume_sessions (
+               project        TEXT NOT NULL,
+               worktree       TEXT NOT NULL,
+               cli            TEXT NOT NULL CHECK(cli IN ('claude','codex')),
+               session_id     TEXT,
+               source         TEXT NOT NULL DEFAULT '',
+               agent_present  INTEGER NOT NULL DEFAULT 1,
+               cleared_id     TEXT,
+               observed_at    INTEGER NOT NULL,
+               PRIMARY KEY (project, worktree)
+             );
+             INSERT INTO resume_sessions VALUES ('p', 'a', 'claude', 'c-1', 'herdr:claude', 1, NULL, 11);
+             INSERT INTO resume_sessions VALUES ('p', 'b', 'codex', NULL, 'herdr:codex', 0, 'x-0', 22);",
+        )
+        .unwrap();
+    }
+
+    fn resume_sql(ls: &LocalStore) -> String {
+        ls.conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'resume_sessions'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn table_count(ls: &LocalStore, name: &str) -> i64 {
+        ls.conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn resume_rows(ls: &LocalStore) -> i64 {
+        ls.conn
+            .query_row("SELECT COUNT(*) FROM resume_sessions", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn init_schema_upgrades_resume_check_for_antigravity() {
+        let db = TempDb::new();
+        old_resume_db(&db);
+        let ls = db.open();
+        assert!(
+            resume_sql(&ls).contains("'antigravity'"),
+            "{}",
+            resume_sql(&ls)
+        );
+    }
+
+    #[test]
+    fn resume_upgrade_preserves_rows() {
+        let db = TempDb::new();
+        old_resume_db(&db);
+        let ls = db.open();
+        assert_eq!(
+            ls.resume_get("p", "a").unwrap(),
+            Some(ResumeRow {
+                cli: CliKind::Claude,
+                session_id: Some("c-1".into()),
+                source: "herdr:claude".into(),
+                agent_present: true,
+                cleared_id: None,
+                observed_at: 11,
+            })
+        );
+        assert_eq!(
+            ls.resume_get("p", "b").unwrap(),
+            Some(ResumeRow {
+                cli: CliKind::Codex,
+                session_id: None,
+                source: "herdr:codex".into(),
+                agent_present: false,
+                cleared_id: Some("x-0".into()),
+                observed_at: 22,
+            })
+        );
+    }
+
+    #[test]
+    fn resume_accepts_antigravity_after_upgrade() {
+        let db = TempDb::new();
+        old_resume_db(&db);
+        let ls = db.open();
+        observe(&ls, CliKind::Antigravity, Some("id"), true, 5);
+        let got = row(&ls).unwrap();
+        assert_eq!(got.cli, CliKind::Antigravity);
+        assert_eq!(got.session_id.as_deref(), Some("id"));
+    }
+
+    #[test]
+    fn resume_upgrade_is_idempotent() {
+        let db = TempDb::new();
+        old_resume_db(&db);
+        let sql_after_first = {
+            let ls = db.open();
+            assert_eq!(resume_rows(&ls), 2);
+            resume_sql(&ls)
+        };
+        let ls = db.open();
+        assert_eq!(table_count(&ls, "resume_sessions"), 1);
+        assert_eq!(table_count(&ls, "resume_sessions_new"), 0);
+        assert_eq!(resume_rows(&ls), 2);
+        assert_eq!(resume_sql(&ls), sql_after_first);
+    }
+
+    #[test]
+    fn fresh_db_has_the_new_check() {
+        let db = TempDb::new();
+        let ls = db.open();
+        assert!(resume_sql(&ls).contains("'antigravity'"));
+        observe(&ls, CliKind::Antigravity, Some("id"), true, 1);
+        assert_eq!(row(&ls).unwrap().cli, CliKind::Antigravity);
+        // The CHECK still rejects unknown providers.
+        let bad = ls.conn.execute(
+            "INSERT INTO resume_sessions (project, worktree, cli, observed_at) \
+             VALUES ('p', 'z', 'gemini', 1)",
+            [],
+        );
+        assert!(bad.is_err());
     }
 }

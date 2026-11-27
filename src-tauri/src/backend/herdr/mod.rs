@@ -290,6 +290,8 @@ pub struct HerdrBackend {
     launcher: Option<LaunchResolver>,
     /// Claude's projects dir for transcript checks; `None` = the user's own.
     projects_dir: Option<PathBuf>,
+    /// Antigravity's `brain/` dir for conversation checks; `None` = the user's own.
+    antigravity_dir: Option<PathBuf>,
     /// Front end for server-death reports (shared with the supervisor).
     watchdog: Arc<Watchdog>,
     /// The death channel's receiving end, taken once by `start` for the pump.
@@ -784,6 +786,7 @@ struct Spawner {
     locks: SpawnLocks,
     launcher: Option<LaunchResolver>,
     projects_dir: Option<PathBuf>,
+    antigravity_dir: Option<PathBuf>,
     /// Whether a bridge stream that just ended is a real pane exit.
     exit_authority: ExitAuthority,
     /// Each session's last measured size (a resume takes over at it).
@@ -808,6 +811,7 @@ impl Spawner {
                 registry_id: launch.resume_target.as_deref(),
                 fresh: launch.fresh,
                 projects_dir: self.projects_dir.as_deref(),
+                antigravity_dir: self.antigravity_dir.as_deref(),
             },
         )
     }
@@ -970,11 +974,13 @@ impl Spawner {
         let name = agent::agent_name(kind, key);
         // A PATH that resolves the configured exe (on unix always built on herdr's
         // own PATH; on Windows a bare `claude`/`codex` adds none and the pane
-        // inherits herdr's), plus the user's own XDG dirs.
-        let pane_env = env::pane_env(
+        // inherits herdr's), plus the user's own XDG dirs and `KEITORA_BIN` (which
+        // the global Antigravity hooks need to act only inside Keitora panes).
+        let pane_env = env::pane_env_with(
             &launch.path,
             &self.ops.env().original_xdg,
             self.ops.env().path(),
+            &crate::hooks::keitora_bin_extra_env(Path::new(&cwd)),
         );
         // One `agent_name_taken` per launch is recovered from by closing the
         // unmapped holders in this cwd and starting over in a fresh pane.
@@ -1978,8 +1984,10 @@ impl HerdrBackend {
         store: Arc<ResumeStore>,
         launcher: Option<LaunchResolver>,
     ) -> Self {
-        // Unit tests never look at the user's real Claude transcripts.
+        // Unit tests never look at the user's real Claude transcripts or Antigravity
+        // conversations.
         let projects_dir = cfg!(test).then(|| ops.env().home.join("claude-projects"));
+        let antigravity_dir = cfg!(test).then(|| ops.env().home.join("antigravity-brain"));
         // `with_path` loads any prior mapping so panes survive an app restart.
         let keymap = Arc::new(KeyMap::with_path(ops.env().keymap_path()));
         // A session pending recovery still shows its old (restored) shell; that
@@ -2017,6 +2025,7 @@ impl HerdrBackend {
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
             launcher,
             projects_dir,
+            antigravity_dir,
             watchdog,
             death_rx: Mutex::new(Some(death_rx)),
             status_cache: Arc::default(),
@@ -2176,6 +2185,7 @@ impl HerdrBackend {
             locks: Arc::clone(&self.spawn_locks),
             launcher: self.launcher.clone(),
             projects_dir: self.projects_dir.clone(),
+            antigravity_dir: self.antigravity_dir.clone(),
             exit_authority: self.exit_authority(),
             sizes: self.sizes.clone(),
             trails: Arc::clone(&self.trails),
@@ -2458,7 +2468,7 @@ impl Drop for HerdrBackend {
 /// A pane's `state_hint` from the agent status `pane list` reports. Pure, so
 /// the `list_sessions` busy-hint mapping is unit-testable without a live herdr:
 /// a pane with no agent status (or one that is idle/done/unknown) is `None`;
-/// `working` / `blocked` are `Some(HINT_BUSY)` (see
+/// `working` is `Some(HINT_BUSY)` and `blocked` is `Some(HINT_WAITING)` (see
 /// [`agent::agent_status_to_state_hint`]).
 fn state_hint_for_pane(pane: &PaneInfo) -> Option<String> {
     pane.agent_status
@@ -3193,7 +3203,11 @@ mod tests {
             ..pane("w1:p1")
         };
         assert_eq!(state_hint_for_pane(&with(Some("working"))), busy, "working");
-        assert_eq!(state_hint_for_pane(&with(Some("blocked"))), busy, "blocked");
+        assert_eq!(
+            state_hint_for_pane(&with(Some("blocked"))),
+            Some(crate::backend::HINT_WAITING.to_string()),
+            "blocked"
+        );
         assert_eq!(state_hint_for_pane(&with(Some("idle"))), None, "idle");
         assert_eq!(state_hint_for_pane(&with(Some("done"))), None, "done");
         assert_eq!(state_hint_for_pane(&with(None)), None, "a bare shell");
@@ -3408,7 +3422,7 @@ mod tests {
 
         // Cold cache: no sessions, no herdr call.
         assert_eq!(backend.cached_sessions().unwrap(), Vec::new());
-        assert!(crate::backend::cached_background_set(&backend).is_empty());
+        assert!(crate::backend::cached_agent_hints(&backend).is_empty());
 
         // A stale list taken at an older keymap version still answers.
         let mut busy = pane("pane_busy");
@@ -3426,8 +3440,8 @@ mod tests {
             Some(crate::backend::HINT_BUSY)
         );
         assert_eq!(
-            crate::backend::cached_background_set(&backend),
-            HashSet::from([skey("wt")])
+            crate::backend::cached_agent_hints(&backend),
+            crate::backend::HintMap::from([(skey("wt"), crate::backend::HINT_BUSY.to_string())])
         );
         assert!(
             backend.live_set_snapshot().is_empty(),
@@ -3443,7 +3457,7 @@ mod tests {
             backend.cached_sessions(),
             Err(PtyBackendError::RecoveryPending)
         ));
-        assert!(crate::backend::cached_background_set(&backend).is_empty());
+        assert!(crate::backend::cached_agent_hints(&backend).is_empty());
 
         assert_eq!(count(&fake, ops::Op::PaneList), 0, "{:?}", fake.calls());
         assert!(fake.calls().is_empty(), "{:?}", fake.calls());
@@ -8108,6 +8122,72 @@ mod tests {
         }
     }
 
+    const AG_ID: &str = "0b9e6c3e-1f2a-4c5d-8e7f-a1b2c3d4e5f6";
+
+    fn antigravity_launch() -> AgentLaunch {
+        AgentLaunch {
+            cli: keitora_tasks::CliKind::Antigravity,
+            path: "agy".into(),
+            autonomy: false,
+            resume_target: Some(AG_ID.into()),
+            fresh: false,
+            policy: LaunchPolicy::Default,
+        }
+    }
+
+    #[test]
+    fn antigravity_launch_resumes_by_conversation_when_brain_dir_exists() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        std::fs::create_dir_all(fake.env().home.join("antigravity-brain").join(AG_ID)).unwrap();
+        codex_spawn(&fake, &backend, antigravity_launch()).unwrap();
+        let starts: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter(|c| c.op == ops::Op::AgentStart)
+            .map(|c| c.args)
+            .collect();
+        assert_eq!(starts.len(), 1, "{starts:?}");
+        assert_eq!(starts[0].split(' ').nth(1), Some("agy"), "{starts:?}");
+        assert_eq!(
+            raw_agent_start_args(&fake),
+            vec![format!("--conversation {AG_ID}")]
+        );
+    }
+
+    #[test]
+    fn antigravity_launch_without_brain_dir_starts_fresh() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        codex_spawn(&fake, &backend, antigravity_launch()).unwrap();
+        assert_eq!(raw_agent_start_args(&fake), vec![String::new()]);
+    }
+
+    #[test]
+    fn default_launch_env_comes_from_pane_env_with() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let cwd = worktree_dir(&fake, "wt", None);
+        backend
+            .spawn_agent(
+                skey("wt"),
+                cwd.clone(),
+                String::new(),
+                Some((80, 24)),
+                antigravity_launch(),
+            )
+            .unwrap();
+        let want = env::pane_env_with("agy", &fake.env().original_xdg, fake.env().path(), &[]);
+        let creates: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter(|c| c.op == ops::Op::WorkspaceCreate)
+            .map(|c| c.args)
+            .collect();
+        assert_eq!(creates, vec![format!("{cwd} {want:?}")]);
+        assert!(!creates[0].contains("KEITORA_BIN"));
+    }
+
     fn codex_spawn(
         fake: &Arc<fake::FakeHerdr>,
         backend: &HerdrBackend,
@@ -9272,12 +9352,15 @@ mod tests {
             streamed = output.frames().iter().any(|f| !f.is_empty());
         }
 
-        // list_sessions reflects the agent: present, with a VALID hint (busy or none).
+        // list_sessions reflects the agent: present, with a VALID hint (busy, waiting or none).
         let sessions = backend.list_sessions().unwrap_or_default();
         let summary = sessions.iter().find(|s| s.key == key).cloned();
         let present = summary.is_some();
         let hint = summary.and_then(|s| s.state_hint.clone());
-        let hint_valid = hint.is_none() || hint.as_deref() == Some(crate::backend::HINT_BUSY);
+        let hint_valid = matches!(
+            hint.as_deref(),
+            None | Some(crate::backend::HINT_BUSY) | Some(crate::backend::HINT_WAITING)
+        );
 
         // write_line, empty text → submit-only (Enter): no LLM content at all.
         let empty = backend.write_line(&key, "", 0);

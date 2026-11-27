@@ -11,10 +11,10 @@
 //! so a broken store degrades resume, never a spawn.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use keitora_tasks::{is_safe_claude_session_id, CliKind, LocalStore, ResumeRow};
+use keitora_tasks::{is_safe_session_id, CliKind, LocalStore, ResumeRow};
 
 use crate::backend::SessionKey;
 
@@ -40,12 +40,29 @@ pub struct ResolveCtx<'a> {
     pub cli: CliKind,
     /// The worktree path the agent runs in.
     pub cwd: &'a Path,
-    /// The worktree registry's stored id (`claude_session_id` / `codex_thread_id`).
+    /// The worktree registry's stored id (`claude_session_id` / `codex_thread_id` /
+    /// `antigravity_conversation_id`).
     pub registry_id: Option<&'a str>,
     /// The user asked for a fresh conversation.
     pub fresh: bool,
     /// Claude's projects dir; `None` → [`crate::transfer::claude_projects_dir`].
     pub projects_dir: Option<&'a Path>,
+    /// Antigravity's `brain/` dir; `None` → `~/.gemini/antigravity-cli/brain`.
+    pub antigravity_dir: Option<&'a Path>,
+}
+
+/// Antigravity's per-conversation `brain/` dir: `injected` if given, else
+/// `~/.gemini/antigravity-cli/brain`.
+fn antigravity_brain_dir(injected: Option<&Path>) -> Option<PathBuf> {
+    match injected {
+        Some(p) => Some(p.to_path_buf()),
+        None => Some(
+            dirs::home_dir()?
+                .join(".gemini")
+                .join("antigravity-cli")
+                .join("brain"),
+        ),
+    }
 }
 
 /// How to launch the agent.
@@ -60,11 +77,9 @@ pub enum ResumeDecision {
 }
 
 fn cli_of(agent: &str) -> Option<CliKind> {
-    match agent {
-        "claude" => Some(CliKind::Claude),
-        "codex" => Some(CliKind::Codex),
-        _ => None,
-    }
+    CliKind::ALL
+        .into_iter()
+        .find(|c| c.spec().herdr_agent_names.contains(&agent))
 }
 
 fn system_now_ms() -> i64 {
@@ -187,8 +202,8 @@ impl ResumeStore {
     /// Record what herdr reports for each `(key, pane)` (see [`observation_pairs`]).
     ///
     /// A pane with a recorded session stores its id when the session is a herdr
-    /// id for claude/codex (`source == "herdr:<agent>"`, `kind == id`, and a safe
-    /// id for claude). A pane without one only refreshes whether the agent is still
+    /// id for a known provider (`source == "herdr:<agent>"`, `kind == id`, and a
+    /// safe id). A pane without one only refreshes whether the agent is still
     /// running, on an existing record.
     pub fn observe(&self, obs: &[(SessionKey, PaneInfo)]) {
         let skip = self.skip.lock().unwrap().clone();
@@ -246,10 +261,13 @@ impl ResumeStore {
 
     /// Decide how to launch `key`'s agent. In order:
     /// 1. `fresh` → clear the record, start fresh;
-    /// 2. the stored id for the same cli, if its transcript exists (claude);
+    /// 2. the stored id for the same cli, if its transcript exists (claude) or its
+    ///    `brain/<id>/` dir exists (antigravity);
     /// 3. the registry's id, with the same checks, unless the row cleared it;
     /// 4. claude: continue when the worktree has any transcript, else fresh;
     ///    codex: continue (`resume --last` starts fresh when there is nothing);
+    ///    antigravity: fresh (`brain/` is shared by every workspace, so it cannot
+    ///    tell whether this cwd has history for `-c`);
     /// 5. fresh.
     pub fn resolve(&self, key: &SessionKey, ctx: &ResolveCtx) -> ResumeDecision {
         if ctx.fresh {
@@ -276,6 +294,10 @@ impl ResumeStore {
                 // Codex rollouts live in a date tree; a pruned thread is caught by the
                 // launch's early-exit fallback instead.
                 CliKind::Codex => true,
+                // Each conversation has a `brain/<id>/` dir.
+                CliKind::Antigravity => {
+                    antigravity_brain_dir(ctx.antigravity_dir).is_some_and(|d| d.join(id).is_dir())
+                }
             }
         };
 
@@ -312,6 +334,9 @@ impl ResumeStore {
                 }
             }
             CliKind::Codex => ResumeDecision::Continue,
+            // No stored id: start fresh rather than guess at `-c` for a directory
+            // that may have no history.
+            CliKind::Antigravity => ResumeDecision::Fresh,
         }
     }
 
@@ -339,12 +364,6 @@ impl ResumeStore {
         )
         .map_err(|e| format!("replace resume record for {key}: {e}"))
     }
-}
-
-/// Session ids are passed to the agent as bare arguments; accept only the
-/// conservative id alphabet.
-fn is_safe_session_id(id: &str) -> bool {
-    is_safe_claude_session_id(id)
 }
 
 /// Pair each keymap entry with the live pane it maps to: same `pane_id` **and**
@@ -406,9 +425,11 @@ mod tests {
     struct Fixture {
         store: ResumeStore,
         tmp: tempfile::TempDir,
-        /// A real worktree dir (the cwd) and the Claude projects dir.
+        /// A real worktree dir (the cwd), the Claude projects dir and the
+        /// Antigravity `brain/` dir.
         cwd: PathBuf,
         projects: PathBuf,
+        antigravity: PathBuf,
     }
 
     impl Fixture {
@@ -422,11 +443,13 @@ mod tests {
             let cwd = tmp.path().join("wt");
             std::fs::create_dir_all(&cwd).unwrap();
             let projects = tmp.path().join("projects");
+            let antigravity = tmp.path().join("brain");
             Fixture {
                 store,
                 tmp,
                 cwd,
                 projects,
+                antigravity,
             }
         }
 
@@ -447,7 +470,12 @@ mod tests {
                 registry_id,
                 fresh: false,
                 projects_dir: Some(&self.projects),
+                antigravity_dir: Some(&self.antigravity),
             }
+        }
+
+        fn add_brain(&self, id: &str) {
+            std::fs::create_dir_all(self.antigravity.join(id)).unwrap();
         }
 
         fn row(&self, w: &str) -> Option<ResumeRow> {
@@ -681,7 +709,119 @@ mod tests {
         );
     }
 
+    const AG_ID: &str = "0b9e6c3e-1f2a-4c5d-8e7f-a1b2c3d4e5f6";
+
+    #[test]
+    fn cli_of_accepts_the_three_antigravity_names() {
+        for name in ["antigravity_cli", "antigravity-cli", "agy"] {
+            assert_eq!(cli_of(name), Some(CliKind::Antigravity), "{name}");
+        }
+        assert_eq!(cli_of("gemini"), None);
+        assert_eq!(cli_of("claude"), Some(CliKind::Claude));
+        assert_eq!(cli_of("codex"), Some(CliKind::Codex));
+    }
+
+    #[test]
+    fn resolve_antigravity_store_id_resumes_when_brain_dir_exists() {
+        let f = Fixture::new();
+        f.observe_session("a", "antigravity_cli", AG_ID);
+        f.add_brain(AG_ID);
+        assert_eq!(
+            f.store
+                .resolve(&key("a"), &f.ctx(CliKind::Antigravity, None)),
+            ResumeDecision::Resume {
+                cli: CliKind::Antigravity,
+                id: AG_ID.into()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_antigravity_store_id_without_brain_dir_is_fresh() {
+        let f = Fixture::new();
+        f.observe_session("a", "antigravity_cli", AG_ID);
+        assert_eq!(
+            f.store
+                .resolve(&key("a"), &f.ctx(CliKind::Antigravity, None)),
+            ResumeDecision::Fresh
+        );
+    }
+
+    #[test]
+    fn resolve_antigravity_registry_id_resumes_when_usable() {
+        let f = Fixture::new();
+        assert_eq!(
+            f.store
+                .resolve(&key("a"), &f.ctx(CliKind::Antigravity, Some(AG_ID))),
+            ResumeDecision::Fresh,
+            "no brain dir yet"
+        );
+        f.add_brain(AG_ID);
+        assert_eq!(
+            f.store
+                .resolve(&key("a"), &f.ctx(CliKind::Antigravity, Some(AG_ID))),
+            ResumeDecision::Resume {
+                cli: CliKind::Antigravity,
+                id: AG_ID.into()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_antigravity_without_any_id_is_fresh() {
+        let f = Fixture::new();
+        // Even with other conversations on disk, no id never means `-c`.
+        f.add_brain(AG_ID);
+        assert_eq!(
+            f.store
+                .resolve(&key("a"), &f.ctx(CliKind::Antigravity, None)),
+            ResumeDecision::Fresh
+        );
+    }
+
+    #[test]
+    fn resolve_antigravity_fresh_flag_clears_the_record() {
+        let f = Fixture::new();
+        f.observe_session("a", "antigravity_cli", AG_ID);
+        f.add_brain(AG_ID);
+        let ctx = ResolveCtx {
+            fresh: true,
+            ..f.ctx(CliKind::Antigravity, None)
+        };
+        assert_eq!(f.store.resolve(&key("a"), &ctx), ResumeDecision::Fresh);
+        let row = f.row("a").unwrap();
+        assert_eq!(row.session_id, None);
+        assert_eq!(row.cleared_id.as_deref(), Some(AG_ID));
+        // The cleared id is not resumed from the registry either.
+        assert_eq!(
+            f.store
+                .resolve(&key("a"), &f.ctx(CliKind::Antigravity, Some(AG_ID))),
+            ResumeDecision::Fresh
+        );
+    }
+
     // ---- observe ----
+
+    #[test]
+    fn observe_records_an_antigravity_session() {
+        let f = Fixture::new();
+        f.observe_session("a", "antigravity_cli", AG_ID);
+        let a = f.row("a").unwrap();
+        assert_eq!(
+            (a.cli, a.session_id.as_deref(), a.source.as_str()),
+            (CliKind::Antigravity, Some(AG_ID), "herdr:antigravity_cli")
+        );
+    }
+
+    #[test]
+    fn observe_ignores_antigravity_with_a_foreign_source() {
+        let f = Fixture::new();
+        let mut foreign = session("antigravity_cli", AG_ID);
+        foreign.source = "herdr:other".into();
+        f.store
+            .observe(&[(key("a"), pane_with(Some("antigravity_cli"), Some(foreign)))]);
+        assert_eq!(f.row("a"), None);
+    }
 
     #[test]
     fn observe_upserts_claude_and_codex_sessions() {

@@ -33,6 +33,7 @@ import { TopBar, type View } from "./components/TopBar";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { UpdatesProvider } from "./components/UpdatesProvider";
 import { WorktreePicker } from "./components/WorktreePicker";
+import { switchConfirmCopy } from "./lib/agentSwitch";
 import { useAttention } from "./lib/attention";
 import {
   clampFontSize,
@@ -43,6 +44,7 @@ import {
 import {
   type CliKind,
   cancelTransfer,
+  cliAvailability,
   createWorktree,
   currentProject,
   injectHandoffSummary,
@@ -54,6 +56,7 @@ import {
   type ProjectSummary,
   previewClaudeTransfer,
   reorderProjects,
+  switchWorktreeCli,
   takeXdgLeakNotice,
   transferDiagnostics,
   transferSettled,
@@ -71,6 +74,7 @@ import {
   shouldDrop,
 } from "./lib/pendingIntent";
 import { useProjectsOverview } from "./lib/projectsOverview";
+import { byCli, initialAvailability, withClaudeAvailable } from "./lib/providers";
 import { activeRegistryKey, buildGroups, type GroupModel, shareGroups } from "./lib/railGroups";
 import { latestWins } from "./lib/railOrder";
 import { nextRestartSignal, type RestartSignal } from "./lib/resumeNotice";
@@ -82,7 +86,6 @@ import {
   useSessions,
   useWorktreeActivity,
 } from "./lib/sessions";
-import { getSettings } from "./lib/settings";
 import { switchProject, switchTarget } from "./lib/switchProject";
 import { useTasks } from "./lib/tasks";
 import {
@@ -96,7 +99,7 @@ import { useTheme } from "./lib/theme";
 import {
   createTransferController,
   isMidTurn,
-  MID_TURN_NOTE,
+  midTurnNote,
   shouldStartTransfer,
   type TransferController,
   type TransferEffect,
@@ -128,6 +131,13 @@ import "./themes.css";
 // Inner component so useToast() can access the ToastProvider above it.
 // Drops persist one at a time and in order, so a slow save can't land after a later one.
 const persistProjectOrder = latestWins(reorderProjects);
+
+const renderDispatchEditor = (steps: string[], onChange: (steps: string[]) => void) => (
+  <DispatchStepsEditor steps={steps} onChange={onChange} />
+);
+
+// Constant, so SettingsDrawer sees the same object on every render.
+const DISPATCH_EDITORS = byCli(() => renderDispatchEditor);
 
 function AppInner() {
   // First-run nudge to put the `keitora` CLI on PATH (so session hooks work anywhere).
@@ -184,10 +194,11 @@ function AppInner() {
   // Add-project dialog — single instance lifted here so both the rail and
   // SettingsDrawer share one mount (avoids duplicate flow state).
   const [addProjectOpen, setAddProjectOpen] = useState(false);
-  // Whether a `codex` binary was found on this machine — gates the Rail's
-  // "Transfer to Codex" menu item. Re-fetched on project switch below (once
-  // `activeProjectName` exists), matching the SettingsDrawer re-seed trigger.
-  const [codexAvailable, setCodexAvailable] = useState(false);
+  // Which providers' binaries were found (or configured) on this machine — gates
+  // the Rail's worktree-menu items. Refreshed on mount, whenever a worktree menu
+  // opens and when the Settings drawer closes, so a fresh install shows up without
+  // a restart (bounded by the backend's 30-second discovery miss cache).
+  const [available, setAvailable] = useState<Record<CliKind, boolean>>(initialAvailability);
 
   // Registry project list — the single source for both the rail's project groups
   // and the keymap's cycle order (project.prev/next), so the visible group order and
@@ -352,14 +363,22 @@ function AppInner() {
   // safety-net poll cadence (github polls far less often — its push is dead so the
   // gated poll is primary, but each probe is cheap).
   const activeBackend = typeof project === "object" && project !== null ? project.backend : null;
-  // Whether Codex is installed — gates the Rail's "Transfer to Codex" menu
-  // item. Codex availability is machine-global (PATH-based discovery), so probe once
-  // on mount; the Settings drawer re-seeds it via getSettings() whenever it opens.
-  useEffect(() => {
-    void getSettings()
-      .then((s) => setCodexAvailable(s.user.codex_available))
-      .catch(() => {}); // non-fatal — the transfer item just stays disabled
+  // Provider availability is machine-global (discovery), not per project.
+  const refreshAvailability = useCallback(() => {
+    void cliAvailability()
+      .then((a) => setAvailable(withClaudeAvailable(a)))
+      .catch(() => {}); // non-fatal — the previous availability stays
   }, []);
+  useEffect(() => {
+    refreshAvailability();
+  }, [refreshAvailability]);
+  const onSettingsOpenChange = useCallback(
+    (open: boolean) => {
+      setSettingsOpen(open);
+      if (!open) refreshAvailability();
+    },
+    [refreshAvailability],
+  );
   // Shared task data for the Board + Inspector (one list, one live subscription),
   // scoped to the active project.
   const {
@@ -670,7 +689,7 @@ function AppInner() {
                 `• ${preview.filename} (modified ${preview.mtime})\n` +
                 `“${preview.first_user_line}”\n\n` +
                 `If this isn't the session you expect, cancel and check the worktree first.` +
-                (midTurn ? `\n\n${MID_TURN_NOTE}` : ""),
+                (midTurn ? `\n\n${midTurnNote("claude")}` : ""),
               confirmLabel: "Transfer to Codex",
               danger: true,
             });
@@ -706,6 +725,58 @@ function AppInner() {
       })();
     },
     [showToast, confirmDialog, transferCtl, subscribeResume],
+  );
+
+  // Switches the worktree to another agent, starting it fresh. Shares only the focus, key
+  // and guard prelude with `onTransfer`: the user is warned that the conversation is not
+  // carried over, then the backend stops the pane and persists the new agent, and the
+  // phase controller drives the restart, toast and settle.
+  const onSwitch = useCallback(
+    (worktree: string, to: CliKind) => {
+      setSelected(worktree);
+      setView("focus");
+      const project = warmRef.current.active;
+      if (project === null) return;
+      const key = transferKey(project, worktree);
+      if (!shouldStartTransfer(transferCtl.getMap(), key)) {
+        showToast("A transfer or switch is already in progress for this worktree.");
+        return;
+      }
+      const from = activeWorktrees.find((w) => w.name === worktree)?.cli;
+      if (from === undefined) {
+        showToast(`Worktree ${worktree} not found.`);
+        return;
+      }
+      void (async () => {
+        const midTurn = isMidTurn(liveSessionsRef.current.get(worktree)?.state);
+        const copy = switchConfirmCopy(from, to, midTurn);
+        // Not `danger`: nothing is destroyed; the old conversation stays on disk.
+        const ok = await confirmDialog({
+          title: copy.title,
+          body: copy.body,
+          confirmLabel: copy.confirmLabel,
+        });
+        if (!ok) return;
+        // The confirm dialog is async: another transfer or switch may have started.
+        if (!shouldStartTransfer(transferCtl.getMap(), key)) return;
+        transferCtl.dispatch({
+          type: "begin",
+          project,
+          worktree,
+          to,
+          mode: "switch",
+          now: Date.now(),
+        });
+        subscribeResume(key, project, worktree);
+        try {
+          const outcome = await switchWorktreeCli(project, worktree, to);
+          transferCtl.dispatch({ type: "outcome", key, outcome });
+        } catch (e) {
+          transferCtl.dispatch({ type: "failed", key, error: String(e) });
+        }
+      })();
+    },
+    [showToast, confirmDialog, transferCtl, subscribeResume, activeWorktrees],
   );
 
   // Set of task ids that are currently active — used to gate the Rail chip.
@@ -783,6 +854,9 @@ function AppInner() {
         case "transfer":
           onTransfer(worktree, action.to);
           break;
+        case "switch":
+          onSwitch(worktree, action.to);
+          break;
         case "terminate":
           onTerminateSession(worktree);
           break;
@@ -792,9 +866,14 @@ function AppInner() {
         case "diff":
           setDiffTarget(worktree);
           break;
+        default: {
+          // Every pending action is handled; a new kind fails to compile here.
+          const unreachable: never = action;
+          return unreachable;
+        }
       }
     },
-    [onRestartSession, onTransfer, onTerminateSession, onLaunchSession],
+    [onRestartSession, onTransfer, onSwitch, onTerminateSession, onLaunchSession],
   );
   // Read through a ref by the rail's lane handlers, so they stay stable as the session
   // handlers change.
@@ -1255,20 +1334,16 @@ function AppInner() {
           onTogglePerf={togglePerf}
           daemonInfo={daemonInfo}
           hintVisible={hintVisible}
-          codexAvailable={codexAvailable}
+          available={available}
+          onWorktreeMenuOpen={refreshAvailability}
           transferBusyKeys={transferBusyKeys}
         />
         <SettingsDrawer
           open={settingsOpen}
-          onOpenChange={setSettingsOpen}
+          onOpenChange={onSettingsOpenChange}
           onSwitchProject={handleSwitchProject}
           onAddProject={() => setAddProjectOpen(true)}
-          dispatchEditor={(steps, onChange) => (
-            <DispatchStepsEditor steps={steps} onChange={onChange} />
-          )}
-          codexDispatchEditor={(steps, onChange) => (
-            <DispatchStepsEditor steps={steps} onChange={onChange} />
-          )}
+          dispatchEditors={DISPATCH_EDITORS}
         />
         {/* Single add-project dialog mount — shared by the rail + SettingsDrawer. */}
         <AddProjectDialog open={addProjectOpen} onOpenChange={setAddProjectOpen} />

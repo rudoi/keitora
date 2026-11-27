@@ -5,6 +5,7 @@
 import type { AttentionKind } from "./attention";
 import type { CliKind } from "./ipc";
 import type { PendingAction } from "./pendingIntent";
+import { cliTitle, switchTargets, transferTargets } from "./providers";
 import type { WorktreeSession } from "./sessions";
 
 /** Every class {@link blockStateCls} can return: a lane block's / summary dot's colour. */
@@ -44,38 +45,44 @@ export function blockAnimates(attn: AttentionKind | undefined): boolean {
   return attn === "waiting";
 }
 
-/** One entry of the worktree context menu. */
+/** One entry of the worktree context menu. Transfer and switch entries carry their target. */
 export type WorktreeMenuItem =
-  | "focus"
-  | "restart"
-  | "fresh"
-  | "transfer"
-  | "terminate"
-  | "launch"
-  | "launch-fresh";
+  | { kind: "focus" | "restart" | "fresh" | "terminate" | "launch" | "launch-fresh" }
+  | { kind: "transfer" | "switch"; to: CliKind };
+
+/** A stable React key for a menu entry: `${kind}:${to}` for transfer/switch, else `kind`. */
+export function menuItemKey(item: WorktreeMenuItem): string {
+  return "to" in item ? `${item.kind}:${item.to}` : item.kind;
+}
 
 /**
- * The context-menu entries for a worktree, in order. A terminated session can only be
- * launched (resuming its conversation, or fresh); restarting or transferring it would
- * bring it back behind the user's back. A lane of a project other than the active one
- * (`inactive`) leads with "focus", which switches to that project and selects the lane.
+ * The context-menu entries for a worktree running `cli`, in order. A terminated session can
+ * only be launched (resuming its conversation, or fresh); restarting, transferring or
+ * switching it would bring it back behind the user's back. A live session offers a transfer
+ * to each provider its conversation can be carried to, then a switch to every other
+ * provider. A lane of a project other than the active one (`inactive`) leads with "focus",
+ * which switches to that project and selects the lane.
  */
 export function worktreeMenuItems(
+  cli: CliKind,
   terminated: boolean,
   opts?: { inactive?: boolean },
 ): WorktreeMenuItem[] {
   const items: WorktreeMenuItem[] = terminated
-    ? ["launch", "launch-fresh"]
-    : ["restart", "fresh", "transfer", "terminate"];
-  return opts?.inactive ? ["focus", ...items] : items;
+    ? [{ kind: "launch" }, { kind: "launch-fresh" }]
+    : [
+        { kind: "restart" },
+        { kind: "fresh" },
+        ...transferTargets(cli).map((to): WorktreeMenuItem => ({ kind: "transfer", to })),
+        ...switchTargets(cli).map((to): WorktreeMenuItem => ({ kind: "switch", to })),
+        { kind: "terminate" },
+      ];
+  return opts?.inactive ? [{ kind: "focus" }, ...items] : items;
 }
 
-/**
- * The lane action a worktree-menu entry runs, with `transferTo` the CLI a transfer moves
- * the session to. `null` for "focus", which only selects the lane.
- */
-export function laneMenuAction(item: WorktreeMenuItem, transferTo: CliKind): PendingAction | null {
-  switch (item) {
+/** The lane action a worktree-menu entry runs. `null` for "focus", which only selects the lane. */
+export function laneMenuAction(item: WorktreeMenuItem): PendingAction | null {
+  switch (item.kind) {
     case "focus":
       return null;
     case "restart":
@@ -83,7 +90,9 @@ export function laneMenuAction(item: WorktreeMenuItem, transferTo: CliKind): Pen
     case "fresh":
       return { kind: "restart", fresh: true };
     case "transfer":
-      return { kind: "transfer", to: transferTo };
+      return { kind: "transfer", to: item.to };
+    case "switch":
+      return { kind: "switch", to: item.to };
     case "terminate":
       return { kind: "terminate" };
     case "launch":
@@ -93,24 +102,37 @@ export function laneMenuAction(item: WorktreeMenuItem, transferTo: CliKind): Pen
   }
 }
 
+/** A worktree-menu action that moves the worktree to another provider. */
+export type LaneAction = "transfer" | "switch";
+
 /**
- * Why the worktree menu's transfer entry is disabled, or `null` when it is enabled. A
- * transfer already in flight wins over a missing Codex install.
+ * Why a transfer or switch entry targeting `to` is disabled, or `null` when it is enabled. A
+ * transfer or switch already in flight wins over a missing target install.
  */
-export function transferDisabledReason(o: { codexMissing: boolean; busy: boolean }): string | null {
-  if (o.busy) return "A transfer is already in progress";
-  if (o.codexMissing) return "Codex isn't installed";
+export function actionDisabledReason(
+  action: LaneAction,
+  to: CliKind,
+  available: Record<CliKind, boolean>,
+  busy: boolean,
+): string | null {
+  if (busy) {
+    return action === "transfer"
+      ? "A transfer is already in progress"
+      : "A switch is already in progress";
+  }
+  if (!available[to]) return `${cliTitle(to)} isn't installed`;
   return null;
 }
 
 /**
  * Why a session-killing worktree-menu entry (restart, start fresh, terminate) is disabled,
- * or `null` when it is enabled: the pane ignores those signals while a transfer owns it.
+ * or `null` when it is enabled: the pane ignores those signals while a transfer or switch
+ * owns it.
  */
 export function sessionItemDisabledReason(
   item: WorktreeMenuItem,
   transferBusy: boolean,
 ): string | null {
-  const kills = item === "restart" || item === "fresh" || item === "terminate";
-  return kills && transferBusy ? "A transfer is in progress" : null;
+  const kills = item.kind === "restart" || item.kind === "fresh" || item.kind === "terminate";
+  return kills && transferBusy ? "A transfer or switch is in progress" : null;
 }

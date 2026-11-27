@@ -8,9 +8,10 @@
 //! **User setters** operate on the per-user registry (`dirs::config_dir()/keitora/keitora.toml`
 //! or `$KEITORA_CONFIG_HOME/keitora/keitora.toml`).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::{Error, Result};
+use crate::{CliKind, Error, Result};
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -121,14 +122,16 @@ fn apply_provider_path(doc: &mut toml_edit::DocumentMut, table: &str, path: Opti
     }
 }
 
-/// Set `[claude].path`, or remove it and collapse the now-empty `[claude]` table.
-fn apply_claude_path(doc: &mut toml_edit::DocumentMut, path: Option<&str>) {
-    apply_provider_path(doc, "claude", path);
+/// The TOML table that holds `cli`'s provider settings.
+fn table_of(cli: CliKind) -> &'static str {
+    cli.spec().config_key
 }
 
-/// Set `[codex].path`, or remove it and collapse the now-empty `[codex]` table.
-fn apply_codex_path(doc: &mut toml_edit::DocumentMut, path: Option<&str>) {
-    apply_provider_path(doc, "codex", path);
+/// The `[dispatch]` key that holds `cli`'s ritual steps.
+/// (`claude_steps` / `codex_steps` / `antigravity_steps`; the legacy claude
+/// `steps` alias is read-only and never written).
+fn steps_key_of(cli: CliKind) -> String {
+    format!("{}_steps", cli.spec().config_key)
 }
 
 /// The legacy committed-file key that serde still reads as an alias of this
@@ -176,16 +179,6 @@ fn apply_provider_autonomy(doc: &mut toml_edit::DocumentMut, table: &str, autono
             }
         }
     }
-}
-
-/// Set `[claude].autonomy`, or remove it and collapse the now-empty `[claude]` table.
-fn apply_claude_autonomy(doc: &mut toml_edit::DocumentMut, autonomy: Option<bool>) {
-    apply_provider_autonomy(doc, "claude", autonomy);
-}
-
-/// Set `[codex].autonomy`, or remove it and collapse the now-empty `[codex]` table.
-fn apply_codex_autonomy(doc: &mut toml_edit::DocumentMut, autonomy: Option<bool>) {
-    apply_provider_autonomy(doc, "codex", autonomy);
 }
 
 /// Set `[dispatch].<key>` (`claude_steps` / `codex_steps`) to the trimmed,
@@ -242,36 +235,32 @@ fn dispatch_steps_legacy_alias(key: &str) -> Option<&'static str> {
     }
 }
 
-/// Set `[dispatch].claude_steps` (freshly written TOML always uses this key, not
-/// the legacy `steps` alias).
-fn apply_claude_dispatch_steps(doc: &mut toml_edit::DocumentMut, steps: &[String]) {
-    apply_dispatch_steps_key(doc, "claude_steps", steps);
-}
-
-/// Set `[dispatch].codex_steps`.
-fn apply_codex_dispatch_steps(doc: &mut toml_edit::DocumentMut, steps: &[String]) {
-    apply_dispatch_steps_key(doc, "codex_steps", steps);
-}
-
 // ---------------------------------------------------------------------------
 // Project setters
 // ---------------------------------------------------------------------------
 
+/// What one provider contributes to a committed-file write.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderWrite {
+    pub path: Option<String>,
+    pub autonomy: Option<bool>,
+    pub dispatch_steps: Vec<String>,
+}
+
 /// Write every editable project field in ONE load → apply-all → save cycle, so
 /// a save is atomic (no partial-write window) and touches the file once instead
 /// of per-field. Days are validated up front, before the file is opened.
-#[allow(clippy::too_many_arguments)]
+///
+/// Every provider in [`CliKind::ALL`] is written; a provider missing from
+/// `providers` behaves as [`ProviderWrite::default`] (path and autonomy removed,
+/// steps cleared). Paths, then autonomy, then steps are applied in provider
+/// order, so newly created tables keep a stable order in the file.
 pub fn write_project_settings(
     project_root: &Path,
     archive_days: i64,
     log_retention_days: i64,
     worktrees_dir: Option<String>,
-    claude_path: Option<String>,
-    codex_path: Option<String>,
-    claude_autonomy: Option<bool>,
-    codex_autonomy: Option<bool>,
-    claude_dispatch_steps: &[String],
-    codex_dispatch_steps: &[String],
+    providers: &BTreeMap<CliKind, ProviderWrite>,
 ) -> Result<()> {
     check_days("archive_days", archive_days)?;
     check_days("log_retention_days", log_retention_days)?;
@@ -280,12 +269,17 @@ pub fn write_project_settings(
     apply_archive_days(&mut doc, archive_days);
     apply_log_retention_days(&mut doc, log_retention_days);
     apply_worktrees_dir(&mut doc, worktrees_dir.as_deref());
-    apply_claude_path(&mut doc, claude_path.as_deref());
-    apply_codex_path(&mut doc, codex_path.as_deref());
-    apply_claude_autonomy(&mut doc, claude_autonomy);
-    apply_codex_autonomy(&mut doc, codex_autonomy);
-    apply_claude_dispatch_steps(&mut doc, claude_dispatch_steps);
-    apply_codex_dispatch_steps(&mut doc, codex_dispatch_steps);
+    let empty = ProviderWrite::default();
+    let write_of = |cli: CliKind| providers.get(&cli).unwrap_or(&empty);
+    for cli in CliKind::ALL {
+        apply_provider_path(&mut doc, table_of(cli), write_of(cli).path.as_deref());
+    }
+    for cli in CliKind::ALL {
+        apply_provider_autonomy(&mut doc, table_of(cli), write_of(cli).autonomy);
+    }
+    for cli in CliKind::ALL {
+        apply_dispatch_steps_key(&mut doc, &steps_key_of(cli), &write_of(cli).dispatch_steps);
+    }
     save_doc(&file, &doc)
 }
 
@@ -319,77 +313,96 @@ pub fn set_worktrees_dir(project_root: &Path, dir: Option<String>) -> Result<()>
     save_doc(&file, &doc)
 }
 
-/// Set `[claude].path` in the project `keitora.toml`. When `path` is `None` or
-/// empty, remove the `path` key and, if the `[claude]` table is now empty,
+/// Set `[<provider>].path` in the project `keitora.toml`. When `path` is `None`
+/// or empty, remove the `path` key and, if the provider table is now empty,
 /// remove the whole table (mirrors `ProviderConfig::is_empty`).
+pub fn set_project_provider_path(
+    project_root: &Path,
+    cli: CliKind,
+    path: Option<String>,
+) -> Result<()> {
+    let file = project_root.join("keitora.toml");
+    let mut doc = load_doc(&file)?;
+    apply_provider_path(&mut doc, table_of(cli), path.as_deref());
+    save_doc(&file, &doc)
+}
+
+/// Set `[claude].path` in the project `keitora.toml`; see [`set_project_provider_path`].
 pub fn set_project_claude_path(project_root: &Path, path: Option<String>) -> Result<()> {
-    let file = project_root.join("keitora.toml");
-    let mut doc = load_doc(&file)?;
-    apply_claude_path(&mut doc, path.as_deref());
-    save_doc(&file, &doc)
+    set_project_provider_path(project_root, CliKind::Claude, path)
 }
 
-/// Set `[codex].path` in the project `keitora.toml`. Mirrors
-/// [`set_project_claude_path`]: `None`/empty removes the key and collapses the
-/// `[codex]` table when it is then empty.
+/// Set `[codex].path` in the project `keitora.toml`; see [`set_project_provider_path`].
 pub fn set_project_codex_path(project_root: &Path, path: Option<String>) -> Result<()> {
+    set_project_provider_path(project_root, CliKind::Codex, path)
+}
+
+/// Set `[dispatch].<provider>_steps` to the trimmed, non-empty elements of
+/// `steps`. When nothing remains, remove the key and collapse `[dispatch]` only
+/// when it is then empty (keeping the built-in-prompt fallback + siblings).
+pub fn set_project_dispatch_steps(
+    project_root: &Path,
+    cli: CliKind,
+    steps: &[String],
+) -> Result<()> {
     let file = project_root.join("keitora.toml");
     let mut doc = load_doc(&file)?;
-    apply_codex_path(&mut doc, path.as_deref());
+    apply_dispatch_steps_key(&mut doc, &steps_key_of(cli), steps);
     save_doc(&file, &doc)
 }
 
-/// Set `[dispatch].claude_steps` to the trimmed, non-empty elements of `steps`.
-/// When nothing remains, remove the key and collapse `[dispatch]` only when
-/// `codex_steps` is also absent (keeping the built-in-prompt fallback + siblings).
+/// Set `[dispatch].claude_steps`; see [`set_project_dispatch_steps`].
 pub fn set_dispatch_steps(project_root: &Path, steps: &[String]) -> Result<()> {
-    let file = project_root.join("keitora.toml");
-    let mut doc = load_doc(&file)?;
-    apply_claude_dispatch_steps(&mut doc, steps);
-    save_doc(&file, &doc)
+    set_project_dispatch_steps(project_root, CliKind::Claude, steps)
 }
 
-/// Set `[dispatch].codex_steps`. The Codex sibling of [`set_dispatch_steps`].
+/// Set `[dispatch].codex_steps`; see [`set_project_dispatch_steps`].
 pub fn set_dispatch_steps_codex(project_root: &Path, steps: &[String]) -> Result<()> {
-    let file = project_root.join("keitora.toml");
-    let mut doc = load_doc(&file)?;
-    apply_codex_dispatch_steps(&mut doc, steps);
-    save_doc(&file, &doc)
+    set_project_dispatch_steps(project_root, CliKind::Codex, steps)
 }
 
 // ---------------------------------------------------------------------------
 // User setters
 // ---------------------------------------------------------------------------
 
-/// Set `[claude].path` in the user `keitora.toml`. When `path` is `None` or
-/// empty, remove the `path` key and, if the `[claude]` table is now empty,
+/// Set `[<provider>].path` in the user `keitora.toml`. When `path` is `None` or
+/// empty, remove the `path` key and, if the provider table is now empty,
 /// remove the whole table.
 ///
 /// Creates the user-config file (and its parent directory) when it does not
 /// yet exist.
-pub fn set_user_claude_path(path: Option<String>) -> Result<()> {
+pub fn set_user_provider_path(cli: CliKind, path: Option<String>) -> Result<()> {
     let file = user_config_file()?;
     let _registry = crate::UserConfig::write_lock();
-    set_user_claude_path_at(&file, path)
+    set_user_provider_path_at(&file, cli, path)
 }
 
-/// Same as [`set_user_claude_path`] but operates on an explicit path
+/// Same as [`set_user_provider_path`] but operates on an explicit path
 /// (used by tests for hermeticity).
-pub fn set_user_claude_path_at(file: &Path, path: Option<String>) -> Result<()> {
-    edit_user_doc(file, |doc| apply_claude_path(doc, path.as_deref()))
+pub fn set_user_provider_path_at(file: &Path, cli: CliKind, path: Option<String>) -> Result<()> {
+    edit_user_doc(file, |doc| {
+        apply_provider_path(doc, table_of(cli), path.as_deref())
+    })
 }
 
-/// Set `[codex].path` in the user `keitora.toml`. The Codex sibling of
-/// [`set_user_claude_path`]; creates the file/parent dir when absent.
+/// Set `[claude].path` in the user `keitora.toml`; see [`set_user_provider_path`].
+pub fn set_user_claude_path(path: Option<String>) -> Result<()> {
+    set_user_provider_path(CliKind::Claude, path)
+}
+
+/// Same as [`set_user_claude_path`] but operates on an explicit path (tests).
+pub fn set_user_claude_path_at(file: &Path, path: Option<String>) -> Result<()> {
+    set_user_provider_path_at(file, CliKind::Claude, path)
+}
+
+/// Set `[codex].path` in the user `keitora.toml`; see [`set_user_provider_path`].
 pub fn set_user_codex_path(path: Option<String>) -> Result<()> {
-    let file = user_config_file()?;
-    let _registry = crate::UserConfig::write_lock();
-    set_user_codex_path_at(&file, path)
+    set_user_provider_path(CliKind::Codex, path)
 }
 
 /// Same as [`set_user_codex_path`] but operates on an explicit path (tests).
 pub fn set_user_codex_path_at(file: &Path, path: Option<String>) -> Result<()> {
-    edit_user_doc(file, |doc| apply_codex_path(doc, path.as_deref()))
+    set_user_provider_path_at(file, CliKind::Codex, path)
 }
 
 /// Load the user registry doc (empty when absent), apply `edit`, and save it,
@@ -460,6 +473,11 @@ mod tests {
     use tempfile::TempDir;
 
     // ---- helpers -----------------------------------------------------------
+
+    /// Build the per-provider map `write_project_settings` takes.
+    fn writes(entries: &[(CliKind, ProviderWrite)]) -> BTreeMap<CliKind, ProviderWrite> {
+        entries.iter().cloned().collect()
+    }
 
     /// Write a `keitora.toml` with a comment, worktrees, and both retention fields,
     /// returning the root dir (kept alive by caller).
@@ -996,12 +1014,24 @@ mod tests {
             14,
             45,
             Some("~/wt".to_string()),
-            Some("/usr/bin/claude".to_string()),
-            Some("/usr/bin/codex".to_string()),
-            Some(true),
-            Some(false),
-            &["/clear".to_string(), "/park".to_string()],
-            &["/codex-clear".to_string()],
+            &writes(&[
+                (
+                    CliKind::Claude,
+                    ProviderWrite {
+                        path: Some("/usr/bin/claude".to_string()),
+                        autonomy: Some(true),
+                        dispatch_steps: vec!["/clear".to_string(), "/park".to_string()],
+                    },
+                ),
+                (
+                    CliKind::Codex,
+                    ProviderWrite {
+                        path: Some("/usr/bin/codex".to_string()),
+                        autonomy: Some(false),
+                        dispatch_steps: vec!["/codex-clear".to_string()],
+                    },
+                ),
+            ]),
         )
         .unwrap();
 
@@ -1041,15 +1071,9 @@ mod tests {
         let before = std::fs::read_to_string(tmp.path().join("keitora.toml")).unwrap();
 
         // archive_days < 1 → Err, validated before the file is opened.
-        assert!(
-            write_project_settings(tmp.path(), 0, 90, None, None, None, None, None, &[], &[])
-                .is_err()
-        );
+        assert!(write_project_settings(tmp.path(), 0, 90, None, &BTreeMap::new()).is_err());
         // log_retention_days < 1 → Err.
-        assert!(
-            write_project_settings(tmp.path(), 30, 0, None, None, None, None, None, &[], &[])
-                .is_err()
-        );
+        assert!(write_project_settings(tmp.path(), 30, 0, None, &BTreeMap::new()).is_err());
 
         let after = std::fs::read_to_string(tmp.path().join("keitora.toml")).unwrap();
         assert_eq!(
@@ -1137,12 +1161,13 @@ mod tests {
             30,
             90,
             None,
-            None,
-            None,
-            Some(true),
-            None,
-            &[],
-            &[],
+            &writes(&[(
+                CliKind::Claude,
+                ProviderWrite {
+                    autonomy: Some(true),
+                    ..ProviderWrite::default()
+                },
+            )]),
         )
         .unwrap();
 
@@ -1153,6 +1178,180 @@ mod tests {
             !raw.contains("[codex]"),
             "unconfigured [codex] omitted:\n{raw}"
         );
+    }
+
+    #[test]
+    fn write_project_settings_writes_all_three_providers_and_omits_empty() {
+        let tmp = TempDir::new().unwrap();
+        write_sample_project(tmp.path());
+
+        // Claude and Antigravity configured, Codex empty → no [codex] table.
+        write_project_settings(
+            tmp.path(),
+            30,
+            90,
+            None,
+            &writes(&[
+                (
+                    CliKind::Claude,
+                    ProviderWrite {
+                        path: Some("/usr/bin/claude".to_string()),
+                        ..ProviderWrite::default()
+                    },
+                ),
+                (CliKind::Codex, ProviderWrite::default()),
+                (
+                    CliKind::Antigravity,
+                    ProviderWrite {
+                        path: Some("/usr/bin/agy".to_string()),
+                        autonomy: Some(true),
+                        dispatch_steps: vec!["/a".to_string()],
+                    },
+                ),
+            ]),
+        )
+        .unwrap();
+
+        let raw = std::fs::read_to_string(tmp.path().join("keitora.toml")).unwrap();
+        let doc: toml_edit::DocumentMut = raw.parse().unwrap();
+        assert_eq!(doc["claude"]["path"].as_str(), Some("/usr/bin/claude"));
+        assert!(!raw.contains("[codex]"), "empty [codex] omitted:\n{raw}");
+        assert_eq!(doc["antigravity"]["path"].as_str(), Some("/usr/bin/agy"));
+        assert_eq!(doc["antigravity"]["autonomy"].as_bool(), Some(true));
+        let steps: Vec<&str> = doc["dispatch"]["antigravity_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(steps, vec!["/a"]);
+        assert!(doc["dispatch"].get("claude_steps").is_none());
+        let cfg = crate::config::ProjectConfig::load(tmp.path()).expect("must load");
+        assert_eq!(cfg.antigravity.path.as_deref(), Some("/usr/bin/agy"));
+        assert_eq!(cfg.dispatch.antigravity_steps, vec!["/a"]);
+
+        // An empty Antigravity write removes its table and steps again.
+        write_project_settings(tmp.path(), 30, 90, None, &BTreeMap::new()).unwrap();
+        let raw = std::fs::read_to_string(tmp.path().join("keitora.toml")).unwrap();
+        assert!(!raw.contains("antigravity"), "{raw}");
+        assert!(!raw.contains("[dispatch]"), "{raw}");
+    }
+
+    /// Claude/Codex output must be byte-identical to the per-key write sequence the
+    /// committed-file writer has always used (paths, then autonomy, then steps).
+    #[test]
+    fn write_project_settings_claude_codex_output_is_byte_identical() {
+        let start = format!(
+            "{MINIMAL_PROJECT}worktrees = []\n# keep me\n\n[claude]\nskip_permissions = true\n\n\
+             [dispatch]\nsteps = [\"/old\"]\ntimeout = 3\n"
+        );
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("keitora.toml"), &start).unwrap();
+        write_project_settings(
+            tmp.path(),
+            7,
+            8,
+            Some(" ~/wt ".to_string()),
+            &writes(&[
+                (
+                    CliKind::Claude,
+                    ProviderWrite {
+                        path: Some("/c".to_string()),
+                        autonomy: Some(true),
+                        dispatch_steps: vec!["/clear".to_string(), " ".to_string()],
+                    },
+                ),
+                (
+                    CliKind::Codex,
+                    ProviderWrite {
+                        path: Some("/x".to_string()),
+                        autonomy: Some(false),
+                        dispatch_steps: vec!["/codex".to_string()],
+                    },
+                ),
+            ]),
+        )
+        .unwrap();
+        let got = std::fs::read_to_string(tmp.path().join("keitora.toml")).unwrap();
+
+        let mut doc: toml_edit::DocumentMut = start.parse().unwrap();
+        apply_archive_days(&mut doc, 7);
+        apply_log_retention_days(&mut doc, 8);
+        apply_worktrees_dir(&mut doc, Some(" ~/wt "));
+        apply_provider_path(&mut doc, "claude", Some("/c"));
+        apply_provider_path(&mut doc, "codex", Some("/x"));
+        apply_provider_autonomy(&mut doc, "claude", Some(true));
+        apply_provider_autonomy(&mut doc, "codex", Some(false));
+        apply_dispatch_steps_key(&mut doc, "claude_steps", &["/clear".to_string()]);
+        apply_dispatch_steps_key(&mut doc, "codex_steps", &["/codex".to_string()]);
+        assert_eq!(got, doc.to_string());
+        assert!(!got.contains("antigravity"), "{got}");
+    }
+
+    #[test]
+    fn set_project_provider_path_antigravity_creates_and_removes_table() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("keitora.toml"), MINIMAL_PROJECT).unwrap();
+
+        set_project_provider_path(
+            tmp.path(),
+            CliKind::Antigravity,
+            Some("/usr/bin/agy".to_string()),
+        )
+        .unwrap();
+        let doc = read_doc(tmp.path());
+        assert_eq!(doc["antigravity"]["path"].as_str(), Some("/usr/bin/agy"));
+
+        set_project_provider_path(tmp.path(), CliKind::Antigravity, None).unwrap();
+        let raw = std::fs::read_to_string(tmp.path().join("keitora.toml")).unwrap();
+        assert!(
+            !raw.contains("[antigravity]"),
+            "empty [antigravity] must be removed:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn set_project_dispatch_steps_antigravity_writes_key_and_keeps_siblings() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("keitora.toml"),
+            format!("{MINIMAL_PROJECT}\n[dispatch]\nclaude_steps = [\"/c\"]\n"),
+        )
+        .unwrap();
+
+        set_project_dispatch_steps(tmp.path(), CliKind::Antigravity, &["/a".to_string()]).unwrap();
+        let doc = read_doc(tmp.path());
+        let got: Vec<&str> = doc["dispatch"]["antigravity_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(got, vec!["/a"]);
+
+        set_project_dispatch_steps(tmp.path(), CliKind::Antigravity, &[]).unwrap();
+        let doc = read_doc(tmp.path());
+        assert!(doc["dispatch"].get("antigravity_steps").is_none());
+        assert_eq!(doc["dispatch"]["claude_steps"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn set_user_provider_path_antigravity_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let file = user_file(&tmp);
+
+        set_user_provider_path_at(
+            &file,
+            CliKind::Antigravity,
+            Some("/usr/bin/agy".to_string()),
+        )
+        .unwrap();
+        let cfg = crate::UserConfig::load_from(&file).unwrap();
+        assert_eq!(cfg.antigravity.path.as_deref(), Some("/usr/bin/agy"));
+
+        set_user_provider_path_at(&file, CliKind::Antigravity, None).unwrap();
+        let raw = std::fs::read_to_string(&file).unwrap();
+        assert!(!raw.contains("antigravity"), "{raw}");
     }
 
     #[test]
@@ -1231,7 +1430,7 @@ mod tests {
         let start = format!("{MINIMAL_PROJECT}\n[claude]\nskip_permissions = true\n");
         let mut doc: toml_edit::DocumentMut = start.parse().unwrap();
 
-        apply_claude_autonomy(&mut doc, Some(true));
+        apply_provider_autonomy(&mut doc, table_of(CliKind::Claude), Some(true));
 
         let out = doc.to_string();
         // (a) only the new key remains — no legacy `skip_permissions` left.
@@ -1264,12 +1463,13 @@ mod tests {
             30,
             90,
             None,
-            None,
-            None,
-            Some(false),
-            None,
-            &[],
-            &[],
+            &writes(&[(
+                CliKind::Claude,
+                ProviderWrite {
+                    autonomy: Some(false),
+                    ..ProviderWrite::default()
+                },
+            )]),
         )
         .unwrap();
 
@@ -1288,7 +1488,11 @@ mod tests {
         let start = format!("{MINIMAL_PROJECT}\n[dispatch]\nsteps = [\"/clear\"]\n");
         let mut doc: toml_edit::DocumentMut = start.parse().unwrap();
 
-        apply_claude_dispatch_steps(&mut doc, &["/clear".to_string(), "/park".to_string()]);
+        apply_dispatch_steps_key(
+            &mut doc,
+            &steps_key_of(CliKind::Claude),
+            &["/clear".to_string(), "/park".to_string()],
+        );
 
         let out = doc.to_string();
         // (a) the legacy `steps` key is gone; only `claude_steps` remains.
@@ -1316,8 +1520,12 @@ mod tests {
         );
         let mut doc: toml_edit::DocumentMut = start.parse().unwrap();
 
-        apply_codex_autonomy(&mut doc, Some(true));
-        apply_codex_dispatch_steps(&mut doc, &["/codex".to_string()]);
+        apply_provider_autonomy(&mut doc, table_of(CliKind::Codex), Some(true));
+        apply_dispatch_steps_key(
+            &mut doc,
+            &steps_key_of(CliKind::Codex),
+            &["/codex".to_string()],
+        );
 
         let out = doc.to_string();
         assert!(

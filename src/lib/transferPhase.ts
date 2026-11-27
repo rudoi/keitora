@@ -4,9 +4,10 @@
 // effects instead of running them, and the controller owns the single backstop timer, so
 // every decision is unit-testable without React or Tauri.
 
-import { cliTitle, updatePromptCliOf } from "./agentUpdates";
+import { updatePromptCliOf } from "./agentUpdates";
 import type { CliKind, PtyResumeEvent, TransferOutcome, TransferProgress } from "./ipc";
 import type { Status } from "./paneStatus";
+import { cliBinary, cliTitle } from "./providers";
 import type { RestartSignal } from "./resumeNotice";
 import type { SessionState } from "./sessions";
 
@@ -22,12 +23,17 @@ export type TransferResult =
   /** `reasonText` null: the strict launch fell back to fresh after a good import. */
   | { kind: "fresh"; reasonText: string | null }
   /** Codex to Claude. */
-  | { kind: "done" };
+  | { kind: "done" }
+  /** A switch: the new agent starts fresh, no conversation carried over. */
+  | { kind: "switched" };
 
 export interface TransferEntry {
   project: string;
   worktree: string;
   to: CliKind;
+  /** A transfer carries the conversation over; a switch starts the new agent fresh. A switch
+   *  enters `restarting` at `begin` and awaits its outcome there while `result` is null. */
+  mode: "transfer" | "switch";
   phase: "importing" | "restarting";
   /** Epoch ms at `begin`; the overlay's elapsed clock. */
   startedAt: number;
@@ -35,7 +41,7 @@ export interface TransferEntry {
   progress: TransferProgress | null;
   /** The user clicked Cancel (or the backend reported it is cancelling). */
   cancelling: boolean;
-  /** Null while importing. */
+  /** Null while importing (or, for a switch, until its outcome arrives). */
   result: TransferResult | null;
 }
 
@@ -45,7 +51,15 @@ export type TransferMap = ReadonlyMap<string, TransferEntry>;
 export type SpawnResult = { ok: true } | { ok: false; error: string };
 
 export type TransferEvent =
-  | { type: "begin"; project: string; worktree: string; to: CliKind; now: number }
+  | {
+      type: "begin";
+      project: string;
+      worktree: string;
+      to: CliKind;
+      now: number;
+      /** Defaults to "transfer". */
+      mode?: "transfer" | "switch";
+    }
   | { type: "progress"; key: string; progress: TransferProgress }
   | { type: "cancel_requested"; key: string }
   | { type: "outcome"; key: string; outcome: TransferOutcome }
@@ -84,9 +98,21 @@ function without(map: TransferMap, key: string): TransferMap {
   return next;
 }
 
-/** Diagnostics are offered only for Codex-bound transfers (the import is what leaves a trail). */
+/** Diagnostics are offered only for Codex-bound transfers (the import is what leaves a trail);
+ *  never for a switch. */
 function codexDiagnostics(e: TransferEntry): Diagnostics | null {
-  return e.to === "codex" ? { project: e.project, worktree: e.worktree } : null;
+  return e.mode === "transfer" && e.to === "codex"
+    ? { project: e.project, worktree: e.worktree }
+    : null;
+}
+
+/** Whether the entry still waits for the backend's outcome: a transfer while importing, a
+ *  switch while restarting with no result yet. */
+function awaitingOutcome(e: TransferEntry): boolean {
+  return (
+    e.phase === "importing" ||
+    (e.mode === "switch" && e.phase === "restarting" && e.result === null)
+  );
 }
 
 /** Remove the entry, toast `message`, and settle the transfer. */
@@ -114,12 +140,16 @@ export function transferReducer(map: TransferMap, event: TransferEvent): Transfe
   if (event.type === "begin") {
     const key = transferKey(event.project, event.worktree);
     if (map.has(key)) return noop(map);
+    const mode = event.mode ?? "transfer";
     return {
       map: withEntry(map, key, {
         project: event.project,
         worktree: event.worktree,
         to: event.to,
-        phase: "importing",
+        mode,
+        // A switch has no import: it restarts as soon as the backend reports the outcome,
+        // and the restarting backstop covers the backend call too.
+        phase: mode === "switch" ? "restarting" : "importing",
         startedAt: event.now,
         progress: null,
         cancelling: false,
@@ -151,7 +181,7 @@ export function transferReducer(map: TransferMap, event: TransferEvent): Transfe
       return { map: withEntry(map, key, { ...e, cancelling: true }), effects: [] };
 
     case "outcome": {
-      if (e.phase !== "importing") return noop(map);
+      if (!awaitingOutcome(e)) return noop(map);
       const o = event.outcome;
       switch (o.kind) {
         case "imported":
@@ -177,16 +207,24 @@ export function transferReducer(map: TransferMap, event: TransferEvent): Transfe
           };
         case "cancelled":
           return finish(map, key, e, "Transfer cancelled.", null);
+        case "switched":
+          if (e.mode !== "switch") return noop(map);
+          return {
+            map: withEntry(map, key, { ...e, result: { kind: "switched" } }),
+            effects: [{ kind: "restart", ...target, fresh: true }],
+          };
       }
       return noop(map);
     }
 
     case "failed":
-      if (e.phase !== "importing") return noop(map);
+      if (!awaitingOutcome(e)) return noop(map);
       return finish(map, key, e, event.error, codexDiagnostics(e));
 
     case "spawn_settled":
       if (e.phase !== "restarting") return noop(map);
+      // A switch's restart has not been requested before its outcome arrived.
+      if (e.result === null) return noop(map);
       if (event.result.ok) {
         const diagnostics =
           e.result?.kind === "fresh" || e.result?.kind === "imported" ? target : null;
@@ -217,15 +255,13 @@ export function transferReducer(map: TransferMap, event: TransferEvent): Transfe
   return noop(map);
 }
 
-/** The CLI's display name. */
-export function cliLabel(cli: CliKind): "Codex" | "Claude" {
-  return cli === "codex" ? "Codex" : "Claude";
-}
-
 /** The toast for a transfer whose restart spawned successfully. */
 export function resultToast(entry: TransferEntry): string {
   if (entry.result?.kind === "fresh") return freshToastMessage(entry.result.reasonText);
-  return `Transferred ${entry.worktree} to ${cliLabel(entry.to)}.`;
+  if (entry.result?.kind === "switched") {
+    return `Switched ${entry.worktree} to ${cliTitle(entry.to)}.`;
+  }
+  return `Transferred ${entry.worktree} to ${cliTitle(entry.to)}.`;
 }
 
 /** The toast for a transfer that ended on a fresh Codex session. */
@@ -239,7 +275,7 @@ export function freshToastMessage(reasonText: string | null): string {
 /** The toast for a transfer restart that never reported its spawn. */
 export function backstopMessage(entry: TransferEntry): string {
   const secs = Math.round(RESTARTING_BACKSTOP_MS / 1000);
-  return `${cliLabel(entry.to)} did not report that it started within ${secs} seconds. Check the ${entry.worktree} pane.`;
+  return `${cliTitle(entry.to)} did not report that it started within ${secs} seconds. Check the ${entry.worktree} pane.`;
 }
 
 /** The overlay's line for the latest progress event (`null`: nothing reported yet). */
@@ -286,9 +322,10 @@ export function canCancel(e: TransferEntry): boolean {
   );
 }
 
-/** Whether terminal input is blocked: only while importing (typing would race the import). */
+/** Whether terminal input is blocked: while importing (typing would race the import), or
+ *  while a switch awaits its outcome (the pane is about to be stopped). */
 export function blocksInput(e: TransferEntry | null | undefined): boolean {
-  return e?.phase === "importing";
+  return e?.phase === "importing" || (e?.mode === "switch" && e.result === null);
 }
 
 /** Whether the agent is mid-turn (working, or blocked on a permission prompt). */
@@ -296,9 +333,10 @@ export function isMidTurn(state: SessionState | undefined): boolean {
   return state === "busy" || state === "waiting";
 }
 
-/** Appended to the Claude to Codex confirm body when Claude is mid-turn. */
-export const MID_TURN_NOTE =
-  "Claude is in the middle of a turn. That in-flight turn will not be carried over.";
+/** Appended to a transfer's confirm body when the `from` agent is mid-turn. */
+export function midTurnNote(from: CliKind): string {
+  return `${cliTitle(from)} is in the middle of a turn. That in-flight turn will not be carried over.`;
+}
 
 /**
  * The spawn-failed screen's copy. The strict launch's own failure string already names
@@ -309,14 +347,14 @@ export function spawnFailedCopy(
   cli: CliKind,
   error: string | null,
 ): { message: string; detail: string | null } {
-  const generic = `Failed to launch ${cli} — is it on PATH?`;
+  const generic = `Failed to launch ${cliBinary(cli)} — is it on PATH?`;
   if (error === null || error === "") return { message: generic, detail: null };
   // The launch found the CLI on its own update screen (`AgentUpdatePrompt: <cli>`).
   const prompted = updatePromptCliOf(error);
   if (prompted !== null) {
     return { message: `${cliTitle(prompted)} wants to update before it starts`, detail: null };
   }
-  if (error.startsWith(`${cli} did not start`)) return { message: error, detail: null };
+  if (error.startsWith(`${cliBinary(cli)} did not start`)) return { message: error, detail: null };
   return { message: generic, detail: error };
 }
 

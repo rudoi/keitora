@@ -6,6 +6,24 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { CliKind, DiffBase } from "./ipc";
 
+/** One provider's project-level settings. */
+export interface SettingsProjectProvider {
+  /** Project-level `[<provider>].path` override; null → user default. */
+  path: string | null;
+  /** Project-level `[<provider>].autonomy`; true → forces the flag on. */
+  autonomy: boolean;
+  /** Project-level dispatch ritual; [] → built-in prompt. */
+  dispatch_steps: string[];
+}
+
+/** One provider's user-level settings. */
+export interface SettingsUserProvider {
+  /** User-level `[<provider>].path` default. */
+  path: string | null;
+  /** User-level `[<provider>].autonomy` default. */
+  autonomy: boolean;
+}
+
 /** Editable + display fields of the active project's keitora.toml. */
 export interface SettingsProject {
   name: string; // read-only (registry key)
@@ -14,16 +32,8 @@ export interface SettingsProject {
   worktrees_dir: string | null; // editable; null → ~/.keitora/<name> default
   archive_days: number; // editable (>= 1)
   log_retention_days: number; // editable (>= 1)
-  claude_path: string | null; // editable project override; null → user default
-  /** Project-level `[claude] skip_permissions`; true → forces the flag on. */
-  skip_permissions: boolean;
-  dispatch_steps: string[]; // editable ordered ritual; [] → built-in prompt
-  /** Project-level `[codex].path` override. Mirrors `claude_path`. */
-  codex_path: string | null;
-  /** Project-level `[codex].autonomy`. Mirrors `skip_permissions`. */
-  codex_autonomy: boolean;
-  /** Project-level `[dispatch].codex_steps` override. Mirrors `dispatch_steps`. */
-  codex_dispatch_steps: string[];
+  /** Project-level settings for every provider. */
+  providers: Record<CliKind, SettingsProjectProvider>;
   /** Project default diff-view base (`[project].diff_base`); null → Auto. Per-worktree
    *  overrides (set from the diff header) win over this. */
   diff_base: DiffBase | null;
@@ -42,23 +52,15 @@ export interface SettingsUserProject {
 
 /** Editable fields of the user keitora.toml plus the project registry. */
 export interface SettingsUser {
-  claude_path: string | null; // editable user-level default
   active: string | null; // active project name
   projects: SettingsUserProject[];
-  /**
-   * Whether interactive Claude sessions launch with
-   * `--dangerously-skip-permissions` (persisted in `[claude] skip_permissions`).
-   */
-  skip_permissions: boolean;
-  /** User-level `[codex].path` default. Mirrors `claude_path`. */
-  codex_path: string | null;
-  /** User-level `[codex].autonomy` default. Mirrors `skip_permissions`. */
-  codex_autonomy: boolean;
+  /** User-level settings for every provider. */
+  providers: Record<CliKind, SettingsUserProvider>;
   /** User-level default CLI, falling back to `"claude"` when unset. */
   default_cli: CliKind;
-  /** Whether a `codex` binary was found on this machine. Gates the
-   *  Codex group's enabled state in the drawer. */
-  codex_available: boolean;
+  /** Per provider: a configured path resolves, or its executable was found on this
+   *  machine. Gates each provider group's autonomy and dispatch controls. */
+  available: Record<CliKind, boolean>;
   /** Whether the app checks for updates by itself (`[updates] auto_check`). */
   auto_check_updates: boolean;
   /** Hours between agent CLI update checks (`[updates] agent_check_hours`); 0 = app start only. */
@@ -78,18 +80,15 @@ export function getSettings(): Promise<SettingsSnapshot> {
 
 /**
  * Write the editable project fields to the active project's keitora.toml.
- * Pass the full current form state — null worktrees_dir/claudePath/codexPath
- * clears that key; an empty dispatchSteps/codexDispatchSteps removes the
- * corresponding [dispatch] key. Emits `project://changed`.
+ * Pass the full current form state, every provider included — a null
+ * worktreesDir or provider path clears that key; an empty provider
+ * dispatchSteps clears that provider's dispatch ritual. Emits `project://changed`.
  */
 export function saveProjectSettings(input: {
   archiveDays: number;
   logRetentionDays: number;
   worktreesDir: string | null;
-  claudePath: string | null;
-  codexPath: string | null;
-  dispatchSteps: string[];
-  codexDispatchSteps: string[];
+  providers: Record<CliKind, { path: string | null; dispatchSteps: string[] }>;
   /** Project default diff base; null → Auto. */
   diffBase: DiffBase | null;
 }): Promise<void> {
@@ -97,12 +96,11 @@ export function saveProjectSettings(input: {
 }
 
 /**
- * Write the user-level claude/codex paths and default CLI. Null/empty
- * paths clear that CLI's override. Emits `project://changed`.
+ * Write every provider's user-level path and the default CLI. Null/empty
+ * paths clear that provider's override. Emits `project://changed`.
  */
 export function saveUserSettings(input: {
-  claudePath: string | null;
-  codexPath: string | null;
+  providers: Record<CliKind, string | null>;
   defaultCli: CliKind;
 }): Promise<void> {
   return invoke("save_user_settings", input);
@@ -114,8 +112,7 @@ export function removeProject(name: string): Promise<void> {
 }
 
 /**
- * Persist the user-level `[claude] autonomy` / `[codex] autonomy` flag for the
- * given CLI. Persist-only (no `project://changed` emit): the value is
+ * Persist the user-level `[<provider>] autonomy` flag for the given CLI. Persist-only (no `project://changed` emit): the value is
  * read when the next session is spawned, so the drawer prompts the user to
  * restart the daemon for running sessions to pick it up.
  */

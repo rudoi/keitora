@@ -18,9 +18,12 @@ function listen<T>(channel: string, cb: (payload: T) => void): Promise<UnlistenF
 
 export type WorktreeStatus = "available" | "missing" | "not_dir" | "not_git";
 
+/** Every provider, in display order. `providers.ts` re-exports it. */
+export const CLI_KINDS = ["claude", "codex", "antigravity"] as const;
+
 /** Which coding CLI drives a worktree's session. The single place this
  *  union is declared in TS — other modules import it from here. */
-export type CliKind = "claude" | "codex";
+export type CliKind = (typeof CLI_KINDS)[number];
 
 // ── Daemon status types ────────────────────────────────────────────────────────
 
@@ -1121,13 +1124,15 @@ export type TransferFailure =
  * What a transfer produced. `imported`: resume the imported Codex thread. `fresh`: the
  * import failed but the worktree is now Codex; start fresh (`reasonText` is the
  * plain-language reason, never ending with a period). `done`: the Codex to Claude
- * handoff completed. `cancelled`: nothing changed.
+ * handoff completed. `cancelled`: nothing changed. `switched`: a switch (not a transfer)
+ * persisted the worktree as `to`; it starts fresh, the `from` conversation is not carried.
  */
 export type TransferOutcome =
   | { kind: "imported"; threadId: string }
   | { kind: "fresh"; reason: TransferFailure; reasonText: string }
   | { kind: "done" }
-  | { kind: "cancelled" };
+  | { kind: "cancelled" }
+  | { kind: "switched"; from: CliKind; to: CliKind };
 
 /** Payload of the advisory `transfer://progress` event. */
 export interface TransferProgress {
@@ -1167,6 +1172,20 @@ export function transferWorktree(
     targetCli,
     ...(jsonl === undefined ? {} : { jsonl }),
   });
+}
+
+/**
+ * Switch the worktree's agent to `targetCli` without carrying the conversation over: the
+ * backend stops the live pane and persists the new provider. Resolves with a `switched`
+ * outcome; rejects when nothing changed (already running it, a transfer pair, not
+ * installed, terminated, or a transfer or switch already in flight).
+ */
+export function switchWorktreeCli(
+  project: string,
+  worktree: string,
+  targetCli: CliKind,
+): Promise<TransferOutcome> {
+  return invoke<TransferOutcome>("switch_worktree_cli", { project, worktree, targetCli });
 }
 
 /**
@@ -1389,13 +1408,16 @@ export type DoctorAction = "install" | "upgrade" | "browse";
 
 /** One row of `deps_doctor`. */
 export interface DoctorRow {
-  tool: "herdr" | "git" | "claude" | "codex";
+  tool: "herdr" | "git" | CliKind;
   path: string | null;
   version: string | null;
   /** Minimum version (herdr only). */
   floor: string | null;
   status: DoctorStatus;
   action: DoctorAction | null;
+  /** Install command shown for a missing agent CLI Keitora does not install itself
+   *  (Antigravity only). */
+  hint: string | null;
 }
 
 export function depsStatus(): Promise<DepsSnapshot> {
@@ -1488,8 +1510,8 @@ export interface StoppedSession extends UpdateSession {
 
 /** `agent_updates_status` reply and the `agent-updates://status` payload. */
 export interface AgentUpdatesSnapshot {
-  codex: AgentUpdateEntry;
-  claude: AgentUpdateEntry;
+  /** One entry per provider. */
+  agents: Record<CliKind, AgentUpdateEntry>;
   /** RFC 3339 time of the last completed check. */
   checked_at: string | null;
   stopped: StoppedSession[];
@@ -1540,7 +1562,7 @@ export function agentUpdatesStatus(): Promise<AgentUpdatesSnapshot> {
   return invoke("agent_updates_status");
 }
 
-/** Check both CLIs. Unless `force`, a check right after another answers with its result.
+/** Check every provider's CLI. Unless `force`, a check right after another answers with its result.
  *  A probing check's result also arrives as an `agent-updates://status` event. */
 export function agentUpdatesCheck(force: boolean): Promise<AgentUpdatesSnapshot> {
   return invoke("agent_updates_check", { force });
@@ -1597,4 +1619,10 @@ export function onAgentUpdateRestart(cb: (e: AgentSessionsEvent) => void): Promi
 
 export function onAgentUpdatePrompt(cb: (e: AgentPromptEvent) => void): Promise<UnlistenFn> {
   return listen<AgentPromptEvent>("agent-updates://prompt", cb);
+}
+
+/** Which providers' executables are configured or discoverable on this machine;
+ *  a light alternative to the full settings snapshot. */
+export function cliAvailability(): Promise<Record<CliKind, boolean>> {
+  return invoke<Record<CliKind, boolean>>("cli_availability");
 }

@@ -10,6 +10,7 @@ import type { CliKind } from "./ipc";
 export type PendingAction =
   | { kind: "restart"; fresh: boolean }
   | { kind: "transfer"; to: CliKind }
+  | { kind: "switch"; to: CliKind }
   | { kind: "terminate" }
   | { kind: "launch"; fresh: boolean }
   | { kind: "diff" }

@@ -21,14 +21,16 @@ import {
   openWorktreeShell,
 } from "../lib/ipc";
 import {
+  actionDisabledReason,
   laneMenuAction,
+  menuItemKey,
   sessionItemDisabledReason,
-  transferDisabledReason,
   type WorktreeMenuItem,
   worktreeMenuItems,
 } from "../lib/laneState";
 import type { PendingAction } from "../lib/pendingIntent";
 import { isMac, isWindows, modKeyLabel } from "../lib/platform";
+import { cliTitle } from "../lib/providers";
 import {
   applyExpanded,
   collapseOthers,
@@ -350,8 +352,9 @@ function MenuAnchor({ x, y }: { x: number; y: number }) {
   );
 }
 
-// A live session offers "Restart session", "Start fresh conversation", "Transfer to {other
-// CLI}" and "Terminate session"; a terminated one offers only "Launch" and "Launch fresh"
+// A live session offers "Restart session", "Start fresh conversation", "Transfer to {CLI}"
+// for each transfer pair, "Switch to {CLI}" for every other provider, and "Terminate
+// session"; a terminated one offers only "Launch" and "Launch fresh"
 // (`worktreeMenuItems`). A lane of a project other than the active one leads with "Focus",
 // under a label naming the lane, and its actions switch to that project first.
 type WorktreeMenuState = {
@@ -367,7 +370,10 @@ type WorktreeMenuState = {
   terminated: boolean;
 };
 
-const WORKTREE_ITEM_LABEL: Record<Exclude<WorktreeMenuItem, "transfer">, string> = {
+const WORKTREE_ITEM_LABEL: Record<
+  Exclude<WorktreeMenuItem["kind"], "transfer" | "switch">,
+  string
+> = {
   focus: "Focus",
   restart: "Restart session",
   fresh: "Start fresh conversation",
@@ -380,43 +386,43 @@ function WorktreeMenu({
   state,
   onOpenChange,
   onPick,
-  codexAvailable,
+  available,
   transferBusy,
 }: {
   state: WorktreeMenuState | null;
   onOpenChange: (open: boolean) => void;
-  onPick: (state: WorktreeMenuState, item: WorktreeMenuItem, targetCli: CliKind) => void;
-  codexAvailable: boolean;
-  /** A transfer is already in flight for the menu's worktree. */
+  onPick: (state: WorktreeMenuState, item: WorktreeMenuItem) => void;
+  /** Which providers were found on this machine. */
+  available: Record<CliKind, boolean>;
+  /** A transfer or switch is already in flight for the menu's worktree. */
   transferBusy: boolean;
 }) {
-  const targetCli: CliKind = state?.cli === "codex" ? "claude" : "codex";
-  // Claude is never surfaced as unavailable here — it's the default agent and a
-  // hard requirement of the app today (pane launches fall back to a bare `claude`
-  // when no path is configured or discovered), so only a Codex *target* can be
-  // disabled.
-  const codexMissing = targetCli === "codex" && !codexAvailable;
-  const transferReason = transferDisabledReason({ codexMissing, busy: transferBusy });
-  const items = worktreeMenuItems(state?.terminated ?? false, { inactive: state?.inactive });
-  const item = (kind: WorktreeMenuItem) => {
+  const items = worktreeMenuItems(state?.cli ?? "claude", state?.terminated ?? false, {
+    inactive: state?.inactive,
+  });
+  const item = (entry: WorktreeMenuItem) => {
     const reason =
-      kind === "transfer" ? transferReason : sessionItemDisabledReason(kind, transferBusy);
+      entry.kind === "transfer" || entry.kind === "switch"
+        ? actionDisabledReason(entry.kind, entry.to, available, transferBusy)
+        : sessionItemDisabledReason(entry, transferBusy);
     const off = reason !== null;
     return (
-      <Fragment key={kind}>
+      <Fragment key={menuItemKey(entry)}>
         <DropdownMenu.Item
           disabled={off}
           title={reason ?? undefined}
           onSelect={() => {
-            if (state && !off) onPick(state, kind, targetCli);
+            if (state && !off) onPick(state, entry);
           }}
-          className={`${menuItemCls} ${kind === "focus" ? "font-medium text-tx-1" : "text-tx-2"}`}
+          className={`${menuItemCls} ${entry.kind === "focus" ? "font-medium text-tx-1" : "text-tx-2"}`}
         >
-          {kind === "transfer"
-            ? `Transfer to ${targetCli === "codex" ? "Codex" : "Claude"}`
-            : WORKTREE_ITEM_LABEL[kind]}
+          {entry.kind === "transfer"
+            ? `Transfer to ${cliTitle(entry.to)}`
+            : entry.kind === "switch"
+              ? `Switch to ${cliTitle(entry.to)}`
+              : WORKTREE_ITEM_LABEL[entry.kind]}
         </DropdownMenu.Item>
-        {kind === "focus" && <DropdownMenu.Separator className={menuSepCls} />}
+        {entry.kind === "focus" && <DropdownMenu.Separator className={menuSepCls} />}
       </Fragment>
     );
   };
@@ -587,7 +593,8 @@ export function Rail({
   onTogglePerf,
   daemonInfo,
   hintVisible,
-  codexAvailable,
+  available,
+  onWorktreeMenuOpen,
   transferBusyKeys,
 }: {
   groups: GroupModel[];
@@ -609,7 +616,10 @@ export function Rail({
   onTogglePerf: () => void;
   daemonInfo: DaemonInfo;
   hintVisible: boolean;
-  codexAvailable: boolean;
+  /** Which providers were found on this machine. */
+  available: Record<CliKind, boolean>;
+  /** A worktree menu is opening (the caller refreshes provider availability). */
+  onWorktreeMenuOpen: () => void;
   /** Transfer keys (`project/worktree`) with a transfer in flight. */
   transferBusyKeys: ReadonlySet<string>;
 }) {
@@ -688,15 +698,15 @@ export function Rail({
   // is now (not as it was when the menu opened), which runs it in place only once the
   // active project is ready and otherwise switches first, so a pick during a cold switch
   // can't land on the previous project's same-named worktree.
-  const pickLaneItem = (m: WorktreeMenuState, item: WorktreeMenuItem, targetCli: CliKind) => {
+  const pickLaneItem = (m: WorktreeMenuState, item: WorktreeMenuItem) => {
     setMenu(null);
     const g = groups.find((x) => x.key === m.projectKey);
     if (!g) return;
-    if (item === "focus") {
+    if (item.kind === "focus") {
       onSelectLane(g, m.name);
       return;
     }
-    const action = laneMenuAction(item, targetCli);
+    const action = laneMenuAction(item);
     if (action !== null) onLaneAction(g, m.name, action);
   };
 
@@ -750,19 +760,23 @@ export function Rail({
     (key: string) => updateExpanded((s) => toggle(s, key)),
     [updateExpanded],
   );
-  const openLaneMenu = useCallback((g: GroupModel, name: string, x: number, y: number) => {
-    const lane = g.lanes.find((l) => l.name === name);
-    if (!lane) return;
-    setMenu({
-      name,
-      projectKey: g.key,
-      inactive: !g.isActive,
-      x,
-      y,
-      cli: lane.cli,
-      terminated: lane.terminated,
-    });
-  }, []);
+  const openLaneMenu = useCallback(
+    (g: GroupModel, name: string, x: number, y: number) => {
+      const lane = g.lanes.find((l) => l.name === name);
+      if (!lane) return;
+      onWorktreeMenuOpen();
+      setMenu({
+        name,
+        projectKey: g.key,
+        inactive: !g.isActive,
+        x,
+        y,
+        cli: lane.cli,
+        terminated: lane.terminated,
+      });
+    },
+    [onWorktreeMenuOpen],
+  );
   const openProjectMenu = useCallback(
     (g: GroupModel, x: number, y: number, from: HTMLElement | null) => {
       projectMenuReturn.current = from;
@@ -836,7 +850,7 @@ export function Rail({
           if (!open) setMenu(null);
         }}
         onPick={pickLaneItem}
-        codexAvailable={codexAvailable}
+        available={available}
         transferBusy={menuBusy}
       />
       <ProjectMenu

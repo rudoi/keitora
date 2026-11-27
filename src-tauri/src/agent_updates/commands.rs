@@ -29,7 +29,7 @@ pub fn agent_updates_status(updates: State<'_, AgentUpdates>) -> AgentUpdatesSna
     updates.snapshot()
 }
 
-/// Check both CLIs. Unless `force`, a check right after another answers with its result.
+/// Check every provider's CLI. Unless `force`, a check right after another answers with its result.
 /// Also emits `agent-updates://status` when it probes.
 #[tauri::command(async)]
 pub async fn agent_updates_check(
@@ -39,7 +39,12 @@ pub async fn agent_updates_check(
     blocking(app, move |app| Ok(app.state::<AgentUpdates>().check(force))).await
 }
 
-/// Skip `version` of `cli`: persisted in `[updates] agent_skip_{codex,claude}`, then
+/// Record `version` as the skipped release of `cli` in `cfg`.
+fn set_skipped(cfg: &mut keitora_tasks::UserConfig, cli: CliKind, version: String) {
+    *cfg.updates.skipped_mut(cli) = Some(version);
+}
+
+/// Skip `version` of `cli`: persisted in `[updates] agent_skip_{codex,claude,antigravity}`, then
 /// re-assessed. A newer release shows the banner again.
 #[tauri::command(async)]
 pub async fn agent_update_skip(
@@ -48,11 +53,8 @@ pub async fn agent_update_skip(
     version: String,
 ) -> Result<AgentUpdatesSnapshot, String> {
     blocking(app, move |app| {
-        keitora_tasks::UserConfig::update(|cfg| match cli {
-            CliKind::Codex => cfg.updates.agent_skip_codex = Some(version),
-            CliKind::Claude => cfg.updates.agent_skip_claude = Some(version),
-        })
-        .map_err(|e| e.to_string())?;
+        keitora_tasks::UserConfig::update(|cfg| set_skipped(cfg, cli, version))
+            .map_err(|e| e.to_string())?;
         Ok(app.state::<AgentUpdates>().skip_changed(cli))
     })
     .await
@@ -140,4 +142,26 @@ pub async fn agent_update_restart(
         Ok(app.state::<AgentUpdates>().restart(cli, &live))
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keitora_tasks::UserConfig;
+
+    #[test]
+    fn agent_update_skip_persists_antigravity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = UserConfig::default();
+        set_skipped(&mut cfg, CliKind::Antigravity, "1.5.18".into());
+        cfg.save_to(&path).unwrap();
+        let back = UserConfig::load_from(&path).unwrap();
+        assert_eq!(
+            back.updates.agent_skip_antigravity.as_deref(),
+            Some("1.5.18")
+        );
+        assert_eq!(back.updates.agent_skip_codex, None);
+        assert_eq!(back.updates.agent_skip_claude, None);
+    }
 }

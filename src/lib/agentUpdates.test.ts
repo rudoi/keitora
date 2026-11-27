@@ -36,8 +36,17 @@ function entry(cli: CliKind, state: AgentUpdateState, over: Partial<AgentUpdateE
   } satisfies AgentUpdateEntry;
 }
 
-function snap(codex: AgentUpdateEntry, claude: AgentUpdateEntry): AgentUpdatesSnapshot {
-  return { codex, claude, checked_at: "2026-11-18T00:00:00Z", stopped: [], running: null };
+function snap(
+  codex: AgentUpdateEntry,
+  claude: AgentUpdateEntry,
+  antigravity: AgentUpdateEntry = entry("antigravity", { type: "unchecked" }),
+): AgentUpdatesSnapshot {
+  return {
+    agents: { claude, codex, antigravity },
+    checked_at: "2026-11-18T00:00:00Z",
+    stopped: [],
+    running: null,
+  };
 }
 
 const codexAvail = entry("codex", {
@@ -68,10 +77,22 @@ describe("bannerRows", () => {
     expect(bannerRows(snap(entry("codex", state), entry("claude", state)), {})).toEqual([]);
   });
 
-  it("shows one row per available CLI, codex first", () => {
+  it("orders claude, codex, antigravity and words the antigravity row", () => {
+    const agyAvail = entry("antigravity", {
+      type: "available",
+      installed: "1.5.17",
+      latest: "1.5.18",
+      command: "agy update",
+    });
+    const rows = bannerRows(snap(codexAvail, claudeAvail, agyAvail), {});
+    expect(rows.map((r) => r.cli)).toEqual(["claude", "codex", "antigravity"]);
+    expect(rows[2].text).toBe("Antigravity 1.5.18 is available (you have 1.5.17)");
+  });
+
+  it("shows one row per available CLI, in provider order", () => {
     const rows = bannerRows(snap(codexAvail, claudeAvail), {});
-    expect(rows.map((r) => r.cli)).toEqual(["codex", "claude"]);
-    expect(rows[0]).toEqual({
+    expect(rows.map((r) => r.cli)).toEqual(["claude", "codex"]);
+    expect(rows[1]).toEqual({
       cli: "codex",
       latest: "0.163.0",
       text: "Codex 0.163.0 is available (you have 0.160.0)",
@@ -79,13 +100,13 @@ describe("bannerRows", () => {
       guidance: null,
       guidanceNote: null,
     });
-    expect(rows[1].text).toBe("Claude 2.1.328 is available (you have 2.1.300)");
+    expect(rows[0].text).toBe("Claude 2.1.328 is available (you have 2.1.300)");
   });
 
   it("hides a CLI put off until later, but shows a newer release again", () => {
     const s = snap(codexAvail, claudeAvail);
     expect(bannerRows(s, { codex: "0.163.0" }).map((r) => r.cli)).toEqual(["claude"]);
-    expect(bannerRows(s, { codex: "0.162.0" }).map((r) => r.cli)).toEqual(["codex", "claude"]);
+    expect(bannerRows(s, { codex: "0.162.0" }).map((r) => r.cli)).toEqual(["claude", "codex"]);
   });
 
   it("offers guidance instead of a run when there is no command", () => {
@@ -101,7 +122,7 @@ describe("bannerRows", () => {
 
     const unknown = { ...native, install_kind: "unknown" as const, guidance: "npm i -g x" };
     const [u] = bannerRows(snap(unknown, entry("claude", { type: "up_to_date" })), {});
-    expect(u.guidanceNote).toContain("couldn't tell how codex was installed");
+    expect(u.guidanceNote).toContain("couldn't tell how Codex was installed");
   });
 });
 
@@ -114,7 +135,9 @@ describe("updateDisabledReason", () => {
   });
 
   it("is disabled without a command whatever recovery says", () => {
-    expect(updateDisabledReason({ ...row, canRun: false }, "Healthy")).toContain("can't update");
+    expect(updateDisabledReason({ ...row, canRun: false }, "Healthy")).toBe(
+      "Keitora can't update this Codex install itself",
+    );
   });
 });
 
@@ -129,7 +152,7 @@ describe("runOutcomeCopy", () => {
 
   it("explains an unchanged version", () => {
     const c = runOutcomeCopy("claude", { type: "unchanged", version: "2.1.300" });
-    expect(c.text).toBe("The update finished but claude is still 2.1.300");
+    expect(c.text).toBe("The update finished but Claude is still 2.1.300");
     expect(c.canRestart).toBe(false);
     expect(runOutcomeCopy("claude", { type: "unchanged", version: null }).text).toContain(
       "didn't change",
@@ -179,17 +202,19 @@ describe("shouldAskToStop", () => {
 describe("pane copy", () => {
   it("hints at a pane parked on the update screen", () => {
     expect(updatePromptHint("codex")).toBe(
-      "codex is asking to update — answer in the terminal, or use keitora's updater",
+      "Codex is asking to update — answer in the terminal, or use keitora's updater",
     );
   });
 
   it("names the update a pane was stopped for", () => {
-    expect(stoppedForUpdateCopy("codex")).toBe("stopped for the codex update");
+    expect(stoppedForUpdateCopy("codex")).toBe("stopped for the Codex update");
   });
 
   it("reads the CLI from the update-prompt token", () => {
     expect(updatePromptCliOf("AgentUpdatePrompt: codex")).toBe("codex");
     expect(updatePromptCliOf("AgentUpdatePrompt: claude")).toBe("claude");
+    expect(updatePromptCliOf("AgentUpdatePrompt: antigravity")).toBe("antigravity");
+    expect(updatePromptCliOf("AgentUpdatePrompt: nope")).toBeNull();
     expect(updatePromptCliOf("AgentUpdatePrompt: other")).toBeNull();
     expect(updatePromptCliOf("boom")).toBeNull();
     expect(updatePromptCliOf("codex did not start: x")).toBeNull();
@@ -298,7 +323,7 @@ describe("closeInterruptsRun", () => {
       expect(closeInterruptsRun(step, false)).toBe(false);
     }
     expect(interruptRunCopy("codex")).toBe(
-      "The codex update is still running — closing will interrupt it.",
+      "The Codex update is still running — closing will interrupt it.",
     );
   });
 });

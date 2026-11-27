@@ -72,6 +72,7 @@ mod tests {
             },
             claude: ProviderConfig::default(),
             codex: ProviderConfig::default(),
+            antigravity: ProviderConfig::default(),
             cli: CliConfig::default(),
             dispatch: DispatchConfig::default(),
         }

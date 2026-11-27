@@ -12,11 +12,12 @@ waiting on you, and which are free for the next task.
 
 ## What you get
 
-- **Every session in one place.** Each worktree gets its own terminal running `claude` (or
-  `codex`). Look at one at a time in Focus view, or at all of them in Grid view.
+- **Every session in one place.** Each worktree gets its own terminal running `claude`, `codex`
+  or `agy` (Antigravity). Look at one at a time in Focus view, or at all of them in Grid view.
 - **Status at a glance.** The sidebar shows each worktree as idle, busy, waiting for you, or
   offline, along with its branch, the task it's on, and progress for long builds. Keitora gets
-  these states from Claude Code hooks, which it installs for you.
+  these states from the agents' hooks (Claude Code and Codex hooks, and Antigravity's global
+  hook), which it installs for you.
 - **A task board shared by every worktree.** Create tasks, claim them, and mark them done from the
   app or from the `keitora` command line. Both read and write the same task list, so a claim made
   in one worktree shows up everywhere straight away.
@@ -38,7 +39,10 @@ from source; that means installing a couple of tools and building the app once.
 
 Follow Anthropic's [Claude Code setup guide](https://code.claude.com/docs/en/setup), then check
 that `claude` starts from a new terminal. Keitora runs `claude` in each worktree, so it needs to
-work on its own first. Codex is optional; install it too if you want to use it in some worktrees.
+work on its own first. Codex and Antigravity are optional; install them too if you want to use
+them in some worktrees. Install the Antigravity CLI (`agy`) with its official installer from
+<https://antigravity.google/product/antigravity-cli/>. A fresh `agy` install is noticed without
+restarting Keitora.
 
 ### 2. Install herdr
 
@@ -104,10 +108,11 @@ The first build compiles a lot of Rust and can take several minutes. When it fin
 1. Open Keitora and click **+** next to *Projects*, then choose your repo's folder.
 2. Pick which of its git worktrees to track. You can create more from the sidebar later; new ones
    go in `~/.keitora/<project>` unless you choose another folder in **Settings**.
-3. Click a worktree to open its Claude Code session, and add tasks with **New** on the board.
+3. Click a worktree to open its Claude Code session (or its Codex / Antigravity equivalent), and add tasks with **New** on the board.
 
-Keitora saves a project's settings in a `keitora.toml` at the repo root and installs the Claude Code
-hooks that report each session's status. If the `keitora` command isn't on your `PATH`, Keitora
+Keitora saves a project's settings in a `keitora.toml` at the repo root and installs the hooks
+for each agent that report each session's status. Antigravity's hook lives in the global
+`~/.gemini/config/hooks.json` and only acts inside Keitora panes. If the `keitora` command isn't on your `PATH`, Keitora
 offers to add it to `~/.local/bin`. Make sure that folder is on your `PATH`; on Windows it usually
 isn't by default.
 
@@ -116,7 +121,7 @@ isn't by default.
 - **The sidebar says herdr wasn't found.** The card lists everywhere Keitora looked. Either fix your
   `PATH` or point Keitora at the binary with `herdr_bin` under `[pty]` in `keitora.toml`, then
   press **Restart** on that card.
-- **A session shows offline and never starts.** Check that `claude` runs in a terminal opened in
+- **A session shows offline and never starts.** Check that the worktree's agent (`claude`, `codex` or `agy`) runs in a terminal opened in
   that worktree. If it does, look in Keitora's log at `~/.keitora/logs/keitora.log`.
 
 ## The `keitora` command
