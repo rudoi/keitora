@@ -48,6 +48,17 @@ impl Platform {
     }
 }
 
+/// What the user is told where [`Platform::current`] is `None`. On Linux that is a deb or rpm
+/// install (or a build from source), whose updates come from the package manager.
+pub fn unsupported_message(os: &str) -> &'static str {
+    if os == "linux" {
+        "This copy of Keitora is managed outside the app, by your package manager for a .deb or \
+         .rpm install. Update it there, or switch to the AppImage for in-app updates."
+    } else {
+        "Updates aren't available on this platform."
+    }
+}
+
 /// A newer release with a signed installer for this platform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
@@ -411,6 +422,15 @@ mod tests {
         );
         assert_eq!(Platform::detect("macos", "x86_64", false), None);
         assert_eq!(Platform::detect("windows", "aarch64", false), None);
+    }
+
+    #[test]
+    fn linux_without_updates_points_at_the_package_manager() {
+        assert!(unsupported_message("linux").contains("package manager"));
+        assert_eq!(
+            unsupported_message("freebsd"),
+            "Updates aren't available on this platform."
+        );
     }
 
     #[test]

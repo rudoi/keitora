@@ -12,6 +12,9 @@ import {
   updatesReducer,
 } from "./updates";
 
+// The backend says why updates are off; the UI shows its words as they are.
+const UNSUPPORTED = "Update it with your package manager.";
+
 const AVAILABLE: UpdateStatus = {
   type: "available",
   version: "0.4.1",
@@ -153,7 +156,7 @@ describe("bannerOf", () => {
       { type: "unchecked" },
       { type: "up_to_date" },
       { type: "failed", message: "x" },
-      { type: "unsupported" },
+      { type: "unsupported", message: "x" },
     ] as UpdateStatus[]) {
       expect(bannerOf(st({ status }))).toBeNull();
     }
@@ -229,9 +232,7 @@ describe("toastFor", () => {
       "Update check failed: offline",
     );
     expect(toastFor(ev(AVAILABLE, true))).toBeNull();
-    expect(toastFor(ev({ type: "unsupported" }, true))).toBe(
-      "Updates aren't available on this platform.",
-    );
+    expect(toastFor(ev({ type: "unsupported", message: UNSUPPORTED }, true))).toBe(UNSUPPORTED);
   });
 
   it("stays quiet for background checks", () => {
@@ -246,7 +247,7 @@ describe("statusLine", () => {
     expect(statusLine({ type: "up_to_date" })).toBe("Up to date");
     expect(statusLine(AVAILABLE)).toBe("Version 0.4.1 is available");
     expect(statusLine({ type: "failed", message: "offline" })).toBe("Last check failed: offline");
-    expect(statusLine({ type: "unsupported" })).toBe("Updates aren't available on this platform.");
+    expect(statusLine({ type: "unsupported", message: UNSUPPORTED })).toBe(UNSUPPORTED);
   });
 });
 

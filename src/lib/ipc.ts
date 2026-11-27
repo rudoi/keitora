@@ -1229,7 +1229,7 @@ export type UpdateStatus =
       published_at: string | null;
     }
   | { type: "failed"; message: string }
-  | { type: "unsupported" };
+  | { type: "unsupported"; message: string };
 
 export type UpdatePhase = "idle" | "downloading" | "ready" | "applying";
 
