@@ -481,6 +481,10 @@ pub fn run(job: Sampler) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::backend::SessionKey;
+    use crate::perf::{PerfHistory, PerfProc, PerfRow, PerfRowKind, HISTORY_LEN};
+
     /// Linux lists every thread as a process unless the refresh opts out; a thread would then
     /// look like a second copy of its process (a second `herdr server`, double-counted memory).
     #[cfg(target_os = "linux")]
@@ -490,8 +494,8 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let _ = stop_rx.recv();
         });
-        let mut sys = super::System::new();
-        super::refresh(&mut sys);
+        let mut sys = System::new();
+        refresh(&mut sys);
         let threads = sys
             .processes()
             .values()
@@ -504,10 +508,6 @@ mod tests {
         assert!(sys.process(me).is_some());
         assert_eq!(threads, 0);
     }
-
-    use super::*;
-    use crate::backend::SessionKey;
-    use crate::perf::{PerfHistory, PerfProc, PerfRow, PerfRowKind, HISTORY_LEN};
 
     fn raw(pid: u32, start: u64, cpu_usage: f32, disk_read: u64, disk_written: u64) -> RawProc {
         RawProc {
