@@ -398,6 +398,15 @@ body {
   --block: var(--accent-2);
   box-shadow: 0 0 9px -1px var(--accent-2);
 }
+/* Brokered: a driven worktree waiting while its driver decides. The waiting colour with a
+   dashed outline and no glow, never animated: it needs nobody yet. */
+.wt-block.brokered {
+  --block: var(--waiting);
+  box-sizing: border-box;
+  background: color-mix(in srgb, var(--waiting) 16%, transparent);
+  border: 1.5px dashed var(--waiting);
+  box-shadow: none;
+}
 /* Attention: a static glow ring (the reduced-motion baseline) … */
 .wt-block.attn {
   box-shadow: 0 0 10px 0 var(--block);
@@ -500,6 +509,71 @@ body {
    working dot right-align in the name row. */
 .lane-status {
   flex: none;
+}
+/* Workflow row: the drive badge/chip leads, then the stage chip, as same-height peers. */
+.lane-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  flex-wrap: nowrap;
+}
+.lane-meta > .lane-stage {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.lane-meta > .lane-drive-badge,
+.lane-meta > .lane-drive-chip {
+  box-sizing: border-box;
+  padding: 2px 7px;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Row-2 badge on a driven lane, tinted with the project hue (--proj is set by
+   .rail-group and themed per mode). */
+.lane-drive-badge {
+  --drive: var(--proj, var(--accent-2));
+  flex: none;
+  max-width: 48%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  color: var(--drive);
+  background: color-mix(in srgb, var(--drive) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--drive) 32%, transparent);
+}
+/* The driver is deciding one of this lane's prompts. */
+.lane-drive-badge.deciding {
+  color: var(--waiting);
+  background: transparent;
+  border: 1px dashed color-mix(in srgb, var(--waiting) 60%, transparent);
+}
+/* The driver escalated a prompt to the human. */
+.lane-drive-badge.escalated {
+  color: var(--waiting);
+  background: color-mix(in srgb, var(--waiting) 16%, transparent);
+  border: 1px solid var(--waiting);
+}
+.lane-drive-badge.paused {
+  opacity: 0.75;
+  border-style: dotted;
+}
+/* Row-2 chip on a driver lane: "drives N". */
+.lane-drive-chip {
+  flex: none;
+  font-size: 9.5px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  color: var(--tx-2);
+  border: 1px solid var(--line);
+  white-space: nowrap;
 }
 /* A small live dot in the name row — the worktree is doing something right now. */
 .lane-work-dot {
@@ -1478,6 +1552,62 @@ body {
   background: color-mix(in srgb, var(--tx-1) 10%, transparent);
 }
 
+/* Driven-pane banner: a slim strip over the top of the terminal. An overlay, so it never
+   resizes the terminal (no refit, no pty resize) and never takes the keyboard. */
+.pane-drive-banner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 12;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--tx-1);
+  background: color-mix(in srgb, var(--accent-2) 14%, var(--bg-2));
+  border-bottom: 1px solid color-mix(in srgb, var(--accent-2) 40%, var(--line));
+}
+.pane-drive-banner.deciding,
+.pane-drive-banner.escalated {
+  background: color-mix(in srgb, var(--waiting) 14%, var(--bg-2));
+  border-bottom-color: color-mix(in srgb, var(--waiting) 55%, var(--line));
+}
+.pane-drive-banner-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.pane-drive-banner-pending {
+  flex: 1 0 100%;
+  color: var(--tx-2);
+}
+.pane-drive-banner-pending code {
+  font-family: var(--font-mono, monospace);
+  color: var(--tx-1);
+}
+.pane-drive-btn {
+  flex: none;
+  padding: 2px 8px;
+  font-size: 11.5px;
+  font-weight: 600;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  color: var(--tx-1);
+  background: transparent;
+}
+.pane-drive-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--tx-1) 10%, transparent);
+}
+.pane-drive-btn:disabled {
+  opacity: 0.45;
+}
+/* The update hint moves below the drive banner. */
+.pane.driven .pane-update-hint {
+  top: 44px;
+}
+
 /* Transient terminal-font-size HUD: a centered "zoom indicator" that flashes the
    current px on Cmd +/-/0. Non-interactive (pointer-events: none) so it never blocks
    the terminal; sits above panes but below dialogs (--z-modal). */
@@ -1905,6 +2035,12 @@ html[data-theme="light"] .rail-group-head[data-stuck="true"] {
 .rail-dot.working {
   --block: var(--accent-2);
 }
+.rail-dot.brokered {
+  --block: var(--waiting);
+  background: transparent;
+  outline: 1px dashed var(--waiting);
+  outline-offset: -1px;
+}
 /* "You are here" in the active project's collapsed strip: larger, with an accent ring. The
    side margin keeps the ring clear of its neighbours. */
 .rail-dot.focused {
@@ -1923,6 +2059,14 @@ html[data-theme="light"] .rail-group-head[data-stuck="true"] {
 }
 .lane-work-dot.off {
   visibility: hidden;
+}
+/* "N driven" in a group header: lanes driven by another worktree. */
+.rail-group-driven {
+  flex: none;
+  font-size: 10px;
+  color: var(--tx-3);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 .rail-group-count {
   min-width: 2ch;

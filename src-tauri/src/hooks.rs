@@ -20,14 +20,40 @@ use serde_json::{json, Value};
 /// idle session. `StopFailure` mirrors `Stop` so an errored turn doesn't stick at
 /// `busy`. `SubagentStop` is intentionally absent — it fires mid-turn and would
 /// wrongly flip the main session to idle.
-const HOOK_MAP: [(&str, &str, &str); 6] = [
-    ("UserPromptSubmit", "", "busy"),
-    ("Notification", "permission_prompt", "waiting"),
-    ("Stop", "", "idle"),
-    ("StopFailure", "", "idle"),
-    ("SessionStart", "", "idle"),
-    ("SessionEnd", "", "offline"),
+///
+/// `Stop`/`StopFailure` also capture the turn's reply for a driver (`--stdin` /
+/// `--failed`), still ending in the same `idle` state.
+const HOOK_MAP: [(&str, &str, HookCmd); 6] = [
+    ("UserPromptSubmit", "", HookCmd::State("busy")),
+    (
+        "Notification",
+        "permission_prompt",
+        HookCmd::State("waiting"),
+    ),
+    ("Stop", "", HookCmd::Stop),
+    ("StopFailure", "", HookCmd::StopFailure),
+    ("SessionStart", "", HookCmd::State("idle")),
+    ("SessionEnd", "", HookCmd::State("offline")),
 ];
+
+/// (event, matcher) pairs that run the permission/question gate. `PermissionRequest`
+/// covers every tool; `PreToolUse` is limited to `AskUserQuestion` so a driver can
+/// answer questions. Both carry [`keitora_tasks::DRIVE_HOOK_TIMEOUT_S`].
+const CLAUDE_GATE_MAP: [(&str, &str); 2] =
+    [("PermissionRequest", ""), ("PreToolUse", "AskUserQuestion")];
+
+/// Which command a hook entry runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HookCmd {
+    /// `session <state>`, all streams silenced.
+    State(&'static str),
+    /// Turn end: capture the reply from stdin, then record idle.
+    Stop,
+    /// Errored turn end: record the failure, then idle.
+    StopFailure,
+    /// Permission/question gate; stdout reaches Claude, stderr is discarded.
+    Gate,
+}
 
 /// Marker embedded in every command we write, so we can recognize (and replace)
 /// our own entries regardless of the surrounding shell guard.
@@ -35,6 +61,25 @@ const HOOK_MAP: [(&str, &str, &str); 6] = [
 /// rather than duplicates it). Carried as a trailing `# …` (sh) or `rem …` (cmd)
 /// comment depending on platform; [`is_ours`] matches the bare token.
 const HOOK_MARKER: &str = "keitora:session-hook";
+
+/// POSIX guard for `session <state>` with every stream silenced and exit 0 forced.
+pub(crate) fn posix_state_command(bin: &str, state: &str, marker: &str) -> String {
+    format!("[ -x \"{bin}\" ] && \"{bin}\" session {state} >/dev/null 2>&1 || true # {marker}")
+}
+
+/// POSIX guard that runs `session <primary>` with only stderr discarded (so stdout
+/// reaches the agent) and falls back to a plain silenced `session <fallback>` when an
+/// older installed CLI rejects the primary form; exit 0 is forced.
+pub(crate) fn posix_fallback_command(
+    bin: &str,
+    primary: &str,
+    fallback: &str,
+    marker: &str,
+) -> String {
+    format!(
+        "[ -x \"{bin}\" ] && {{ \"{bin}\" session {primary} 2>/dev/null || \"{bin}\" session {fallback} >/dev/null 2>&1; }} || true # {marker}"
+    )
+}
 
 /// The resilient command we install for one (binary, state).
 ///
@@ -49,7 +94,7 @@ const HOOK_MARKER: &str = "keitora:session-hook";
 /// resolved build path can carry (Git Bash's `[ -x ]` and execution both handle a
 /// plain `C:\…\keitora.exe`, but not a `\\?\…` one). The strip is UNC-safe and a no-op
 /// on unix.
-fn hook_command(task_bin: &str, state: &str) -> String {
+fn hook_command(task_bin: &str, cmd: HookCmd) -> String {
     let bin = keitora_tasks::strip_extended_prefix_str(task_bin);
     // Git Bash (which Claude Code uses to run hooks on Windows) resolves a
     // forward-slashed drive path (`D:/…/keitora.exe`) unambiguously; convert
@@ -57,7 +102,19 @@ fn hook_command(task_bin: &str, state: &str) -> String {
     // handling. No-op on unix (no backslashes there).
     #[cfg(windows)]
     let bin = bin.replace('\\', "/");
-    format!("[ -x \"{bin}\" ] && \"{bin}\" session {state} >/dev/null 2>&1 || true # {HOOK_MARKER}")
+    let m = HOOK_MARKER;
+    match cmd {
+        HookCmd::State(state) => posix_state_command(&bin, state, m),
+        // Only fd 2 is redirected so stdout (the decision) reaches Claude; `|| true`
+        // forces exit 0 whatever the child did.
+        HookCmd::Gate => format!(
+            "[ -x \"{bin}\" ] && \"{bin}\" session gate --provider claude 2>/dev/null || true # {m}"
+        ),
+        // Fall back to a plain `session idle` so an older installed CLI still records
+        // idle and a session can never stick at `busy`.
+        HookCmd::Stop => posix_fallback_command(&bin, "idle --stdin", "idle", m),
+        HookCmd::StopFailure => posix_fallback_command(&bin, "idle --failed", "idle", m),
+    }
 }
 
 /// True if a hook-group entry is one we manage. Matches the current marker and the
@@ -95,19 +152,39 @@ pub fn merged_hooks_settings(existing: Value, task_bin: &str) -> Value {
     }
     let hooks = hooks.as_object_mut().unwrap();
 
-    for (event, matcher, state) in HOOK_MAP {
-        let command = hook_command(task_bin, state);
-        let entry = json!({
-            "matcher": matcher,
-            "hooks": [ { "type": "command", "command": command } ],
-        });
+    let mut install = |event: &str, entry: Value| {
         let arr = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
         if !arr.is_array() {
             *arr = json!([]);
         }
         let arr = arr.as_array_mut().unwrap();
-        arr.retain(|e| !is_ours(e)); // drop our prior entries → idempotent + path-change safe
+        // Drop our prior entries (every command we write carries the marker) →
+        // idempotent + path-change safe; a user's own hooks on the event stay.
+        arr.retain(|e| !is_ours(e));
         arr.push(entry);
+    };
+
+    for (event, matcher, cmd) in HOOK_MAP {
+        install(
+            event,
+            json!({
+                "matcher": matcher,
+                "hooks": [ { "type": "command", "command": hook_command(task_bin, cmd) } ],
+            }),
+        );
+    }
+    for (event, matcher) in CLAUDE_GATE_MAP {
+        install(
+            event,
+            json!({
+                "matcher": matcher,
+                "hooks": [ {
+                    "type": "command",
+                    "command": hook_command(task_bin, HookCmd::Gate),
+                    "timeout": keitora_tasks::DRIVE_HOOK_TIMEOUT_S,
+                } ],
+            }),
+        );
     }
     root
 }
@@ -138,13 +215,45 @@ fn is_exec(p: &Path) -> bool {
     )
 }
 
+/// The candidate `keitora` binaries other than a worktree's own build, gathered once and
+/// handed to [`resolve_keitora_bin`]. Named fields keep the three same-typed paths from
+/// being swapped at a call site.
+#[derive(Debug, Default, Clone)]
+pub struct KeitoraBinSources {
+    /// The `keitora.toml [cli].path` override (project over user).
+    pub override_path: Option<String>,
+    /// The CLI bundled next to the running app (see [`app_bundled_cli`]).
+    pub app_cli: Option<String>,
+    /// `keitora` on the user's login PATH.
+    pub on_path: Option<String>,
+}
+
+impl KeitoraBinSources {
+    /// Gather the sources for `project` (`None` → user-level override only). `on_path` is
+    /// passed in because its lookup runs a login shell on unix: callers hold the result
+    /// (computed once per process, or once per install pass) rather than re-scanning.
+    pub fn gather(project: Option<&keitora_tasks::ProjectConfig>, on_path: Option<String>) -> Self {
+        let user = keitora_tasks::UserConfig::load().unwrap_or_default();
+        Self {
+            override_path: keitora_tasks::resolve_keitora_path(project, &user),
+            app_cli: app_bundled_cli().map(str::to_string),
+            on_path,
+        }
+    }
+}
+
 /// Resolve the absolute `keitora` binary to embed in `wt_path`'s session hooks.
 ///
-/// Order: `keitora` on the user's login PATH (`path_keitora`, precomputed by the caller via
-/// `keitora_tasks::keitora_on_path()` so we don't re-scan PATH per worktree) → the
-/// `keitora.toml [cli].path` override (`override_path`) → the worktree's own fresh build.
+/// Order: `keitora` on the user's login PATH (`sources.on_path`, precomputed by the caller so
+/// we don't re-scan PATH per worktree) → the `keitora.toml [cli].path` override
+/// (`sources.override_path`) → the CLI bundled next to the running app (`sources.app_cli`)
+/// → the worktree's own fresh build.
 /// `None` → the caller skips install for this worktree (clean no-op). The hooks must
 /// not go through the `./keitora` wrapper's `cargo run` fallback — far too slow per turn.
+///
+/// The bundled CLI outranks the worktree build because the installed app's process
+/// PATH often lacks the installer's bin dir: without it, every worktree fell back to
+/// its own build, which can be months old and miss newer subcommands the hooks call.
 ///
 /// PATH wins by design: the installed CLI is unambiguous and can never be the GUI app,
 /// so the per-turn session hooks always run the real CLI. The worktree build is only a
@@ -158,19 +267,21 @@ fn is_exec(p: &Path) -> bool {
 /// it would make every per-turn hook run `<gui> session <state>` — which launches a
 /// window. So the build candidate is trusted ONLY when a sibling `keitora-app` is
 /// present (the unambiguous marker that `keitora` here is the CLI).
-pub fn resolve_keitora_bin(
-    wt_path: &Path,
-    override_path: Option<&str>,
-    path_keitora: Option<&str>,
-) -> Option<String> {
+pub fn resolve_keitora_bin(wt_path: &Path, sources: &KeitoraBinSources) -> Option<String> {
     // PATH first: the installed CLI is the safe, unsurprising choice and can never be
     // the GUI app. It wins even over an explicit `[cli].path` override.
-    if let Some(p) = path_keitora {
-        return Some(p.to_string());
+    if let Some(p) = &sources.on_path {
+        return Some(p.clone());
     }
-    if let Some(o) = override_path {
+    if let Some(o) = &sources.override_path {
         if is_exec(Path::new(o)) {
-            return Some(o.to_string());
+            return Some(o.clone());
+        }
+    }
+    // The CLI shipped with the running app: always as new as the app itself.
+    if let Some(s) = &sources.app_cli {
+        if is_exec(Path::new(s)) {
+            return Some(s.clone());
         }
     }
     // The worktree build is the LAST resort (e.g. a dev with no installed `keitora` on
@@ -208,14 +319,48 @@ pub fn keitora_bin_extra_env(cwd: &Path) -> Vec<(String, String)> {
     if cfg!(test) {
         return Vec::new();
     }
-    let on_path = keitora_on_path_cached();
-    let user = keitora_tasks::UserConfig::load().unwrap_or_default();
-    let user_override = keitora_tasks::resolve_keitora_path(None, &user);
-    keitora_bin_pair(resolve_keitora_bin(
-        cwd,
-        user_override.as_deref(),
-        on_path.as_deref(),
-    ))
+    let sources = KeitoraBinSources::gather(None, keitora_on_path_cached().clone());
+    keitora_bin_pair(resolve_keitora_bin(cwd, &sources))
+}
+
+/// The `keitora` CLI shipped next to the running app executable (`keitora-cli.exe`
+/// beside an installed `keitora-app.exe`), looked up once per process. `None` under
+/// `cfg!(test)`, so tests never pick up the real app's sibling, and `None` for an app
+/// that isn't an installed one (see [`exe_is_untrusted_for_bundled_cli`]): a dev app's
+/// `target/debug` CLI would otherwise outrank worktree builds and get written into the
+/// real active project's hooks.
+pub fn app_bundled_cli() -> Option<&'static str> {
+    if cfg!(test) {
+        return None;
+    }
+    static SIDECAR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SIDECAR
+        .get_or_init(|| {
+            let exe = std::env::current_exe().ok()?;
+            if cfg!(debug_assertions) || exe_is_untrusted_for_bundled_cli(&exe) {
+                return None;
+            }
+            keitora_tasks::bundled_cli(&exe).map(|p| p.to_string_lossy().into_owned())
+        })
+        .as_deref()
+}
+
+/// Pure: whether the app at `exe` must not offer its sibling CLI for hooks or install —
+/// a cargo build (`…/target/{debug,release}/…`, or `…/target/<triple>/{debug,release}/…`)
+/// or a macOS translocated copy (`…/AppTranslocation/…`, a randomized read-only path
+/// that vanishes when the app quits).
+fn exe_is_untrusted_for_bundled_cli(exe: &Path) -> bool {
+    let parts: Vec<String> = exe
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect();
+    let is_profile = |s: &str| s == "debug" || s == "release";
+    parts.iter().any(|p| p == "apptranslocation")
+        || parts.iter().enumerate().any(|(i, p)| {
+            p == "target"
+                && (parts.get(i + 1).is_some_and(|n| is_profile(n))
+                    || parts.get(i + 2).is_some_and(|n| is_profile(n)))
+        })
 }
 
 /// The `keitora` on PATH, looked up once per process.
@@ -279,16 +424,36 @@ pub fn install_hooks_for(wt_path: &Path, task_bin: &str) {
     }
 }
 
-/// Install/refresh the hooks for every configured worktree that exists on disk.
+/// Startup install: refresh the hooks for every existing worktree of the project the
+/// cwd resolves to AND of the registry's active project (once if they are the same).
 ///
-/// The `keitora` binary is resolved per worktree (build → `[cli].path` override → PATH),
-/// so hooks install in any project where `keitora` is reachable — not just the keitora repo
-/// with an in-tree build. Worktrees with no resolvable binary are skipped (not fatal).
+/// The cwd alone is not enough: an installed app starts in a directory that is no
+/// project, so hooks only ever got (re)installed on project activation and an upgrade
+/// left every worktree's hooks stale. A dev run (`yarn tauri dev` from the repo)
+/// still resolves its repo through the cwd. The `keitora` binary is resolved per
+/// worktree (see [`resolve_keitora_bin`]); worktrees with none are skipped.
 pub fn install_session_hooks() {
-    let Ok(config) = Config::find() else {
-        return; // no config yet → nothing to install
-    };
-    install_hooks_into(config);
+    let cwd = Config::find().ok();
+    let active = Config::find_active().ok();
+    for config in startup_hook_targets(cwd, active, Config::main_worktree_path) {
+        install_hooks_into(config);
+    }
+}
+
+/// The projects to install hooks into at startup: the cwd's project, then the
+/// active project unless it is the same one (by `key`). Pure.
+fn startup_hook_targets<T, K: PartialEq>(
+    cwd: Option<T>,
+    active: Option<T>,
+    key: impl Fn(&T) -> K,
+) -> Vec<T> {
+    let mut out: Vec<T> = cwd.into_iter().collect();
+    if let Some(a) = active {
+        if !out.iter().any(|c| key(c) == key(&a)) {
+            out.push(a);
+        }
+    }
+    out
 }
 
 /// Active-project variant of [`install_session_hooks`]: install hooks for the
@@ -309,12 +474,13 @@ pub fn install_active_session_hooks() {
 ///
 /// The `keitora` binary override is derived from THIS config's project (not a fresh
 /// `resolve_active()`) so the embedded path matches the project we install into.
-/// The PATH scan (`keitora_on_path`) runs a login shell, so both candidates are
-/// computed once, outside the per-worktree loop.
+/// The PATH scan (`keitora_on_path`) runs a login shell, so the sources are gathered
+/// once, outside the per-worktree loop.
 fn install_hooks_into(config: Config) {
-    let user = keitora_tasks::UserConfig::load().unwrap_or_default();
-    let override_path = keitora_tasks::resolve_keitora_path(Some(config.project_config()), &user);
-    let path_keitora = keitora_tasks::keitora_on_path();
+    let sources = KeitoraBinSources::gather(
+        Some(config.project_config()),
+        keitora_tasks::keitora_on_path(),
+    );
 
     let worktrees = match config.resolved_worktrees() {
         Ok(w) => w,
@@ -326,7 +492,7 @@ fn install_hooks_into(config: Config) {
         if !wt.path.is_dir() {
             continue;
         }
-        match resolve_keitora_bin(&wt.path, override_path.as_deref(), path_keitora.as_deref()) {
+        match resolve_keitora_bin(&wt.path, &sources) {
             Some(bin) => {
                 install_hooks_for(&wt.path, &bin);
                 // Codex worktrees additionally get a worktree-local `.codex/hooks.json`
@@ -340,7 +506,7 @@ fn install_hooks_into(config: Config) {
             None => {
                 if !warned_none {
                     eprintln!(
-                        "[keitora] session hooks: no `keitora` binary found (build, [cli].path, or PATH); \
+                        "[keitora] session hooks: no `keitora` binary found (PATH, [cli].path, app bundle, or build); \
                          skipping install for worktrees without one"
                     );
                     warned_none = true;
@@ -353,6 +519,31 @@ fn install_hooks_into(config: Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dev_and_translocated_apps_offer_no_bundled_cli() {
+        let untrusted = [
+            "D:/repos/proj/target/debug/keitora-app.exe",
+            "D:/repos/proj/target/release/keitora-app.exe",
+            "/Users/me/src/keitora/target/debug/keitora-app",
+            "/Users/me/src/keitora/target/aarch64-apple-darwin/release/keitora-app",
+            "D:/repos/proj/Target/Debug/keitora-app.exe",
+            "/private/var/folders/x/AppTranslocation/ABC/d/Keitora.app/Contents/MacOS/keitora-app",
+        ];
+        for p in untrusted {
+            assert!(exe_is_untrusted_for_bundled_cli(Path::new(p)), "{p}");
+        }
+        let installed = [
+            "C:/Users/x/AppData/Local/Keitora/keitora-app.exe",
+            "C:/Program Files/Keitora/keitora-app.exe",
+            "/Applications/Keitora.app/Contents/MacOS/keitora-app",
+            // a "target" dir that isn't a cargo profile dir
+            "/opt/target/bin/keitora-app",
+        ];
+        for p in installed {
+            assert!(!exe_is_untrusted_for_bundled_cli(Path::new(p)), "{p}");
+        }
+    }
 
     #[test]
     fn keitora_bin_pair_sets_the_variable() {
@@ -381,10 +572,10 @@ mod tests {
     #[test]
     fn empty_input_gets_all_six_events() {
         let out = merged_hooks_settings(json!({}), "/abs/keitora");
-        for (event, _m, state) in HOOK_MAP {
+        for (event, _m, cmd) in HOOK_MAP {
             assert_eq!(
                 commands_for(&out, event),
-                vec![hook_command("/abs/keitora", state)],
+                vec![hook_command("/abs/keitora", cmd)],
                 "event {event}"
             );
         }
@@ -423,7 +614,7 @@ mod tests {
         // the user's Stop hook is kept, ours appended
         let stop = commands_for(&out, "Stop");
         assert!(stop.contains(&"/usr/bin/mine.sh".to_string()));
-        assert!(stop.contains(&hook_command("/abs/keitora", "idle")));
+        assert!(stop.contains(&hook_command("/abs/keitora", HookCmd::Stop)));
         assert_eq!(stop.len(), 2);
     }
 
@@ -442,7 +633,7 @@ mod tests {
         let out = merged_hooks_settings(legacy, "/abs/keitora");
         assert_eq!(
             commands_for(&out, "Stop"),
-            vec![hook_command("/abs/keitora", "idle")]
+            vec![hook_command("/abs/keitora", HookCmd::Stop)]
         );
     }
 
@@ -453,11 +644,11 @@ mod tests {
         // only the new path remains for each event (no stale /old entry)
         assert_eq!(
             commands_for(&second, "Stop"),
-            vec![hook_command("/new/keitora", "idle")]
+            vec![hook_command("/new/keitora", HookCmd::Stop)]
         );
         assert_eq!(
             commands_for(&second, "UserPromptSubmit"),
-            vec![hook_command("/new/keitora", "busy")]
+            vec![hook_command("/new/keitora", HookCmd::State("busy"))]
         );
     }
 
@@ -476,9 +667,112 @@ mod tests {
         let out = merged_hooks_settings(pre_rename, "/main/target/debug/keitora");
         assert_eq!(
             commands_for(&out, "Stop"),
-            vec![hook_command("/main/target/debug/keitora", "idle")],
+            vec![hook_command("/main/target/debug/keitora", HookCmd::Stop)],
             "pre-rename task command upgraded to keitora, no duplicate"
         );
+    }
+
+    #[test]
+    fn exact_command_strings() {
+        let b = "/abs/keitora";
+        assert_eq!(
+            hook_command(b, HookCmd::State("busy")),
+            "[ -x \"/abs/keitora\" ] && \"/abs/keitora\" session busy >/dev/null 2>&1 || true # keitora:session-hook"
+        );
+        let gate = "[ -x \"/abs/keitora\" ] && \"/abs/keitora\" session gate --provider claude 2>/dev/null || true # keitora:session-hook";
+        assert_eq!(hook_command(b, HookCmd::Gate), gate);
+        assert_eq!(
+            hook_command(b, HookCmd::Stop),
+            "[ -x \"/abs/keitora\" ] && { \"/abs/keitora\" session idle --stdin 2>/dev/null || \"/abs/keitora\" session idle >/dev/null 2>&1; } || true # keitora:session-hook"
+        );
+        assert_eq!(
+            hook_command(b, HookCmd::StopFailure),
+            "[ -x \"/abs/keitora\" ] && { \"/abs/keitora\" session idle --failed 2>/dev/null || \"/abs/keitora\" session idle >/dev/null 2>&1; } || true # keitora:session-hook"
+        );
+        // The CLI's install check keys off this literal.
+        assert!(gate.contains("session gate"));
+    }
+
+    #[test]
+    fn gate_entries_installed_with_timeout_only_there() {
+        let out = merged_hooks_settings(json!({}), "/abs/keitora");
+        let gate = hook_command("/abs/keitora", HookCmd::Gate);
+        for (event, matcher) in CLAUDE_GATE_MAP {
+            let arr = out["hooks"][event].as_array().unwrap();
+            assert_eq!(arr.len(), 1, "{event}");
+            assert_eq!(arr[0]["matcher"], matcher);
+            assert_eq!(arr[0]["hooks"][0]["command"], gate);
+            assert_eq!(arr[0]["hooks"][0]["timeout"], 600);
+        }
+        assert_eq!(out["hooks"]["PermissionRequest"][0]["matcher"], "");
+        assert_eq!(out["hooks"]["PreToolUse"][0]["matcher"], "AskUserQuestion");
+        for (event, _m, _c) in HOOK_MAP {
+            for e in out["hooks"][event].as_array().unwrap() {
+                assert!(e["hooks"][0].get("timeout").is_none(), "{event}");
+            }
+        }
+    }
+
+    #[test]
+    fn is_ours_matches_every_new_command() {
+        for cmd in [
+            HookCmd::State("idle"),
+            HookCmd::Stop,
+            HookCmd::StopFailure,
+            HookCmd::Gate,
+        ] {
+            let entry = json!({ "hooks": [ { "type": "command", "command": hook_command("/abs/keitora", cmd) } ] });
+            assert!(is_ours(&entry), "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn user_hooks_on_gate_events_are_preserved() {
+        let existing = json!({
+            "hooks": {
+                "PermissionRequest": [ { "matcher": "Bash", "hooks": [ { "type": "command", "command": "/usr/bin/mine.sh" } ] } ],
+                "PreToolUse": [ { "matcher": "Write", "hooks": [ { "type": "command", "command": "/usr/bin/lint.sh" } ] } ]
+            }
+        });
+        let out = merged_hooks_settings(existing, "/abs/keitora");
+        let gate = hook_command("/abs/keitora", HookCmd::Gate);
+        assert_eq!(
+            commands_for(&out, "PermissionRequest"),
+            vec!["/usr/bin/mine.sh".to_string(), gate.clone()]
+        );
+        assert_eq!(
+            commands_for(&out, "PreToolUse"),
+            vec!["/usr/bin/lint.sh".to_string(), gate]
+        );
+    }
+
+    #[test]
+    fn gate_path_change_replaces_and_second_install_is_noop() {
+        let first = merged_hooks_settings(json!({}), "/old/keitora");
+        let second = merged_hooks_settings(first, "/new/keitora");
+        assert_eq!(
+            commands_for(&second, "PermissionRequest"),
+            vec![hook_command("/new/keitora", HookCmd::Gate)]
+        );
+        assert_eq!(
+            commands_for(&second, "PreToolUse"),
+            vec![hook_command("/new/keitora", HookCmd::Gate)]
+        );
+        assert_eq!(
+            second,
+            merged_hooks_settings(second.clone(), "/new/keitora")
+        );
+    }
+
+    #[test]
+    fn install_hooks_for_writes_once_in_temp_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_hooks_for(tmp.path(), "/abs/keitora");
+        let file = tmp.path().join(".claude/settings.local.json");
+        let first = std::fs::read_to_string(&file).unwrap();
+        assert!(first.contains("session gate --provider claude"));
+        install_hooks_for(tmp.path(), "/abs/keitora");
+        assert_eq!(first, std::fs::read_to_string(&file).unwrap());
     }
 
     // resolve_keitora_bin's runnability gate is exec-bit-based on unix; the windows
@@ -506,22 +800,47 @@ mod tests {
         // PATH wins even over an explicit override — the installed CLI is always
         // preferred so a stale/GUI build can never be embedded in the hooks.
         assert_eq!(
-            resolve_keitora_bin(&wt, Some(&override_s), Some(&path_s)).as_deref(),
+            resolve_keitora_bin(
+                &wt,
+                &KeitoraBinSources {
+                    override_path: Some(override_s.clone()),
+                    on_path: Some(path_s.clone()),
+                    ..Default::default()
+                }
+            )
+            .as_deref(),
             Some(path_s.as_str()),
             "PATH must win even when an override is set"
         );
         // No PATH → the override is the fallback.
         assert_eq!(
-            resolve_keitora_bin(&wt, Some(&override_s), None).as_deref(),
+            resolve_keitora_bin(
+                &wt,
+                &KeitoraBinSources {
+                    override_path: Some(override_s.clone()),
+                    ..Default::default()
+                }
+            )
+            .as_deref(),
             Some(override_s.as_str())
         );
         // Only PATH available → PATH.
         assert_eq!(
-            resolve_keitora_bin(&wt, None, Some(&path_s)).as_deref(),
+            resolve_keitora_bin(
+                &wt,
+                &KeitoraBinSources {
+                    on_path: Some(path_s.clone()),
+                    ..Default::default()
+                }
+            )
+            .as_deref(),
             Some(path_s.as_str())
         );
         // Nothing available → None (caller skips install).
-        assert_eq!(resolve_keitora_bin(&wt, None, None), None);
+        assert_eq!(
+            resolve_keitora_bin(&wt, &KeitoraBinSources::default()),
+            None
+        );
 
         // A renamed worktree build (`keitora` + sibling `keitora-app`) is used ONLY as a last
         // resort, when there is neither a PATH `keitora` nor an override.
@@ -529,17 +848,32 @@ mod tests {
         mk_exec(&build);
         mk_exec(&dbg.join("keitora-app"));
         assert_eq!(
-            resolve_keitora_bin(&wt, None, None).as_deref(),
+            resolve_keitora_bin(&wt, &KeitoraBinSources::default()).as_deref(),
             Some(build.to_string_lossy().as_ref()),
             "build is the last-resort fallback when nothing else resolves"
         );
         // ...but PATH and the override still outrank it.
         assert_eq!(
-            resolve_keitora_bin(&wt, Some(&override_s), Some(&path_s)).as_deref(),
+            resolve_keitora_bin(
+                &wt,
+                &KeitoraBinSources {
+                    override_path: Some(override_s.clone()),
+                    on_path: Some(path_s.clone()),
+                    ..Default::default()
+                }
+            )
+            .as_deref(),
             Some(path_s.as_str())
         );
         assert_eq!(
-            resolve_keitora_bin(&wt, Some(&override_s), None).as_deref(),
+            resolve_keitora_bin(
+                &wt,
+                &KeitoraBinSources {
+                    override_path: Some(override_s.clone()),
+                    ..Default::default()
+                }
+            )
+            .as_deref(),
             Some(override_s.as_str())
         );
 
@@ -548,7 +882,7 @@ mod tests {
         std::fs::remove_file(&build).unwrap();
         std::fs::write(&build, b"not exec\n").unwrap();
         assert_eq!(
-            resolve_keitora_bin(&wt, None, None),
+            resolve_keitora_bin(&wt, &KeitoraBinSources::default()),
             None,
             "a non-executable build must not be used even with a sibling keitora-app"
         );
@@ -559,9 +893,108 @@ mod tests {
         // even as a last resort.
         std::fs::remove_file(dbg.join("keitora-app")).unwrap();
         assert_eq!(
-            resolve_keitora_bin(&wt, None, None),
+            resolve_keitora_bin(&wt, &KeitoraBinSources::default()),
             None,
             "keitora without sibling keitora-app must be treated as the GUI app, not the CLI"
+        );
+    }
+
+    #[test]
+    fn startup_hook_targets_fall_back_to_the_active_project() {
+        let key = |p: &&str| p.to_string();
+        // Installed app: the cwd is no project → the active project still gets hooks.
+        assert_eq!(startup_hook_targets(None, Some("proj"), key), ["proj"]);
+        // Dev run from the repo that is also active → installed once.
+        assert_eq!(
+            startup_hook_targets(Some("proj"), Some("proj"), key),
+            ["proj"]
+        );
+        // Dev run from one repo while another is active → both.
+        assert_eq!(
+            startup_hook_targets(Some("proj"), Some("other-proj"), key),
+            ["proj", "other-proj"]
+        );
+        assert_eq!(startup_hook_targets(Some("proj"), None, key), ["proj"]);
+        assert!(startup_hook_targets::<&str, String>(None, None, key).is_empty());
+    }
+
+    /// A runnable `name` (an `.exe` on Windows, an exec-bit file on unix) in `dir`.
+    fn mk_runnable(dir: &Path, name: &str) -> std::path::PathBuf {
+        let p = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&p, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        p
+    }
+
+    /// The app-bundled CLI sits after PATH and the override but ahead of the
+    /// worktree's own build, so a stale worktree build is never embedded when the
+    /// running app ships a CLI.
+    #[test]
+    fn resolve_keitora_bin_prefers_app_cli_over_worktree_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join("wt");
+        let dbg = wt.join("target").join("debug");
+        std::fs::create_dir_all(&dbg).unwrap();
+        let build = mk_runnable(&dbg, "keitora");
+        mk_runnable(&dbg, "keitora-app");
+        let app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let app_cli = mk_runnable(&app_dir, "keitora-cli");
+        let override_bin = mk_runnable(tmp.path(), "override-keitora");
+        let path_bin = mk_runnable(tmp.path(), "path-keitora");
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let (app_s, override_s, path_s) = (s(&app_cli), s(&override_bin), s(&path_bin));
+
+        // The bundled CLI beats the worktree build.
+        assert_eq!(
+            resolve_keitora_bin(
+                &wt,
+                &KeitoraBinSources {
+                    app_cli: Some(app_s.clone()),
+                    ..Default::default()
+                }
+            ),
+            Some(app_s.clone())
+        );
+        // PATH and the override still outrank it.
+        assert_eq!(
+            resolve_keitora_bin(
+                &wt,
+                &KeitoraBinSources {
+                    app_cli: Some(app_s.clone()),
+                    on_path: Some(path_s.clone()),
+                    ..Default::default()
+                }
+            ),
+            Some(path_s.clone())
+        );
+        assert_eq!(
+            resolve_keitora_bin(
+                &wt,
+                &KeitoraBinSources {
+                    override_path: Some(override_s.clone()),
+                    app_cli: Some(app_s.clone()),
+                    ..Default::default()
+                }
+            ),
+            Some(override_s.clone())
+        );
+        // A bundled path that is not runnable falls through to the build.
+        let missing = s(&app_dir.join("gone"));
+        assert_eq!(
+            resolve_keitora_bin(
+                &wt,
+                &KeitoraBinSources {
+                    app_cli: Some(missing.clone()),
+                    ..Default::default()
+                }
+            )
+            .map(std::path::PathBuf::from),
+            Some(build)
         );
     }
 
@@ -588,7 +1021,7 @@ mod tests {
 
         // Build candidate needs the sibling keitora-app.exe marker.
         assert_eq!(
-            resolve_keitora_bin(&wt, None, None),
+            resolve_keitora_bin(&wt, &KeitoraBinSources::default()),
             None,
             "keitora.exe without sibling keitora-app.exe is the GUI app, not the CLI"
         );
@@ -596,7 +1029,7 @@ mod tests {
         // Compare as PathBuf so separator style (native vs the test's join) doesn't
         // matter — only that it resolves to the same file.
         assert_eq!(
-            resolve_keitora_bin(&wt, None, None).map(std::path::PathBuf::from),
+            resolve_keitora_bin(&wt, &KeitoraBinSources::default()).map(std::path::PathBuf::from),
             Some(exe.clone()),
             "keitora.exe + sibling keitora-app.exe resolves as the CLI build"
         );

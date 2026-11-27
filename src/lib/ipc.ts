@@ -365,6 +365,14 @@ export interface WorktreeActivity {
   workflow: WorkflowState | null;
   build: BuildProgress | null;
   working: boolean;
+  /** The worktree driving this one; null when it is not driven. */
+  drivenBy: string | null;
+  /** Worktrees this one drives (sorted); empty when it drives none. */
+  drives: string[];
+  /** Brokered prompts pending a driver decision for this worktree. */
+  pendingPrompts: number;
+  /** This worktree's drive is paused (its prompts come to the human). */
+  drivePaused: boolean;
 }
 
 interface RawWorkflowState {
@@ -397,7 +405,7 @@ interface RawBuildProgress {
   message?: string;
 }
 
-interface RawWorktreeActivity {
+export interface RawWorktreeActivity {
   project: string;
   worktree: string;
   cli: string;
@@ -405,6 +413,10 @@ interface RawWorktreeActivity {
   workflow?: RawWorkflowState;
   build?: RawBuildProgress;
   working: boolean;
+  driven_by?: string;
+  drives?: string[];
+  pending_prompts?: number;
+  drive_paused?: boolean;
 }
 
 function normalizeWorkflow(raw: RawWorkflowState): WorkflowState {
@@ -441,7 +453,7 @@ function normalizeBuild(raw: RawBuildProgress): BuildProgress {
   };
 }
 
-function normalizeWorktreeActivity(raw: RawWorktreeActivity): WorktreeActivity {
+export function normalizeWorktreeActivity(raw: RawWorktreeActivity): WorktreeActivity {
   return {
     project: raw.project,
     worktree: raw.worktree,
@@ -450,6 +462,10 @@ function normalizeWorktreeActivity(raw: RawWorktreeActivity): WorktreeActivity {
     workflow: raw.workflow ? normalizeWorkflow(raw.workflow) : null,
     build: raw.build ? normalizeBuild(raw.build) : null,
     working: raw.working,
+    drivenBy: raw.driven_by ?? null,
+    drives: raw.drives ?? [],
+    pendingPrompts: raw.pending_prompts ?? 0,
+    drivePaused: raw.drive_paused ?? false,
   };
 }
 
@@ -458,6 +474,107 @@ export function worktreeActivity(): Promise<WorktreeActivity[]> {
   return invoke<RawWorktreeActivity[]>("worktree_activity").then((rows) =>
     rows.map(normalizeWorktreeActivity),
   );
+}
+
+// ── Driving ────────────────────────────────────────────────────────────────────
+// Mirrors `drive::DriveView` / `PendingPromptView` (src-tauri/src/drive.rs). These keep
+// the wire's snake_case names: they are passed straight through to the UI.
+
+/** A brokered prompt waiting on the driver's decision. */
+export interface PendingPrompt {
+  id: number;
+  kind: "permission" | "question";
+  tool_name: string;
+  summary: string;
+  created_at: string;
+}
+
+/** One drive binding of a project, with its pending prompts (oldest first). */
+export interface DriveView {
+  driven: string;
+  driver: string;
+  since: string;
+  forced_from: string | null;
+  paused: boolean;
+  escalate_after_s: number;
+  awaiting_turn: number | null;
+  pending: PendingPrompt[];
+}
+
+/** The project's drives (any registered project, active or not). */
+export function drivesList(project: string): Promise<DriveView[]> {
+  return invoke<DriveView[]>("drives_list", { project });
+}
+
+/** End the drive of `driven`; its pending prompts escalate to the human. */
+export function driveRelease(project: string, driven: string): Promise<void> {
+  return invoke<void>("drive_release", { project, driven });
+}
+
+/** Escalate `driven`'s pending prompts to the human, keeping the binding. Resolves to
+ *  the number of prompts escalated (0 is not an error). */
+export function driveTakeOver(project: string, driven: string): Promise<number> {
+  return invoke<number>("drive_take_over", { project, driven });
+}
+
+/** Pause (or resume) the drive of `driven`; pausing escalates its pending prompts. */
+export function drivePause(project: string, driven: string, paused: boolean): Promise<void> {
+  return invoke<void>("drive_pause", { project, driven, paused });
+}
+
+/** How the window resolved a driver request it was asked to carry out. */
+export type DriveOutcome = "accepted" | "applied" | "refused";
+
+/** Report the window's result for a driver request back to the runner. */
+export function driveRequestResolve(
+  project: string,
+  requestId: number,
+  outcome: DriveOutcome,
+  reason = "",
+): Promise<void> {
+  return invoke<void>("drive_request_resolve", { project, requestId, outcome, reason });
+}
+
+/** Tell the runner which projects this window has open (it serves only those). */
+export function driveSetOpenProjects(projects: string[]): Promise<void> {
+  return invoke<void>("drive_set_open_projects", { projects });
+}
+
+/** The fields every driver request event carries. */
+export interface DriveRequestEvent {
+  request_id: number;
+  project: string;
+  worktree: string;
+  driver: string;
+}
+
+/** What a `drive://restart` asks of the pane: kill and start again (`reset`), or start
+ *  an agent that isn't running and leave a running one alone (`wake`). */
+export type DriveRestartMode = "reset" | "wake";
+
+/** `drive://restart`: restart or wake the driven pane (the provider is already
+ *  persisted). `fresh` starts a new conversation instead of resuming. `replace` says the
+ *  pane must start a new session (a reset, or a wake that is fresh or on another
+ *  provider): a session the pane still holds runs the old conversation or provider. */
+export interface DriveRestartEvent extends DriveRequestEvent {
+  mode: DriveRestartMode;
+  fresh: boolean;
+  replace: boolean;
+}
+
+/** `drive://swap`: run the transfer flow for the driven pane to `to`. */
+export interface DriveSwapEvent extends DriveRequestEvent {
+  to: CliKind;
+}
+
+/** Subscribe to the runner's requests to reset a driven pane. */
+export function onDriveRestart(cb: (e: DriveRestartEvent) => void): Promise<UnlistenFn> {
+  return listen<DriveRestartEvent>("drive://restart", cb);
+}
+
+/** Subscribe to the runner's requests to swap a driven pane's CLI. */
+export function onDriveSwap(cb: (e: DriveSwapEvent) => void): Promise<UnlistenFn> {
+  return listen<DriveSwapEvent>("drive://swap", cb);
 }
 
 /** A single live session hint returned by `daemon_list_sessions`. */

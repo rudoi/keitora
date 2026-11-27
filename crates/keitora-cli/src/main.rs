@@ -1,8 +1,14 @@
 //! Keitora CLI (`keitora`) — a thin command layer over the `keitora-tasks` library.
-//! Task tracking (`keitora task …`), session state (`keitora session …`), and project
-//! configuration (`keitora config …`) from the terminal.
+//! Task tracking (`keitora task …`), session state (`keitora session …`), project
+//! configuration (`keitora config …`) and the driver verbs (`keitora drive`, `send`,
+//! `wait`, …) from the terminal.
+
+mod drive;
+mod gate;
+mod stop_capture;
 
 use std::error::Error;
+use std::io::IsTerminal;
 
 use clap::{Parser, Subcommand};
 use keitora_tasks::{
@@ -17,7 +23,7 @@ mod hook_payload;
 #[derive(Parser)]
 #[command(
     name = "keitora",
-    about = "Keitora — task tracking, sessions, and config",
+    about = "Keitora — task tracking, sessions, config, and driving other worktrees",
     version
 )]
 struct Cli {
@@ -35,7 +41,8 @@ enum Cmd {
     Task(TaskCmd),
     /// Record this worktree's agent session state (used by agent hooks)
     Session {
-        /// One of: idle | busy | waiting | offline
+        /// One of: idle | busy | waiting | offline, or `gate` (the permission hook of a
+        /// driven session)
         state: String,
         /// Read the hook's JSON payload from stdin and take the worktree from its
         /// `cwd` (else `workspacePaths[0]`); never fails the hook
@@ -44,10 +51,62 @@ enum Cmd {
         /// With `--stdin-payload`: do nothing unless the payload has `fullyIdle: true`
         #[arg(long, requires = "stdin_payload")]
         if_fully_idle: bool,
+        /// `gate` only: the agent CLI running the hook (claude | codex)
+        #[arg(long)]
+        provider: Option<String>,
+        /// `idle` only (Stop hook): record the turn's last reply from the hook payload
+        #[arg(long, conflicts_with = "stdin_payload")]
+        stdin: bool,
+        /// `idle` only (StopFailure hook): record that the turn ended with an error
+        #[arg(long)]
+        failed: bool,
     },
     /// Manage project configuration
     #[command(subcommand)]
     Config(ConfigCmd),
+    /// Bind this worktree as the driver of another
+    #[command(long_about = drive::DRIVE_GUIDANCE)]
+    Drive(drive::DriveArgs),
+    /// End a drive binding
+    Release(drive::ReleaseArgs),
+    /// List drive bindings in this project
+    Drives,
+    /// Send a prompt to a driven worktree
+    Send(drive::SendArgs),
+    /// Block until a driven worktree finishes its turn, needs a decision, stalls, or has a send refused
+    Wait(drive::WaitArgs),
+    /// Read a driven worktree's pane tail or last reply
+    Read(drive::ReadArgs),
+    /// List pending brokered prompts
+    Prompts(drive::PromptsArgs),
+    /// Decide a brokered prompt
+    Answer(drive::AnswerArgs),
+    /// Start a fresh conversation in a driven worktree, optionally on another provider
+    Reset(drive::ResetArgs),
+    /// Switch a driven worktree's provider, carrying context (needs a human confirm)
+    Swap(drive::SwapArgs),
+    /// Start a driven worktree's agent when it isn't running (resuming its conversation)
+    Wake(drive::WakeArgs),
+}
+
+impl Cmd {
+    /// The driver verb this command is, if it is one.
+    fn into_verb(self) -> Option<drive::Verb> {
+        Some(match self {
+            Cmd::Drive(a) => drive::Verb::Drive(a),
+            Cmd::Release(a) => drive::Verb::Release(a),
+            Cmd::Drives => drive::Verb::Drives,
+            Cmd::Send(a) => drive::Verb::Send(a),
+            Cmd::Wait(a) => drive::Verb::Wait(a),
+            Cmd::Read(a) => drive::Verb::Read(a),
+            Cmd::Prompts(a) => drive::Verb::Prompts(a),
+            Cmd::Answer(a) => drive::Verb::Answer(a),
+            Cmd::Reset(a) => drive::Verb::Reset(a),
+            Cmd::Swap(a) => drive::Verb::Swap(a),
+            Cmd::Wake(a) => drive::Verb::Wake(a),
+            Cmd::Task(_) | Cmd::Session { .. } | Cmd::Config(_) => return None,
+        })
+    }
 }
 
 #[derive(Subcommand)]
@@ -241,13 +300,30 @@ fn cli_actor() -> String {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(e) = run().await {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+        // An empty message means the verb already printed its result on stdout.
+        let msg = e.to_string();
+        if !msg.is_empty() {
+            eprintln!("error: {msg}");
+        }
+        std::process::exit(drive::exit_code(e.as_ref()));
     }
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+
+    // The gate is a blocking hook that must exit 0 with no stray output on every path,
+    // so it runs before anything here can fail (it resolves the project itself).
+    if let Cmd::Session {
+        ref state,
+        ref provider,
+        ..
+    } = cli.cmd
+    {
+        if state == "gate" {
+            gate::gate_main(provider.as_deref());
+        }
+    }
 
     // Config subcommands do not need the store; short-circuit before resolve().
     if let Cmd::Config(ref sub) = cli.cmd {
@@ -262,34 +338,39 @@ async fn run() -> Result<(), Box<dyn Error>> {
         ..
     } = cli.cmd
     {
-        if !enter_payload_dir(if_fully_idle) {
+        let Some(raw) = enter_payload_dir(if_fully_idle) else {
             return Ok(());
-        }
-        if let Err(e) = run_resolved(cli).await {
+        };
+        // A fully idle Stop ends the turn: it also records the turn's reply, so a
+        // driver's `wait` sees it finish.
+        let turn_end = if_fully_idle.then_some(raw);
+        if let Err(e) = run_resolved(cli, turn_end).await {
             eprintln!("error: {e}");
         }
         return Ok(());
     }
 
-    run_resolved(cli).await
+    run_resolved(cli, None).await
 }
 
-/// Read the hook payload from stdin and change into its directory. `false` when
-/// the hook should do nothing (unreadable, oversize, filtered out, no such dir).
-fn enter_payload_dir(if_fully_idle: bool) -> bool {
+/// Read the hook payload from stdin and change into its directory, returning the
+/// payload. `None` when the hook should do nothing (unreadable, oversize, filtered
+/// out, no such dir).
+fn enter_payload_dir(if_fully_idle: bool) -> Option<Vec<u8>> {
     use hook_payload::{interpret_payload, read_capped, PayloadAction, MAX_PAYLOAD_BYTES};
     let Ok(Some(raw)) = read_capped(&mut std::io::stdin(), MAX_PAYLOAD_BYTES) else {
-        return false;
+        return None;
     };
     let PayloadAction::Run { cwd } = interpret_payload(&raw, if_fully_idle) else {
-        return false;
+        return None;
     };
-    cwd.is_dir() && std::env::set_current_dir(&cwd).is_ok()
+    (cwd.is_dir() && std::env::set_current_dir(&cwd).is_ok()).then_some(raw)
 }
 
 /// Everything after the config short-circuit: resolve the project, open the
-/// stores and run the task or session command.
-async fn run_resolved(cli: Cli) -> Result<(), Box<dyn Error>> {
+/// stores and run the task or session command. `turn_end` is the payload of a hook
+/// that already read stdin and ends a turn (see [`run_session`]).
+async fn run_resolved(cli: Cli, turn_end: Option<Vec<u8>>) -> Result<(), Box<dyn Error>> {
     let config = resolve()
         .map(Config::from_project)
         .map_err(|e| -> Box<dyn Error> {
@@ -303,24 +384,170 @@ async fn run_resolved(cli: Cli) -> Result<(), Box<dyn Error>> {
             }
         })?;
 
-    // Task/dispatch commands use the async TaskBackend.
-    // Session commands use the synchronous LocalStore.
+    // Session hooks and the driver verbs need only the local store: they never open
+    // the task backend (a GitHub backend must not be contacted to answer a prompt).
+    let task = match cli.cmd {
+        Cmd::Config(_) => unreachable!("handled above"),
+        Cmd::Session {
+            state,
+            provider,
+            stdin,
+            failed,
+            ..
+        } => {
+            return run_session(
+                &config,
+                &state,
+                provider.as_deref(),
+                SessionCapture {
+                    stdin,
+                    failed,
+                    turn_end: turn_end.as_deref(),
+                },
+                cli.json,
+            )
+        }
+        Cmd::Task(task) => task,
+        other => {
+            let verb = other.into_verb().ok_or("not a driver verb")?;
+            return run_drive(&config, verb, cli.json);
+        }
+    };
+
     let backend = keitora_tasks::open_backend(config.project_config())?;
     let local = LocalStore::open(&config.db_path)?;
+    run_task(task, backend.as_ref(), &local, &config, cli.json).await
+}
 
-    match cli.cmd {
-        Cmd::Config(_) => unreachable!("handled above"),
-        Cmd::Session { state, .. } => {
-            // The hook entry point — runs on every turn, so keep it cheap: one
-            // targeted query for the active task id, no full list scan.
-            let me = cli_actor();
-            let current = local.active_task_id(&me).ok().flatten();
-            local.session_upsert(&me, &state, current, None)?;
-            emit_ok(cli.json, &format!("  {me} session → {state}"))?;
-        }
-        Cmd::Task(task) => run_task(task, backend.as_ref(), &local, &config, cli.json).await?,
+/// How `keitora session` records the turn's reply, if at all.
+struct SessionCapture<'a> {
+    /// `--stdin`: read the Stop payload from stdin.
+    stdin: bool,
+    /// `--failed`: the turn ended with an error.
+    failed: bool,
+    /// A payload already read by `--stdin-payload --if-fully-idle` (Antigravity's
+    /// Stop). Its reply text is usually empty: the payload carries no message and
+    /// its transcript format isn't read, but the turn still counts as finished.
+    turn_end: Option<&'a [u8]>,
+}
+
+/// The payload to record the turn's reply from, or `None` when this call records no
+/// reply: empty for `--failed`, the already-read payload of a turn-ending
+/// `--stdin-payload` hook (`idle` only), else stdin for `--stdin`.
+fn reply_payload(
+    state: &str,
+    cap: &SessionCapture<'_>,
+    read_stdin: impl FnOnce() -> Vec<u8>,
+) -> Option<Vec<u8>> {
+    if cap.failed {
+        return Some(Vec::new());
     }
+    if let Some(raw) = cap.turn_end.filter(|_| state == "idle") {
+        return Some(raw.to_vec());
+    }
+    cap.stdin.then(read_stdin)
+}
 
+/// `keitora session <state>`: the hook entry point. Runs on every turn, so keep it
+/// cheap: one targeted query for the active task id, no full list scan.
+fn run_session(
+    config: &Config,
+    state: &str,
+    provider: Option<&str>,
+    cap: SessionCapture<'_>,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    check_session_flags(state, provider, cap.stdin, cap.failed)?;
+    let local = LocalStore::open(&config.db_path)?;
+    let me = cli_actor();
+    let payload = reply_payload(state, &cap, || {
+        let input = std::io::stdin();
+        let terminal = input.is_terminal();
+        gate::read_bounded(
+            input,
+            stop_capture::STOP_STDIN_CAP,
+            stop_capture::STOP_STDIN_TIMEOUT,
+            terminal,
+        )
+    });
+    let capture = payload.is_some();
+    if let Some(payload) = payload {
+        // Reply first, state second: whoever sees `idle` already sees the turn.
+        let message = stop_capture::capture_message(cap.failed, &payload);
+        local.session_reply_record(&me, &message)?;
+    }
+    let current = local.active_task_id(&me).ok().flatten();
+    local.session_upsert(&me, state, current, None)?;
+    // The Stop hooks leave stdout attached, so the capture path prints nothing.
+    if !capture {
+        emit_ok(json, &format!("  {me} session → {state}"))?;
+    }
+    Ok(())
+}
+
+/// Run a driver verb against the project's local store and print its result. A
+/// non-zero outcome (timeout, refusal) exits with its code after printing.
+fn run_drive(config: &Config, verb: drive::Verb, json: bool) -> Result<(), Box<dyn Error>> {
+    let local = LocalStore::open(&config.db_path).map_err(drive::store_err)?;
+    let worktree_path = |w: &str| {
+        config
+            .worktree_path(w)
+            .unwrap_or_else(|_| config.main_worktree_path().join(w))
+    };
+    let registered = || require_registered(config);
+    let read_stdin = |cap: usize| -> std::io::Result<Vec<u8>> {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        std::io::stdin().take(cap as u64).read_to_end(&mut buf)?;
+        Ok(buf)
+    };
+    let worktree_cli = |w: &str| {
+        let user = keitora_tasks::UserConfig::load().ok()?;
+        let entry = config.project_config().worktree_entry(w);
+        Some(keitora_tasks::resolve_cli(entry.as_ref(), &user))
+    };
+    let ctx = drive::Ctx {
+        local: &local,
+        me: cli_actor(),
+        worktrees: config.worktrees.clone(),
+        worktree_path: &worktree_path,
+        worktree_cli: &worktree_cli,
+        registered: &registered,
+        clock: &gate::RealClock,
+        stdin: &read_stdin,
+    };
+    let out = drive::run(&ctx, verb)?;
+    println!("{}", out.render(json));
+    if out.code != 0 {
+        return Err(Box::new(drive::ExitError::new(out.code, "")));
+    }
+    Ok(())
+}
+
+/// The app only reads requests from the DBs of projects in its registry; anywhere
+/// else a request would sit unread until it expired.
+fn require_registered(config: &Config) -> Result<(), String> {
+    let root = &config.project_config().root;
+    let registry = UserConfig::load().map_err(|e| e.to_string())?;
+    if registry.project_ref_by_root(root).is_none() {
+        return Err(unregistered_message(root));
+    }
+    Ok(())
+}
+
+/// Reject flag combinations `keitora session` doesn't support.
+fn check_session_flags(
+    state: &str,
+    provider: Option<&str>,
+    stdin: bool,
+    failed: bool,
+) -> Result<(), Box<dyn Error>> {
+    if provider.is_some() {
+        return Err("--provider applies to `session gate` only".into());
+    }
+    if (stdin || failed) && state != "idle" {
+        return Err("--stdin and --failed apply to `session idle` only".into());
+    }
     Ok(())
 }
 
@@ -706,9 +933,6 @@ async fn run_task(
 
 // ---- task dispatch / watch ----
 
-/// How often `task dispatch --wait` re-reads its request row.
-const DISPATCH_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(200);
-
 /// `keitora task dispatch`: write a dispatch request into the project's `tasks.db`
 /// for the running app to execute through its own dispatch path (the CLI never types
 /// into a pane itself, so it can't race the app's writer). The request is a
@@ -730,13 +954,7 @@ async fn cmd_task_dispatch(
     if until_claimed && wait == 0 {
         return Err("--until-claimed needs --wait <secs> to bound how long it waits".into());
     }
-    // The app only reads requests from the DBs of projects in its registry; anywhere
-    // else a request would sit unread until it expired.
-    let root = &config.project_config().root;
-    let registry = UserConfig::load().map_err(|e| e.to_string())?;
-    if registry.project_ref_by_root(root).is_none() {
-        return Err(unregistered_message(root).into());
-    }
+    require_registered(config)?;
     if !config.worktrees.is_empty() && !config.worktrees.iter().any(|w| w == worktree) {
         return Err(format!(
             "unknown worktree \"{worktree}\" — must be one of: {}",
@@ -758,7 +976,7 @@ async fn cmd_task_dispatch(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
     if wait > 0 {
         while !req.is_resolved() && std::time::Instant::now() < deadline {
-            std::thread::sleep(DISPATCH_WAIT_POLL);
+            std::thread::sleep(drive::REQUEST_POLL);
             req = local
                 .dispatch_request_get(req.id)?
                 .ok_or_else(|| format!("dispatch request {} vanished", req.id))?;
@@ -786,7 +1004,7 @@ async fn cmd_task_dispatch(
             if progress != ClaimProgress::Waiting || std::time::Instant::now() >= deadline {
                 break;
             }
-            std::thread::sleep(DISPATCH_WAIT_POLL);
+            std::thread::sleep(drive::REQUEST_POLL);
         }
         claim = Some(progress);
     }
@@ -1231,6 +1449,7 @@ mod tests {
                 state,
                 stdin_payload,
                 if_fully_idle,
+                ..
             } => {
                 assert_eq!(state, "idle");
                 assert!(stdin_payload && if_fully_idle);
@@ -1310,6 +1529,7 @@ mod tests {
                 state,
                 stdin_payload,
                 if_fully_idle,
+                ..
             } => {
                 assert_eq!(state, "idle");
                 assert!(!stdin_payload && !if_fully_idle);
@@ -1321,6 +1541,80 @@ mod tests {
         assert!(Cli::try_parse_from(["keitora", "task", "list", "--json"]).is_ok());
         // Old flat form must NOT parse anymore (clean break — no `task` alias).
         assert!(Cli::try_parse_from(["keitora", "list"]).is_err());
+    }
+
+    #[test]
+    fn reply_payload_picks_the_capture_source() {
+        let cap = |stdin, failed, turn_end| SessionCapture {
+            stdin,
+            failed,
+            turn_end,
+        };
+        let stdin = || b"from-stdin".to_vec();
+        let agy_stop = br#"{"fullyIdle":true}"#.as_slice();
+        // No capture flag: no reply.
+        assert_eq!(reply_payload("idle", &cap(false, false, None), stdin), None);
+        // --stdin reads stdin; --failed records an empty payload.
+        assert_eq!(
+            reply_payload("idle", &cap(true, false, None), stdin),
+            Some(b"from-stdin".to_vec())
+        );
+        assert_eq!(
+            reply_payload("idle", &cap(false, true, None), stdin),
+            Some(Vec::new())
+        );
+        // A turn-ending payload hook records from the payload it already read...
+        assert_eq!(
+            reply_payload("idle", &cap(false, false, Some(agy_stop)), stdin),
+            Some(agy_stop.to_vec())
+        );
+        // ...but only for `idle`.
+        assert_eq!(
+            reply_payload("busy", &cap(false, false, Some(agy_stop)), stdin),
+            None
+        );
+        // Antigravity's Stop payload has no reply text: the turn counts, with no message.
+        assert_eq!(stop_capture::capture_message(false, agy_stop), "");
+    }
+
+    #[test]
+    fn parses_session_gate_and_capture_flags() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).unwrap().cmd {
+            Cmd::Session {
+                state,
+                provider,
+                stdin,
+                failed,
+                ..
+            } => (state, provider, stdin, failed),
+            _ => panic!("expected `session`"),
+        };
+        assert_eq!(
+            parse(&["keitora", "session", "gate", "--provider", "codex"]),
+            ("gate".into(), Some("codex".into()), false, false)
+        );
+        assert_eq!(
+            parse(&["keitora", "session", "idle", "--stdin"]),
+            ("idle".into(), None, true, false)
+        );
+        assert_eq!(
+            parse(&["keitora", "session", "idle", "--failed"]),
+            ("idle".into(), None, false, true)
+        );
+        // Both read the hook payload from stdin, so they can't be combined.
+        assert!(
+            Cli::try_parse_from(["keitora", "session", "idle", "--stdin", "--stdin-payload"])
+                .is_err()
+        );
+        // `gate` is handled before the store, never as a session state.
+        assert!(!keitora_tasks::SESSION_STATES.contains(&"gate"));
+
+        assert!(check_session_flags("idle", None, true, false).is_ok());
+        assert!(check_session_flags("idle", None, false, true).is_ok());
+        assert!(check_session_flags("busy", None, false, false).is_ok());
+        assert!(check_session_flags("busy", None, true, false).is_err());
+        assert!(check_session_flags("waiting", None, false, true).is_err());
+        assert!(check_session_flags("idle", Some("claude"), false, false).is_err());
     }
 
     #[test]
@@ -1402,6 +1696,9 @@ mod tests {
             current_task_id: task,
             pid: None,
             last_heartbeat: beat.into(),
+            driven_by: None,
+            brokered: false,
+            escalated_reason: None,
         }
     }
 

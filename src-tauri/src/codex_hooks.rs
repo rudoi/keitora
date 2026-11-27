@@ -26,6 +26,7 @@
 
 use std::path::Path;
 
+use crate::hooks::{posix_fallback_command, posix_state_command};
 use serde_json::{json, Value};
 
 /// (Codex event, session state). The Codex analog of `hooks::HOOK_MAP`, using the
@@ -49,13 +50,27 @@ use serde_json::{json, Value};
 /// PascalCase `HookEventName` wire names, so they are registered here. Codex has no
 /// distinct `StopFailure` analog (Claude's second idle trigger), and `SubagentStop`
 /// is deliberately omitted — it fires mid-turn and would wrongly flip to idle.
-const CODEX_HOOK_MAP: [(&str, &str); 5] = [
-    ("SessionStart", "idle"),
-    ("UserPromptSubmit", "busy"),
-    ("Stop", "idle"),
-    ("PermissionRequest", "waiting"),
-    ("SessionEnd", "offline"),
+///
+/// `PermissionRequest` runs the gate (which itself writes `waiting` when nothing
+/// brokers the prompt) and `Stop` captures the reply for a driver before idle.
+const CODEX_HOOK_MAP: [(&str, CodexCmd); 5] = [
+    ("SessionStart", CodexCmd::State("idle")),
+    ("UserPromptSubmit", CodexCmd::State("busy")),
+    ("Stop", CodexCmd::Stop),
+    ("PermissionRequest", CodexCmd::Gate),
+    ("SessionEnd", CodexCmd::State("offline")),
 ];
+
+/// Which command a Codex hook entry runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexCmd {
+    /// `session <state>`, all streams silenced.
+    State(&'static str),
+    /// Permission gate; stdout reaches Codex, only stderr is discarded.
+    Gate,
+    /// Turn end: capture the reply from stdin, then record idle.
+    Stop,
+}
 
 /// Detectable substring identifying a hook `command` as ours, so a refresh replaces
 /// rather than duplicates it (distinct from the Claude installer's marker). Carried
@@ -79,21 +94,40 @@ const CODEX_HOOK_MARKER: &str = "keitora:codex-session-hook";
 /// The `\\?\` extended-length prefix the resolved build path can carry is stripped
 /// (PowerShell's `Test-Path`/`&` and `/bin/sh` both choke on it); UNC-safe, and a
 /// no-op on unix / on a path without the prefix.
-fn hook_command(task_bin: &str, state: &str) -> String {
+fn hook_command(task_bin: &str, cmd: CodexCmd) -> String {
     let bin = keitora_tasks::strip_extended_prefix_str(task_bin);
-    #[cfg(windows)]
-    {
+    build_command(&bin, cmd, cfg!(windows))
+}
+
+/// Platform-independent builder behind [`hook_command`], so both shapes are testable
+/// on any OS.
+///
+/// The gate and `--stdin` forms discard only stderr (`2>$null` / `2>/dev/null`) so
+/// stdout reaches Codex; each falls back to a plain silenced call (`session waiting` /
+/// `session idle`) when the installed CLI predates the new flags. On Windows a trailing
+/// `exit 0` stops an old CLI's non-zero clap exit from reading as a block.
+fn build_command(bin: &str, cmd: CodexCmd, windows: bool) -> String {
+    let m = CODEX_HOOK_MARKER;
+    if windows {
         // Backslashes are literal inside PowerShell double-quotes (backtick is the
         // escape char, not backslash), so a native `C:\…\keitora.exe` is used as-is.
-        format!(
-            "if (Test-Path -LiteralPath \"{bin}\") {{ & \"{bin}\" session {state} *> $null }} # {CODEX_HOOK_MARKER}"
-        )
-    }
-    #[cfg(not(windows))]
-    {
-        format!(
-            "[ -x \"{bin}\" ] && \"{bin}\" session {state} >/dev/null 2>&1 || true # {CODEX_HOOK_MARKER}"
-        )
+        match cmd {
+            CodexCmd::State(state) => format!(
+                "if (Test-Path -LiteralPath \"{bin}\") {{ & \"{bin}\" session {state} *> $null }} # {m}"
+            ),
+            CodexCmd::Gate => format!(
+                "if (Test-Path -LiteralPath \"{bin}\") {{ & \"{bin}\" session gate --provider codex 2>$null; if ($LASTEXITCODE -ne 0) {{ & \"{bin}\" session waiting *> $null }} }}; exit 0 # {m}"
+            ),
+            CodexCmd::Stop => format!(
+                "if (Test-Path -LiteralPath \"{bin}\") {{ & \"{bin}\" session idle --stdin 2>$null; if ($LASTEXITCODE -ne 0) {{ & \"{bin}\" session idle *> $null }} }}; exit 0 # {m}"
+            ),
+        }
+    } else {
+        match cmd {
+            CodexCmd::State(state) => posix_state_command(bin, state, m),
+            CodexCmd::Gate => posix_fallback_command(bin, "gate --provider codex", "waiting", m),
+            CodexCmd::Stop => posix_fallback_command(bin, "idle --stdin", "idle", m),
+        }
     }
 }
 
@@ -133,11 +167,12 @@ pub fn merged_codex_hooks(existing: Value, task_bin: &str) -> Value {
     }
     let hooks = hooks.as_object_mut().unwrap();
 
-    for (event, state) in CODEX_HOOK_MAP {
-        let command = hook_command(task_bin, state);
-        let entry = json!({
-            "hooks": [ { "type": "command", "command": command } ],
-        });
+    for (event, cmd) in CODEX_HOOK_MAP {
+        let mut hook = json!({ "type": "command", "command": hook_command(task_bin, cmd) });
+        if cmd == CodexCmd::Gate {
+            hook["timeout"] = json!(keitora_tasks::DRIVE_HOOK_TIMEOUT_S);
+        }
+        let entry = json!({ "hooks": [ hook ] });
         let arr = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
         if !arr.is_array() {
             *arr = json!([]);
@@ -209,10 +244,10 @@ mod tests {
     #[test]
     fn empty_input_gets_all_five_events_mapped() {
         let out = merged_codex_hooks(json!({}), "/abs/keitora");
-        for (event, state) in CODEX_HOOK_MAP {
+        for (event, cmd) in CODEX_HOOK_MAP {
             assert_eq!(
                 commands_for(&out, event),
-                vec![hook_command("/abs/keitora", state)],
+                vec![hook_command("/abs/keitora", cmd)],
                 "event {event}"
             );
         }
@@ -223,11 +258,11 @@ mod tests {
     #[test]
     fn event_state_mapping_is_exact() {
         let map: std::collections::BTreeMap<_, _> = CODEX_HOOK_MAP.iter().copied().collect();
-        assert_eq!(map.get("SessionStart"), Some(&"idle"));
-        assert_eq!(map.get("UserPromptSubmit"), Some(&"busy"));
-        assert_eq!(map.get("Stop"), Some(&"idle"));
-        assert_eq!(map.get("PermissionRequest"), Some(&"waiting"));
-        assert_eq!(map.get("SessionEnd"), Some(&"offline"));
+        assert_eq!(map.get("SessionStart"), Some(&CodexCmd::State("idle")));
+        assert_eq!(map.get("UserPromptSubmit"), Some(&CodexCmd::State("busy")));
+        assert_eq!(map.get("Stop"), Some(&CodexCmd::Stop));
+        assert_eq!(map.get("PermissionRequest"), Some(&CodexCmd::Gate));
+        assert_eq!(map.get("SessionEnd"), Some(&CodexCmd::State("offline")));
         assert_eq!(map.len(), 5, "no unexpected events");
         // `SubagentStop` must never be mapped (fires mid-turn → false idle).
         assert!(!map.contains_key("SubagentStop"));
@@ -237,7 +272,7 @@ mod tests {
     /// right shell per platform (PowerShell on Windows, POSIX `/bin/sh` on unix).
     #[test]
     fn command_is_guarded_silenced_and_marked() {
-        let cmd = hook_command("/abs/keitora", "busy");
+        let cmd = hook_command("/abs/keitora", CodexCmd::State("busy"));
         assert!(cmd.contains(CODEX_HOOK_MARKER), "carries marker: {cmd}");
         assert!(cmd.contains("session busy"), "invokes state: {cmd}");
         #[cfg(windows)]
@@ -252,6 +287,108 @@ mod tests {
             assert!(cmd.contains(">/dev/null 2>&1"), "silenced: {cmd}");
             assert!(cmd.contains("|| true"), "never errors: {cmd}");
         }
+    }
+
+    #[test]
+    fn exact_unix_command_strings() {
+        let b = "/abs/keitora";
+        assert_eq!(
+            build_command(b, CodexCmd::State("busy"), false),
+            "[ -x \"/abs/keitora\" ] && \"/abs/keitora\" session busy >/dev/null 2>&1 || true # keitora:codex-session-hook"
+        );
+        assert_eq!(
+            build_command(b, CodexCmd::Gate, false),
+            "[ -x \"/abs/keitora\" ] && { \"/abs/keitora\" session gate --provider codex 2>/dev/null || \"/abs/keitora\" session waiting >/dev/null 2>&1; } || true # keitora:codex-session-hook"
+        );
+        assert_eq!(
+            build_command(b, CodexCmd::Stop, false),
+            "[ -x \"/abs/keitora\" ] && { \"/abs/keitora\" session idle --stdin 2>/dev/null || \"/abs/keitora\" session idle >/dev/null 2>&1; } || true # keitora:codex-session-hook"
+        );
+    }
+
+    #[test]
+    fn exact_windows_command_strings() {
+        let b = "C:\\bin\\keitora.exe";
+        assert_eq!(
+            build_command(b, CodexCmd::State("busy"), true),
+            "if (Test-Path -LiteralPath \"C:\\bin\\keitora.exe\") { & \"C:\\bin\\keitora.exe\" session busy *> $null } # keitora:codex-session-hook"
+        );
+        assert_eq!(
+            build_command(b, CodexCmd::Gate, true),
+            "if (Test-Path -LiteralPath \"C:\\bin\\keitora.exe\") { & \"C:\\bin\\keitora.exe\" session gate --provider codex 2>$null; if ($LASTEXITCODE -ne 0) { & \"C:\\bin\\keitora.exe\" session waiting *> $null } }; exit 0 # keitora:codex-session-hook"
+        );
+        assert_eq!(
+            build_command(b, CodexCmd::Stop, true),
+            "if (Test-Path -LiteralPath \"C:\\bin\\keitora.exe\") { & \"C:\\bin\\keitora.exe\" session idle --stdin 2>$null; if ($LASTEXITCODE -ne 0) { & \"C:\\bin\\keitora.exe\" session idle *> $null } }; exit 0 # keitora:codex-session-hook"
+        );
+    }
+
+    #[test]
+    fn gate_and_stop_keep_stdout_unredirected() {
+        for windows in [false, true] {
+            for cmd in [CodexCmd::Gate, CodexCmd::Stop] {
+                let c = build_command("/abs/keitora", cmd, windows);
+                assert!(c.contains("session gate") || c.contains("--stdin"), "{c}");
+                // the primary invocation discards stderr only
+                assert!(
+                    c.contains("2>$null;") || c.contains("2>/dev/null ||"),
+                    "{c}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn timeout_only_on_permission_request() {
+        let out = merged_codex_hooks(json!({}), "/abs/keitora");
+        assert_eq!(
+            out["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"],
+            600
+        );
+        for (event, _cmd) in CODEX_HOOK_MAP {
+            if event != "PermissionRequest" {
+                assert!(
+                    out["hooks"][event][0]["hooks"][0].get("timeout").is_none(),
+                    "{event}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_ours_matches_every_command_shape() {
+        for windows in [false, true] {
+            for cmd in [CodexCmd::State("idle"), CodexCmd::Gate, CodexCmd::Stop] {
+                let entry = json!({ "hooks": [ { "type": "command", "command": build_command("/abs/keitora", cmd, windows) } ] });
+                assert!(is_ours(&entry), "{cmd:?} windows={windows}");
+            }
+        }
+    }
+
+    #[test]
+    fn user_permission_request_hook_preserved() {
+        let existing = json!({
+            "hooks": { "PermissionRequest": [ { "hooks": [ { "type": "command", "command": "/usr/bin/mine.sh" } ] } ] }
+        });
+        let out = merged_codex_hooks(existing, "/abs/keitora");
+        assert_eq!(
+            commands_for(&out, "PermissionRequest"),
+            vec![
+                "/usr/bin/mine.sh".to_string(),
+                hook_command("/abs/keitora", CodexCmd::Gate)
+            ]
+        );
+    }
+
+    #[test]
+    fn install_writes_once_in_temp_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_codex_hooks_for(tmp.path(), "/abs/keitora");
+        let file = tmp.path().join(".codex/hooks.json");
+        let first = std::fs::read_to_string(&file).unwrap();
+        assert!(first.contains("session gate --provider codex"));
+        install_codex_hooks_for(tmp.path(), "/abs/keitora");
+        assert_eq!(first, std::fs::read_to_string(&file).unwrap());
     }
 
     #[test]
@@ -278,7 +415,7 @@ mod tests {
         // the user's own Stop hook is kept, ours appended
         let stop = commands_for(&out, "Stop");
         assert!(stop.contains(&"/usr/bin/mine.sh".to_string()));
-        assert!(stop.contains(&hook_command("/abs/keitora", "idle")));
+        assert!(stop.contains(&hook_command("/abs/keitora", CodexCmd::Stop)));
         assert_eq!(stop.len(), 2);
     }
 
@@ -288,11 +425,11 @@ mod tests {
         let second = merged_codex_hooks(first, "/new/keitora");
         assert_eq!(
             commands_for(&second, "Stop"),
-            vec![hook_command("/new/keitora", "idle")]
+            vec![hook_command("/new/keitora", CodexCmd::Stop)]
         );
         assert_eq!(
             commands_for(&second, "UserPromptSubmit"),
-            vec![hook_command("/new/keitora", "busy")]
+            vec![hook_command("/new/keitora", CodexCmd::State("busy"))]
         );
     }
 
@@ -310,7 +447,7 @@ mod tests {
         let out = merged_codex_hooks(legacy, "/abs/keitora");
         assert_eq!(
             commands_for(&out, "SessionEnd"),
-            vec![hook_command("/abs/keitora", "offline")]
+            vec![hook_command("/abs/keitora", CodexCmd::State("offline"))]
         );
     }
 }

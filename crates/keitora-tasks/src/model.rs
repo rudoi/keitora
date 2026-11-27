@@ -23,6 +23,16 @@ pub struct WorktreeSession {
     pub current_task_id: Option<i64>,
     pub pid: Option<i64>,
     pub last_heartbeat: String,
+    /// The worktree driving this one, if it is driven.
+    #[serde(default)]
+    pub driven_by: Option<String>,
+    /// A brokered prompt (pending and not stale) is waiting on the driver.
+    #[serde(default)]
+    pub brokered: bool,
+    /// While the session is `waiting` and its newest prompt was escalated to the
+    /// human, why it was escalated.
+    #[serde(default)]
+    pub escalated_reason: Option<String>,
 }
 
 /// A worktree's active (claimed) task, as the rail shows it on the worktree's lane.

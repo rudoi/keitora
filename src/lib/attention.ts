@@ -42,8 +42,33 @@ export function latchIdleFromTurn(
   return was;
 }
 
-/** The ball is in the user's court for this worktree. */
-export function needsInput(state: SessionState, idleFromTurn: boolean): boolean {
+/** The facts of a session's drive that decide whether it needs the human. */
+export interface DriveFacts {
+  drivenBy: string | null;
+  brokered: boolean;
+}
+
+/** The session's drive facts; undefined when it is not driven. */
+export function driveFacts(s: WorktreeSession | undefined): DriveFacts | undefined {
+  if (!s?.driven_by) return undefined;
+  return { drivenBy: s.driven_by, brokered: s.brokered === true };
+}
+
+/**
+ * The ball is in the user's court for this worktree. A driven worktree is quieter: while
+ * its driver decides a brokered prompt the human is not needed, and its finished turns are
+ * read by the driver. An escalated prompt (driven, waiting, not brokered) needs the human.
+ * Mirrored by `needs_input` in `src-tauri/src/bg_notifier.rs`.
+ */
+export function needsInput(
+  state: SessionState,
+  idleFromTurn: boolean,
+  drive?: DriveFacts,
+): boolean {
+  if (drive?.drivenBy) {
+    if (state === "waiting" && drive.brokered) return false;
+    if (state === "idle") return false;
+  }
   return state === "waiting" || (state === "idle" && idleFromTurn);
 }
 
@@ -64,10 +89,27 @@ export type AttentionKind = "waiting" | "finished";
 export function classifyAttention(
   state: SessionState,
   idleFromTurn: boolean,
+  drive?: DriveFacts,
 ): AttentionKind | null {
-  if (state === "waiting") return "waiting";
-  if (state === "idle" && idleFromTurn) return "finished";
-  return null;
+  if (!needsInput(state, idleFromTurn, drive)) return null;
+  return state === "waiting" ? "waiting" : "finished";
+}
+
+/** Longest escalation reason (in chars) a notification body carries before it is cut. */
+const BODY_REASON_MAX = 140;
+
+/**
+ * The notification body for a driven session waiting on an escalated prompt with a reason
+ * (`alpha escalated: reason`), or null when the usual task-title body applies.
+ */
+export function escalationBody(s: WorktreeSession): string | null {
+  if (!s.driven_by || !s.escalated_reason || s.state !== "waiting") return null;
+  const chars = Array.from(s.escalated_reason);
+  const reason =
+    chars.length > BODY_REASON_MAX
+      ? `${chars.slice(0, BODY_REASON_MAX).join("")}…`
+      : s.escalated_reason;
+  return `${s.driven_by} escalated: ${reason}`;
 }
 
 /** Shallow value-equality for the attention map, to avoid pointless re-renders. */
@@ -163,6 +205,9 @@ export function useAttention(
   const prevRef = useRef<Map<string, SessionState> | null>(null);
   // idleFromTurn latch per worktree (see latchIdleFromTurn).
   const latchRef = useRef<Map<string, boolean>>(new Map());
+  // Drive facts per worktree at the previous snapshot, so a transition's `before` is judged
+  // by the facts it had then (a brokered -> escalated flip is a rising edge).
+  const prevDriveRef = useRef<Map<string, DriveFacts | undefined>>(new Map());
   // Worktrees the user has acknowledged by viewing (see nextAcknowledged).
   const ackRef = useRef<Set<string>>(new Set());
   // Tracks the last seen active project so we can detect a switch.
@@ -176,6 +221,7 @@ export function useAttention(
   // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only attention tracker; all refs and stable setters intentionally excluded
   useEffect(() => {
     const latch = latchRef.current;
+    const prevDrive = prevDriveRef.current;
     const acknowledged = ackRef.current;
 
     // ── Project switch: reset tracking so no stale latch bleeds across projects ──
@@ -184,6 +230,7 @@ export function useAttention(
       prevProjectRef.current = activeProject;
       prevRef.current = null;
       latch.clear();
+      prevDrive.clear();
       acknowledged.clear();
     }
 
@@ -196,7 +243,8 @@ export function useAttention(
     const updateBadge = () => {
       let count = 0;
       for (const [name, s] of sessions) {
-        if (needsInput(s.state, latch.get(name) ?? false) && !acknowledged.has(name)) count++;
+        const needs = needsInput(s.state, latch.get(name) ?? false, driveFacts(s));
+        if (needs && !acknowledged.has(name)) count++;
       }
       void getCurrentWindow().setBadgeCount(count > 0 ? count : undefined);
     };
@@ -209,6 +257,7 @@ export function useAttention(
       void getCurrentWindow().setBadgeCount(undefined);
       prevRef.current = null;
       latch.clear();
+      prevDrive.clear();
       acknowledged.clear();
       commit(new Map());
       return;
@@ -225,7 +274,9 @@ export function useAttention(
       for (const [name, s] of sessions) {
         seed.set(name, s.state);
         latch.set(name, false);
-        const kind = classifyAttention(s.state, false);
+        const facts = driveFacts(s);
+        prevDrive.set(name, facts);
+        const kind = classifyAttention(s.state, false, facts);
         if (kind) kinds.set(name, kind);
       }
       prevRef.current = seed;
@@ -250,8 +301,10 @@ export function useAttention(
       // Resolve a human-readable body from the active task; fall back when unknown.
       // biome-ignore lint/style/noNonNullAssertion: worktreeName is known to be present in sessions: derived from sessions iteration
       const session = sessions.get(worktreeName)!;
-      let body = "needs attention";
-      if (session.current_task_id !== null && tasks !== null) {
+      // An escalated drive prompt names its driver and reason; otherwise the active task.
+      const escalated = escalationBody(session);
+      let body = escalated ?? "needs attention";
+      if (escalated === null && session.current_task_id !== null && tasks !== null) {
         const task = tasks.find((t) => t.id === session.current_task_id);
         if (task) body = task.title;
       }
@@ -286,21 +339,25 @@ export function useAttention(
       if (prevState === undefined) {
         prev.set(name, s.state);
         latch.set(name, false);
+        const facts = driveFacts(s);
+        prevDrive.set(name, facts);
         acknowledged.delete(name);
-        const kind = classifyAttention(s.state, false);
+        const kind = classifyAttention(s.state, false, facts);
         if (kind) kinds.set(name, kind);
         continue;
       }
 
       const wasLatch = latch.get(name) ?? false;
-      const before = needsInput(prevState, wasLatch);
+      const facts = driveFacts(s);
+      const before = needsInput(prevState, wasLatch, prevDrive.get(name));
       const nextLatch = latchIdleFromTurn(prevState, s.state, wasLatch);
-      const now = needsInput(s.state, nextLatch);
+      const now = needsInput(s.state, nextLatch, facts);
 
       latch.set(name, nextLatch);
       prev.set(name, s.state);
+      prevDrive.set(name, facts);
 
-      const kind = classifyAttention(s.state, nextLatch);
+      const kind = classifyAttention(s.state, nextLatch, facts);
       if (kind) kinds.set(name, kind);
 
       // Acknowledge the worktree the user is actively viewing (and re-arm it on its
@@ -330,6 +387,9 @@ export function useAttention(
     }
     for (const name of latch.keys()) {
       if (!sessions.has(name)) latch.delete(name);
+    }
+    for (const name of prevDrive.keys()) {
+      if (!sessions.has(name)) prevDrive.delete(name);
     }
     for (const name of acknowledged) {
       if (!sessions.has(name)) acknowledged.delete(name);

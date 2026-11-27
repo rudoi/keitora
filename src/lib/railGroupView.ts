@@ -15,6 +15,8 @@ export interface HeaderView {
   work: "working" | "busy" | null;
   /** The live-session count as shown; empty at 0 so the slot keeps its width. */
   count: string;
+  /** Lanes driven by another worktree; the header shows `N driven` when non-zero. */
+  driven: number;
 }
 
 export function headerView(stats: SummaryStats, open: boolean): HeaderView {
@@ -23,6 +25,7 @@ export function headerView(stats: SummaryStats, open: boolean): HeaderView {
     waiting: stats.waiting > 0,
     work: stats.building > 0 ? "working" : stats.busy > 0 ? "busy" : null,
     count: stats.live > 0 ? String(stats.live) : "",
+    driven: stats.driven,
   };
 }
 
@@ -45,6 +48,7 @@ export function groupAriaLabel(key: string, stats: SummaryStats): string {
   if (stats.waiting > 0) parts.push(plural(stats.waiting, "needs input", "need input"));
   if (stats.building > 0) parts.push(`${stats.building} building`);
   if (stats.busy > 0) parts.push(`${stats.busy} busy`);
+  if (stats.driven > 0) parts.push(`${stats.driven} driven`);
   if (stats.live > 0) parts.push(plural(stats.live, "live session", "live sessions"));
   return parts.join(", ");
 }

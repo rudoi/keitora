@@ -11,6 +11,13 @@ import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { Activity, HelpCircle, Settings } from "lucide-react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cardModel } from "../lib/deps";
+import {
+  type DriveMenuItem,
+  driveMenuDisabledReason,
+  isDriveMenuItem,
+  type LaneDrive,
+} from "../lib/drive";
+import { runDriveAction as runDriveActionIn } from "../lib/drives";
 import { formatBytes, formatCpu, formatUptime } from "../lib/format";
 import type { CliKind, DaemonInfo } from "../lib/ipc";
 import {
@@ -356,7 +363,9 @@ function MenuAnchor({ x, y }: { x: number; y: number }) {
 // for each transfer pair, "Switch to {CLI}" for every other provider, and "Terminate
 // session"; a terminated one offers only "Launch" and "Launch fresh"
 // (`worktreeMenuItems`). A lane of a project other than the active one leads with "Focus",
-// under a label naming the lane, and its actions switch to that project first.
+// under a label naming the lane, and its actions switch to that project first. A driven
+// lane ends with "Take over", "Pause driver"/"Resume driver" and "Release", which write
+// the task store only and never switch the project.
 type WorktreeMenuState = {
   name: string;
   /** Registry key of the lane's project. */
@@ -368,6 +377,8 @@ type WorktreeMenuState = {
   y: number;
   cli: CliKind;
   terminated: boolean;
+  /** The lane's drive relationship when the menu opened. */
+  drive: LaneDrive | null;
 };
 
 const WORKTREE_ITEM_LABEL: Record<
@@ -380,6 +391,10 @@ const WORKTREE_ITEM_LABEL: Record<
   terminate: "Terminate session",
   launch: "Launch",
   "launch-fresh": "Launch fresh",
+  "take-over": "Take over",
+  "pause-driver": "Pause driver",
+  "resume-driver": "Resume driver",
+  release: "Release",
 };
 
 function WorktreeMenu({
@@ -399,15 +414,21 @@ function WorktreeMenu({
 }) {
   const items = worktreeMenuItems(state?.cli ?? "claude", state?.terminated ?? false, {
     inactive: state?.inactive,
+    drive: state?.drive,
   });
   const item = (entry: WorktreeMenuItem) => {
     const reason =
       entry.kind === "transfer" || entry.kind === "switch"
         ? actionDisabledReason(entry.kind, entry.to, available, transferBusy)
-        : sessionItemDisabledReason(entry, transferBusy);
+        : isDriveMenuItem(entry.kind)
+          ? state?.drive
+            ? driveMenuDisabledReason(entry.kind, state.drive)
+            : null
+          : sessionItemDisabledReason(entry, transferBusy);
     const off = reason !== null;
     return (
       <Fragment key={menuItemKey(entry)}>
+        {entry.kind === "take-over" && <DropdownMenu.Separator className={menuSepCls} />}
         <DropdownMenu.Item
           disabled={off}
           title={reason ?? undefined}
@@ -706,9 +727,22 @@ export function Rail({
       onSelectLane(g, m.name);
       return;
     }
+    // Drive actions write the task store only: they must not switch the human's project.
+    if (isDriveMenuItem(item.kind)) {
+      void runDriveAction(g, m.name, item.kind, m.drive?.drivenBy ?? "the driver");
+      return;
+    }
     const action = laneMenuAction(item);
     if (action !== null) onLaneAction(g, m.name, action);
   };
+
+  // A drive menu pick, run against the lane's project by its resolved name. The lane picks
+  // up the change on the next activity poll or sessions://changed.
+  const runDriveAction = useCallback(
+    (g: GroupModel, name: string, item: DriveMenuItem, driver: string) =>
+      runDriveActionIn(g.resolvedName, name, item, driver, showToast),
+    [showToast],
+  );
 
   // Opens the project root in the OS file manager (the parent folder, with the project
   // selected). Reveal needs no path scope in the opener plugin's default capability.
@@ -773,6 +807,7 @@ export function Rail({
         y,
         cli: lane.cli,
         terminated: lane.terminated,
+        drive: lane.drive,
       });
     },
     [onWorktreeMenuOpen],

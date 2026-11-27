@@ -141,6 +141,15 @@ impl CliKind {
     pub fn spec(self) -> &'static ProviderSpec {
         &SPECS[self as usize]
     }
+
+    /// Parse a provider from its config key (`"claude"`, `"codex"`, `"antigravity"`)
+    /// or its executable name (`"agy"`). Case-sensitive, matching the stored form.
+    pub fn from_name(name: &str) -> Option<CliKind> {
+        CliKind::ALL.into_iter().find(|c| {
+            let spec = c.spec();
+            spec.config_key == name || spec.binary == name
+        })
+    }
 }
 
 /// Session ids are embedded as bare shell arguments on every platform.
@@ -2679,10 +2688,33 @@ pub fn herdr_well_known_paths() -> Vec<PathBuf> {
 /// session-hook installer as the friendly default when no local build / override
 /// applies. Mirrors [`discover_claude`] but without the well-known-location
 /// fallbacks (a CLI the user installed is expected to be on PATH).
+///
+/// Uses the per-process cached login PATH, so a PATH fix made while the app runs is not
+/// seen; the CLI install status/install commands use [`keitora_on_path_fresh`] instead.
 #[cfg(unix)]
 pub fn keitora_on_path() -> Option<String> {
-    let path = login_path()?;
-    find_in_path(&path, "keitora").map(|p| p.to_string_lossy().into_owned())
+    keitora_in_login_path(cached_login_path())
+}
+
+/// [`keitora_on_path`] with a fresh login-shell PATH probe instead of the per-process cache,
+/// so a user who just fixed their PATH (e.g. added `~/.local/bin` to a profile) is seen
+/// without an app restart. Spawns a login shell: never call it on the app's setup thread.
+#[cfg(unix)]
+pub fn keitora_on_path_fresh() -> Option<String> {
+    keitora_in_login_path(login_path())
+}
+
+/// Windows: the process PATH is the only source and is read on every call, so this is
+/// [`keitora_on_path`].
+#[cfg(windows)]
+pub fn keitora_on_path_fresh() -> Option<String> {
+    keitora_on_path()
+}
+
+/// `keitora` in a `:`-separated login `path`, if any. Pure apart from the file probes.
+#[cfg(unix)]
+fn keitora_in_login_path(path: Option<String>) -> Option<String> {
+    find_in_path(&path?, "keitora").map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Windows: search the process `PATH` (`;`-separated) for `keitora.exe`/`.cmd`/`.bat`
@@ -2949,41 +2981,58 @@ pub fn discover_cli(cli: CliKind) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Windows: expose the bundled `keitora` CLI on spawned terminals' PATH
+// Bundled `keitora` CLI: locate it, mirror it, expose it on spawned terminals' PATH
 // ---------------------------------------------------------------------------
 
-/// Windows: pick the bundled `keitora` CLI sibling to mirror onto PATH for terminals the
-/// herdr server spawns. Prefers the packaged sidecar `keitora-cli.exe` (unambiguous); otherwise a
-/// dev-build `keitora.exe` — but ONLY when a sibling `keitora-app.exe` is also present. That
-/// guard mirrors `cli_install::locate_installable`: on a pre-rename branch `keitora.exe` is
-/// the GUI app, not the CLI, and must never be exposed as `keitora`. Pure (takes the dir).
-///
-/// This is the **canonical Windows CLI-resolver**. The GUI installer's
-/// `cli_install::{sidecar_candidate, locate_installable}` join extension-less names
-/// (`"keitora"`, `"keitora-app"`) and so only match on Unix; their Windows install path is
-/// deferred. When that lands, route its Windows resolution through
-/// this function rather than re-deriving the `keitora-app` rename guard a third time.
-#[cfg(windows)]
-fn pick_cli_source(dir: &Path) -> Option<PathBuf> {
-    let bundled = dir.join("keitora-cli.exe");
-    if bundled.is_file() {
-        return Some(bundled);
+/// `%LOCALAPPDATA%/keitora/bin` (the per-user data dir's equivalent elsewhere): where the
+/// managed copy of the `keitora` CLI lives on Windows (`keitora.exe`).
+pub fn managed_keitora_bin_dir() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("keitora").join("bin"))
+}
+
+/// True if `a` and `b` name the same path (on Windows case-insensitively and with
+/// either separator, as its file system treats them). Lexical: no file-system access.
+pub fn same_file_name(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").to_lowercase();
+        norm(a) == norm(b)
+    } else {
+        a == b
     }
-    let dev = dir.join("keitora.exe");
-    if dev.is_file() && dir.join("keitora-app.exe").is_file() {
+}
+
+/// The `keitora` CLI shipped beside the running app executable `current_exe`. Prefers the
+/// packaged sidecar `keitora-cli` (unambiguous); otherwise a dev-build `keitora` — but ONLY
+/// when a sibling `keitora-app` is also present (on a pre-rename branch `keitora` is the GUI
+/// app, not the CLI) and never the running executable itself. Names carry the platform exe
+/// suffix. The canonical resolver: the Windows PATH mirror, the CLI installer and the session
+/// hooks all go through it rather than re-deriving the guards. Pure apart from stat calls.
+pub fn bundled_cli(current_exe: &Path) -> Option<PathBuf> {
+    let dir = current_exe.parent()?;
+    let exe = std::env::consts::EXE_SUFFIX;
+    let usable = |p: &Path| is_executable_file(p) && !same_file_name(p, current_exe);
+    let sidecar = dir.join(format!("keitora-cli{exe}"));
+    if usable(&sidecar) {
+        return Some(sidecar);
+    }
+    let dev = dir.join(format!("keitora{exe}"));
+    // `is_file()` (not `exists()`) so a directory named `keitora-app` can't satisfy the marker.
+    if usable(&dev) && dir.join(format!("keitora-app{exe}")).is_file() {
         return Some(dev);
     }
     None
 }
 
-/// Windows: true if the per-user `keitora.exe` alias at `dst` is missing or stale relative to
-/// `src` (differs in length or modified-time). Stat-only — no hashing on the spawn path.
-/// Total: if `dst` (or `src`) metadata is unreadable, err toward refreshing rather than
-/// serving a possibly-bad copy.
-#[cfg(windows)]
-fn alias_needs_refresh(src: &Path, dst: &Path) -> bool {
-    let (Ok(s), Ok(d)) = (std::fs::metadata(src), std::fs::metadata(dst)) else {
+/// True if the mirror at `dst` is missing or differs from `src` by length or modified time.
+/// Stat-only (no hashing): [`mirror_file`] copies the source's modified time onto the copy,
+/// so equal stats mean the copy came from this source. Unreadable `dst` → true; unreadable
+/// `src` → false (nothing to refresh from).
+pub fn mirror_is_stale(src: &Path, dst: &Path) -> bool {
+    let Ok(d) = std::fs::metadata(dst) else {
         return true;
+    };
+    let Ok(s) = std::fs::metadata(src) else {
+        return false;
     };
     if s.len() != d.len() {
         return true;
@@ -2992,6 +3041,105 @@ fn alias_needs_refresh(src: &Path, dst: &Path) -> bool {
         (Ok(sm), Ok(dm)) => sm != dm,
         // modified-time unavailable on this fs → lengths matched, treat as fresh.
         _ => false,
+    }
+}
+
+/// Copy `src` over `dst` without ever leaving a half-written `dst`: copy to a per-call unique
+/// temp sibling (carrying `src`'s modified time), then rename it into place. Windows will not
+/// replace an exe that is running, but it does let one be renamed, so on a failed rename the
+/// old `dst` is moved aside first; leftovers from earlier moves are swept best-effort on the
+/// next call. Creates `dst`'s parent dir. Calls within one process are serialized; another
+/// process's in-flight files are protected by their unique names and the sweep's age floor.
+pub fn mirror_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    static MIRROR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = MIRROR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    mirror_file_unlocked(src, dst)
+}
+
+fn mirror_file_unlocked(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let ctx =
+        |what: String, e: std::io::Error| std::io::Error::new(e.kind(), format!("{what}: {e}"));
+    let dir = dst
+        .parent()
+        .ok_or_else(|| std::io::Error::other(format!("{} has no parent dir", dst.display())))?;
+    let name = dst
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| std::io::Error::other(format!("{} has no file name", dst.display())))?;
+    std::fs::create_dir_all(dir).map_err(|e| ctx(format!("creating {}", dir.display()), e))?;
+    sweep_moved_aside(dir, &name, MOVED_ASIDE_MIN_AGE);
+    let suffix = mirror_suffix();
+    let tmp = dir.join(format!("{name}.refresh-{suffix}"));
+    let copied = std::fs::copy(src, &tmp).and_then(|_| {
+        let mtime = std::fs::metadata(src)?.modified()?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp)?
+            .set_modified(mtime)
+    });
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ctx(
+            format!("copying {} -> {}", src.display(), tmp.display()),
+            e,
+        ));
+    }
+    if std::fs::rename(&tmp, dst).is_ok() {
+        return Ok(());
+    }
+    let aside = dir.join(format!("{name}.old-{suffix}"));
+    if let Err(e) = std::fs::rename(dst, &aside) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ctx(format!("moving {} aside", dst.display()), e));
+    }
+    if let Err(e) = std::fs::rename(&tmp, dst) {
+        let _ = std::fs::rename(&aside, dst);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ctx(format!("replacing {}", dst.display()), e));
+    }
+    let _ = std::fs::remove_file(&aside); // still running → swept next time
+    Ok(())
+}
+
+/// Moved-aside copies younger than this may belong to another process's in-flight
+/// [`mirror_file`] (it renames back on a failed replace), so the sweep leaves them.
+const MOVED_ASIDE_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// A temp-name suffix unique per [`mirror_file`] call: pid (across processes), a process-wide
+/// counter (across calls in this process), and the clock's nanos (across pid reuse).
+fn mirror_suffix() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{}-{seq}-{nanos}", std::process::id())
+}
+
+/// Best-effort removal of `<name>.old-*` files left in `dir` by [`mirror_file`], skipping any
+/// modified within `min_age` (or whose age can't be read).
+fn sweep_moved_aside(dir: &Path, name: &str, min_age: std::time::Duration) {
+    let prefix = format!("{name}.old-");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age >= min_age);
+        if old_enough {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -3027,38 +3175,17 @@ pub fn windows_keitora_bin_dir() -> Option<PathBuf> {
     BIN_DIR.get_or_init(ensure_windows_keitora_alias).clone()
 }
 
-/// Ensure `dst` mirrors `src` inside `bin_dir`, creating the dir and refreshing only when
-/// stale. `Ok(())` means `dst` is usable afterward — either freshly copied, already fresh,
-/// or kept after a *recoverable* failure (a present-but-unreplaceable `dst`); `Err` means
-/// there is no usable `dst`. Pure of env/global state (takes concrete paths) so the
-/// copy/refresh/fallback branches are unit-testable. Split out of [`ensure_windows_keitora_alias`].
+/// Ensure `dst` mirrors `src`, refreshing only when stale. `Ok(())` means `dst` is usable
+/// afterward — freshly mirrored, already fresh, or kept after a *recoverable* failure (a
+/// present-but-unreplaceable `dst`); `Err` means there is no usable `dst`. Pure of
+/// env/global state so the branches are unit-testable.
 #[cfg(windows)]
-fn refresh_alias(src: &Path, bin_dir: &Path, dst: &Path) -> std::io::Result<()> {
-    if let Err(e) = std::fs::create_dir_all(bin_dir) {
-        // A pre-existing `dst` is still usable even if we can't (re)create the dir.
-        return if dst.is_file() { Ok(()) } else { Err(e) };
-    }
-    if !alias_needs_refresh(src, dst) {
+fn refresh_alias(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if !mirror_is_stale(src, dst) {
         return Ok(());
     }
-    // Copy to a temp sibling then rename over `dst`, so a concurrent reader never sees a
-    // half-written exe and a locked `dst` (a running `keitora.exe`) can't be corrupted.
-    let tmp = bin_dir.join("keitora.exe.new");
-    match std::fs::copy(src, &tmp).and_then(|_| std::fs::rename(&tmp, dst)) {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            // Best-effort fallback: if a `dst` already exists we keep it
-            // rather than fail. Note this means an app UPGRADE while a `keitora.exe` is running
-            // (rename blocked) leaves the OLD copy in place until the next app restart
-            // refreshes it — acceptable for a CLI shim.
-            if dst.is_file() {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        }
-    }
+    // Best-effort: a `dst` that already exists is kept rather than failing the spawn.
+    mirror_file(src, dst).or_else(|e| if dst.is_file() { Ok(()) } else { Err(e) })
 }
 
 /// The uncached body of [`windows_keitora_bin_dir`] — resolves the env-derived paths, then
@@ -3066,10 +3193,10 @@ fn refresh_alias(src: &Path, bin_dir: &Path, dst: &Path) -> std::io::Result<()> 
 #[cfg(windows)]
 fn ensure_windows_keitora_alias() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let src = pick_cli_source(exe.parent()?)?;
-    let bin_dir = dirs::data_local_dir()?.join("keitora").join("bin");
+    let src = bundled_cli(&exe)?;
+    let bin_dir = managed_keitora_bin_dir()?;
     let dst = bin_dir.join("keitora.exe");
-    match refresh_alias(&src, &bin_dir, &dst) {
+    match refresh_alias(&src, &dst) {
         Ok(()) => Some(bin_dir),
         Err(e) => {
             log::warn!("keitora CLI install failed: {e}");
@@ -3218,7 +3345,16 @@ pub fn config_path() -> crate::Result<PathBuf> {
 /// Best-effort current worktree name: basename of the git toplevel, else
 /// `"unknown"`. Used by the CLI to derive the acting worktree.
 pub fn current_worktree() -> String {
-    if let Some(root) = git_toplevel() {
+    worktree_name_of(git_toplevel())
+}
+
+/// [`current_worktree`] as seen from `dir` instead of the process cwd.
+pub fn current_worktree_in(dir: &Path) -> String {
+    worktree_name_of(git_toplevel_in(Some(dir)))
+}
+
+fn worktree_name_of(toplevel: Option<PathBuf>) -> String {
+    if let Some(root) = toplevel {
         if let Some(name) = root.file_name() {
             return name.to_string_lossy().into_owned();
         }
@@ -6122,6 +6258,23 @@ idle_shutdown_secs = 60
     // the windows runnability/PATHEXT path is a stage-050 concern with its own test.
     #[cfg(unix)]
     #[test]
+    fn keitora_in_login_path_reads_the_given_path_not_a_cache() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = format!("/nonexistent-dir:{}", bin.display());
+        // Not there yet; after the user "fixes" it, the same probe sees it.
+        assert_eq!(keitora_in_login_path(Some(path.clone())), None);
+        mk_exe(&bin.join("keitora"));
+        assert_eq!(
+            keitora_in_login_path(Some(path)),
+            Some(bin.join("keitora").to_string_lossy().into_owned())
+        );
+        assert_eq!(keitora_in_login_path(None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn find_in_path_returns_first_executable_match() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new().unwrap();
@@ -6317,42 +6470,198 @@ idle_shutdown_secs = 60
         assert_eq!(find_on_path_windows(";;", &names), None);
     }
 
-    // Windows CLI-alias resolution: prefer the bundled `keitora-cli.exe`, fall back to
-    // a dev `keitora.exe` ONLY behind the `keitora-app.exe` rename guard.
-    #[cfg(windows)]
-    #[test]
-    fn pick_cli_source_prefers_bundled_then_guarded_dev() {
-        let tmp = TempDir::new().unwrap();
-        let d = tmp.path();
-        // Empty dir → nothing to mirror.
-        assert_eq!(pick_cli_source(d), None);
-        // A bare dev `keitora.exe` without the `keitora-app.exe` marker is NOT trusted (it could
-        // be a pre-rename GUI app).
-        std::fs::write(d.join("keitora.exe"), b"MZ").unwrap();
-        assert_eq!(pick_cli_source(d), None);
-        // With the marker present, the dev CLI is selected.
-        std::fs::write(d.join("keitora-app.exe"), b"MZ").unwrap();
-        assert_eq!(pick_cli_source(d), Some(d.join("keitora.exe")));
-        // The packaged sidecar wins over the dev build when both exist.
-        std::fs::write(d.join("keitora-cli.exe"), b"MZ").unwrap();
-        assert_eq!(pick_cli_source(d), Some(d.join("keitora-cli.exe")));
+    fn named(dir: &Path, name: &str) -> PathBuf {
+        dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
     }
 
-    #[cfg(windows)]
+    /// Write an executable stand-in (exec bit set on unix).
+    fn mk_exe(p: &Path) {
+        std::fs::write(p, b"bin").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// Give `p` a distinct, fixed modified time so staleness is deterministic.
+    fn set_mtime(p: &Path, secs: u64) {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    // Prefer the bundled `keitora-cli`, fall back to a dev `keitora` ONLY behind the
+    // `keitora-app` rename guard, and never hand out the running exe.
     #[test]
-    fn alias_needs_refresh_on_missing_or_size_change() {
+    fn bundled_cli_prefers_sidecar_then_guarded_dev() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        let app = named(d, "keitora-app");
+        mk_exe(&app);
+        // No CLI beside the app -> nothing.
+        assert_eq!(bundled_cli(&app), None);
+        // A bare dev `keitora` is trusted only with the `keitora-app` marker present (it is).
+        let dev = named(d, "keitora");
+        mk_exe(&dev);
+        assert_eq!(bundled_cli(&app), Some(dev.clone()));
+        // The packaged sidecar wins over the dev build when both exist.
+        let sidecar = named(d, "keitora-cli");
+        mk_exe(&sidecar);
+        assert_eq!(bundled_cli(&app), Some(sidecar));
+    }
+
+    #[test]
+    fn bundled_cli_rejects_unmarked_dev_build_and_the_running_exe() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        // Pre-rename build: the GUI itself is `keitora`, with no marker and no CLI beside it.
+        let gui = named(d, "keitora");
+        mk_exe(&gui);
+        assert_eq!(bundled_cli(&gui), None);
+        // Even with a marker, the running exe is never returned as the CLI.
+        mk_exe(&named(d, "keitora-app"));
+        assert_eq!(bundled_cli(&gui), None);
+        // A non-executable sidecar is ignored on unix (it would fail the hook guard).
+        // Its own dir, so the marked dev `keitora` above can't be picked up as the fallback.
+        #[cfg(unix)]
+        {
+            let tmp2 = TempDir::new().unwrap();
+            let d2 = tmp2.path();
+            let other = named(d2, "other-app");
+            std::fs::write(named(d2, "keitora-cli"), b"cli").unwrap();
+            assert_eq!(bundled_cli(&other), None);
+        }
+    }
+
+    #[test]
+    fn mirror_is_stale_on_missing_or_size_change() {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("keitora-cli.exe");
         let dst = tmp.path().join("keitora.exe");
         std::fs::write(&src, b"MZ-v1").unwrap();
-        // dst missing → refresh.
-        assert!(alias_needs_refresh(&src, &dst));
-        // identical copy → no refresh.
+        // dst missing -> stale.
+        assert!(mirror_is_stale(&src, &dst));
+        // identical copy -> fresh.
         std::fs::copy(&src, &dst).unwrap();
-        assert!(!alias_needs_refresh(&src, &dst));
-        // different length → refresh.
+        set_mtime(&src, 1_000_000_000);
+        set_mtime(&dst, 1_000_000_000);
+        assert!(!mirror_is_stale(&src, &dst));
+        // same length, different mtime -> stale.
+        set_mtime(&src, 2_000_000_000);
+        assert!(mirror_is_stale(&src, &dst));
+        // different length -> stale.
         std::fs::write(&src, b"MZ-version-two-longer").unwrap();
-        assert!(alias_needs_refresh(&src, &dst));
+        assert!(mirror_is_stale(&src, &dst));
+        // unreadable src with a dst present -> nothing to refresh from.
+        assert!(!mirror_is_stale(&tmp.path().join("missing.exe"), &dst));
+    }
+
+    #[test]
+    fn mirror_file_carries_mtime_and_leaves_no_temp_files() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.exe");
+        let dst = tmp.path().join("bin").join("keitora.exe");
+        std::fs::write(&src, b"V1").unwrap();
+        set_mtime(&src, 1_500_000_000);
+        // Creates the parent dir, copies, and the copy reads as fresh.
+        mirror_file(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"V1");
+        assert!(!mirror_is_stale(&src, &dst));
+        // Replaces a stale copy of the same length (mtime only).
+        std::fs::write(&src, b"V2").unwrap();
+        set_mtime(&src, 1_600_000_000);
+        assert!(mirror_is_stale(&src, &dst));
+        mirror_file(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"V2");
+        let names: Vec<_> = std::fs::read_dir(dst.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("keitora.exe")]);
+    }
+
+    #[test]
+    fn mirror_file_sweeps_leftover_moved_aside_copies() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.exe");
+        let dst = tmp.path().join("keitora.exe");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dst, b"old").unwrap();
+        let leftover = tmp.path().join("keitora.exe.old-1234");
+        std::fs::write(&leftover, b"older").unwrap();
+        set_mtime(&leftover, 1_000_000_000);
+        mirror_file(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+        assert!(!leftover.exists());
+    }
+
+    #[test]
+    fn mirror_sweep_spares_recent_moved_aside_copies() {
+        // A fresh `.old-*` may be another process's in-flight move-aside: keep it.
+        let tmp = TempDir::new().unwrap();
+        let fresh = tmp.path().join("keitora.exe.old-99-0-1");
+        let stale = tmp.path().join("keitora.exe.old-98-0-1");
+        let unrelated = tmp.path().join("other.exe.old-1");
+        for p in [&fresh, &stale, &unrelated] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        set_mtime(&stale, 1_000_000_000);
+        set_mtime(&unrelated, 1_000_000_000);
+        sweep_moved_aside(tmp.path(), "keitora.exe", MOVED_ASIDE_MIN_AGE);
+        assert!(fresh.exists());
+        assert!(!stale.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn mirror_suffix_is_unique_per_call() {
+        let a = mirror_suffix();
+        let b = mirror_suffix();
+        assert_ne!(a, b);
+        assert!(a.starts_with(&format!("{}-", std::process::id())));
+    }
+
+    #[test]
+    fn mirror_file_concurrent_calls_in_one_process_all_succeed() {
+        let tmp = TempDir::new().unwrap();
+        let dst = tmp.path().join("bin").join("keitora.exe");
+        let srcs: Vec<_> = (0..8)
+            .map(|i| {
+                let p = tmp.path().join(format!("src{i}.exe"));
+                std::fs::write(&p, format!("V{i}")).unwrap();
+                p
+            })
+            .collect();
+        std::thread::scope(|s| {
+            for src in &srcs {
+                let dst = &dst;
+                s.spawn(move || mirror_file(src, dst).unwrap());
+            }
+        });
+        let body = std::fs::read_to_string(&dst).unwrap();
+        assert!(body.starts_with('V'));
+        let names: Vec<_> = std::fs::read_dir(dst.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("keitora.exe")]);
+    }
+
+    #[test]
+    fn cli_kind_from_name_accepts_config_key_and_binary() {
+        for c in CliKind::ALL {
+            assert_eq!(CliKind::from_name(c.spec().config_key), Some(c));
+            assert_eq!(CliKind::from_name(c.spec().binary), Some(c));
+        }
+        assert_eq!(CliKind::from_name("agy"), Some(CliKind::Antigravity));
+        assert_eq!(CliKind::from_name("Claude"), None, "case-sensitive");
+        assert_eq!(CliKind::from_name(""), None);
+        assert_eq!(CliKind::from_name("gemini"), None);
     }
 
     #[cfg(windows)]
@@ -6387,16 +6696,13 @@ idle_shutdown_secs = 60
         let bin = tmp.path().join("bin");
         let dst = bin.join("keitora.exe");
         std::fs::write(&src, b"V1").unwrap();
-        // dst missing → creates bin dir + copies.
-        refresh_alias(&src, &bin, &dst).unwrap();
+        // dst missing -> creates bin dir + copies.
+        refresh_alias(&src, &dst).unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"V1");
-        // fresh (same len + copied mtime) → no-op, and no temp left behind.
-        refresh_alias(&src, &bin, &dst).unwrap();
+        // fresh (same len + copied mtime) -> no-op, and no temp left behind.
+        refresh_alias(&src, &dst).unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"V1");
-        assert!(
-            !bin.join("keitora.exe.new").exists(),
-            "no orphaned temp file"
-        );
+        assert_eq!(std::fs::read_dir(&bin).unwrap().count(), 1);
     }
 
     #[cfg(windows)]
@@ -6409,21 +6715,20 @@ idle_shutdown_secs = 60
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(&dst, b"OLD-AND-LONGER").unwrap();
         std::fs::write(&src, b"NEW").unwrap();
-        refresh_alias(&src, &bin, &dst).unwrap();
+        refresh_alias(&src, &dst).unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"NEW");
     }
 
     #[cfg(windows)]
     #[test]
-    fn refresh_alias_falls_back_to_existing_dst_when_src_unreadable() {
+    fn refresh_alias_keeps_existing_dst_when_src_unreadable() {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("missing-src.exe"); // never created
         let bin = tmp.path().join("bin");
         let dst = bin.join("keitora.exe");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(&dst, b"EXISTING").unwrap();
-        // src unreadable but a usable dst already exists → recoverable: keep it.
-        refresh_alias(&src, &bin, &dst).unwrap();
+        refresh_alias(&src, &dst).unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"EXISTING");
     }
 
@@ -6432,10 +6737,9 @@ idle_shutdown_secs = 60
     fn refresh_alias_errs_when_src_missing_and_no_dst() {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("missing-src.exe");
-        let bin = tmp.path().join("bin");
-        let dst = bin.join("keitora.exe");
-        // No source to copy and no prior dst → no usable alias.
-        assert!(refresh_alias(&src, &bin, &dst).is_err());
+        let dst = tmp.path().join("bin").join("keitora.exe");
+        // No source to copy and no prior dst -> no usable alias.
+        assert!(refresh_alias(&src, &dst).is_err());
         assert!(!dst.exists());
     }
 

@@ -18,6 +18,13 @@ import {
   updatePromptHint,
 } from "../lib/agentUpdates";
 import { classifyAttachError } from "../lib/attachErrors";
+import type { PaneDrive } from "../lib/drive";
+import {
+  transferInProgressReason,
+  WAKE_UNAVAILABLE,
+  wakeRetryReason,
+  wakeStep,
+} from "../lib/driveEvents";
 import { useTerminalFontSize } from "../lib/fontSize";
 import { createFrameCoalescer, type FrameCoalescer } from "../lib/frameCoalescer";
 import { appOwnsScroll } from "../lib/historySearch";
@@ -71,6 +78,7 @@ import { cliTitle } from "../lib/providers";
 import { paneRecoveryState, recoveryItem, recoveryPaneMessage } from "../lib/recovery";
 import {
   dimLine,
+  type RestartKind,
   restartConfirmCopy,
   resumeNoticeLine,
   terminateConfirmCopy,
@@ -125,6 +133,7 @@ import {
   type TransferEntry,
 } from "../lib/transferPhase";
 import { useAgentUpdatePane } from "./AgentUpdatesProvider";
+import { DriveBanner } from "./DriveBanner";
 import { type HistoryView, TerminalSearch } from "./TerminalSearch";
 import { useToast } from "./Toast";
 import { TransferOverlay } from "./TransferOverlay";
@@ -188,8 +197,14 @@ export function TerminalPane({
   restartFresh = false,
   cli,
   transfer = null,
-  restartTransfer = false,
+  restartKind = "restart",
   onSpawnSettled,
+  restartDriveRequest = null,
+  onDriveSpawnSettled,
+  drive = null,
+  onDriveTakeOver,
+  onDriveRelease,
+  onDriveResume,
   onCancelTransfer,
   terminated,
   terminateNonce,
@@ -215,11 +230,23 @@ export function TerminalPane({
   /** This worktree's CLI-transfer entry while one is in flight: covers the pane with the
    * transfer overlay and, during the import, blocks input. */
   transfer?: TransferEntry | null;
-  /** Whether the latest `restartNonce` bump belongs to a transfer: restart without the
-   * confirm (already confirmed in the rail) and report the spawn via `onSpawnSettled`. */
-  restartTransfer?: boolean;
+  /** Who asked for the latest `restartNonce` bump. A `transfer` restart skips the confirm
+   * (already confirmed in the rail) and reports the spawn via `onSpawnSettled`; a
+   * `drive-reset`, `drive-wake` or `drive-wake-replace` carries out `restartDriveRequest`. */
+  restartKind?: RestartKind;
   /** How a transfer restart's spawn ended. Fires only for transfer restarts. */
   onSpawnSettled?: (r: SpawnResult) => void;
+  /** The driver request the latest `restartNonce` bump carries out (a driver's reset or
+   * wake): restart without the confirm and report the spawn via `onDriveSpawnSettled`. */
+  restartDriveRequest?: number | null;
+  /** How a driver reset's spawn ended (or why it never ran), for request `id`. */
+  onDriveSpawnSettled?: (id: number, r: SpawnResult) => void;
+  /** This worktree is driven by another: shows the drive banner over the pane. */
+  drive?: PaneDrive | null;
+  /** The drive banner's actions. */
+  onDriveTakeOver?: () => void;
+  onDriveRelease?: () => void;
+  onDriveResume?: () => void;
   /** The transfer overlay's Cancel button. */
   onCancelTransfer?: () => void;
   /** The user terminated this worktree's session (from the worktree list). The single
@@ -337,6 +364,8 @@ export function TerminalPane({
   cliRef.current = cli;
   const onSpawnSettledRef = useRef(onSpawnSettled);
   onSpawnSettledRef.current = onSpawnSettled;
+  const onDriveSpawnSettledRef = useRef(onDriveSpawnSettled);
+  onDriveSpawnSettledRef.current = onDriveSpawnSettled;
   // How the last spawn failed (cleared by the next spawn): the CLI it ran (a transfer's
   // target, since the entry is gone by the time the screen shows), the backend's error, and
   // the launch flavour, which the spawn-failed buttons repeat.
@@ -852,7 +881,7 @@ export function TerminalPane({
   // Launch a terminated session again: `spawn` through `sessionLaunch`, after
   // clearing the old session's output like a restart does.
   const launch = useCallback(
-    async (fresh = false) => {
+    async (fresh = false): Promise<SpawnResult> => {
       coalescerRef.current?.reset();
       liveTailRef.current?.reset();
       termRef.current?.clear();
@@ -864,7 +893,7 @@ export function TerminalPane({
       }
       fitBeforeTakeover();
       updateStatus("attaching");
-      await spawn(fresh, "launch");
+      return await spawn(fresh, "launch");
     },
     [spawn, updateStatus, fitBeforeTakeover],
   );
@@ -939,30 +968,84 @@ export function TerminalPane({
   // initial mount. `restartPlan` decides: a plain restart of a live session asks first (as the
   // "Kill & Restart" button does); a transfer restart was already confirmed in the rail, so it
   // restarts straight away with the bump's flavour and reports how the spawn ended.
-  // `restartFresh`/`restartTransfer` change together with the nonce.
+  // A driver's reset (`restartDriveRequest`) never asks either, and reports its spawn for the
+  // request. `restartFresh`/`restartKind`/`restartDriveRequest` change with the nonce.
   useEffect(() => {
     if (restartNonce <= lastSeenRestartNonceRef.current) return;
     lastSeenRestartNonceRef.current = restartNonce;
+    const driveId = restartDriveRequest;
+    const transfer = restartKind === "transfer";
+    const replace = restartKind === "drive-wake-replace";
+    const wake = (restartKind === "drive-wake" || replace) && driveId !== null;
+    const settleDrive = (r: SpawnResult) => {
+      if (driveId !== null) onDriveSpawnSettledRef.current?.(driveId, r);
+    };
+    const failDrive = (e: unknown) => settleDrive({ ok: false, error: String(e) });
     // While a transfer owns the pane only its own restart may kill and respawn it.
-    if (!shouldHonourSignal({ transfer: restartTransfer }, transferRef.current)) return;
-    // A terminated session is only brought back by a launch.
-    if (terminatedRef.current || statusRef.current === "terminated") {
-      if (restartTransfer) {
-        onSpawnSettledRef.current?.({ ok: false, error: "The session is terminated." });
-      }
+    if (!shouldHonourSignal({ transfer }, transferRef.current)) {
+      settleDrive({ ok: false, error: transferInProgressReason(name) });
       return;
     }
-    const plan = restartPlan({ fresh: restartFresh, transfer: restartTransfer }, statusRef.current);
+    // A driver's wake leaves a running agent alone and brings a suspended one back through
+    // recovery; anything else starts the way a reset does (a launch when terminated). A
+    // wake that needs a new session (fresh, or another provider) restarts a suspended one
+    // and refuses while a live or settling one is in the way, never reporting a kept one.
+    if (wake) {
+      switch (wakeStep(statusRef.current, terminatedRef.current, replace)) {
+        case "awake":
+          settleDrive({ ok: true });
+          return;
+        case "retry":
+          settleDrive({ ok: false, error: wakeRetryReason(name, statusRef.current) });
+          return;
+        case "unavailable":
+          settleDrive({ ok: false, error: WAKE_UNAVAILABLE });
+          return;
+        case "resume":
+          void recoveryFocus(projectName, name).then(() => settleDrive({ ok: true }), failDrive);
+          return;
+      }
+    }
+    // A terminated session is only brought back by a launch: a wake does that through the
+    // same launch as the rail's Launch item (clearing the mark); anything else is refused.
+    if (terminatedRef.current || statusRef.current === "terminated") {
+      if (wake) {
+        void launch(restartFresh).then(settleDrive, failDrive);
+        return;
+      }
+      if (transfer) {
+        onSpawnSettledRef.current?.({ ok: false, error: "The session is terminated." });
+      }
+      settleDrive({ ok: false, error: "The session is terminated." });
+      return;
+    }
+    const plan = restartPlan(
+      { fresh: restartFresh, transfer, drive: driveId !== null },
+      statusRef.current,
+    );
     if (plan.transfer) {
       void restart(plan.fresh, { transfer: true })
         .then((r) => onSpawnSettledRef.current?.(r))
         .catch((e) => onSpawnSettledRef.current?.({ ok: false, error: String(e) }));
+    } else if (plan.drive) {
+      // A driver's reset (or a wake of an ended session): a plain restart; the transfer
+      // flag selects the strict launch, not wanted here.
+      void restart(plan.fresh).then(settleDrive).catch(failDrive);
     } else if (plan.confirm) {
       setConfirmKill(plan.fresh ? "fresh" : "resume");
     } else {
       void restart(plan.fresh);
     }
-  }, [restartNonce, restartFresh, restartTransfer, restart]);
+  }, [
+    restartNonce,
+    restartFresh,
+    restartKind,
+    restartDriveRequest,
+    name,
+    projectName,
+    restart,
+    launch,
+  ]);
 
   // Keystrokes must not reach the terminal while the import reads the conversation.
   // biome-ignore lint/correctness/useExhaustiveDependencies: only the phase matters
@@ -1943,7 +2026,9 @@ export function TerminalPane({
     // data-project/data-name are how a file drop finds this pane's PTY identity
     // (App.tsx hit-tests with elementFromPoint — see terminalFileDrop.ts).
     <div
-      className={isDropTarget ? "pane drop-target" : "pane"}
+      className={["pane", isDropTarget ? "drop-target" : "", drive ? "driven" : ""]
+        .filter(Boolean)
+        .join(" ")}
       style={{ display: active ? "flex" : "none" }}
       ref={paneRef}
       data-project={projectName}
@@ -1960,6 +2045,14 @@ export function TerminalPane({
             setSearchOpen(false);
             termRef.current?.focus();
           }}
+        />
+      )}
+      {drive && !transfer && (
+        <DriveBanner
+          drive={drive}
+          onTakeOver={onDriveTakeOver}
+          onRelease={onDriveRelease}
+          onResume={onDriveResume}
         />
       )}
 

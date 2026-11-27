@@ -20,6 +20,7 @@ mod db_watch;
 mod deps;
 mod diff;
 mod dispatch;
+mod drive;
 mod global_writes;
 mod headroom;
 mod hooks;

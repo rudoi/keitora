@@ -121,6 +121,10 @@ describe("showBuildBar", () => {
       workflow: null,
       build: null,
       working: false,
+      drivenBy: null,
+      drives: [],
+      pendingPrompts: 0,
+      drivePaused: false,
       ...partial,
     };
   }

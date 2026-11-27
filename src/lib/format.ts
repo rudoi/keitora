@@ -1,5 +1,8 @@
 // Shared formatting utilities.
 
+/** `word` pluralised with a trailing `s` unless `n` is 1 (`prompt`, `prompts`). */
+export const plural = (n: number, word: string): string => `${word}${n === 1 ? "" : "s"}`;
+
 /**
  * Format a duration given as milliseconds into a human-readable uptime string.
  * Pass `startedAt * 1000` (unix epoch seconds → ms) at the call site when the

@@ -295,7 +295,7 @@ impl HerdrOps for RealHerdr {
 
     /// `herdr pane send-text <pane_id> <text>` — literal UTF-8, no trailing Enter.
     fn pane_send_text(&self, pane_id: &str, text: &str) -> Result<(), HerdrError> {
-        self.run(CallClass::Quick, &["pane", "send-text", pane_id, text])
+        self.run(CallClass::Quick, &pane_send_text_args(pane_id, text))
             .map(|_| ())
     }
 
@@ -396,12 +396,13 @@ impl HerdrOps for RealHerdr {
         }
     }
 
-    /// `herdr agent prompt <pane_id> -- <text>` — fire-and-forget (no `--wait`).
+    /// `herdr agent prompt <pane_id> <text>` — fire-and-forget (no `--wait`).
     /// `agent_blocked` / `agent_not_ready` come back as [`HerdrError::Api`]; the
     /// backend maps them to "queue the line" via [`super::cli::agent_prompt_error_from`].
     fn agent_prompt(&self, pane_id: &str, text: &str) -> Result<(), HerdrError> {
-        self.run(CallClass::Quick, &["agent", "prompt", pane_id, "--", text])
-            .map(|_| ())
+        let args = agent_prompt_args(pane_id, text);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run(CallClass::Quick, &argv).map(|_| ())
     }
 
     /// `herdr agent list` → every live agent (`/result/agents`). Errors propagate
@@ -697,9 +698,79 @@ fn pane_read_args(pane_id: &str, source: &str, format: &str, lines: Option<u32>)
     args
 }
 
+/// Make user-supplied `text` safe to pass to herdr as a plain positional argument.
+///
+/// herdr 0.9.5's parser has no `--` end-of-options marker for these commands (it rejects
+/// `--` as "unknown option"), so a text that begins with `-` would be read as an option.
+/// Prefixing a single space keeps it a positional; a leading space is harmless in an agent
+/// prompt. Worth an upstream issue asking for `--` support. Apply only to agent prompt
+/// text — not to `pane send-text`, which is also the raw keystroke fallback (a prefix would
+/// type an extra space), nor to command argv (`pane run`), where it would change the command.
+fn positional_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.starts_with('-') {
+        std::borrow::Cow::Owned(format!(" {text}"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+/// argv for `herdr pane send-text <pane_id> <text>`. The text goes through verbatim: this
+/// is also the keystroke fallback, so typed input like `-la` must arrive unchanged.
+fn pane_send_text_args<'a>(pane_id: &'a str, text: &'a str) -> [&'a str; 4] {
+    ["pane", "send-text", pane_id, text]
+}
+
+/// argv for `herdr agent prompt <TARGET> <TEXT>`.
+fn agent_prompt_args(pane_id: &str, text: &str) -> Vec<String> {
+    vec![
+        "agent".into(),
+        "prompt".into(),
+        pane_id.into(),
+        positional_text(text).into_owned(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_prompt_args_pass_text_as_plain_positional() {
+        assert_eq!(
+            agent_prompt_args("w1:p2", "fix the tests"),
+            ["agent", "prompt", "w1:p2", "fix the tests"]
+        );
+        assert!(!agent_prompt_args("w1:p2", "x").iter().any(|a| a == "--"));
+    }
+
+    #[test]
+    fn agent_prompt_args_guard_leading_dash_text() {
+        assert_eq!(
+            agent_prompt_args("w1:p2", "--help me"),
+            ["agent", "prompt", "w1:p2", " --help me"]
+        );
+        assert_eq!(agent_prompt_args("w1:p2", "-")[3], " -");
+        // a dash later in the text is left alone
+        assert_eq!(agent_prompt_args("w1:p2", "a -b")[3], "a -b");
+    }
+
+    #[test]
+    fn pane_send_text_args_pass_typed_text_verbatim() {
+        // send-text doubles as the keystroke fallback: a leading dash must not gain a space
+        assert_eq!(
+            pane_send_text_args("w1:p2", "-la"),
+            ["pane", "send-text", "w1:p2", "-la"]
+        );
+        assert_eq!(pane_send_text_args("w1:p2", "-")[3], "-");
+    }
+
+    #[test]
+    fn positional_text_prefixes_only_a_leading_dash() {
+        assert_eq!(positional_text("--help"), " --help");
+        assert_eq!(positional_text("-"), " -");
+        assert_eq!(positional_text("fix -x"), "fix -x");
+        assert_eq!(positional_text(""), "");
+    }
 
     const STDERR_BODY: &str = r#"{"error":{"code":"pane_not_found","message":"pane w0:p0 not found"},"id":"cli:pane:close"}"#;
 

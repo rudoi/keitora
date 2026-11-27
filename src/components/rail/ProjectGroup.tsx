@@ -92,6 +92,14 @@ function HeaderSummary({
             />
           )}
           <span className="rail-group-meta" aria-hidden="true">
+            {view.driven > 0 && (
+              <span
+                className="rail-group-driven"
+                title={`${view.driven} worktree${view.driven === 1 ? "" : "s"} driven by another worktree`}
+              >
+                {view.driven} driven
+              </span>
+            )}
             <span
               className={workCls}
               title={

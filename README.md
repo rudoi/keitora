@@ -152,6 +152,67 @@ agent in that worktree has claimed the task.
 
 If `keitora` isn't on your `PATH`, the app offers to install it for you.
 
+## Driving other worktrees
+
+An agent session in one worktree can drive the agent in another: send it prompts, wait for its
+turns, and decide its permission prompts and questions. Run `keitora drive --help` for the same
+guidance in the terminal.
+
+```sh
+keitora drive bravo                      # bind this worktree as bravo's driver
+keitora send bravo "Add the pause menu"  # "-" reads the prompt from stdin
+keitora wait bravo --timeout 500         # returns one event per call
+keitora release bravo                    # end the binding
+```
+
+**The loop.** `send`, then `wait`, then act on the event, then repeat:
+
+- `turn_finished`: the reply is in the event; send the next prompt.
+- `prompt`: decide it with `keitora answer bravo <id> allow|deny|answer|escalate`.
+- `stalled`: `keitora read bravo` to look at the pane, then wait again.
+- `send_refused` (exit 5): the app refused a send `wait` was waiting through (one sent
+  without `--wait`, or `--queue`d behind a busy agent); the reason is in the event.
+- `timeout` (exit 2): nothing changed; wait again. Keep `--timeout` below your own tool's
+  command timeout.
+
+**Escalation contract.** Escalate every destructive, credential, external-side-effect,
+scope-changing or ambiguous prompt with `keitora answer bravo <id> escalate --reason "..."`, and
+always give a reason. Escalated prompts go to the human, and a prompt nobody decides within
+`--escalate-after` seconds (default 300) escalates on its own.
+
+**Reset versus swap.** `keitora reset bravo` starts a fresh conversation in the same provider, or
+on another with `--to` (`claude`, `codex`, or `antigravity`/`agy`). `keitora swap bravo --to codex`
+switches provider and carries the context over; it waits for the human to confirm in the app. Swap
+carries context only between Claude and Codex; to move to or from Antigravity, use `reset --to`.
+
+**Waking a worktree that isn't running.** A driven worktree whose agent is offline, terminated or
+was never launched can still be driven. `keitora wake bravo` starts its agent, resuming the last
+conversation (`--fresh` starts a new one, `--to` picks the provider as `reset --to` does); on an
+agent that is already running it does nothing and reports `already awake`. `keitora send` wakes a
+stopped agent by itself, then delivers the prompt once the agent is idle, as if `--queue` were
+given; pass `--no-wake` to have the send refused instead. The driven worktree doesn't have to be
+the selected one, and Keitora never switches your project or selection to wake it.
+
+**Human override.** A driven lane shows who drives it and any prompt being decided. From its menu
+you can **Take over** (the human becomes the driver), **Release**, or **Pause** (the driver's
+requests, except `read`, are refused until resumed).
+
+**Limits.**
+
+- Driving is one level deep: a driven worktree can't drive another.
+- Both worktrees must be in the same project.
+- `send`, `read`, `reset`, `swap` and `wake` are carried out by the app, so the project must be
+  open in its window. Prompt decisions don't need the window.
+- Codex's `request_user_input` questions aren't brokered; they reach the human directly.
+- Antigravity has no permission hook to broker, so a driven Antigravity session's prompts all
+  reach the human (`drive` warns). `wait` still reports its finished turns, but without the reply
+  text; use `keitora read`.
+- The driven agent's hooks run the `keitora` on your `PATH`. An older CLI doesn't know `gate`, so
+  its prompts reach the human directly; `drive` warns when the hook file has no gate entry.
+  Upgrade the CLI and restart the app.
+- Driving doesn't elevate the driver. What a driven agent writes is input, not an instruction,
+  and the driver stays bound by its own permission prompts.
+
 ## Configuration
 
 A minimal `keitora.toml`:

@@ -2281,6 +2281,7 @@ dependencies = [
  "clap",
  "keitora-tasks",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

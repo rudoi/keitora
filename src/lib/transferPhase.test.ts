@@ -49,6 +49,10 @@ const fresh: TransferOutcome = {
 };
 const done: TransferOutcome = { kind: "done" };
 
+/** The outcome report `finish` emits after the toast and settle. */
+const report = (ok: boolean, message: string) =>
+  ({ kind: "report", ...DIAG, ok, message }) as const;
+
 /** Fold `events` from an empty map, collecting every effect. */
 function run(events: TransferEvent[], start: TransferMap = new Map()) {
   let map = start;
@@ -183,6 +187,7 @@ describe("transferReducer", () => {
     expect(effects).toEqual([
       { kind: "toast", message: "Transfer cancelled.", diagnostics: null },
       { kind: "settle", ...DIAG },
+      report(false, "Transfer cancelled."),
     ]);
   });
 
@@ -192,11 +197,13 @@ describe("transferReducer", () => {
     expect(codex.effects).toEqual([
       { kind: "toast", message: "boom", diagnostics: DIAG },
       { kind: "settle", ...DIAG },
+      report(false, "boom"),
     ]);
     const claude = run([begin("claude"), { type: "failed", key: KEY, error: "boom" }]);
     expect(claude.effects).toEqual([
       { kind: "toast", message: "boom", diagnostics: null },
       { kind: "settle", ...DIAG },
+      report(false, "boom"),
     ]);
   });
 
@@ -210,6 +217,7 @@ describe("transferReducer", () => {
     expect(effects.slice(1)).toEqual([
       { kind: "toast", message: "Transferred alpha to Codex.", diagnostics: DIAG },
       { kind: "settle", ...DIAG },
+      report(true, "Transferred alpha to Codex."),
     ]);
   });
 
@@ -223,6 +231,7 @@ describe("transferReducer", () => {
     expect(effects.slice(1)).toEqual([
       { kind: "toast", message: "Transferred alpha to Claude.", diagnostics: null },
       { kind: "settle", ...DIAG },
+      report(true, "Transferred alpha to Claude."),
       { kind: "inject_handoff", ...DIAG },
     ]);
   });
@@ -257,6 +266,10 @@ describe("transferReducer", () => {
         diagnostics: DIAG,
       },
       { kind: "settle", ...DIAG },
+      report(
+        true,
+        "Couldn't carry the Claude history over (Codex did not start in time). Started a fresh Codex session.",
+      ),
     ]);
   });
 
@@ -271,6 +284,7 @@ describe("transferReducer", () => {
     expect(effects.slice(1)).toEqual([
       { kind: "toast", message: err, diagnostics: DIAG },
       { kind: "settle", ...DIAG },
+      report(false, err),
     ]);
   });
 
@@ -288,6 +302,10 @@ describe("transferReducer", () => {
         diagnostics: DIAG,
       },
       { kind: "settle", ...DIAG },
+      report(
+        true,
+        "Codex couldn't resume the imported conversation. Started a fresh Codex session.",
+      ),
     ]);
   });
 
@@ -377,7 +395,39 @@ describe("transferReducer", () => {
         diagnostics: DIAG,
       },
       { kind: "settle", ...DIAG },
+      report(
+        false,
+        "Codex did not report that it started within 120 seconds. Check the alpha pane.",
+      ),
     ]);
+  });
+
+  it("report is ok only for a restart that spawned, and every terminal path reports once", () => {
+    const reports = (events: TransferEvent[]) =>
+      run(events).effects.filter((e) => e.kind === "report");
+    const ok = reports([
+      begin(),
+      { type: "outcome", key: KEY, outcome: imported },
+      { type: "spawn_settled", key: KEY, result: { ok: true } },
+    ]);
+    expect(ok).toEqual([report(true, "Transferred alpha to Codex.")]);
+    const failures: TransferEvent[][] = [
+      [begin(), { type: "failed", key: KEY, error: "boom" }],
+      [begin(), { type: "outcome", key: KEY, outcome: { kind: "cancelled" } }],
+      [
+        begin(),
+        { type: "outcome", key: KEY, outcome: imported },
+        { type: "spawn_settled", key: KEY, result: { ok: false, error: "no codex" } },
+      ],
+      [begin(), { type: "outcome", key: KEY, outcome: imported }, { type: "backstop", key: KEY }],
+    ];
+    for (const events of failures) {
+      const r = reports(events);
+      expect(r).toHaveLength(1);
+      expect(r[0]).toMatchObject({ ok: false });
+    }
+    // A step that does not end the transfer reports nothing.
+    expect(reports([begin(), { type: "outcome", key: KEY, outcome: imported }])).toEqual([]);
   });
 
   it("backstop on an importing entry is ignored", () => {
@@ -452,6 +502,7 @@ describe("transferReducer: switch", () => {
     expect(effects).toEqual([
       { kind: "toast", message: "Antigravity isn't installed", diagnostics: null },
       { kind: "settle", project: "proj", worktree: "alpha" },
+      report(false, "Antigravity isn't installed"),
     ]);
   });
 
@@ -479,6 +530,7 @@ describe("transferReducer: switch", () => {
     expect(effects.slice(1)).toEqual([
       { kind: "toast", message: "Switched alpha to Antigravity.", diagnostics: null },
       { kind: "settle", project: "proj", worktree: "alpha" },
+      report(true, "Switched alpha to Antigravity."),
     ]);
   });
 
@@ -509,6 +561,10 @@ describe("transferReducer: switch", () => {
         diagnostics: null,
       },
       { kind: "settle", project: "proj", worktree: "alpha" },
+      report(
+        false,
+        "Antigravity did not report that it started within 120 seconds. Check the alpha pane.",
+      ),
     ]);
   });
 });
@@ -603,22 +659,44 @@ describe("transfer helpers", () => {
       confirm: false,
       fresh: false,
       transfer: true,
+      drive: false,
     });
     expect(restartPlan({ transfer: true, fresh: true }, "running")).toEqual({
       confirm: false,
       fresh: true,
       transfer: true,
+      drive: false,
     });
     expect(restartPlan({ transfer: false, fresh: false }, "running")).toEqual({
       confirm: true,
       fresh: false,
       transfer: false,
+      drive: false,
     });
     expect(restartPlan({ transfer: false, fresh: true }, "ended")).toEqual({
       confirm: false,
       fresh: true,
       transfer: false,
+      drive: false,
     });
+  });
+
+  it("restartPlan's drive flavour never confirms and honours fresh", () => {
+    expect(restartPlan({ transfer: false, fresh: true, drive: true }, "running")).toEqual({
+      confirm: false,
+      fresh: true,
+      transfer: false,
+      drive: true,
+    });
+    expect(restartPlan({ transfer: false, fresh: false, drive: true }, "running")).toEqual({
+      confirm: false,
+      fresh: false,
+      transfer: false,
+      drive: true,
+    });
+    // Without the flag a live session still asks first.
+    const plain = restartPlan({ transfer: false, fresh: true, drive: false }, "running");
+    expect(plain.confirm).toBe(true);
   });
 
   it("shouldStartTransfer rejects re-entry", () => {
@@ -722,7 +800,7 @@ describe("createTransferController", () => {
     vi.advanceTimersByTime(119_999);
     expect(run).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
-    expect(run.mock.calls.map(([e]) => e.kind)).toEqual(["toast", "settle"]);
+    expect(run.mock.calls.map(([e]) => e.kind)).toEqual(["toast", "settle", "report"]);
     expect(onChange).toHaveBeenCalledTimes(1);
     expect(onChange.mock.calls[0][0].size).toBe(0);
     expect(ctl.getMap().size).toBe(0);
@@ -756,7 +834,13 @@ describe("createTransferController", () => {
     expect(order).toEqual([]);
     // The handoff is injected after the restarted session reported its spawn.
     ctl.dispatch({ type: "spawn_settled", key: KEY, result: { ok: true } });
-    expect(order).toEqual(["change", "run:toast", "run:settle", "run:inject_handoff"]);
+    expect(order).toEqual([
+      "change",
+      "run:toast",
+      "run:settle",
+      "run:report",
+      "run:inject_handoff",
+    ]);
   });
 
   it("a progress event that changes nothing visible does not notify", () => {
@@ -818,7 +902,7 @@ describe("createTransferController", () => {
     vi.advanceTimersByTime(RESTARTING_BACKSTOP_MS - 1);
     expect(run).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
-    expect(run.mock.calls.map(([e]) => e.kind)).toEqual(["toast", "settle"]);
+    expect(run.mock.calls.map(([e]) => e.kind)).toEqual(["toast", "settle", "report"]);
     const toast = run.mock.calls[0][0];
     expect(toast.kind === "toast" && toast.message.startsWith("Antigravity did not report")).toBe(
       true,
@@ -834,7 +918,7 @@ describe("createTransferController", () => {
     vi.advanceTimersByTime(4_999);
     expect(run).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
-    expect(run.mock.calls.map(([e]) => e.kind)).toEqual(["toast", "settle"]);
+    expect(run.mock.calls.map(([e]) => e.kind)).toEqual(["toast", "settle", "report"]);
   });
 });
 
