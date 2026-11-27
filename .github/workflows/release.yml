@@ -7,7 +7,8 @@ name: Release
 # identity stored there (Developer ID or self-signed) and the updater artifacts with the updater key
 # (TAURI_SIGNING_PRIVATE_KEY*), check that each .sig was made by the key whose pubkey is in tauri.conf.json, and fail
 # if any of that is missing. Every other run (PR, schedule, dispatch) never sees a secret, builds unsigned without
-# updater artifacts, and publishes nothing.
+# updater artifacts, and publishes nothing. The Linux build downloads and runs linuxdeploy and its plugins without a
+# checksum, so it runs without the key; the AppImage is signed afterwards in a step that runs only the Tauri CLI.
 
 on:
   push:
@@ -272,12 +273,26 @@ jobs:
           UPDATER_KEY: ${{ steps.updater-key.outputs.has_key }}
         run: yarn --silent tsx scripts/bundle-overlay.ts --target linux --out "$RUNNER_TEMP/bundle-overlay.json"
 
-      # The only step that sees the updater key.
-      - name: Build the packages and the AppImage's updater signature
+      # No key here: the AppImage bundler downloads and runs linuxdeploy, AppRun and linuxdeploy-plugin-appimage
+      # without verifying them, so nothing it runs may see the secret.
+      - name: Build the packages
+        run: yarn tauri:bundle --config "$RUNNER_TEMP/bundle-overlay.json"
+
+      # The only step that sees the updater key, and it runs nothing but the Tauri CLI from the lockfile. The version
+      # goes into the signed comment, as `tauri build` does for the artifacts it signs itself.
+      - name: Sign the AppImage for the updater
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: yarn tauri:bundle --config "$RUNNER_TEMP/bundle-overlay.json"
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          files=(target/release/bundle/appimage/Keitora_*_amd64.AppImage)
+          if [ "${#files[@]}" -ne 1 ] || [ ! -f "${files[0]}" ]; then
+            echo "Expected exactly one AppImage, found: ${files[*]}" >&2
+            exit 1
+          fi
+          yarn --silent tauri signer sign --app-version "$version" "${files[0]}" > /dev/null
 
       - name: Collect the packages and the signature
         id: collect

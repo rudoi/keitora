@@ -925,8 +925,9 @@ describe("bundleOverlay", () => {
       bundle: { createUpdaterArtifacts: true, targets: ["app", "dmg"] },
     });
   });
-  it("only turns on updater artifacts on Linux, where the AppImage is the updater artifact", () => {
-    expect(overlay("linux", "true", TAG_REF)).toEqual({ bundle: { createUpdaterArtifacts: true } });
+  it("leaves Linux alone, whose AppImage is signed after the build in a step of its own", () => {
+    expect(overlay("linux", "true", TAG_REF)).toEqual({});
+    expect(overlay("linux", "true", BRANCH_REF)).toEqual({});
   });
   it("is empty without the key off a tag", () => {
     for (const ref of [BRANCH_REF, PR_REF, undefined]) {
