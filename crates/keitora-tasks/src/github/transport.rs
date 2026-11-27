@@ -53,7 +53,6 @@ const SCOPE_REMEDIATION: &str = "run `gh auth refresh -s project`";
 #[cfg(unix)]
 fn gh_command() -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("gh");
-    cmd.no_window();
     // `var_os` + lossy so a non-UTF-8 PATH still augments (rather than dropping the
     // inherited PATH, which would strip `gh`'s own `git` subprocess resolution).
     let inherited = std::env::var_os("PATH");
@@ -62,6 +61,8 @@ fn gh_command() -> tokio::process::Command {
         "PATH",
         crate::config::prepend_path_dirs(&crate::config::extra_path_dirs(), inherited.as_deref()),
     );
+    // After the PATH, so the AppImage cleanup sees (and cleans) it.
+    cmd.no_window();
     cmd
 }
 

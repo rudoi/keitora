@@ -6,8 +6,6 @@
 
 mod activity;
 mod agent_updates;
-#[cfg(target_os = "linux")]
-mod appimage_env;
 mod backend;
 mod bg_notifier;
 mod cli_install;
@@ -19,6 +17,7 @@ mod db_watch;
 mod deps;
 mod diff;
 mod dispatch;
+mod external_open;
 mod headroom;
 mod hooks;
 mod host;

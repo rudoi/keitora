@@ -107,7 +107,7 @@ fn spawn_shell(dir: &Path) -> std::io::Result<()> {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         #[cfg(target_os = "linux")]
-        crate::appimage_env::scrub(&mut cmd);
+        keitora_tasks::appimage_env::scrub(&mut cmd);
         match cmd.spawn() {
             Ok(_) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => tried.push(program),

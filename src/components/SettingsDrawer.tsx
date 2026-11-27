@@ -17,6 +17,7 @@ import { btnGhost, btnPrimary } from "../lib/buttonStyles";
 import type { CliKind, DiffBase, ProjectSummary } from "../lib/ipc";
 import { daemonRestart, daemonShutdown } from "../lib/ipc";
 import { LAYER_MODAL, MODAL_OVERLAY_CLS } from "../lib/layers";
+import { openDaemonLog } from "../lib/openExternal";
 import { RESTART_FALLBACK_MS, restartOutcome } from "../lib/recovery";
 import { useDaemonStatus, useRecovery } from "../lib/sessions";
 import {
@@ -109,8 +110,7 @@ function DaemonSection() {
   const revealLog = async () => {
     if (!info.log_path) return;
     try {
-      const { openPath } = await import("@tauri-apps/plugin-opener");
-      await openPath(info.log_path);
+      await openDaemonLog();
     } catch (e) {
       showToast(`Could not reveal log: ${String(e)}`);
     }

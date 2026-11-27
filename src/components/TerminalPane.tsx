@@ -4,7 +4,6 @@
 // live GPU contexts) and we never fit/resize while hidden (avoids 0×0 corruption).
 
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
@@ -58,6 +57,7 @@ import {
 } from "../lib/keybindings";
 import { markPending, onFrame, stamp } from "../lib/latencyProbe";
 import { createLiveTail, type LiveTail } from "../lib/liveTail";
+import { openUrl } from "../lib/openExternal";
 import { createPaneAttachments } from "../lib/paneAttach";
 import { createOutputGate, type OutputGate } from "../lib/paneOutput";
 import {

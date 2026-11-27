@@ -1,10 +1,14 @@
-//! Undo the AppImage runtime's environment for programs Keitora starts on the user's behalf.
+//! Undo the AppImage runtime's environment for programs Keitora starts.
 //!
 //! An AppImage's `AppRun` points `LD_LIBRARY_PATH`, `PATH`, `PYTHONHOME`, `XDG_DATA_DIRS`, the
 //! GTK/GIO module paths and more at the mounted image, so Keitora's own WebKit finds its bundled
-//! libraries. A terminal or shell started from Keitora inherits all of it and loads the image's
-//! libraries instead of the system's, which can crash or mis-theme it. Keitora itself still needs
-//! those values, so they are removed per child [`Command`], never from the process.
+//! libraries. Anything started from Keitora (git, gh, the login-shell probe, agent CLIs, herdr, a
+//! terminal, a browser or file manager) inherits all of it and loads the image's libraries instead
+//! of the system's, which can crash or mis-theme it. Keitora itself and WebKit's helper processes
+//! still need those values, so they are removed per child [`Command`], never from the process.
+//!
+//! The spawn helpers apply [`scrub`] for their callers: `CommandNoWindow::no_window` in this
+//! crate and the app's `configure_command`.
 //!
 //! Outside an AppImage (`$APPDIR` unset) nothing changes.
 
@@ -54,11 +58,19 @@ fn current_appdir() -> Option<OsString> {
 }
 
 /// Strip the AppImage's environment from `cmd` when Keitora runs as an AppImage.
+///
+/// Works on the environment the child would get: the inherited variables with `cmd`'s own
+/// changes applied, so a `PATH` the caller already built from the inherited one is cleaned too.
+/// Call it after the caller's last `env`/`env_remove`; a value set later is not cleaned.
 pub fn scrub(cmd: &mut Command) {
     let Some(appdir) = current_appdir() else {
         return;
     };
-    for change in plan(std::env::vars_os(), &appdir) {
+    let explicit: Vec<(OsString, Option<OsString>)> = cmd
+        .get_envs()
+        .map(|(k, v)| (k.to_owned(), v.map(OsStr::to_owned)))
+        .collect();
+    for change in plan(effective_env(std::env::vars_os(), explicit), &appdir) {
         match change {
             EnvChange::Remove(k) => {
                 cmd.env_remove(k);
@@ -70,18 +82,18 @@ pub fn scrub(cmd: &mut Command) {
     }
 }
 
-/// `value` (a `:`-separated path list) without its entries under `$APPDIR`; `None` when nothing
-/// is left. For a list Keitora derived itself, such as a login shell's `PATH` probed from inside
-/// the image. Outside an AppImage it is returned unchanged.
-pub fn clean_path_list(value: &OsStr) -> Option<OsString> {
-    let Some(appdir) = current_appdir() else {
-        return Some(value.to_owned());
-    };
-    match strip_list(value, trim_dir(&appdir)) {
-        Stripped::Unchanged => Some(value.to_owned()),
-        Stripped::Kept(v) => Some(v),
-        Stripped::Empty => None,
-    }
+/// The environment a child gets: `inherited` with each `explicit` change (`Some` sets, `None`
+/// removes) applied.
+fn effective_env(
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    explicit: Vec<(OsString, Option<OsString>)>,
+) -> Vec<(OsString, OsString)> {
+    let mut env: Vec<(OsString, OsString)> = inherited
+        .into_iter()
+        .filter(|(k, _)| !explicit.iter().any(|(e, _)| e == k))
+        .collect();
+    env.extend(explicit.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))));
+    env
 }
 
 /// The changes that remove every trace of `appdir` from `vars`: the runtime's own variables go,
@@ -266,6 +278,36 @@ mod tests {
             ["APPDIR", "APPIMAGE", "ARGV0", "OWD", "GTK_THEME"]
                 .map(|k| EnvChange::Remove(os(k)))
                 .to_vec()
+        );
+    }
+
+    #[test]
+    fn the_command_s_own_changes_are_cleaned_too() {
+        let inherited = [
+            ("PATH", "/tmp/.mount_KeitoX/usr/bin:/usr/bin"),
+            ("PYTHONHOME", "/tmp/.mount_KeitoX/usr"),
+            ("GIO_MODULE_DIR", "/tmp/.mount_KeitoX/usr/lib/gio/modules"),
+        ]
+        .map(|(k, v)| (os(k), os(v)));
+        let explicit = vec![
+            // A PATH the caller built from the inherited one still carries the image's dirs.
+            (
+                os("PATH"),
+                Some(os(
+                    "/home/me/.local/bin:/tmp/.mount_KeitoX/usr/bin:/usr/bin",
+                )),
+            ),
+            // Already removed by the caller: nothing left to change.
+            (os("PYTHONHOME"), None),
+            (os("GIT_OPTIONAL_LOCKS"), Some(os("0"))),
+        ];
+        let changes = plan(effective_env(inherited, explicit), OsStr::new(APPDIR));
+        assert_eq!(
+            changes,
+            vec![
+                EnvChange::Remove(os("GIO_MODULE_DIR")),
+                EnvChange::Set(os("PATH"), os("/home/me/.local/bin:/usr/bin")),
+            ]
         );
     }
 

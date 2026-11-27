@@ -664,10 +664,8 @@ impl HerdrEnv {
     ///
     /// Run from an AppImage, herdr would otherwise inherit the image's library, Python and GTK
     /// paths and hand them to every pane, and keep them after the image is unmounted; they are
-    /// stripped first, and from the probed `PATH` too, since the login shell inherited them.
+    /// stripped last, from the composed `PATH` too, since it starts from the inherited one.
     pub fn apply(&self, cmd: &mut std::process::Command) {
-        #[cfg(target_os = "linux")]
-        crate::appimage_env::scrub(cmd);
         for name in &self.env_remove {
             cmd.env_remove(name);
         }
@@ -675,14 +673,10 @@ impl HerdrEnv {
             cmd.env(k, v);
         }
         if let Some(path) = self.path() {
-            #[cfg(target_os = "linux")]
-            match crate::appimage_env::clean_path_list(std::ffi::OsStr::new(path)) {
-                Some(path) => cmd.env("PATH", path),
-                None => cmd.env_remove("PATH"),
-            };
-            #[cfg(not(target_os = "linux"))]
             cmd.env("PATH", path);
         }
+        #[cfg(target_os = "linux")]
+        keitora_tasks::appimage_env::scrub(cmd);
     }
 }
 

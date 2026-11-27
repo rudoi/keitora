@@ -82,6 +82,10 @@ tree-sitter-cpp = "0.23"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal"] }
 
+# Runs the platform openers directly so the AppImage's environment can be stripped first.
+[target.'cfg(target_os = "linux")'.dependencies]
+open = "5"
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",

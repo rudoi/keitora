@@ -1983,6 +1983,16 @@ fn daemon_status(client: State<SharedBackend>) -> StatusPayload {
     client.status_payload_snapshot()
 }
 
+/// Open the active daemon's log (the settings drawer's "reveal log") in the default app.
+#[tauri::command(async)]
+fn open_daemon_log(app: AppHandle, client: State<SharedBackend>) -> Result<(), String> {
+    let path = client.status_payload_snapshot().log_path;
+    if path.is_empty() {
+        return Err("The daemon has no log yet".into());
+    }
+    crate::external_open::open_path(&app, &path).map_err(|e| format!("Could not open log: {e}"))
+}
+
 /// The one-time "panes now use your normal tool folders" notice: the old
 /// isolated folders left in place, or `None` (nothing to say, or already said).
 #[tauri::command(async)]
@@ -2450,6 +2460,7 @@ pub fn run() {
             crate::terminal_links::open_terminal_file,
             crate::session_toast::notify_session,
             crate::worktree_open::open_worktree_folder,
+            crate::external_open::open_external_url,
             crate::worktree_open::open_worktree_shell,
             pty_resize,
             pty_scroll,
@@ -2460,6 +2471,7 @@ pub fn run() {
             session_terminate,
             session_launch,
             daemon_status,
+            open_daemon_log,
             take_xdg_leak_notice,
             daemon_recovery,
             recovery_resume_now,

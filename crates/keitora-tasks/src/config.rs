@@ -2091,17 +2091,18 @@ pub fn resolve_keitora_path(project: Option<&ProjectConfig>, user: &UserConfig) 
 const PATH_BEGIN: &str = "__KEITORA_PATH_BEGIN__";
 const PATH_END: &str = "__KEITORA_PATH_END__";
 
-/// Capture the user's real login `$PATH` by running their login+interactive shell
-/// once. A GUI process launched via LaunchServices inherits only a minimal
-/// `PATH`; the login shell sources the user's profile (homebrew, `~/.local/bin`,
-/// fnm, …). Shell-agnostic: `printenv` reads the exported, colon-joined `PATH`
-/// regardless of the shell's own list semantics (e.g. fish).
-/// Extension to suppress the console window Windows allocates when a GUI process
-/// (which has no console of its own) spawns a console-subsystem child — `git`, the
-/// login shell, `claude`, etc. Without it a window flashes on every such call, and
-/// the UI's worktree/session-status polling fires them rapidly (looks like a fork
-/// bomb). Sets `CREATE_NO_WINDOW`; no-op off Windows. Apply just before
-/// `output()`/`spawn()`. Implemented for both `std` and `tokio` commands.
+/// Prepares a child the GUI starts — `git`, `gh`, the login shell, etc.
+///
+/// On Windows it suppresses the console window Windows allocates when a GUI process
+/// (which has no console of its own) spawns a console-subsystem child. Without it a
+/// window flashes on every such call, and the UI's worktree/session-status polling
+/// fires them rapidly (looks like a fork bomb). Sets `CREATE_NO_WINDOW`.
+///
+/// On Linux it strips the AppImage runtime's environment (see [`crate::appimage_env`]),
+/// so the child loads the system's libraries rather than the image's.
+///
+/// Apply after the command's last `env`/`env_remove`, just before `output()`/`spawn()`.
+/// Implemented for both `std` and `tokio` commands.
 pub(crate) trait CommandNoWindow {
     fn no_window(&mut self) -> &mut Self;
 }
@@ -2114,6 +2115,8 @@ impl CommandNoWindow for Command {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             self.creation_flags(CREATE_NO_WINDOW);
         }
+        #[cfg(target_os = "linux")]
+        crate::appimage_env::scrub(self);
         self
     }
 }
@@ -2126,10 +2129,20 @@ impl CommandNoWindow for tokio::process::Command {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             self.creation_flags(CREATE_NO_WINDOW);
         }
+        #[cfg(target_os = "linux")]
+        crate::appimage_env::scrub(self.as_std_mut());
         self
     }
 }
 
+/// Capture the user's real login `$PATH` by running their login+interactive shell
+/// once. A GUI process launched via LaunchServices inherits only a minimal
+/// `PATH`; the login shell sources the user's profile (homebrew, `~/.local/bin`,
+/// fnm, …). Shell-agnostic: `printenv` reads the exported, colon-joined `PATH`
+/// regardless of the shell's own list semantics (e.g. fish).
+///
+/// The shell runs without the AppImage's environment (see [`CommandNoWindow`]), so
+/// the user's profile never executes against the image's libraries.
 pub fn login_path() -> Option<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let script = format!("printf %s {PATH_BEGIN}; printenv PATH; printf %s {PATH_END}");
@@ -2256,7 +2269,6 @@ pub(crate) fn git_path_env(login: Option<String>, inherited: Option<&str>) -> Op
 /// here are POSIX-specific).
 pub(crate) fn git_command() -> Command {
     let mut cmd = Command::new("git");
-    cmd.no_window();
     #[cfg(unix)]
     {
         // `var_os` + lossy so a non-UTF-8 PATH still augments rather than being dropped.
@@ -2266,6 +2278,8 @@ pub(crate) fn git_command() -> Command {
             cmd.env("PATH", p);
         }
     }
+    // After the PATH, so the AppImage cleanup sees (and cleans) it.
+    cmd.no_window();
     cmd
 }
 

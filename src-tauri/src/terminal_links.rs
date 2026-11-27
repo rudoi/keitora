@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 use keitora_tasks::ProjectConfig;
 use tauri::AppHandle;
-use tauri_plugin_opener::OpenerExt;
 
 #[tauri::command(async)]
 pub fn open_terminal_file(
@@ -18,8 +17,7 @@ pub fn open_terminal_file(
     let target = validate_target(&root, &path)?;
     // Some default handlers mis-handle the `\\?\` prefix canonicalization adds on Windows.
     let target = dunce::simplified(&target);
-    app.opener()
-        .open_path(target.to_string_lossy().into_owned(), None::<String>)
+    crate::external_open::open_path(&app, &target.to_string_lossy())
         .map_err(|e| format!("Could not open file: {e}"))
 }
 

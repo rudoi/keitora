@@ -22,7 +22,7 @@ impl Platform {
     /// The running build's platform, or `None` where no update artifacts are published.
     pub fn current() -> Option<Platform> {
         #[cfg(target_os = "linux")]
-        let appimage = crate::appimage_env::running_as_appimage();
+        let appimage = keitora_tasks::appimage_env::running_as_appimage();
         #[cfg(not(target_os = "linux"))]
         let appimage = false;
         Self::detect(std::env::consts::OS, std::env::consts::ARCH, appimage)
