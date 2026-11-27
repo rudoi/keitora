@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   classifyAttention,
+  type DriveFacts,
+  driveFacts,
+  escalationBody,
   isWorktreeFocused,
   latchIdleFromTurn,
   needsInput,
@@ -8,7 +11,7 @@ import {
   projectChanged,
   shouldSuppressNotification,
 } from "./attention";
-import type { SessionState } from "./sessions";
+import type { SessionState, WorktreeSession } from "./sessions";
 
 describe("latchIdleFromTurn", () => {
   it("latches on busy→idle (turn finished)", () => {
@@ -173,5 +176,110 @@ describe("classifyAttention seed-path invariant", () => {
 
   it("waiting with idleFromTurn=false still yields 'waiting' (genuine need preserved)", () => {
     expect(classifyAttention("waiting", false)).toBe("waiting");
+  });
+});
+
+describe("driven sessions", () => {
+  const brokered: DriveFacts = { drivenBy: "alpha", brokered: true };
+  const escalated: DriveFacts = { drivenBy: "alpha", brokered: false };
+
+  // [label, state, latch, drive, needsInput, kind]
+  const rows: [string, SessionState, boolean, DriveFacts | undefined, boolean, string | null][] = [
+    ["not driven, waiting", "waiting", false, undefined, true, "waiting"],
+    ["driven, waiting, brokered", "waiting", false, brokered, false, null],
+    ["driven, waiting, escalated", "waiting", false, escalated, true, "waiting"],
+    ["driven, idle after a turn", "idle", true, escalated, false, null],
+    ["driven, busy", "busy", true, escalated, false, null],
+    ["driven, offline", "offline", false, escalated, false, null],
+    ["not driven, idle after a turn", "idle", true, undefined, true, "finished"],
+  ];
+
+  it.each(rows)("%s", (_label, state, latch, drive, needs, kind) => {
+    expect(needsInput(state, latch, drive)).toBe(needs);
+    expect(classifyAttention(state, latch, drive)).toBe(kind);
+  });
+
+  it("keeps classifyAttention non-null exactly when needsInput, with and without a drive", () => {
+    const states: SessionState[] = ["idle", "busy", "waiting", "offline"];
+    for (const drive of [undefined, brokered, escalated]) {
+      for (const state of states) {
+        for (const latch of [false, true]) {
+          expect(classifyAttention(state, latch, drive) !== null).toBe(
+            needsInput(state, latch, drive),
+          );
+        }
+      }
+    }
+  });
+
+  it("never classifies a driven idle as finished, even with the latch set", () => {
+    expect(classifyAttention("idle", true, brokered)).toBeNull();
+    expect(classifyAttention("idle", true, escalated)).toBeNull();
+  });
+
+  it("seeds a brokered waiting session without attention", () => {
+    // The seed path passes latch=false and the current facts.
+    expect(classifyAttention("waiting", false, brokered)).toBeNull();
+    expect(classifyAttention("waiting", false, escalated)).toBe("waiting");
+  });
+
+  it("treats brokered without a driver as no drive", () => {
+    expect(needsInput("waiting", false, { drivenBy: null, brokered: true })).toBe(true);
+  });
+});
+
+function sess(extra: Partial<WorktreeSession>): WorktreeSession {
+  return {
+    project: "my-game",
+    worktree: "bravo",
+    state: "waiting",
+    current_task_id: null,
+    pid: null,
+    last_heartbeat: "",
+    ...extra,
+  };
+}
+
+describe("driveFacts", () => {
+  it("is undefined for a missing or undriven session", () => {
+    expect(driveFacts(undefined)).toBeUndefined();
+    expect(driveFacts(sess({}))).toBeUndefined();
+    expect(driveFacts(sess({ driven_by: null, brokered: true }))).toBeUndefined();
+  });
+
+  it("carries the driver and whether a prompt is brokered", () => {
+    expect(driveFacts(sess({ driven_by: "alpha", brokered: true }))).toEqual({
+      drivenBy: "alpha",
+      brokered: true,
+    });
+    expect(driveFacts(sess({ driven_by: "alpha" }))).toEqual({
+      drivenBy: "alpha",
+      brokered: false,
+    });
+  });
+});
+
+describe("escalationBody", () => {
+  it("names the driver and the reason for an escalated waiting session", () => {
+    const s = sess({ driven_by: "alpha", escalated_reason: "needs prod credentials" });
+    expect(escalationBody(s)).toBe("alpha escalated: needs prod credentials");
+  });
+
+  it("is null without a driver, a reason, or a waiting state", () => {
+    expect(escalationBody(sess({ escalated_reason: "why" }))).toBeNull();
+    expect(escalationBody(sess({ driven_by: "alpha" }))).toBeNull();
+    const idle = sess({ driven_by: "alpha", escalated_reason: "why", state: "idle" });
+    expect(escalationBody(idle)).toBeNull();
+  });
+
+  it("cuts a long reason at 140 characters without splitting a character", () => {
+    const reason = `${"a".repeat(139)}${"\u2603".repeat(5)}`;
+    expect(escalationBody(sess({ driven_by: "alpha", escalated_reason: reason }))).toBe(
+      `alpha escalated: ${"a".repeat(139)}\u2603\u2026`,
+    );
+    const exact = "b".repeat(140);
+    expect(escalationBody(sess({ driven_by: "alpha", escalated_reason: exact }))).toBe(
+      `alpha escalated: ${exact}`,
+    );
   });
 });

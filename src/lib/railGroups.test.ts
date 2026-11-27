@@ -4,6 +4,7 @@ import type { BuildProgress, ProjectSummary, WorktreeActivity, WorktreeInfo } fr
 import type { ProjectOverview } from "./projectsOverview";
 import {
   activeRegistryKey,
+  attachDrivenSummaries,
   type BuildGroupsInput,
   buildGroups,
   buildLane,
@@ -60,7 +61,14 @@ const running: BuildProgress = {
 function activity(
   project: string,
   worktree: string,
-  opts: { working?: boolean; building?: boolean } = {},
+  opts: {
+    working?: boolean;
+    building?: boolean;
+    drivenBy?: string;
+    drives?: string[];
+    pendingPrompts?: number;
+    drivePaused?: boolean;
+  } = {},
 ): [string, WorktreeActivity] {
   return [
     `${project}/${worktree}`,
@@ -72,6 +80,10 @@ function activity(
       workflow: null,
       build: opts.building ? running : null,
       working: opts.working ?? false,
+      drivenBy: opts.drivenBy ?? null,
+      drives: opts.drives ?? [],
+      pendingPrompts: opts.pendingPrompts ?? 0,
+      drivePaused: opts.drivePaused ?? false,
     },
   ];
 }
@@ -564,5 +576,181 @@ describe("shareGroups", () => {
     expect(a.lanes).not.toBe(prev[0].lanes);
     expect(a.lanes[0]).toBe(prev[0].lanes[1]);
     expect(a.lanes[1]).toBe(prev[0].lanes[0]);
+  });
+});
+
+// ── driving ───────────────────────────────────────────────────────────────────
+
+function driven(
+  project: string,
+  worktree: string,
+  state: SessionState,
+  extra: Partial<WorktreeSession> = {},
+): WorktreeSession {
+  return { ...session(project, worktree, state), driven_by: "a1", ...extra };
+}
+
+describe("lane drive", () => {
+  it("maps the lane's drive from its session and activity", () => {
+    const acts = new Map([
+      activity("res", "a", { drives: ["b"] }),
+      activity("res", "b", { drivenBy: "a", pendingPrompts: 1, drivePaused: true }),
+    ]);
+    const a = buildLane(wt("a"), "res", undefined, undefined, undefined, acts);
+    expect(a.drive?.drivenBy).toBeNull();
+    expect(a.drive?.drives.map((d) => d.name)).toEqual(["b"]);
+    const b = buildLane(
+      wt("b"),
+      "res",
+      { ...session("res", "b", "waiting"), driven_by: "a", brokered: true },
+      undefined,
+      undefined,
+      acts,
+    );
+    expect(b.drive).toEqual({
+      drivenBy: "a",
+      drives: [],
+      pendingPrompts: 1,
+      paused: true,
+      brokered: true,
+      escalatedReason: null,
+    });
+    expect(b.blockState).toBe("brokered");
+    // Neither role: no drive.
+    const c = buildLane(wt("c"), "res", undefined, undefined, undefined, acts);
+    expect(c.drive).toBeNull();
+  });
+
+  it("fills a driver's summaries from its sibling lanes", () => {
+    const [a] = buildGroups(
+      input({
+        activeWorktrees: [wt("a1"), wt("d1"), wt("d2"), wt("d3"), wt("d4"), wt("d5"), wt("d6")],
+        sessions: new Map([
+          ["a1", session("alpha-res", "a1", "busy")],
+          ["d1", driven("alpha-res", "d1", "idle")],
+          ["d2", driven("alpha-res", "d2", "busy")],
+          ["d3", driven("alpha-res", "d3", "waiting", { brokered: true })],
+          ["d4", driven("alpha-res", "d4", "waiting", { escalated_reason: "why" })],
+          ["d5", driven("alpha-res", "d5", "offline")],
+          ["d6", driven("alpha-res", "d6", "idle")],
+        ]),
+        activity: new Map([
+          activity("alpha-res", "a1", { drives: ["d1", "d2", "d3", "d4", "d5", "d6", "gone"] }),
+          activity("alpha-res", "d3", { drivenBy: "a1", pendingPrompts: 2 }),
+          activity("alpha-res", "d6", { drivenBy: "a1", working: true }),
+        ]),
+      }),
+    );
+    expect(a.lanes[0].drive?.drives).toEqual([
+      { name: "d1", visual: "idle", pending: 0 },
+      { name: "d2", visual: "busy", pending: 0 },
+      { name: "d3", visual: "deciding", pending: 2 },
+      { name: "d4", visual: "needs-you", pending: 0 },
+      { name: "d5", visual: "offline", pending: 0 },
+      { name: "d6", visual: "busy", pending: 0 },
+      { name: "gone", visual: "offline", pending: 0 },
+    ]);
+  });
+
+  it("shows a terminated or sessionless sibling as offline", () => {
+    const lanes = [
+      buildLane(
+        wt("a"),
+        "r",
+        undefined,
+        undefined,
+        undefined,
+        new Map([activity("r", "a", { drives: ["b", "c"] })]),
+      ),
+      buildLane(
+        wt("b", { terminated: true }),
+        "r",
+        driven("r", "b", "idle"),
+        undefined,
+        undefined,
+        new Map(),
+      ),
+      buildLane(wt("c"), "r", undefined, undefined, undefined, new Map()),
+    ];
+    expect(attachDrivenSummaries(lanes)[0].drive?.drives.map((d) => d.visual)).toEqual([
+      "offline",
+      "offline",
+    ]);
+    // Lanes without drives are passed through as the same objects.
+    expect(attachDrivenSummaries(lanes)[1]).toBe(lanes[1]);
+  });
+
+  it("keeps a brokered lane quiet in a non-active group", () => {
+    const [, b] = buildGroups(
+      input({
+        overview: [
+          alphaOverview,
+          {
+            ...betaOverview,
+            sessions: [
+              driven("beta-res", "b1", "waiting", { brokered: true }),
+              driven("beta-res", "b2", "waiting"),
+            ],
+          },
+        ],
+      }),
+    );
+    expect(b.lanes[0].attn).toBeUndefined();
+    expect(b.lanes[0].blockState).toBe("brokered");
+    // An escalated (not brokered) lane still needs the human.
+    expect(b.lanes[1].attn).toBe("waiting");
+    expect(b.lanes[1].blockState).toBe("waiting");
+    expect(b.summaryStats.waiting).toBe(1);
+    expect(b.summaryStats.driven).toBe(2);
+    expect(b.summaryStats.dots).toEqual(["brokered", "waiting"]);
+  });
+
+  it("counts driven lanes, and a group with none reports zero", () => {
+    const [a, b] = buildGroups(
+      input({ activity: new Map([activity("alpha-res", "a2", { drivenBy: "a1" })]) }),
+    );
+    expect(a.summaryStats.driven).toBe(1);
+    expect(b.summaryStats.driven).toBe(0);
+  });
+
+  it("compares drives structurally for lane sharing", () => {
+    const d = {
+      drivenBy: "a",
+      drives: [],
+      pendingPrompts: 1,
+      paused: false,
+      brokered: true,
+      escalatedReason: null,
+    };
+    expect(sameData({ drive: d }, { drive: { ...d } })).toBe(true);
+    expect(sameData({ drive: d }, { drive: { ...d, pendingPrompts: 2 } })).toBe(false);
+    expect(sameData({ drive: d }, { drive: { ...d, paused: true } })).toBe(false);
+    expect(sameData({ drive: null }, { drive: d })).toBe(false);
+    const withVisual = (visual: string) => ({
+      ...d,
+      drivenBy: null,
+      drives: [{ name: "b", visual, pending: 0 }],
+    });
+    expect(sameData(withVisual("idle"), withVisual("busy"))).toBe(false);
+  });
+
+  it("keeps lane identity when only an unrelated lane's drive changed", () => {
+    const build = (pending: number) =>
+      buildGroups(
+        input({
+          activity: new Map([
+            activity("alpha-res", "a1", { drives: ["a2"] }),
+            activity("alpha-res", "a2", { drivenBy: "a1", pendingPrompts: pending }),
+            activity("beta-res", "b1"),
+          ]),
+        }),
+      );
+    const prev = build(0);
+    const next = shareGroups(prev, build(1));
+    expect(next[1]).toBe(prev[1]);
+    expect(next[0]).not.toBe(prev[0]);
+    expect(next[0].lanes[1]).not.toBe(prev[0].lanes[1]);
+    // The driver lane's summary carries the sibling's pending count, so it changes too.
+    expect(next[0].lanes[0].drive?.drives[0].pending).toBe(1);
   });
 });

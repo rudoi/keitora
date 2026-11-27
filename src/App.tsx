@@ -35,6 +35,19 @@ import { UpdatesProvider } from "./components/UpdatesProvider";
 import { WorktreePicker } from "./components/WorktreePicker";
 import { switchConfirmCopy } from "./lib/agentSwitch";
 import { useAttention } from "./lib/attention";
+import type { DriveMenuItem } from "./lib/drive";
+import {
+  createDriveEventHandlers,
+  driveRestartKind,
+  driveRestartOutcome,
+  driveSwapConfirmPrefix,
+  openProjectsFromKey,
+  openProjectsKey,
+  SWAP_CANCELLED,
+  SWAP_EXPIRED_TOAST,
+  TRANSFER_ALREADY_RUNNING,
+} from "./lib/driveEvents";
+import { runDriveAction, useDrives, usePaneDrives } from "./lib/drives";
 import {
   clampFontSize,
   getTerminalFontSize,
@@ -47,8 +60,12 @@ import {
   cliAvailability,
   createWorktree,
   currentProject,
+  driveRequestResolve,
+  driveSetOpenProjects,
   injectHandoffSummary,
   listWorktrees,
+  onDriveRestart,
+  onDriveSwap,
   onNotificationActivated,
   onProjectChanged,
   onPtyResume,
@@ -77,7 +94,7 @@ import { useProjectsOverview } from "./lib/projectsOverview";
 import { byCli, initialAvailability, withClaudeAvailable } from "./lib/providers";
 import { activeRegistryKey, buildGroups, type GroupModel, shareGroups } from "./lib/railGroups";
 import { latestWins } from "./lib/railOrder";
-import { nextRestartSignal, type RestartSignal } from "./lib/resumeNotice";
+import { nextRestartSignal, type RestartKind, type RestartSignal } from "./lib/resumeNotice";
 import { countsByProject } from "./lib/sessionCounts";
 import {
   useDaemonSessions,
@@ -100,6 +117,7 @@ import {
   createTransferController,
   isMidTurn,
   midTurnNote,
+  type SpawnResult,
   shouldStartTransfer,
   type TransferController,
   type TransferEffect,
@@ -255,19 +273,41 @@ function AppInner() {
   // BEFORE an await (e.g. a transfer — the active project can change during the
   // transfer); it defaults to the current active project for the synchronous
   // restart path (onRestartSession), which never awaits.
-  // `fresh` asks the pane to start a new, empty conversation instead of resuming;
-  // `transfer` marks the restart as part of a CLI transfer (no confirm, spawn reported back).
+  // `fresh` asks the pane to start a new, empty conversation instead of resuming; `kind`
+  // says who asked (see `RestartKind`), and `driveRequest` is the driver request a
+  // `drive-*` restart carries out.
   const bumpRestartNonce = useCallback(
-    (worktree: string, project?: string | null, fresh = false, transfer = false) => {
+    (
+      worktree: string,
+      project?: string | null,
+      fresh = false,
+      kind: RestartKind = "restart",
+      driveRequest: number | null = null,
+    ) => {
       // Use the explicitly-passed project (even if null) when provided; otherwise the
       // current active project for the synchronous restart path.
       const proj = project === undefined ? warmRef.current.active : project;
       const key = `${proj}/${worktree}`;
       setRestartNonces((prev) => {
         const next = new Map(prev);
-        next.set(key, nextRestartSignal(next.get(key), fresh, transfer));
+        next.set(key, nextRestartSignal(next.get(key), fresh, kind, driveRequest));
         return next;
       });
+    },
+    [],
+  );
+  // Driver requests in flight by `project/worktree`: a reset until its pane reports the
+  // spawn, a swap until its transfer ends. Each request is resolved exactly once.
+  const driveRestartsRef = useRef(new Map<string, number>());
+  const driveSwapsRef = useRef(new Map<string, number>());
+  const settleDriveRestart = useCallback(
+    (project: string, worktree: string, id: number, r: SpawnResult) => {
+      const key = transferKey(project, worktree);
+      if (driveRestartsRef.current.get(key) !== id) return;
+      driveRestartsRef.current.delete(key);
+      const { outcome, reason } = driveRestartOutcome(r);
+      // A rejected resolve means the runner already gave up on the request.
+      void driveRequestResolve(project, id, outcome, reason).catch(() => {});
     },
     [],
   );
@@ -581,7 +621,7 @@ function AppInner() {
   runTransferEffectRef.current = (e: TransferEffect) => {
     switch (e.kind) {
       case "restart":
-        bumpRestartNonce(e.worktree, e.project, e.fresh, true);
+        bumpRestartNonce(e.worktree, e.project, e.fresh, "transfer");
         return;
       case "inject_handoff":
         injectHandoffWhenIdle(e.worktree, e.project);
@@ -606,6 +646,17 @@ function AppInner() {
         const key = transferKey(e.project, e.worktree);
         resumeUnlistenRef.current.get(key)?.();
         resumeUnlistenRef.current.delete(key);
+        return;
+      }
+      case "report": {
+        // Only a driver's swap has a request to answer; a human's transfer has none.
+        const key = transferKey(e.project, e.worktree);
+        const id = driveSwapsRef.current.get(key);
+        if (id === undefined) return;
+        driveSwapsRef.current.delete(key);
+        void driveRequestResolve(e.project, id, e.ok ? "applied" : "refused", e.message).catch(
+          () => {},
+        );
         return;
       }
     }
@@ -659,17 +710,34 @@ function AppInner() {
   // the transfer overlay must render on a visible pane), then confirms, imports and lets
   // the phase controller drive the restart, toasts and settle. Confirmation always runs
   // BEFORE any backend side effect.
+  // Driven mode (`opts.drive`, a driver's swap request): the human's selection and view are
+  // left alone, the confirm names the driver, and every refusal and the outcome are
+  // reported back for the request.
   const onTransfer = useCallback(
-    (worktree: string, targetCli: CliKind) => {
-      setSelected(worktree);
-      setView("focus");
+    (
+      worktree: string,
+      targetCli: CliKind,
+      opts?: { project?: string; drive?: { requestId: number; driver: string } },
+    ) => {
+      const drive = opts?.drive ?? null;
+      if (drive === null) {
+        setSelected(worktree);
+        setView("focus");
+      }
       // Captured NOW: every step below targets this project even if the user switches
       // projects while the transfer runs.
-      const project = warmRef.current.active;
+      const project = opts?.project ?? warmRef.current.active;
       if (project === null) return;
+      const refuse = (reason: string) => {
+        if (drive === null) return;
+        void driveRequestResolve(project, drive.requestId, "refused", reason).catch(() => {});
+      };
+      const prefix =
+        drive === null ? "" : driveSwapConfirmPrefix(drive.driver, worktree, project, targetCli);
       const key = transferKey(project, worktree);
       if (!shouldStartTransfer(transferCtl.getMap(), key)) {
         showToast("A transfer is already in progress for this worktree.");
+        refuse(TRANSFER_ALREADY_RUNNING);
         return;
       }
       void (async () => {
@@ -681,10 +749,14 @@ function AppInner() {
             // Codex's ledger). Show the lock-free preview and require explicit
             // confirmation before anything imports.
             const preview = await previewClaudeTransfer(project, worktree);
-            const midTurn = isMidTurn(liveSessionsRef.current.get(worktree)?.state);
+            // The live-session map holds the active project's sessions only.
+            const midTurn =
+              project === warmRef.current.active &&
+              isMidTurn(liveSessionsRef.current.get(worktree)?.state);
             const ok = await confirmDialog({
               title: `Transfer ${worktree} to Codex?`,
               body:
+                prefix +
                 `Codex will import this Claude session and it cannot be undone:\n` +
                 `• ${preview.filename} (modified ${preview.mtime})\n` +
                 `“${preview.first_user_line}”\n\n` +
@@ -693,7 +765,10 @@ function AppInner() {
               confirmLabel: "Transfer to Codex",
               danger: true,
             });
-            if (!ok) return; // no side effects have happened yet
+            if (!ok) {
+              refuse(SWAP_CANCELLED);
+              return; // no side effects have happened yet
+            }
             confirmedJsonl = preview.path;
           } else {
             // Codex → Claude is a lossy SUMMARY handoff, not a full-history transfer —
@@ -701,19 +776,38 @@ function AppInner() {
             const ok = await confirmDialog({
               title: `Transfer ${worktree} to Claude?`,
               body:
+                prefix +
                 `Claude can't import a Codex thread directly, so this carries a generated ` +
                 `summary (goal, decisions, next steps, open files) — not the full ` +
                 `conversation. Detail will be lost.`,
               confirmLabel: "Transfer to Claude",
             });
-            if (!ok) return;
+            if (!ok) {
+              refuse(SWAP_CANCELLED);
+              return;
+            }
           }
         } catch (e) {
           showToast(String(e));
+          refuse(String(e));
           return;
         }
+        if (drive !== null) {
+          // The runner may have timed out while the dialog was open: then the request is
+          // gone and the transfer must not start.
+          try {
+            await driveRequestResolve(project, drive.requestId, "accepted");
+          } catch {
+            showToast(SWAP_EXPIRED_TOAST);
+            return;
+          }
+        }
         // The confirm dialog is async: another transfer may have started meanwhile.
-        if (!shouldStartTransfer(transferCtl.getMap(), key)) return;
+        if (!shouldStartTransfer(transferCtl.getMap(), key)) {
+          refuse(TRANSFER_ALREADY_RUNNING);
+          return;
+        }
+        if (drive !== null) driveSwapsRef.current.set(key, drive.requestId);
         transferCtl.dispatch({ type: "begin", project, worktree, to: targetCli, now: Date.now() });
         subscribeResume(key, project, worktree);
         try {
@@ -725,6 +819,56 @@ function AppInner() {
       })();
     },
     [showToast, confirmDialog, transferCtl, subscribeResume],
+  );
+  const onTransferRef = useRef(onTransfer);
+  onTransferRef.current = onTransfer;
+
+  // A driver's reset, wake and swap requests, carried out on the driven pane in the
+  // background: never a selection, view or project change.
+  useEffect(() => {
+    const handlers = createDriveEventHandlers({
+      warm: () => warmRef.current,
+      transfers: () => transferCtl.getMap(),
+      resolve: driveRequestResolve,
+      restart: (project, worktree, id, launch) => {
+        driveRestartsRef.current.set(transferKey(project, worktree), id);
+        bumpRestartNonce(worktree, project, launch.fresh, driveRestartKind(launch), id);
+      },
+      swap: (project, worktree, to, drive) =>
+        onTransferRef.current(worktree, to, { project, drive }),
+    });
+    let cancelled = false;
+    const uns: (() => void)[] = [];
+    const keep = (u: () => void) => {
+      if (cancelled) u();
+      else uns.push(u);
+    };
+    void onDriveRestart(handlers.onRestart).then(keep, () => {});
+    void onDriveSwap(handlers.onSwap).then(keep, () => {});
+    return () => {
+      cancelled = true;
+      for (const u of uns) u();
+    };
+  }, [transferCtl, bumpRestartNonce]);
+
+  // The runner serves only projects this window has open; tell it whenever the set changes.
+  const openKey = openProjectsKey(warm);
+  useEffect(() => {
+    void driveSetOpenProjects(openProjectsFromKey(openKey)).catch(() => {});
+  }, [openKey]);
+
+  // Drive banners for the driven panes, by `project/worktree`.
+  const activeDrives = useDrives(activeProjectName);
+  const paneDrives = usePaneDrives(worktreeActivity, activeProjectName, sessions, activeDrives);
+  const paneDrivesRef = useRef(paneDrives);
+  paneDrivesRef.current = paneDrives;
+  // The banner's actions, with the same toasts as the rail menu's drive entries.
+  const runPaneDriveAction = useCallback(
+    (project: string, worktree: string, item: DriveMenuItem) => {
+      const driver = paneDrivesRef.current.get(transferKey(project, worktree))?.driver;
+      void runDriveAction(project, worktree, item, driver ?? "the driver", showToast);
+    },
+    [showToast],
   );
 
   // Switches the worktree to another agent, starting it fresh. Shares only the focus, key
@@ -1419,8 +1563,8 @@ function AppInner() {
                   }
                   restartNonce={restartNonces.get(`${wp.summary.name}/${w.name}`)?.n ?? 0}
                   restartFresh={restartNonces.get(`${wp.summary.name}/${w.name}`)?.fresh ?? false}
-                  restartTransfer={
-                    restartNonces.get(transferKey(wp.summary.name, w.name))?.transfer ?? false
+                  restartKind={
+                    restartNonces.get(transferKey(wp.summary.name, w.name))?.kind ?? "restart"
                   }
                   cli={w.cli}
                   transfer={transfers.get(transferKey(wp.summary.name, w.name)) ?? null}
@@ -1432,6 +1576,16 @@ function AppInner() {
                     })
                   }
                   onCancelTransfer={() => onCancelTransfer(wp.summary.name, w.name)}
+                  restartDriveRequest={
+                    restartNonces.get(transferKey(wp.summary.name, w.name))?.driveRequest ?? null
+                  }
+                  onDriveSpawnSettled={(id, r) =>
+                    settleDriveRestart(wp.summary.name, w.name, id, r)
+                  }
+                  drive={paneDrives.get(transferKey(wp.summary.name, w.name)) ?? null}
+                  onDriveTakeOver={() => runPaneDriveAction(wp.summary.name, w.name, "take-over")}
+                  onDriveRelease={() => runPaneDriveAction(wp.summary.name, w.name, "release")}
+                  onDriveResume={() => runPaneDriveAction(wp.summary.name, w.name, "resume-driver")}
                   terminated={w.terminated}
                   terminateNonce={terminateNonces.get(`${wp.summary.name}/${w.name}`)?.n ?? 0}
                   launchNonce={launchNonces.get(`${wp.summary.name}/${w.name}`)?.n ?? 0}

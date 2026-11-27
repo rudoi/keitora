@@ -11,6 +11,7 @@ import {
   stageChipText,
   stageChipTone,
 } from "../../lib/activity";
+import { driveKind, driveTag } from "../../lib/drive";
 import type { WorkflowState, WorktreeActivity, WorktreeStatus } from "../../lib/ipc";
 import { blockAnimates } from "../../lib/laneState";
 import { isWindows } from "../../lib/platform";
@@ -175,13 +176,17 @@ export const Lane = memo(function Lane({
   const badge = hintBadge;
   // Path/state on hovering the name only — not the whole row — so the tooltip
   // never sits over the task line's marquee.
+  const drive = lane.drive;
+  const deciding = driveKind(drive, lane.sessionState) === "deciding";
   const nameTitle = terminated
     ? `${lane.name} — ${TERMINATED_LABEL}`
-    : lane.sessionState
-      ? `${lane.name} — ${attn === "waiting" ? WAITING_LABEL : lane.sessionState}`
-      : ok
-        ? lane.path
-        : `${lane.name} — ${STATUS_LABEL[lane.status]}`;
+    : deciding
+      ? `${lane.name} — ${drive?.drivenBy} deciding`
+      : lane.sessionState
+        ? `${lane.name} — ${attn === "waiting" ? WAITING_LABEL : lane.sessionState}`
+        : ok
+          ? lane.path
+          : `${lane.name} — ${STATUS_LABEL[lane.status]}`;
   const rowCls = [
     "lane-row",
     ok ? "" : "disabled",
@@ -207,6 +212,8 @@ export const Lane = memo(function Lane({
   const workDotCls = ["lane-work-dot", building ? "working" : "busy", reduceMotion ? "" : "live"]
     .filter(Boolean)
     .join(" ");
+  const tag = driveTag(drive, lane.sessionState);
+  const stage = ok && !!act?.workflow;
   return (
     <div
       className={rowCls}
@@ -286,7 +293,16 @@ export const Lane = memo(function Lane({
             </span>
           )}
         </div>
-        {ok && act?.workflow && <StageChip workflow={act.workflow} />}
+        {(tag || stage) && (
+          <div className="lane-meta">
+            {tag && (
+              <span className={tag.className} title={tag.title}>
+                {tag.text}
+              </span>
+            )}
+            {stage && act?.workflow && <StageChip workflow={act.workflow} />}
+          </div>
+        )}
         {task && <Marquee text={task.title} outerClassName="lane-task" />}
         {ok && act?.branch && <Marquee text={`⎇ ${act.branch}`} outerClassName="lane-branch" />}
         {ok && showBuildBar(act) && act?.build && <LaneBuild build={act.build} />}

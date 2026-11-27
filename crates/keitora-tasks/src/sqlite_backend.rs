@@ -148,12 +148,48 @@ pub(crate) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         "#,
     )?;
 
+    // Cross-worktree drive state: bindings, brokered prompts, pane requests, replies.
+    conn.execute_batch(crate::drive::DRIVE_DDL)?;
+    conn.execute_batch(&crate::drive::drive_requests_ddl("drive_requests"))?;
+    conn.execute_batch(crate::drive::DRIVE_REQUESTS_INDEX_DDL)?;
+    // A `drive_requests` table created before `confirm_started_at` existed
+    // lacks the column; add it in place.
+    let has_confirm_col = conn
+        .prepare(
+            "SELECT 1 FROM pragma_table_info('drive_requests') WHERE name = 'confirm_started_at'",
+        )?
+        .exists([])?;
+    if !has_confirm_col {
+        conn.execute_batch("ALTER TABLE drive_requests ADD COLUMN confirm_started_at TEXT")?;
+    }
+    // One created before the `wake` kind rejects it; rebuild it with the new CHECK.
+    rebuild_for_check(
+        conn,
+        &TableRebuild {
+            table: "drive_requests",
+            marker: "'wake'",
+            ddl: crate::drive::drive_requests_ddl,
+            columns: crate::drive::DRIVE_REQUESTS_COLUMNS,
+            after: crate::drive::DRIVE_REQUESTS_INDEX_DDL,
+        },
+    )?;
+
     // `dispatch_log` (table + index) shares one DDL source of truth with the
     // GitHub sidecar so the two schemas can never drift .
     conn.execute_batch(crate::github::sidecar::DISPATCH_LOG_DDL)?;
 
     conn.execute_batch(&resume_sessions_ddl("resume_sessions"))?;
-    upgrade_resume_sessions_check(conn)?;
+    // One created before Antigravity rejects `'antigravity'`; rebuild it.
+    rebuild_for_check(
+        conn,
+        &TableRebuild {
+            table: "resume_sessions",
+            marker: "'antigravity'",
+            ddl: resume_sessions_ddl,
+            columns: "project, worktree, cli, session_id, source, agent_present, cleared_id,                       observed_at",
+            after: "",
+        },
+    )?;
 
     Ok(())
 }
@@ -179,31 +215,56 @@ fn resume_sessions_ddl(name: &str) -> String {
     RESUME_SESSIONS_DDL.replace("{name}", name)
 }
 
-/// Rebuild a `resume_sessions` table created with an older CHECK constraint
-/// (which rejects `'antigravity'`), keeping every row. SQLite cannot alter a
-/// CHECK in place, so the table is copied into a replacement and renamed, all
-/// in one transaction. A table that already allows `'antigravity'` is left alone,
-/// so running this on every open is cheap and idempotent.
-fn upgrade_resume_sessions_check(conn: &Connection) -> rusqlite::Result<()> {
-    if !resume_sessions_needs_upgrade(conn)? {
+/// A table whose CHECK constraint may predate a value it must now accept.
+struct TableRebuild<'a> {
+    table: &'a str,
+    /// Text the current CREATE statement contains (a newly allowed value, quoted).
+    marker: &'a str,
+    /// The table's DDL under a given name (`CREATE TABLE IF NOT EXISTS {name} …`).
+    ddl: fn(&str) -> String,
+    /// Every column, copied by name.
+    columns: &'a str,
+    /// SQL run after the rename (the table's indexes, which the drop removed).
+    after: &'a str,
+}
+
+/// Rebuild `t.table` when its stored CREATE statement lacks `t.marker`, keeping every
+/// row and its AUTOINCREMENT counter. SQLite cannot alter a CHECK in place, so the
+/// table is copied into a replacement and renamed, all in one transaction. A table
+/// that already has the marker (or doesn't exist) is left alone, so running this on
+/// every open is cheap and idempotent.
+fn rebuild_for_check(conn: &Connection, t: &TableRebuild<'_>) -> rusqlite::Result<()> {
+    if !needs_rebuild(conn, t)? {
         return Ok(());
     }
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> rusqlite::Result<()> {
         // Another connection may have upgraded between the check and the lock.
-        if !resume_sessions_needs_upgrade(conn)? {
+        if !needs_rebuild(conn, t)? {
             return Ok(());
         }
-        conn.execute_batch("DROP TABLE IF EXISTS resume_sessions_new")?;
-        conn.execute_batch(&resume_sessions_ddl("resume_sessions_new"))?;
-        conn.execute_batch(
-            "INSERT INTO resume_sessions_new \
-               (project, worktree, cli, session_id, source, agent_present, cleared_id, observed_at) \
-             SELECT project, worktree, cli, session_id, source, agent_present, cleared_id, observed_at \
-             FROM resume_sessions; \
-             DROP TABLE resume_sessions; \
-             ALTER TABLE resume_sessions_new RENAME TO resume_sessions;",
-        )
+        let (table, cols) = (t.table, t.columns);
+        let new = format!("{table}_new");
+        let seq = autoincrement_seq(conn, table);
+        conn.execute_batch(&format!("DROP TABLE IF EXISTS {new}"))?;
+        conn.execute_batch(&(t.ddl)(&new))?;
+        conn.execute_batch(&format!(
+            "INSERT INTO {new} ({cols}) SELECT {cols} FROM {table};              DROP TABLE {table};              ALTER TABLE {new} RENAME TO {table};"
+        ))?;
+        if let Some(seq) = seq {
+            // Ids are never reused, even ones whose rows were purged before the copy.
+            let n = conn.execute(
+                "UPDATE sqlite_sequence SET seq = MAX(seq, ?2) WHERE name = ?1",
+                params![table, seq],
+            )?;
+            if n == 0 {
+                conn.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES (?1, ?2)",
+                    params![table, seq],
+                )?;
+            }
+        }
+        conn.execute_batch(t.after)
     })();
     match result {
         Ok(()) => conn.execute_batch("COMMIT"),
@@ -214,16 +275,26 @@ fn upgrade_resume_sessions_check(conn: &Connection) -> rusqlite::Result<()> {
     }
 }
 
-/// True when `resume_sessions` exists and its CHECK does not allow `'antigravity'`.
-fn resume_sessions_needs_upgrade(conn: &Connection) -> rusqlite::Result<bool> {
+/// True when `t.table` exists and its CREATE statement lacks `t.marker`.
+fn needs_rebuild(conn: &Connection, t: &TableRebuild<'_>) -> rusqlite::Result<bool> {
     let sql: Option<String> = conn
         .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'resume_sessions'",
-            [],
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [t.table],
             |r| r.get(0),
         )
         .optional()?;
-    Ok(sql.is_some_and(|s| !s.contains("'antigravity'")))
+    Ok(sql.is_some_and(|s| !s.contains(t.marker)))
+}
+
+/// `table`'s AUTOINCREMENT counter; `None` without one (or without `sqlite_sequence`).
+fn autoincrement_seq(conn: &Connection, table: &str) -> Option<i64> {
+    conn.query_row(
+        "SELECT seq FROM sqlite_sequence WHERE name = ?1",
+        [table],
+        |r| r.get(0),
+    )
+    .ok()
 }
 
 /// Map an arbitrary `rusqlite::Error` to a `BackendError`, classifying SQLITE_BUSY /
@@ -1297,6 +1368,126 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    #[test]
+    fn init_schema_adds_confirm_column_to_an_older_drive_requests_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE drive_requests (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, worktree TEXT NOT NULL,
+               requested_by TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}',
+               queue INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending',
+               reason TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL DEFAULT (datetime('now')), resolved_at TEXT);",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        // Idempotent on a second run.
+        init_schema(&conn).unwrap();
+        let has: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('drive_requests') WHERE name = 'confirm_started_at'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(has);
+    }
+
+    #[test]
+    fn init_schema_rebuilds_an_old_drive_requests_check_to_allow_wake() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The shape before `wake` (and before `confirm_started_at`), with rows.
+        conn.execute_batch(
+            "CREATE TABLE drive_requests (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               kind TEXT NOT NULL CHECK(kind IN ('send', 'read', 'reset', 'swap')),
+               worktree TEXT NOT NULL, requested_by TEXT NOT NULL,
+               payload TEXT NOT NULL DEFAULT '{}',
+               queue INTEGER NOT NULL DEFAULT 0 CHECK(queue IN (0, 1)),
+               status TEXT NOT NULL DEFAULT 'pending'
+                 CHECK(status IN ('pending','running','pending_confirm','applied','refused')),
+               reason TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL DEFAULT (datetime('now')), resolved_at TEXT);
+             CREATE INDEX idx_drive_requests_status ON drive_requests(status);
+             INSERT INTO drive_requests (kind, worktree, requested_by, payload, status, reason)
+               VALUES ('send', 'bravo', 'alpha', '{\"text\":\"hi\"}', 'applied', ''),
+                      ('reset', 'bravo', 'alpha', '{}', 'refused', 'busy'),
+                      ('swap', 'charlie', 'alpha', '{\"to\":\"codex\"}', 'pending', '');
+             DELETE FROM drive_requests WHERE id = 3;",
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO drive_requests (kind, worktree, requested_by) VALUES ('wake', 'b', 'a')",
+                [],
+            )
+            .is_err());
+
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap(); // idempotent
+
+        let rows: Vec<(i64, String, String, String, String)> = conn
+            .prepare("SELECT id, kind, payload, status, reason FROM drive_requests ORDER BY id")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    1,
+                    "send".into(),
+                    r#"{"text":"hi"}"#.into(),
+                    "applied".into(),
+                    "".into()
+                ),
+                (
+                    2,
+                    "reset".into(),
+                    "{}".into(),
+                    "refused".into(),
+                    "busy".into()
+                ),
+            ]
+        );
+        // `wake` is accepted now, and the purged id 3 is not reused.
+        conn.execute(
+            "INSERT INTO drive_requests (kind, worktree, requested_by) VALUES ('wake', 'b', 'a')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(conn.last_insert_rowid(), 4);
+        // Unknown kinds are still rejected, and the index and column are back.
+        assert!(conn
+            .execute(
+                "INSERT INTO drive_requests (kind, worktree, requested_by) VALUES ('nap', 'b', 'a')",
+                [],
+            )
+            .is_err());
+        let has_index: bool = conn
+            .prepare(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index'                  AND name = 'idx_drive_requests_status'",
+            )
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(has_index);
+        let has_confirm: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('drive_requests') WHERE name = 'confirm_started_at'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(has_confirm);
+        let leftover: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE name = 'drive_requests_new'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(!leftover);
+    }
 
     /// A throwaway on-disk DB so multiple actors (worktrees) can share it.
     /// (`:memory:` is per-connection, so it can't model two worktrees.)

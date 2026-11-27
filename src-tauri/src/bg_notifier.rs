@@ -75,9 +75,49 @@ fn latch_idle_from_turn(prev: Option<&str>, next: &str, was: bool) -> bool {
 /// The ball is in the user's court: blocked on a permission prompt (`waiting`),
 /// or just finished a turn (`idle` with the turn-latch set).
 ///
+/// A driven worktree is quieter: while its driver is deciding a brokered prompt
+/// (`waiting` + `brokered`) the human is not needed, and its finished turns are read by
+/// the driver, so a driven `idle` never needs input. An escalated prompt (driven,
+/// `waiting`, not brokered) needs the human like any other.
+///
 /// Mirrors `needsInput` in `src/lib/attention.ts`.
-fn needs_input(state: &str, idle_from_turn: bool) -> bool {
+fn needs_input(state: &str, idle_from_turn: bool, driven: bool, brokered: bool) -> bool {
+    if driven {
+        if state == "waiting" && brokered {
+            return false;
+        }
+        if state == "idle" {
+            return false;
+        }
+    }
     state == "waiting" || (state == "idle" && idle_from_turn)
+}
+
+/// Longest escalation reason (in chars) a toast body carries before it is cut.
+const TOAST_REASON_MAX: usize = 140;
+
+/// The toast body for a session that needs input: `{driver} escalated: {reason}` for a
+/// driven session waiting on an escalated prompt with a reason, else the task title.
+fn toast_body(session: &keitora_tasks::WorktreeSession, task_title: String) -> String {
+    match (&session.driven_by, &session.escalated_reason) {
+        (Some(driver), Some(reason)) if session.state == "waiting" => {
+            format!(
+                "{driver} escalated: {}",
+                truncate_chars(reason, TOAST_REASON_MAX)
+            )
+        }
+        _ => task_title,
+    }
+}
+
+/// `s` cut to at most `max` chars (never inside a char), with `…` when cut.
+fn truncate_chars(s: &str, max: usize) -> String {
+    let cut = keitora_tasks::truncate_chars(s, max);
+    if cut.len() < s.len() {
+        format!("{cut}\u{2026}")
+    } else {
+        cut
+    }
 }
 
 /// One worktree's state-map step. Given its prior stored tuple
@@ -91,15 +131,21 @@ fn needs_input(state: &str, idle_from_turn: bool) -> bool {
 /// background pass after a switch-away fires for a session that went `waiting`
 /// while its project was active. On the first observation (`prev == None`)
 /// we seed a baseline and never fire (mirrors `useAttention`'s seed guard).
+///
+/// `driven`/`brokered` are the session's current drive facts. The stored
+/// `prev_needs_input` already holds the previous result, so a brokered -> escalated
+/// flip is a rising edge without any extra state.
 fn step_session(
     prev: Option<(&str, bool, bool)>,
     next_state: &str,
     active: bool,
+    driven: bool,
+    brokered: bool,
 ) -> ((String, bool, bool), bool) {
     let is_new = prev.is_none();
     let (prev_state, was_latch, prev_needs_input) = prev.unwrap_or((next_state, false, false));
     let next_latch = latch_idle_from_turn(Some(prev_state), next_state, was_latch);
-    let now_needs_input = needs_input(next_state, next_latch);
+    let now_needs_input = needs_input(next_state, next_latch, driven, brokered);
     let should_fire = !active && !is_new && !prev_needs_input && now_needs_input;
     // Pin to false while active so the first background pass sees a rising edge.
     let stored_needs_input = if active { false } else { now_needs_input };
@@ -270,8 +316,13 @@ fn spawn_project_watcher<R: Runtime + 'static>(
                     // would still be live at the `insert` below and conflict.
                     let prev_owned = state_map.get(wt.as_str()).cloned();
                     let prev = prev_owned.as_ref().map(|(s, l, n)| (s.as_str(), *l, *n));
-                    let (next_tuple, should_fire) =
-                        step_session(prev, session.state.as_str(), active);
+                    let (next_tuple, should_fire) = step_session(
+                        prev,
+                        session.state.as_str(),
+                        active,
+                        session.driven_by.is_some(),
+                        session.brokered,
+                    );
                     state_map.insert(wt.clone(), next_tuple);
 
                     // Fire only on the false→true edge; suppressed while active and on
@@ -291,7 +342,7 @@ fn spawn_project_watcher<R: Runtime + 'static>(
                         crate::session_toast::show_session_toast(
                             &app,
                             format!("Keitora \u{2014} {project_name}/{wt}"),
-                            task_title,
+                            toast_body(session, task_title),
                             crate::session_toast::ToastTarget {
                                 project: resolved_name.clone(),
                                 worktree: wt.clone(),
@@ -368,32 +419,32 @@ mod tests {
     #[test]
     fn needs_input_waiting() {
         // waiting always needs input regardless of latch.
-        assert!(needs_input("waiting", false));
-        assert!(needs_input("waiting", true));
+        assert!(needs_input("waiting", false, false, false));
+        assert!(needs_input("waiting", true, false, false));
     }
 
     #[test]
     fn needs_input_idle_with_latch() {
         // idle + latch=true: just finished a turn, needs input.
-        assert!(needs_input("idle", true));
+        assert!(needs_input("idle", true, false, false));
     }
 
     #[test]
     fn needs_input_idle_no_latch() {
         // idle + latch=false: fresh/resting idle — does NOT need input.
-        assert!(!needs_input("idle", false));
+        assert!(!needs_input("idle", false, false, false));
     }
 
     #[test]
     fn needs_input_busy() {
         // busy: agent is working — not blocked on user, even if latch somehow true.
-        assert!(!needs_input("busy", true));
+        assert!(!needs_input("busy", true, false, false));
     }
 
     #[test]
     fn needs_input_offline() {
         // offline: session gone — not blocked on user.
-        assert!(!needs_input("offline", true));
+        assert!(!needs_input("offline", true, false, false));
     }
 
     // ── step_session: the per-worktree state-map step (production logic) ─────────
@@ -402,7 +453,7 @@ mod tests {
     /// the stored tuple forward as `prev` — exactly what the watcher loop does.
     fn step_bg(prev: &Option<(String, bool, bool)>, next: &str) -> ((String, bool, bool), bool) {
         let p = prev.as_ref().map(|(s, l, n)| (s.as_str(), *l, *n));
-        step_session(p, next, false)
+        step_session(p, next, false, false, false)
     }
 
     #[test]
@@ -444,7 +495,7 @@ mod tests {
     fn seed_does_not_fire_even_if_waiting() {
         // First observation of a background worktree already in "waiting": the seed
         // (prev == None) suppresses the fire (mirrors useAttention's seed path).
-        let (tup, fire) = step_session(None, "waiting", false);
+        let (tup, fire) = step_session(None, "waiting", false, false, false);
         assert!(!fire, "seed observation must not fire");
         assert_eq!(tup.0, "waiting");
     }
@@ -455,10 +506,10 @@ mod tests {
     fn active_window_seeds_but_never_fires() {
         // While active: seed "busy", then go busy→waiting. Neither fires, and the
         // stored needs-input flag stays pinned to false so the edge stays armed.
-        let (seed, fire) = step_session(None, "busy", true);
+        let (seed, fire) = step_session(None, "busy", true, false, false);
         assert!(!fire, "active seed must not fire");
         let prev = (seed.0.as_str(), seed.1, seed.2);
-        let (after, fire) = step_session(Some(prev), "waiting", true);
+        let (after, fire) = step_session(Some(prev), "waiting", true, false, false);
         assert!(
             !fire,
             "busy→waiting while active must not fire (frontend owns it)"
@@ -474,7 +525,7 @@ mod tests {
         // sees the still-waiting state as a rising edge and fires.
         let active_stored = ("waiting".to_string(), false, false);
         let prev = (active_stored.0.as_str(), active_stored.1, active_stored.2);
-        let (_tup, fire) = step_session(Some(prev), "waiting", false);
+        let (_tup, fire) = step_session(Some(prev), "waiting", false, false, false);
         assert!(
             fire,
             "session waiting since switch-time must surface on first bg pass"
@@ -486,9 +537,9 @@ mod tests {
         // Seeded "busy" while active; the active flag flips to background before the
         // busy→waiting transition is processed → that single pass fires (is_new is
         // false because the worktree was seeded during the active window).
-        let (seed, _) = step_session(None, "busy", true);
+        let (seed, _) = step_session(None, "busy", true, false, false);
         let prev = (seed.0.as_str(), seed.1, seed.2);
-        let (_tup, fire) = step_session(Some(prev), "waiting", false);
+        let (_tup, fire) = step_session(Some(prev), "waiting", false, false, false);
         assert!(fire, "busy(seeded active)→waiting(background) should fire");
     }
 
@@ -496,18 +547,155 @@ mod tests {
     fn active_then_active_waiting_stays_armed_across_passes() {
         // Repeated active passes on a stuck-waiting session keep needs-input pinned
         // false, so it never self-suppresses before the handoff to background.
-        let mut st = step_session(None, "waiting", true).0; // active seed, no fire
+        let mut st = step_session(None, "waiting", true, false, false).0; // active seed, no fire
         for _ in 0..3 {
             let prev = (st.0.as_str(), st.1, st.2);
-            let (next, fire) = step_session(Some(prev), "waiting", true);
+            let (next, fire) = step_session(Some(prev), "waiting", true, false, false);
             assert!(!fire, "active waiting passes never fire");
             assert!(!next.2, "needs-input stays pinned false while active");
             st = next;
         }
         // Now background: the armed edge fires once.
         let prev = (st.0.as_str(), st.1, st.2);
-        let (_n, fire) = step_session(Some(prev), "waiting", false);
+        let (_n, fire) = step_session(Some(prev), "waiting", false, false, false);
         assert!(fire, "armed waiting edge fires on background handoff");
+    }
+
+    // ── driven sessions (mirrors the drive rows of attention.test.ts) ────────────
+
+    #[test]
+    fn needs_input_truth_table_with_drive() {
+        // (state, latch, driven, brokered) -> needs input
+        let cases = [
+            ("waiting", false, false, false, true), // not driven, waiting
+            ("waiting", false, true, true, false),  // driven, brokered: driver deciding
+            ("waiting", false, true, false, true),  // driven, escalated
+            ("idle", true, true, false, false),     // driven, latched idle: driver reads it
+            ("idle", false, true, false, false),
+            ("busy", false, true, false, false),
+            ("offline", false, true, false, false),
+            ("idle", true, false, false, true), // not driven, finished turn
+            ("idle", false, false, false, false),
+            // brokered without a driver is not a drive fact: plain waiting
+            ("waiting", false, false, true, true),
+        ];
+        for (state, latch, driven, brokered, want) in cases {
+            assert_eq!(
+                needs_input(state, latch, driven, brokered),
+                want,
+                "{state} latch={latch} driven={driven} brokered={brokered}"
+            );
+        }
+    }
+
+    /// Background step with drive facts, threading the stored tuple.
+    fn step_drive(
+        prev: &Option<(String, bool, bool)>,
+        next: &str,
+        driven: bool,
+        brokered: bool,
+    ) -> ((String, bool, bool), bool) {
+        let p = prev.as_ref().map(|(s, l, n)| (s.as_str(), *l, *n));
+        step_session(p, next, false, driven, brokered)
+    }
+
+    #[test]
+    fn brokered_waiting_is_quiet_then_escalation_fires() {
+        let (tup, _) = step_drive(&None, "busy", true, false);
+        let st = Some(tup);
+        // busy -> waiting while the driver decides: no toast.
+        let (tup, fire) = step_drive(&st, "waiting", true, true);
+        assert!(!fire, "brokered waiting must not fire");
+        let st = Some(tup);
+        let (tup, fire) = step_drive(&st, "waiting", true, true);
+        assert!(!fire, "still brokered, still quiet");
+        let st = Some(tup);
+        // The driver escalates: same state, no longer brokered -> rising edge.
+        let (tup, fire) = step_drive(&st, "waiting", true, false);
+        assert!(fire, "brokered -> escalated must fire");
+        let st = Some(tup);
+        let (_, fire) = step_drive(&st, "waiting", true, false);
+        assert!(!fire, "escalated waiting fires once");
+    }
+
+    #[test]
+    fn driven_idle_latch_does_not_fire() {
+        let (tup, _) = step_drive(&None, "busy", true, false);
+        let (tup, fire) = step_drive(&Some(tup), "idle", true, false);
+        assert!(!fire, "a driven finished turn belongs to the driver");
+        assert!(tup.1, "the latch itself still tracks the finished turn");
+        assert!(!tup.2);
+    }
+
+    #[test]
+    fn release_of_a_latched_idle_drive_fires() {
+        let (tup, _) = step_drive(&None, "busy", true, false);
+        let (tup, _) = step_drive(&Some(tup), "idle", true, false);
+        // The drive is released: idle with the latch still set now needs the human.
+        let (_, fire) = step_drive(&Some(tup), "idle", false, false);
+        assert!(fire, "release while latched idle surfaces the unread turn");
+    }
+
+    fn session(
+        state: &str,
+        driven_by: Option<&str>,
+        reason: Option<&str>,
+    ) -> keitora_tasks::WorktreeSession {
+        keitora_tasks::WorktreeSession {
+            project: "my-game".into(),
+            worktree: "bravo".into(),
+            state: state.into(),
+            current_task_id: None,
+            pid: None,
+            last_heartbeat: String::new(),
+            driven_by: driven_by.map(str::to_string),
+            brokered: false,
+            escalated_reason: reason.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn toast_body_names_the_escalating_driver() {
+        let s = session("waiting", Some("alpha"), Some("needs prod credentials"));
+        assert_eq!(
+            toast_body(&s, "task".into()),
+            "alpha escalated: needs prod credentials"
+        );
+    }
+
+    #[test]
+    fn toast_body_falls_back_to_the_task_title() {
+        let title = || "Fix the build".to_string();
+        // No reason, not driven, or not waiting: the task title.
+        assert_eq!(
+            toast_body(&session("waiting", Some("alpha"), None), title()),
+            "Fix the build"
+        );
+        assert_eq!(
+            toast_body(&session("waiting", None, Some("why")), title()),
+            "Fix the build"
+        );
+        assert_eq!(
+            toast_body(&session("idle", Some("alpha"), Some("why")), title()),
+            "Fix the build"
+        );
+    }
+
+    #[test]
+    fn toast_body_truncates_the_reason_on_a_char_boundary() {
+        // 139 ASCII chars then multi-byte chars: the cut lands after the 140th char,
+        // which is a 3-byte char, and must not split it.
+        let reason = format!("{}{}", "a".repeat(139), "\u{2603}".repeat(5));
+        let body = toast_body(
+            &session("waiting", Some("alpha"), Some(&reason)),
+            "t".into(),
+        );
+        let want = format!("alpha escalated: {}\u{2603}\u{2026}", "a".repeat(139));
+        assert_eq!(body, want);
+        // Exactly 140 chars is not cut.
+        let exact = "b".repeat(140);
+        let body = toast_body(&session("waiting", Some("alpha"), Some(&exact)), "t".into());
+        assert_eq!(body, format!("alpha escalated: {exact}"));
     }
 
     // ── which projects are watched ──────────────────────────────────────────────

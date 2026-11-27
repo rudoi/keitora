@@ -17,7 +17,7 @@ pub mod progress;
 pub mod workflow;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -62,6 +62,139 @@ pub struct WorktreeActivity {
     /// The worktree is doing something now: a build is running, or a herdr pane in it is
     /// busy. (Internal Claude Task subagents are OS-invisible and never counted.)
     pub working: bool,
+    /// The driver worktree when this worktree is driven.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driven_by: Option<String>,
+    /// Worktrees this worktree drives (names, sorted); empty when it drives none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub drives: Vec<String>,
+    /// Pending, undecided brokered prompts for this worktree (0 when not driven).
+    pub pending_prompts: u32,
+    /// This worktree's drive is paused.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub drive_paused: bool,
+}
+
+/// One project's drive state for a tick: its bindings and live pending-prompt counts.
+#[derive(Debug, Default, Clone)]
+struct ProjectDrives {
+    drives: Vec<keitora_tasks::Drive>,
+    pending: HashMap<String, usize>,
+}
+
+/// A worktree's drive fields on [`WorktreeActivity`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct DriveFields {
+    driven_by: Option<String>,
+    drives: Vec<String>,
+    pending_prompts: u32,
+    drive_paused: bool,
+}
+
+/// Read one project's drive state through a read-only handle. `None` when the DB
+/// can't be opened or read (missing, locked); a DB without the drive tables reads
+/// as no drives.
+#[cfg(test)]
+fn read_project_drives(db_path: &Path) -> Option<ProjectDrives> {
+    let local = keitora_tasks::LocalStore::open_read_only(&db_path.to_string_lossy()).ok()?;
+    read_drives_from(&local)
+}
+
+fn read_drives_from(local: &keitora_tasks::LocalStore) -> Option<ProjectDrives> {
+    Some(ProjectDrives {
+        drives: local.drives_list().ok()?,
+        pending: local.drive_pending_prompt_counts().ok()?,
+    })
+}
+
+/// A project's long-lived read-only handle with its last read.
+struct CachedDrives {
+    store: keitora_tasks::LocalStore,
+    /// `PRAGMA data_version` observed just before `info` was read.
+    version: i64,
+    info: ProjectDrives,
+}
+
+/// Per-DB read-only handles held across ticks. While a DB's `data_version` is
+/// unchanged the drive bindings are reused; pending-prompt counts are also
+/// time-sensitive (stale prompts drop out), so they are re-read while any are live.
+#[derive(Default)]
+struct DriveCache {
+    entries: HashMap<PathBuf, CachedDrives>,
+    /// Full (drives + pending) reads performed; lets tests observe the skip.
+    full_reads: usize,
+}
+
+impl DriveCache {
+    /// Drop handles for DBs no longer in `keep`.
+    fn retain_paths(&mut self, keep: &HashSet<&PathBuf>) {
+        self.entries.retain(|p, _| keep.contains(p));
+    }
+
+    fn read(&mut self, db_path: &Path) -> Option<ProjectDrives> {
+        if !db_path.exists() {
+            self.entries.remove(db_path);
+            return None;
+        }
+        if let Some(entry) = self.entries.get_mut(db_path) {
+            match entry.store.data_version() {
+                Ok(v) if v == entry.version => {
+                    if entry.info.pending.is_empty() {
+                        return Some(entry.info.clone());
+                    }
+                    if let Ok(pending) = entry.store.drive_pending_prompt_counts() {
+                        entry.info.pending = pending;
+                        return Some(entry.info.clone());
+                    }
+                }
+                Ok(v) => {
+                    self.full_reads += 1;
+                    if let Some(info) = read_drives_from(&entry.store) {
+                        entry.version = v;
+                        entry.info = info.clone();
+                        return Some(info);
+                    }
+                }
+                Err(_) => {}
+            }
+            self.entries.remove(db_path);
+            return None;
+        }
+        let store = keitora_tasks::LocalStore::open_read_only(&db_path.to_string_lossy()).ok()?;
+        let version = store.data_version().ok()?;
+        self.full_reads += 1;
+        let info = read_drives_from(&store)?;
+        self.entries.insert(
+            db_path.to_path_buf(),
+            CachedDrives {
+                store,
+                version,
+                info: info.clone(),
+            },
+        );
+        Some(info)
+    }
+}
+
+/// Pure: `worktree`'s drive fields within its project's drive state.
+fn drive_fields(info: Option<&ProjectDrives>, worktree: &str) -> DriveFields {
+    let Some(info) = info else {
+        return DriveFields::default();
+    };
+    let own = info.drives.iter().find(|d| d.driven == worktree);
+    let mut drives: Vec<String> = info
+        .drives
+        .iter()
+        .filter(|d| d.driver == worktree)
+        .map(|d| d.driven.clone())
+        .collect();
+    drives.sort();
+    DriveFields {
+        driven_by: own.map(|d| d.driver.clone()),
+        drives,
+        pending_prompts: info.pending.get(worktree).copied().unwrap_or(0) as u32,
+        drive_paused: own.is_some_and(|d| d.paused),
+    }
 }
 
 /// One enumerated worktree (resolved from the registry).
@@ -71,6 +204,8 @@ struct WtRef {
     worktree: String,
     path: PathBuf,
     cli: keitora_tasks::CliKind,
+    /// The project's task DB (drive state lives there).
+    db_path: PathBuf,
 }
 
 /// A worktree with its per-tick branch + workflow reads, before UBT/busy are merged in.
@@ -87,6 +222,7 @@ struct Prepared {
 pub struct ActivityState {
     inner: Mutex<Inner>,
     worktrees: Mutex<Option<(Vec<WtRef>, Instant)>>,
+    drives: Mutex<DriveCache>,
     ubt: progress::UbtEngine,
 }
 
@@ -140,6 +276,7 @@ fn enumerate_worktrees() -> Vec<WtRef> {
         // the active-project UI (`current_project` → `activeProjectName`) and herdr session
         // keys both use the resolved name, so the lane lookup + busy-join must match it.
         let project = pc.project.name.clone();
+        let db_path = pc.tasks.db_path.clone();
         let Ok(wts) = keitora_tasks::Config::from_project(pc).resolved_worktrees() else {
             continue;
         };
@@ -152,6 +289,7 @@ fn enumerate_worktrees() -> Vec<WtRef> {
                 worktree: w.name,
                 path: w.path,
                 cli: w.cli,
+                db_path: db_path.clone(),
             });
         }
     }
@@ -219,10 +357,28 @@ impl ActivityState {
         // Busy worktrees from herdr (all projects, one call). Failure → nobody busy.
         let busy = working_keys(client.list_sessions().unwrap_or_default());
 
+        // Drive state: one cached read-only handle per project DB, one read per tick.
+        let mut project_drives: HashMap<PathBuf, Option<ProjectDrives>> = HashMap::new();
+        {
+            let mut cache = lock(&self.drives);
+            let keep: HashSet<&PathBuf> = prepared.iter().map(|p| &p.wt.db_path).collect();
+            cache.retain_paths(&keep);
+            for p in &prepared {
+                if !project_drives.contains_key(&p.wt.db_path) {
+                    let info = cache.read(&p.wt.db_path);
+                    project_drives.insert(p.wt.db_path.clone(), info);
+                }
+            }
+        }
+
         prepared
             .into_iter()
             .map(|p| {
                 let key = composite(&p.wt.project, &p.wt.worktree);
+                let drive = drive_fields(
+                    project_drives.get(&p.wt.db_path).and_then(Option::as_ref),
+                    &p.wt.worktree,
+                );
                 let bp = build
                     .as_ref()
                     .filter(|(k, _)| *k == key)
@@ -242,6 +398,10 @@ impl ActivityState {
                     workflow: p.workflow,
                     build: bp,
                     working,
+                    driven_by: drive.driven_by,
+                    drives: drive.drives,
+                    pending_prompts: drive.pending_prompts,
+                    drive_paused: drive.drive_paused,
                 }
             })
             .collect()
@@ -275,6 +435,143 @@ mod tests {
         *g = 3;
         drop(g);
         assert_eq!(*lock(&m), 3, "and the lock keeps working");
+    }
+
+    /// A temp project DB with `alpha` driving `bravo` and `charlie`, `charlie`'s drive
+    /// paused, and one pending prompt on `bravo`.
+    fn bound_project_db(dir: &Path) -> PathBuf {
+        let path = dir.join("tasks.db");
+        let local = keitora_tasks::LocalStore::open(&path.to_string_lossy()).unwrap();
+        local.drive_bind("alpha", "bravo", None, false).unwrap();
+        local.drive_bind("alpha", "charlie", None, false).unwrap();
+        local.drive_set_paused("charlie", true).unwrap();
+        local
+            .drive_prompt_insert(&keitora_tasks::NewDrivePrompt {
+                driven: "bravo".to_string(),
+                provider: "claude".to_string(),
+                kind: "permission".to_string(),
+                tool_name: "Bash".to_string(),
+                tool_input: "{}".to_string(),
+                summary: "ls".to_string(),
+                hook_pid: None,
+            })
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn drive_fields_for_a_bound_pair_and_a_paused_drive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = read_project_drives(&bound_project_db(tmp.path())).expect("readable");
+
+        let alpha = drive_fields(Some(&info), "alpha");
+        assert_eq!(alpha.driven_by, None);
+        assert_eq!(
+            alpha.drives,
+            vec!["bravo".to_string(), "charlie".to_string()]
+        );
+        assert_eq!(alpha.pending_prompts, 0);
+        assert!(!alpha.drive_paused);
+
+        let bravo = drive_fields(Some(&info), "bravo");
+        assert_eq!(bravo.driven_by.as_deref(), Some("alpha"));
+        assert!(bravo.drives.is_empty());
+        assert_eq!(bravo.pending_prompts, 1);
+        assert!(!bravo.drive_paused);
+
+        let charlie = drive_fields(Some(&info), "charlie");
+        assert_eq!(charlie.driven_by.as_deref(), Some("alpha"));
+        assert!(charlie.drive_paused);
+
+        assert_eq!(drive_fields(Some(&info), "main"), DriveFields::default());
+    }
+
+    #[test]
+    fn a_missing_or_old_db_reads_as_no_drives() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Missing file: no info this tick, and the fields default.
+        assert!(read_project_drives(&tmp.path().join("absent.db")).is_none());
+        assert_eq!(drive_fields(None, "bravo"), DriveFields::default());
+        // An empty file is a valid DB without the drive tables: no drives.
+        let old = tmp.path().join("old.db");
+        std::fs::write(&old, b"").unwrap();
+        let info = read_project_drives(&old).expect("readable");
+        assert!(info.drives.is_empty());
+        assert_eq!(drive_fields(Some(&info), "bravo"), DriveFields::default());
+    }
+
+    #[test]
+    fn drive_cache_skips_unchanged_reads_and_picks_up_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tasks.db");
+        let writer = keitora_tasks::LocalStore::open(&path.to_string_lossy()).unwrap();
+        let mut cache = DriveCache::default();
+
+        // Missing DB: nothing cached, nothing read.
+        assert!(cache.read(&tmp.path().join("absent.db")).is_none());
+        assert_eq!(cache.full_reads, 0);
+
+        assert!(cache.read(&path).unwrap().drives.is_empty());
+        assert_eq!(cache.full_reads, 1);
+        // Unchanged DB: the cached read is reused.
+        assert!(cache.read(&path).unwrap().drives.is_empty());
+        assert!(cache.read(&path).unwrap().drives.is_empty());
+        assert_eq!(cache.full_reads, 1, "no re-read while data_version holds");
+
+        // Another connection commits a new drive: picked up on the next read.
+        writer.drive_bind("alpha", "bravo", None, false).unwrap();
+        let info = cache.read(&path).unwrap();
+        assert_eq!(info.drives.len(), 1);
+        assert_eq!(cache.full_reads, 2);
+    }
+
+    #[test]
+    fn same_named_worktrees_in_two_projects_do_not_share_drive_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("proj");
+        let b = tmp.path().join("other-proj");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let bound = read_project_drives(&bound_project_db(&a)).unwrap();
+        let empty_path = b.join("tasks.db");
+        keitora_tasks::LocalStore::open(&empty_path.to_string_lossy()).unwrap();
+        let empty = read_project_drives(&empty_path).unwrap();
+        assert_eq!(
+            drive_fields(Some(&bound), "bravo").driven_by.as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(drive_fields(Some(&empty), "bravo"), DriveFields::default());
+    }
+
+    #[test]
+    fn drive_fields_serialize_only_when_set() {
+        let mut a = WorktreeActivity {
+            project: "proj".to_string(),
+            worktree: "bravo".to_string(),
+            cli: keitora_tasks::CliKind::Claude,
+            branch: None,
+            workflow: None,
+            build: None,
+            working: false,
+            driven_by: None,
+            drives: vec![],
+            pending_prompts: 0,
+            drive_paused: false,
+        };
+        let v = serde_json::to_value(&a).unwrap();
+        assert!(v.get("driven_by").is_none());
+        assert!(v.get("drives").is_none());
+        assert!(v.get("drive_paused").is_none());
+        assert_eq!(v["pending_prompts"], 0);
+        a.driven_by = Some("alpha".to_string());
+        a.drives = vec!["charlie".to_string()];
+        a.pending_prompts = 2;
+        a.drive_paused = true;
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(v["driven_by"], "alpha");
+        assert_eq!(v["drives"], serde_json::json!(["charlie"]));
+        assert_eq!(v["pending_prompts"], 2);
+        assert_eq!(v["drive_paused"], true);
     }
 
     #[test]

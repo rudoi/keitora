@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
+use keitora_tasks::{mirror_file, mirror_is_stale, same_file_name};
 use serde::Serialize;
 
 /// True if `p` is an existing regular file with any execute bit set. The binary we
@@ -68,26 +69,9 @@ pub fn decide(on_path: Option<&str>, located: Option<&Path>) -> Action {
     }
 }
 
-/// A `keitora` CLI binary sitting next to the running app executable, if present.
-/// Two forms, both covered: under `tauri dev` the per-worktree build is the sibling
-/// `keitora` (`target/debug/keitora`); in a packaged `.app` the bundled sidecar is
-/// `keitora-cli` (Tauri strips the target-triple suffix at bundle time, and the sidecar
-/// cannot be named `keitora` — that clashes with the `keitora` app package name). Either
-/// way the installer links it onto PATH as `keitora`. Pure (takes the exe path).
-pub fn sidecar_candidate(current_exe: &Path) -> Option<PathBuf> {
-    let dir = current_exe.parent()?;
-    for name in ["keitora", "keitora-cli"] {
-        let p = dir.join(name);
-        if is_exec(&p) {
-            return Some(p);
-        }
-    }
-    None
-}
-
 /// Locate a `keitora` CLI binary to link when it isn't on PATH: the main worktree's
 /// build tree (dogfood when the app runs from a different cwd). Callers should try
-/// [`sidecar_candidate`] first (covers packaged + dev).
+/// `hooks::app_bundled_cli` first (covers packaged + dev).
 ///
 /// As in `hooks::resolve_keitora_bin`, `target/<profile>/keitora` is trusted as the CLI ONLY
 /// when a sibling `keitora-app` is present — on a pre-rename branch `keitora` is the GUI app
@@ -106,9 +90,52 @@ pub fn locate_installable(main_worktree: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The default link location for the CLI: `~/.local/bin/keitora`.
+/// The managed location of the CLI on PATH: the `~/.local/bin/keitora` symlink on
+/// unix, and on Windows the copy the app mirrors to
+/// `%LOCALAPPDATA%/keitora/bin/keitora.exe` (see `keitora_tasks::windows_keitora_bin_dir`).
 pub fn default_link_path() -> Option<PathBuf> {
+    if cfg!(windows) {
+        return keitora_tasks::managed_keitora_bin_dir().map(|d| d.join("keitora.exe"));
+    }
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin/keitora"))
+}
+
+/// What [`refresh_managed_copy_if_stale`] did.
+#[derive(Debug, PartialEq)]
+pub enum Refresh {
+    /// The `keitora` on PATH is not the managed copy (or there is none, or no bundled
+    /// CLI to copy from): left alone.
+    NotManaged,
+    /// The managed copy already matches the bundled CLI.
+    Fresh,
+    /// The managed copy was replaced with the bundled CLI.
+    Refreshed,
+    /// The managed copy is stale but could not be replaced.
+    Failed(String),
+}
+
+/// Refresh the managed CLI copy from the CLI bundled with the app, but ONLY when the
+/// `keitora` resolved on PATH (`on_path`) IS that managed copy (`managed`): a `keitora`
+/// the user put on PATH some other way is never touched. Without this a same-version
+/// upgrade left an old copy on PATH that lacked newer subcommands.
+pub fn refresh_managed_copy_if_stale(
+    on_path: Option<&Path>,
+    managed: Option<&Path>,
+    bundled: Option<&Path>,
+) -> Refresh {
+    let (Some(on_path), Some(managed), Some(bundled)) = (on_path, managed, bundled) else {
+        return Refresh::NotManaged;
+    };
+    if !same_file_name(on_path, managed) || same_file_name(bundled, managed) {
+        return Refresh::NotManaged;
+    }
+    if !mirror_is_stale(bundled, managed) {
+        return Refresh::Fresh;
+    }
+    match mirror_file(bundled, managed) {
+        Ok(()) => Refresh::Refreshed,
+        Err(e) => Refresh::Failed(e.to_string()),
+    }
 }
 
 /// True if `dir` appears as a segment of the colon-separated `path_env`.
@@ -163,6 +190,106 @@ pub fn install_symlink(src: &Path, link: &Path) -> Result<PathBuf, String> {
 // These exercise unix symlink install + exec-bit semantics (`0o755`, `:`-PATH);
 // the windows CLI-install path (D3) is cfg-stubbed and gets its own tests in
 // stage 050.
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+
+    /// Give `p` a distinct, fixed modified time so staleness is deterministic.
+    fn set_mtime(p: &Path, secs: u64) {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    #[test]
+    fn refresh_replaces_a_stale_managed_copy_on_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundled = tmp.path().join("app").join("keitora-cli.exe");
+        let managed = tmp.path().join("bin").join("keitora.exe");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, b"new cli").unwrap();
+        std::fs::write(&managed, b"old cli").unwrap(); // same length, older
+        set_mtime(&bundled, 2_000_000_000);
+        set_mtime(&managed, 1_000_000_000);
+        assert!(mirror_is_stale(&bundled, &managed));
+
+        let r = refresh_managed_copy_if_stale(Some(&managed), Some(&managed), Some(&bundled));
+        assert_eq!(r, Refresh::Refreshed);
+        assert_eq!(std::fs::read(&managed).unwrap(), b"new cli");
+        // The copy carries the source's mtime, so a second pass is a no-op.
+        assert!(!mirror_is_stale(&bundled, &managed));
+        assert_eq!(
+            refresh_managed_copy_if_stale(Some(&managed), Some(&managed), Some(&bundled)),
+            Refresh::Fresh
+        );
+        // No temp or moved-aside files are left behind.
+        let names: Vec<_> = std::fs::read_dir(managed.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("keitora.exe")]);
+    }
+
+    #[test]
+    fn refresh_detects_a_size_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundled = tmp.path().join("keitora-cli.exe");
+        let managed = tmp.path().join("keitora.exe");
+        std::fs::write(&bundled, b"a longer new cli").unwrap();
+        std::fs::write(&managed, b"old").unwrap();
+        set_mtime(&bundled, 1_000_000_000);
+        set_mtime(&managed, 1_000_000_000);
+        assert!(mirror_is_stale(&bundled, &managed));
+    }
+
+    #[test]
+    fn refresh_never_touches_a_keitora_on_path_that_is_not_the_managed_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundled = tmp.path().join("keitora-cli.exe");
+        let managed = tmp.path().join("keitora.exe");
+        let users_own = tmp.path().join("own").join("keitora.exe");
+        std::fs::create_dir_all(users_own.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, b"new cli").unwrap();
+        std::fs::write(&managed, b"old cli").unwrap();
+        std::fs::write(&users_own, b"mine").unwrap();
+        set_mtime(&bundled, 2_000_000_000);
+
+        let r = refresh_managed_copy_if_stale(Some(&users_own), Some(&managed), Some(&bundled));
+        assert_eq!(r, Refresh::NotManaged);
+        assert_eq!(std::fs::read(&managed).unwrap(), b"old cli");
+        assert_eq!(std::fs::read(&users_own).unwrap(), b"mine");
+        // Nothing on PATH, or no bundled CLI → nothing to do.
+        assert_eq!(
+            refresh_managed_copy_if_stale(None, Some(&managed), Some(&bundled)),
+            Refresh::NotManaged
+        );
+        assert_eq!(
+            refresh_managed_copy_if_stale(Some(&managed), Some(&managed), None),
+            Refresh::NotManaged
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn refresh_matches_the_managed_path_case_insensitively_on_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundled = tmp.path().join("keitora-cli.exe");
+        let managed = tmp.path().join("keitora.exe");
+        std::fs::write(&bundled, b"new cli!").unwrap();
+        std::fs::write(&managed, b"old").unwrap();
+        let on_path = PathBuf::from(managed.to_string_lossy().to_uppercase());
+        assert_eq!(
+            refresh_managed_copy_if_stale(Some(&on_path), Some(&managed), Some(&bundled)),
+            Refresh::Refreshed
+        );
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -182,26 +309,6 @@ mod tests {
         );
         assert_eq!(decide(None, Some(&src)), Action::Install(src.clone()));
         assert_eq!(decide(None, None), Action::NoBinary);
-    }
-
-    #[test]
-    fn sidecar_candidate_finds_sibling_dev_or_bundled() {
-        let tmp = tempfile::tempdir().unwrap();
-        let exe = tmp.path().join("keitora-app");
-        std::fs::write(&exe, b"app").unwrap();
-        // No sibling yet.
-        assert_eq!(sidecar_candidate(&exe), None);
-        // A non-executable sibling is ignored (it would fail the [ -x ] hook guard).
-        let bundled = tmp.path().join("keitora-cli");
-        std::fs::write(&bundled, b"cli").unwrap();
-        assert_eq!(sidecar_candidate(&exe), None);
-        // Bundled form: executable sibling `keitora-cli` → found.
-        mk_exec(&bundled);
-        assert_eq!(sidecar_candidate(&exe), Some(bundled));
-        // Dev form: an executable sibling `keitora` takes precedence (per-worktree build).
-        let dev = tmp.path().join("keitora");
-        mk_exec(&dev);
-        assert_eq!(sidecar_candidate(&exe), Some(dev));
     }
 
     #[test]

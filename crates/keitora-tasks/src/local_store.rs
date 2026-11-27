@@ -22,7 +22,10 @@ use crate::{Error, Result};
 /// open against the same DB file as an accompanying
 /// [`SqliteBackend`](crate::SqliteBackend) (WAL-safe concurrent opens).
 pub struct LocalStore {
-    conn: rusqlite::Connection,
+    pub(crate) conn: rusqlite::Connection,
+    /// Set once the drive tables are seen; they are never dropped, so a positive
+    /// answer is cached and the `sqlite_master` probe runs at most once.
+    pub(crate) drive_tables_seen: std::cell::Cell<bool>,
 }
 
 /// One `resume_sessions` row: the agent conversation a (project, worktree)
@@ -47,16 +50,13 @@ fn cli_to_sql(cli: CliKind) -> &'static str {
 }
 
 fn cli_from_sql(s: &str) -> rusqlite::Result<CliKind> {
-    CliKind::ALL
-        .into_iter()
-        .find(|c| c.spec().config_key == s)
-        .ok_or_else(|| {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                format!("unknown cli {s:?}").into(),
-            )
-        })
+    CliKind::from_name(s).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("unknown cli {s:?}").into(),
+        )
+    })
 }
 
 impl LocalStore {
@@ -68,7 +68,10 @@ impl LocalStore {
         // Shared with `SqliteBackend::open` (see `sqlite_backend::init_schema`) — both
         // handles run the **full** init so each sees all tables on a shared file.
         init_schema(&conn)?;
-        Ok(LocalStore { conn })
+        Ok(LocalStore {
+            conn,
+            drive_tables_seen: std::cell::Cell::new(false),
+        })
     }
 
     /// How long a read-only handle waits on a locked DB before giving up.
@@ -87,7 +90,10 @@ impl LocalStore {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.busy_timeout(Self::READ_ONLY_BUSY_TIMEOUT)?;
-        Ok(LocalStore { conn })
+        Ok(LocalStore {
+            conn,
+            drive_tables_seen: std::cell::Cell::new(false),
+        })
     }
 
     // ---- Worktree sessions ----
@@ -113,7 +119,25 @@ impl LocalStore {
                pid = excluded.pid, last_heartbeat = excluded.last_heartbeat",
             params![worktree, state, current_task_id, pid],
         )?;
+        // A brokered prompt is answered while the session is `waiting` (the gate
+        // writes that itself); any other state means the prompt is no longer live.
+        if state != "waiting" {
+            self.drive_prompts_withdraw(worktree)?;
+        }
         Ok(())
+    }
+
+    /// `worktree`'s session state, or `None` without a row. A single-row read for
+    /// callers that don't need the full [`Self::sessions_list`] join.
+    pub fn session_state_get(&self, worktree: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT state FROM worktree_sessions WHERE worktree = ?1",
+                params![worktree],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Force a specific worktree offline (used by the app when its PTY exits).
@@ -127,6 +151,7 @@ impl LocalStore {
                state = 'offline', current_task_id = NULL, pid = NULL, last_heartbeat = datetime('now')",
             params![worktree],
         )?;
+        self.drive_prompts_withdraw(worktree)?;
         Ok(())
     }
 
@@ -166,21 +191,23 @@ impl LocalStore {
         Ok(rows)
     }
 
+    /// Every worktree session, by name, with its drive fields. On a DB without the
+    /// drive tables (an old schema behind a read-only handle) those fields default.
     pub fn sessions_list(&self) -> Result<Vec<WorktreeSession>> {
         // current_task_id is a hook-written cache; validated here against the
         // authoritative tasks table — the pointer is nulled unless it names a
         // task that is still status='active' AND assigned_to = this worktree.
-        let mut stmt = self.conn.prepare(
-            "SELECT s.worktree, s.state, \
-                    CASE WHEN t.id IS NOT NULL THEN s.current_task_id END AS current_task_id, \
-                    s.pid, s.last_heartbeat \
-             FROM worktree_sessions s \
-             LEFT JOIN tasks t \
-               ON t.id = s.current_task_id \
-              AND t.assigned_to = s.worktree \
-              AND t.status = 'active' \
-             ORDER BY s.worktree",
-        )?;
+        let drive_cols = if self.drive_tables_exist()? {
+            format!(
+                "d.driver,                  EXISTS(SELECT 1 FROM drive_prompts p                         WHERE p.driven = s.worktree AND p.status = 'pending' AND NOT ({stale})),                  CASE WHEN s.state = 'waiting' THEN                    (SELECT CASE WHEN p.status = 'escalated' THEN p.reason END                       FROM drive_prompts p WHERE p.driven = s.worktree                      ORDER BY p.id DESC LIMIT 1)                  END                  FROM worktree_sessions s                  LEFT JOIN drives d ON d.driven = s.worktree",
+                stale = crate::drive_store::stale_sql("p")
+            )
+        } else {
+            "NULL, 0, NULL FROM worktree_sessions s".to_string()
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT s.worktree, s.state,                     CASE WHEN t.id IS NOT NULL THEN s.current_task_id END AS current_task_id,                     s.pid, s.last_heartbeat, {drive_cols}              LEFT JOIN tasks t                ON t.id = s.current_task_id               AND t.assigned_to = s.worktree               AND t.status = 'active'              ORDER BY s.worktree"
+        ))?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(WorktreeSession {
@@ -192,6 +219,9 @@ impl LocalStore {
                     current_task_id: r.get(2)?,
                     pid: r.get(3)?,
                     last_heartbeat: r.get(4)?,
+                    driven_by: r.get(5)?,
+                    brokered: r.get(6)?,
+                    escalated_reason: r.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<WorktreeSession>>>()?;
@@ -203,18 +233,21 @@ impl LocalStore {
     /// `Stop`) don't trip `sessions://changed` — only real state transitions **or a
     /// change in the reconciled active-task pointer** (task leaving `active`, or being
     /// reassigned) do. `rid` is the reconciled task id (empty string when none).
+    ///
+    /// With the drive tables present each row also carries the driver, whether a
+    /// pending prompt exists and the newest prompt id
+    /// (`"{worktree}={state}:{rid}:{driver}:{0|1}:{max_prompt_id}"`), so binding, a new
+    /// prompt and a prompt leaving `pending` all change the marker.
     pub fn session_revision(&self) -> Result<String> {
+        let drive_suffix = if self.drive_tables_exist()? {
+            " || ':' || COALESCE((SELECT d.driver FROM drives d WHERE d.driven = worktree), '')              || ':' || (EXISTS (SELECT 1 FROM drive_prompts p                                 WHERE p.driven = worktree AND p.status = 'pending'))              || ':' || COALESCE((SELECT MAX(p.id) FROM drive_prompts p WHERE p.driven = worktree), 0)"
+        } else {
+            ""
+        };
         let rev: Option<String> = self.conn.query_row(
-            "SELECT group_concat(worktree || '=' || state || ':' || COALESCE(rid, ''), ';') \
-             FROM ( \
-               SELECT s.worktree, s.state, \
-                      (SELECT t.id FROM tasks t \
-                        WHERE t.id = s.current_task_id \
-                          AND t.assigned_to = s.worktree \
-                          AND t.status = 'active') AS rid \
-               FROM worktree_sessions s \
-               ORDER BY s.worktree \
-             )",
+            &format!(
+                "SELECT group_concat(worktree || '=' || state || ':' || COALESCE(rid, ''){drive_suffix}, ';')                  FROM (                    SELECT s.worktree, s.state,                           (SELECT t.id FROM tasks t                             WHERE t.id = s.current_task_id                               AND t.assigned_to = s.worktree                               AND t.status = 'active') AS rid                    FROM worktree_sessions s                    ORDER BY s.worktree                  )"
+            ),
             [],
             |r| r.get(0),
         )?;

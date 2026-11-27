@@ -126,7 +126,7 @@ fn queued_reason(worktree: &str, terminated: bool) -> String {
 
 /// The detail recorded for an injection's final `write_line` result: empty on
 /// success; for a missing session of a terminated worktree, how to recover.
-fn injection_detail(result: &Result<(), PtyBackendError>, terminated: bool) -> String {
+pub(crate) fn injection_detail(result: &Result<(), PtyBackendError>, terminated: bool) -> String {
     match result {
         Ok(()) => String::new(),
         Err(PtyBackendError::NoSuchSession) if terminated => {
@@ -172,7 +172,7 @@ fn inject_steps(
 /// The pause matters — a contiguous `text\r` burst reads to the TUI as a paste
 /// (embedded newline, no submit), so the Enter must arrive as a distinct, later
 /// keystroke. Empirically tunable; raise it if the TUI still fails to submit.
-const SUBMIT_DELAY: Duration = Duration::from_millis(60);
+pub(crate) const SUBMIT_DELAY: Duration = Duration::from_millis(60);
 
 /// Delay between dispatch steps so the target TUI finishes processing one submitted
 /// line before the next arrives. Empirically tunable.
@@ -182,7 +182,7 @@ const INTER_STEP_DELAY: Duration = Duration::from_millis(80);
 /// collapse whitespace runs — so an interpolated title/description can't submit the
 /// line early or smuggle an escape sequence. `split_whitespace` alone leaves
 /// non-whitespace C0 controls like ESC intact, hence the explicit map first.
-fn collapse(s: &str) -> String {
+pub(crate) fn collapse(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect::<String>()
@@ -470,17 +470,26 @@ fn request_refusal(
     configured: &[String],
     state: &str,
 ) -> Option<String> {
-    if !configured.is_empty() && !configured.iter().any(|w| w == worktree) {
-        return Some(format!(
-            "unknown worktree `{worktree}`; expected one of: {}",
-            configured.join(", ")
-        ));
+    if let Some(reason) = unknown_worktree_refusal(worktree, configured) {
+        return Some(reason);
     }
     let Some(task) = task else {
         return Some(format!("task #{task_id} not found"));
     };
     keitora_tasks::dispatch::task_refusal(task, worktree)
         .or_else(|| keitora_tasks::dispatch::session_refusal(state, worktree))
+}
+
+/// Pure: `Some(reason)` when `worktree` is not one of the project's `configured`
+/// worktrees. An empty list doesn't restrict, matching how `reconciled_sessions`
+/// scopes. Shared by dispatch and drive requests so both word it the same.
+pub(crate) fn unknown_worktree_refusal(worktree: &str, configured: &[String]) -> Option<String> {
+    (!configured.is_empty() && !configured.iter().any(|w| w == worktree)).then(|| {
+        format!(
+            "unknown worktree `{worktree}`; expected one of: {}",
+            configured.join(", ")
+        )
+    })
 }
 
 /// Pure: the refusal reason for a request whose inject sent nothing. `detail` is the
@@ -523,8 +532,9 @@ fn request_outcome(result: &Result<DispatchOutcome, String>) -> (&'static str, S
 }
 
 /// If `local` (the DB of registered project `project`) holds pending CLI dispatch
-/// requests, start [`run_dispatch_requests`] for it. Called from the tasks-DB
-/// watchers on each debounced write; a cheap indexed read when there are none.
+/// requests, start [`run_dispatch_requests`] for it; if it holds pending drive
+/// requests, start [`crate::drive::run_drive_requests`]. Called from the tasks-DB
+/// watchers on each debounced write; cheap indexed reads when there are none.
 pub(crate) fn spawn_pending_requests<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     local: &keitora_tasks::LocalStore,
@@ -535,6 +545,13 @@ pub(crate) fn spawn_pending_requests<R: tauri::Runtime>(
         .is_ok_and(|p| !p.is_empty());
     if has_pending {
         tauri::async_runtime::spawn(run_dispatch_requests(app.clone(), project.to_string()));
+    }
+    let has_drive = local.drive_requests_pending().is_ok_and(|p| !p.is_empty());
+    if has_drive {
+        tauri::async_runtime::spawn(crate::drive::run_drive_requests(
+            app.clone(),
+            project.to_string(),
+        ));
     }
 }
 
@@ -622,7 +639,11 @@ pub(crate) async fn run_dispatch_requests<R: tauri::Runtime>(
 
 /// `Some(error)` when `worktree` of `project` is mid-transfer or mid-switch;
 /// dispatch must not inject into it.
-fn transfer_refusal(registry: &TransferRegistry, project: &str, worktree: &str) -> Option<String> {
+pub(crate) fn transfer_refusal(
+    registry: &TransferRegistry,
+    project: &str,
+    worktree: &str,
+) -> Option<String> {
     registry.is_transferring(project, worktree).then(|| {
         format!(
             "a transfer or switch is in progress for worktree `{worktree}`; try again when it finishes"
@@ -824,6 +845,9 @@ mod tests {
             current_task_id: Some(5),
             pid: Some(9999),
             last_heartbeat: "2026-06-22T00:00:00Z".to_string(),
+            driven_by: None,
+            brokered: false,
+            escalated_reason: None,
         };
 
         let key = SessionKey {
@@ -868,6 +892,9 @@ mod tests {
             current_task_id: None,
             pid: Some(9999),
             last_heartbeat: "2026-06-22T00:00:00Z".to_string(),
+            driven_by: None,
+            brokered: false,
+            escalated_reason: None,
         };
         let key = SessionKey {
             project: "proj".to_string(),

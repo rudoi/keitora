@@ -10,6 +10,8 @@ mod config;
 pub mod config_edit;
 mod discovery;
 pub mod dispatch;
+mod drive;
+mod drive_store;
 mod factory;
 pub mod git;
 mod github;
@@ -34,20 +36,21 @@ pub use backend::{
     Reservation, ReserveOutcome, TaskBackend,
 };
 pub use config::{
-    cached_login_path, classify_worktree, compare_versions_desc, config_path, current_worktree,
-    discover_claude, discover_cli, discover_cli_cached, effective_config, git_toplevel,
-    herdr_bin_candidates, herdr_on_path, herdr_release_exes_in, herdr_release_paths,
-    herdr_release_paths_in, herdr_release_paths_with_home, herdr_releases_dir_with_home,
-    herdr_well_known_paths, invalidate_discovery_misses, is_executable_file, is_safe_session_id,
-    keitora_on_path, login_path, project_provider, project_provider_mut, resolve, resolve_active,
-    resolve_autonomy, resolve_claude_path, resolve_cli, resolve_keitora_path,
-    resolve_provider_path, resolve_skip_permissions, short_path, sort_versions_desc,
-    stamp_from_registry, strip_extended_prefix_str, unreserved_project_name, user_config_path,
-    user_provider, user_provider_mut, write_atomic, CliConfig, CliKind, Config, DiffBase,
-    DispatchConfig, FieldIntent, HerdrPtyConfig, ProjectConfig, ProjectMeta, ProjectRef,
-    ProjectSettingsPatch, ProviderConfig, ProviderIds, ProviderSpec, PtyConfig, RecoveryConfig,
-    ResolveError, TaskConfig, UpdatesConfig, UserConfig, WorktreeEntry, CLI_COUNT,
-    DISCOVER_NONE_TTL, RESERVED_PROJECT_NAME,
+    bundled_cli, cached_login_path, classify_worktree, compare_versions_desc, config_path,
+    current_worktree, current_worktree_in, discover_claude, discover_cli, discover_cli_cached,
+    effective_config, git_toplevel, herdr_bin_candidates, herdr_on_path, herdr_release_exes_in,
+    herdr_release_paths, herdr_release_paths_in, herdr_release_paths_with_home,
+    herdr_releases_dir_with_home, herdr_well_known_paths, invalidate_discovery_misses,
+    is_executable_file, is_safe_session_id, keitora_on_path, keitora_on_path_fresh, login_path,
+    managed_keitora_bin_dir, mirror_file, mirror_is_stale, project_provider, project_provider_mut,
+    resolve, resolve_active, resolve_autonomy, resolve_claude_path, resolve_cli,
+    resolve_keitora_path, resolve_provider_path, resolve_skip_permissions, same_file_name,
+    short_path, sort_versions_desc, stamp_from_registry, strip_extended_prefix_str,
+    unreserved_project_name, user_config_path, user_provider, user_provider_mut, write_atomic,
+    CliConfig, CliKind, Config, DiffBase, DispatchConfig, FieldIntent, HerdrPtyConfig,
+    ProjectConfig, ProjectMeta, ProjectRef, ProjectSettingsPatch, ProviderConfig, ProviderIds,
+    ProviderSpec, PtyConfig, RecoveryConfig, ResolveError, TaskConfig, UpdatesConfig, UserConfig,
+    WorktreeEntry, CLI_COUNT, DISCOVER_NONE_TTL, RESERVED_PROJECT_NAME,
 };
 // Windows-only: expose the bundled `keitora` CLI on spawned terminals' PATH.
 #[cfg(unix)]
@@ -65,6 +68,16 @@ pub use config_edit::{
 };
 pub use discovery::{
     create_worktree, discover_worktrees, repair_project_worktree_paths, set_project_worktrees,
+};
+pub use drive::{
+    truncate_bytes, truncate_chars, Drive, DriveBind, DrivePrompt, DriveRequest, NewDrivePrompt,
+    PromptDecision, SessionReply, DRIVE_CONFIRM_MAX_AGE_SECS, DRIVE_DDL,
+    DRIVE_DEFAULT_ESCALATE_AFTER_S, DRIVE_ESCALATE_AFTER_MAX_S, DRIVE_ESCALATE_AFTER_MIN_S,
+    DRIVE_HOOK_TIMEOUT_S, DRIVE_PERMISSION_INPUT_MAX, DRIVE_PROMPT_KINDS,
+    DRIVE_PROMPT_STALE_SLACK_S, DRIVE_PROMPT_STATUSES, DRIVE_QUESTION_INPUT_MAX,
+    DRIVE_READ_LINES_DEFAULT, DRIVE_READ_LINES_MAX, DRIVE_READ_RESULT_MAX, DRIVE_REQUEST_KINDS,
+    DRIVE_REQUEST_MAX_AGE_SECS, DRIVE_REQUEST_OUTCOMES, DRIVE_REQUEST_STATUSES,
+    DRIVE_RETENTION_SECS, DRIVE_SEND_TEXT_MAX, DRIVE_SUMMARY_MAX, SESSION_REPLY_MAX,
 };
 pub use factory::open_backend;
 pub use local_store::{LocalStore, ResumeRow};

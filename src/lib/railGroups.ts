@@ -9,6 +9,13 @@
 // name.
 
 import type { AttentionKind } from "./attention";
+import {
+  buildLaneDrive,
+  type DrivenVisual,
+  drivenCount,
+  isQuietWaiting,
+  type LaneDrive,
+} from "./drive";
 import { parseUtc } from "./format";
 import type {
   CliKind,
@@ -40,6 +47,8 @@ export interface LaneModel {
   building: boolean;
   working: boolean;
   blockState: DotState;
+  /** The lane's drive relationship; null when it neither drives nor is driven. */
+  drive: LaneDrive | null;
 }
 
 export interface SummaryStats {
@@ -59,6 +68,8 @@ export interface SummaryStats {
   lastActivity: string | null;
   /** Some lane is working right now: a busy session, background work, or a build. */
   active: boolean;
+  /** Lanes driven by another worktree. */
+  driven: number;
 }
 
 export interface GroupModel {
@@ -125,7 +136,38 @@ export function buildLane(
     building,
     working: activity?.working === true,
     blockState: blockStateCls(attn, session, ok, building, terminated),
+    drive: buildLaneDrive(session, activity),
   };
+}
+
+/** How a driver lane shows a sibling it drives. */
+function drivenVisual(l: LaneModel): DrivenVisual {
+  const s = l.sessionState;
+  if (l.status !== "available" || s === undefined || s === "offline" || l.terminated) {
+    return "offline";
+  }
+  if (l.drive?.brokered) return "deciding";
+  if (s === "waiting") return "needs-you";
+  if (s === "busy" || l.working) return "busy";
+  return "idle";
+}
+
+/**
+ * Fill each driver lane's `drive.drives` from the same-named sibling lanes of its group
+ * (a drive never crosses projects). A name with no sibling lane shows as offline.
+ */
+export function attachDrivenSummaries(lanes: LaneModel[]): LaneModel[] {
+  const byName = new Map(lanes.map((l) => [l.name, l]));
+  return lanes.map((l) => {
+    if (!l.drive || l.drive.drives.length === 0) return l;
+    const drives = l.drive.drives.map(({ name }) => {
+      const sib = byName.get(name);
+      return sib
+        ? { name, visual: drivenVisual(sib), pending: sib.drive?.pendingPrompts ?? 0 }
+        : { name, visual: "offline" as const, pending: 0 };
+    });
+    return { ...l, drive: { ...l.drive, drives } };
+  });
 }
 
 /**
@@ -179,6 +221,7 @@ export function summarize(
     overflow: all.length - dots.length,
     lastActivity,
     active: lanes.some((l) => l.working || l.building || l.sessionState === "busy"),
+    driven: drivenCount(lanes),
   };
 }
 
@@ -232,12 +275,18 @@ export function buildGroups(i: BuildGroupsInput): GroupModel[] {
           w,
           resolvedName,
           session,
-          session?.state === "waiting" ? "waiting" : undefined,
+          // A brokered lane is quiet: its driver is deciding, the human is not needed.
+          isQuietWaiting(session)
+            ? undefined
+            : session?.state === "waiting"
+              ? "waiting"
+              : undefined,
           tasks.get(w.name),
           i.activity,
         );
       });
     }
+    lanes = attachDrivenSummaries(lanes);
 
     return {
       key,

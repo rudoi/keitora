@@ -550,13 +550,10 @@ fn worktree_create(
     let pc = keitora_tasks::resolve_active().map_err(|e| e.to_string())?;
     let wt = keitora_tasks::create_worktree(&pc, &name).map_err(|e| e.to_string())?;
     // Resolve the `keitora` binary for the new worktree: PATH → [cli].path override →
-    // its own build (none yet on a fresh worktree, and only a last resort).
-    let user = keitora_tasks::UserConfig::load().unwrap_or_default();
-    let override_path = keitora_tasks::resolve_keitora_path(Some(&pc), &user);
-    let path_keitora = keitora_tasks::keitora_on_path();
-    if let Some(bin) =
-        hooks::resolve_keitora_bin(&wt.path, override_path.as_deref(), path_keitora.as_deref())
-    {
+    // the app-bundled CLI → its own build (none yet on a fresh worktree, and only a
+    // last resort).
+    let sources = hooks::KeitoraBinSources::gather(Some(&pc), keitora_tasks::keitora_on_path());
+    if let Some(bin) = hooks::resolve_keitora_bin(&wt.path, &sources) {
         hooks::install_hooks_for(&wt.path, &bin);
         // Codex worktrees also get a worktree-local `.codex/hooks.json`,
         // gated on `CliKind::Codex` so a hand-run `codex` in a Claude worktree is
@@ -1177,14 +1174,28 @@ fn cached_login_path() -> Option<String> {
     keitora_tasks::cached_login_path()
 }
 
+/// The login `$PATH` probed now rather than the per-process cache, for the CLI install
+/// commands that must reflect a PATH fix made while the app runs (unix only; Windows has
+/// no login shell, so it keeps the shared value).
+fn fresh_login_path() -> Option<String> {
+    if cfg!(unix) {
+        keitora_tasks::login_path()
+    } else {
+        cached_login_path()
+    }
+}
+
 /// Locate a `keitora` binary to install onto PATH: the binary next to the app
 /// executable (bundled `externalBin` sidecar in a packaged `.app`, or
 /// `target/debug/keitora` under `tauri dev`), else the main worktree's build tree.
 fn locate_keitora_binary() -> Option<std::path::PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(p) = crate::cli_install::sidecar_candidate(&exe) {
-            return Some(p);
-        }
+    // The symlink install is unix-only; on Windows the CLI reaches PATH through the
+    // managed `%LOCALAPPDATA%` copy instead, so there is nothing to offer here.
+    if !cfg!(unix) {
+        return None;
+    }
+    if let Some(p) = hooks::app_bundled_cli() {
+        return Some(std::path::PathBuf::from(p));
     }
     keitora_tasks::Config::find()
         .ok()
@@ -1197,7 +1208,8 @@ fn locate_keitora_binary() -> Option<std::path::PathBuf> {
 #[tauri::command(async)]
 fn keitora_cli_status() -> crate::cli_install::CliStatus {
     use crate::cli_install::{self, Action, CliStatus};
-    let on_path = keitora_tasks::keitora_on_path();
+    // Fresh probe, not the cached login PATH: the user may have fixed PATH since startup.
+    let on_path = keitora_tasks::keitora_on_path_fresh();
     let located = locate_keitora_binary();
     match cli_install::decide(on_path.as_deref(), located.as_deref()) {
         Action::AlreadyOnPath(p) => CliStatus {
@@ -1224,7 +1236,7 @@ fn keitora_cli_status() -> crate::cli_install::CliStatus {
 #[tauri::command(async)]
 fn install_keitora_cli() -> Result<crate::cli_install::CliStatus, String> {
     use crate::cli_install::{self, CliStatus};
-    if let Some(p) = keitora_tasks::keitora_on_path() {
+    if let Some(p) = keitora_tasks::keitora_on_path_fresh() {
         return Ok(CliStatus {
             state: "on_path".into(),
             path: Some(p),
@@ -1237,7 +1249,7 @@ fn install_keitora_cli() -> Result<crate::cli_install::CliStatus, String> {
         .ok_or_else(|| "cannot determine home directory".to_string())?;
     let made = cli_install::install_symlink(&located, &link)?;
     let note = made.parent().and_then(|dir| {
-        if cli_install::dir_on_path(dir, cached_login_path().as_deref()) {
+        if cli_install::dir_on_path(dir, fresh_login_path().as_deref()) {
             None
         } else {
             Some(format!(
@@ -1251,6 +1263,29 @@ fn install_keitora_cli() -> Result<crate::cli_install::CliStatus, String> {
         path: Some(made.to_string_lossy().into_owned()),
         note,
     })
+}
+
+/// Windows startup: when the `keitora` on PATH is the managed `%LOCALAPPDATA%` copy and
+/// it lags the CLI bundled with this app (a same-version upgrade never rewrote it),
+/// replace it. A `keitora` on PATH that is not the managed copy is never touched, and
+/// unix needs nothing (its managed entry is a symlink to the bundled CLI).
+fn refresh_managed_cli() {
+    use crate::cli_install::{self, Refresh};
+    if !cfg!(windows) {
+        return;
+    }
+    let on_path = keitora_tasks::keitora_on_path().map(std::path::PathBuf::from);
+    let bundled = hooks::app_bundled_cli().map(std::path::PathBuf::from);
+    let managed = cli_install::default_link_path();
+    match cli_install::refresh_managed_copy_if_stale(
+        on_path.as_deref(),
+        managed.as_deref(),
+        bundled.as_deref(),
+    ) {
+        Refresh::Refreshed => log::info!("[keitora] refreshed the managed keitora CLI on PATH"),
+        Refresh::Failed(e) => log::warn!("[keitora] couldn't refresh the managed keitora CLI: {e}"),
+        Refresh::NotManaged | Refresh::Fresh => {}
+    }
 }
 
 /// One-time startup: if no `claude` path is configured (neither the active
@@ -2521,6 +2556,9 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         // Serializes dispatch_apply so concurrent dispatches can't double-inject.
         .manage(crate::dispatch::DispatchGate::default())
+        // Drive request runner state: the window's open projects and the reset/swap
+        // requests waiting on it.
+        .manage(crate::drive::DriveRuntime::default())
         // In-flight transfer markers, cancel flags and diagnostics trails.
         .manage(crate::transfer_registry::TransferRegistry::global());
     // "Check for Updates…" in the macOS app menu.
@@ -2582,8 +2620,12 @@ pub fn run() {
             // projects' sessions that need input.
             bg_notifier::start_bg_notifier(app.handle().clone());
             // Off the setup thread: per-worktree file I/O shouldn't delay the window.
-            // Idempotent + Claude Code hot-reloads, so timing doesn't matter.
-            thread::spawn(hooks::install_session_hooks);
+            // Idempotent + Claude Code hot-reloads, so timing doesn't matter. The
+            // managed CLI copy is refreshed first so the hooks' PATH `keitora` is current.
+            thread::spawn(|| {
+                refresh_managed_cli();
+                hooks::install_session_hooks();
+            });
             // Resolve + persist the `claude` path once (runs a login shell), so a
             // LaunchServices-spawned app can find it. Still needed: the agent launch
             // for herdr panes (`agent_launch_with`) takes the persisted path, else
@@ -2723,6 +2765,12 @@ pub fn run() {
             crate::transfer::cancel_transfer,
             crate::transfer::transfer_settled,
             crate::transfer::transfer_diagnostics,
+            crate::drive::drives_list,
+            crate::drive::drive_release,
+            crate::drive::drive_take_over,
+            crate::drive::drive_pause,
+            crate::drive::drive_request_resolve,
+            crate::drive::drive_set_open_projects,
             crate::diff::worktree_diff_summary,
             crate::diff::worktree_diff_committed,
             crate::diff::worktree_file_diff,

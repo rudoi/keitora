@@ -95,6 +95,10 @@ struct FakeState {
     calls: Vec<Call>,
     write_line_results: VecDeque<Result<(), PtyBackendError>>,
     paste_results: VecDeque<Result<(), PtyBackendError>>,
+    /// `read_history` answers: `(key, lines)` asked for, and the scripted results
+    /// (the trait default's "unavailable" error once empty).
+    read_history_asks: Vec<(SessionKey, u32)>,
+    read_history_results: VecDeque<Result<String, PtyBackendError>>,
     kill_results: VecDeque<Result<(), PtyBackendError>>,
     /// `spawn` answers `Ok(1)` once this is empty.
     spawn_results: VecDeque<Result<u64, PtyBackendError>>,
@@ -150,6 +154,16 @@ impl FakeBackend {
     /// Script the next `paste` result.
     pub fn push_paste(&self, r: Result<(), PtyBackendError>) {
         self.state.lock().unwrap().paste_results.push_back(r);
+    }
+
+    /// Script the next `read_history` result.
+    pub fn push_read_history(&self, r: Result<String, PtyBackendError>) {
+        self.state.lock().unwrap().read_history_results.push_back(r);
+    }
+
+    /// Every `read_history` call so far, as `(key, lines)`.
+    pub fn read_history_asks(&self) -> Vec<(SessionKey, u32)> {
+        self.state.lock().unwrap().read_history_asks.clone()
     }
 
     /// Script the next `spawn` result (a terminated key still refuses first).
@@ -332,6 +346,16 @@ impl PtyBackend for FakeBackend {
             submit_delay_ms,
         });
         st.write_line_results.pop_front().unwrap_or(Ok(()))
+    }
+
+    fn read_history(&self, key: &SessionKey, lines: u32) -> Result<String, PtyBackendError> {
+        let mut st = self.state.lock().unwrap();
+        st.read_history_asks.push((key.clone(), lines));
+        st.read_history_results.pop_front().unwrap_or_else(|| {
+            Err(PtyBackendError::Other(
+                "history is not available on this backend".to_string(),
+            ))
+        })
     }
 
     fn resize(&self, key: &SessionKey, cols: u16, rows: u16) -> Result<(), PtyBackendError> {

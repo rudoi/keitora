@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { LaneDrive } from "./drive";
 import type { CliKind } from "./ipc";
 import {
   actionDisabledReason,
@@ -279,5 +280,84 @@ describe("sessionItemDisabledReason", () => {
     for (const item of others) {
       expect(sessionItemDisabledReason(item, true)).toBeNull();
     }
+  });
+});
+
+describe("driving", () => {
+  const drivenSession = (state: SessionState, brokered: boolean): WorktreeSession => ({
+    ...session(state),
+    driven_by: "alpha",
+    brokered,
+  });
+  const drive = (extra: Partial<LaneDrive> = {}): LaneDrive => ({
+    drivenBy: "alpha",
+    drives: [],
+    pendingPrompts: 0,
+    paused: false,
+    brokered: false,
+    escalatedReason: null,
+    ...extra,
+  });
+  const live = worktreeMenuItems("claude", false);
+  const k = (...kinds: string[]) => kinds.map((kind) => ({ kind }));
+
+  it("colours a driven brokered waiting session brokered", () => {
+    expect(blockStateCls(undefined, drivenSession("waiting", true), true)).toBe("brokered");
+    // Even if a stale attention said waiting, the driver is deciding.
+    expect(blockStateCls("waiting", drivenSession("waiting", true), true)).toBe("brokered");
+  });
+
+  it("colours an escalated driven session waiting", () => {
+    expect(blockStateCls("waiting", drivenSession("waiting", false), true)).toBe("waiting");
+  });
+
+  it("lets terminated win over brokered", () => {
+    expect(blockStateCls(undefined, drivenSession("waiting", true), true, false, true)).toBe(
+      "terminated",
+    );
+  });
+
+  it("never animates a brokered lane (it carries no attention)", () => {
+    expect(blockAnimates(undefined)).toBe(false);
+  });
+
+  it("appends the drive items only for a driven lane", () => {
+    expect(worktreeMenuItems("claude", false, { drive: null })).toEqual(live);
+    const driver = drive({
+      drivenBy: null,
+      drives: [{ name: "bravo", visual: "idle", pending: 0 }],
+    });
+    expect(worktreeMenuItems("claude", false, { drive: driver })).toEqual(live);
+    expect(worktreeMenuItems("claude", false, { drive: drive() })).toEqual([
+      ...live,
+      ...k("take-over", "pause-driver", "release"),
+    ]);
+  });
+
+  it("keeps the drive items on a terminated and an inactive lane", () => {
+    expect(worktreeMenuItems("claude", true, { drive: drive() })).toEqual(
+      k("launch", "launch-fresh", "take-over", "pause-driver", "release"),
+    );
+    expect(worktreeMenuItems("claude", false, { inactive: true, drive: drive() })).toEqual([
+      ...k("focus"),
+      ...live,
+      ...k("take-over", "pause-driver", "release"),
+    ]);
+  });
+
+  it("offers Resume instead of Pause while paused", () => {
+    expect(worktreeMenuItems("claude", true, { drive: drive({ paused: true }) })).toEqual(
+      k("launch", "launch-fresh", "take-over", "resume-driver", "release"),
+    );
+  });
+
+  it("runs no lane action for the drive items", () => {
+    for (const item of ["take-over", "pause-driver", "resume-driver", "release"] as const) {
+      expect(laneMenuAction({ kind: item })).toBeNull();
+    }
+  });
+
+  it("never disables a drive item for a transfer", () => {
+    expect(sessionItemDisabledReason({ kind: "release" }, true)).toBeNull();
   });
 });

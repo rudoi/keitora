@@ -13,14 +13,33 @@ export interface ResumeNotice {
 }
 
 /**
+ * Who asked for a restart:
+ * - `restart`: the user (a live session asks to confirm first);
+ * - `transfer`: the restart that completes a CLI transfer (already confirmed, so the pane
+ *   skips its confirm-kill prompt and reports the spawn);
+ * - `drive-reset`: a driver's reset (no confirm; the spawn is reported for the request);
+ * - `drive-wake`: a driver's wake, which starts the agent only when it isn't running (a
+ *   launch for a terminated session) and leaves a running one alone;
+ * - `drive-wake-replace`: a driver's wake that must start a new session (fresh, or on
+ *   another provider), so a session the pane still holds is restarted, never resumed.
+ */
+export type RestartKind =
+  | "restart"
+  | "transfer"
+  | "drive-reset"
+  | "drive-wake"
+  | "drive-wake-replace";
+
+/**
  * The per-worktree restart signal: a bump counter plus the flavour of the latest bump.
- * `fresh` starts a new, empty conversation; `transfer` marks the restart that completes a
- * CLI transfer (already confirmed, so the pane skips its confirm-kill prompt).
+ * `fresh` starts a new, empty conversation; `driveRequest` is the driver request a
+ * `drive-*` bump carries out.
  */
 export interface RestartSignal {
   n: number;
+  kind: RestartKind;
   fresh: boolean;
-  transfer: boolean;
+  driveRequest: number | null;
 }
 
 /** The confirm surface's message and confirm-button label for `mode`. */
@@ -79,11 +98,13 @@ export function dimLine(line: string): string {
   return `\x1b[2m${line}\x1b[m`;
 }
 
-/** The next restart signal after `prev` for a restart of flavour `fresh` (and `transfer`). */
+/** The next restart signal after `prev`: a `kind` restart of flavour `fresh`, on behalf of
+ *  driver request `driveRequest` for a `drive-*` kind. */
 export function nextRestartSignal(
   prev: RestartSignal | undefined,
   fresh: boolean,
-  transfer = false,
+  kind: RestartKind = "restart",
+  driveRequest: number | null = null,
 ): RestartSignal {
-  return { n: (prev?.n ?? 0) + 1, fresh, transfer };
+  return { n: (prev?.n ?? 0) + 1, kind, fresh, driveRequest };
 }

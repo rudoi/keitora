@@ -19,6 +19,7 @@ function stats(extra: Partial<SummaryStats> = {}): SummaryStats {
     overflow: 0,
     lastActivity: null,
     active: false,
+    driven: 0,
     ...extra,
   };
 }
@@ -38,8 +39,23 @@ function lane(name: string, status: LaneModel["status"] = "available"): LaneMode
     building: false,
     working: false,
     blockState: status === "available" ? "idle" : "offline",
+    drive: null,
   };
 }
+
+describe("driven count", () => {
+  it("carries the driven count into the header view", () => {
+    expect(headerView(stats(), true).driven).toBe(0);
+    expect(headerView(stats({ driven: 2 }), false).driven).toBe(2);
+  });
+
+  it("names the driven lanes in the accessible label", () => {
+    expect(groupAriaLabel("my-game", stats({ busy: 1, driven: 2, live: 3 }))).toBe(
+      "my-game, 1 busy, 2 driven, 3 live sessions",
+    );
+    expect(groupAriaLabel("my-game", stats({ driven: 0 }))).toBe("my-game");
+  });
+});
 
 describe("headerView", () => {
   it("shows the dot strip only while collapsed and only with dots", () => {

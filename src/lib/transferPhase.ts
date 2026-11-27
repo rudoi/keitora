@@ -8,7 +8,6 @@ import { updatePromptCliOf } from "./agentUpdates";
 import type { CliKind, PtyResumeEvent, TransferOutcome, TransferProgress } from "./ipc";
 import type { Status } from "./paneStatus";
 import { cliBinary, cliTitle } from "./providers";
-import type { RestartSignal } from "./resumeNotice";
 import type { SessionState } from "./sessions";
 
 /** How long a transfer restart may take to report its spawn before the app gives up waiting. */
@@ -77,7 +76,10 @@ export type TransferEffect =
   | { kind: "inject_handoff"; project: string; worktree: string }
   | { kind: "toast"; message: string; diagnostics: Diagnostics | null }
   /** Tell the backend the transfer settled and drop the resume listener. */
-  | { kind: "settle"; project: string; worktree: string };
+  | { kind: "settle"; project: string; worktree: string }
+  /** How the transfer ended, for a driver that asked for it (ignored when none did).
+   *  `message` is the text the toast shows. */
+  | { kind: "report"; project: string; worktree: string; ok: boolean; message: string };
 
 export interface TransferStep {
   map: TransferMap;
@@ -115,19 +117,22 @@ function awaitingOutcome(e: TransferEntry): boolean {
   );
 }
 
-/** Remove the entry, toast `message`, and settle the transfer. */
+/** Remove the entry, toast `message`, settle the transfer and report how it ended
+ *  (`ok` only for a restart that spawned). Every terminal path goes through here. */
 function finish(
   map: TransferMap,
   key: string,
   e: TransferEntry,
   message: string,
   diagnostics: Diagnostics | null,
+  ok = false,
 ): TransferStep {
   return {
     map: without(map, key),
     effects: [
       { kind: "toast", message, diagnostics },
       { kind: "settle", project: e.project, worktree: e.worktree },
+      { kind: "report", project: e.project, worktree: e.worktree, ok, message },
     ],
   };
 }
@@ -228,7 +233,7 @@ export function transferReducer(map: TransferMap, event: TransferEvent): Transfe
       if (event.result.ok) {
         const diagnostics =
           e.result?.kind === "fresh" || e.result?.kind === "imported" ? target : null;
-        const step = finish(map, key, e, resultToast(e), diagnostics);
+        const step = finish(map, key, e, resultToast(e), diagnostics, true);
         if (e.result?.kind === "done") step.effects.push({ kind: "inject_handoff", ...target });
         return step;
       }
@@ -386,16 +391,19 @@ export function restartNeedsConfirm(status: Status): boolean {
 
 /**
  * What a pane does with a restart signal: a transfer restart was already confirmed in the
- * rail, so it never prompts; a plain restart prompts while the session is still live.
+ * rail and a driver's reset is the driver's call, so neither prompts; a plain restart
+ * prompts while the session is still live.
  */
 export function restartPlan(
-  signal: Pick<RestartSignal, "fresh" | "transfer">,
+  signal: { fresh: boolean; transfer: boolean; drive?: boolean },
   status: Status,
-): { confirm: boolean; fresh: boolean; transfer: boolean } {
+): { confirm: boolean; fresh: boolean; transfer: boolean; drive: boolean } {
+  const drive = signal.drive === true;
   return {
-    confirm: !signal.transfer && restartNeedsConfirm(status),
+    confirm: !signal.transfer && !drive && restartNeedsConfirm(status),
     fresh: signal.fresh,
     transfer: signal.transfer,
+    drive,
   };
 }
 

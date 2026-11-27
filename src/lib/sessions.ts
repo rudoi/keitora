@@ -36,6 +36,12 @@ export interface WorktreeSession {
   current_task_id: number | null;
   pid: number | null;
   last_heartbeat: string;
+  /** The worktree driving this one; absent/null when it is not driven. */
+  driven_by?: string | null;
+  /** Waiting on a brokered prompt the driver is deciding (absent means false). */
+  brokered?: boolean;
+  /** While waiting on a prompt escalated to the human, why it was escalated. */
+  escalated_reason?: string | null;
 }
 
 /** All known worktree session states (PTY-ownership reconciled by the backend). */

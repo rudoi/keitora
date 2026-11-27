@@ -67,15 +67,37 @@ describe("resumeNoticeLine", () => {
 describe("nextRestartSignal", () => {
   it("bumps the counter and carries the latest flavour", () => {
     const first = nextRestartSignal(undefined, true);
-    expect(first).toEqual({ n: 1, fresh: true, transfer: false });
+    expect(first).toEqual({ n: 1, kind: "restart", fresh: true, driveRequest: null });
     // Each bump carries only its own flavour: a resume right after a fresh start is not fresh.
-    expect(nextRestartSignal(first, false)).toEqual({ n: 2, fresh: false, transfer: false });
+    expect(nextRestartSignal(first, false)).toEqual({
+      n: 2,
+      kind: "restart",
+      fresh: false,
+      driveRequest: null,
+    });
   });
 
   it("carries transfer when asked", () => {
-    const first = nextRestartSignal(undefined, false, true);
-    expect(first).toEqual({ n: 1, fresh: false, transfer: true });
+    const first = nextRestartSignal(undefined, false, "transfer");
+    expect(first).toEqual({ n: 1, kind: "transfer", fresh: false, driveRequest: null });
     // A following plain bump is not a transfer restart.
-    expect(nextRestartSignal(first, false)).toEqual({ n: 2, fresh: false, transfer: false });
+    expect(nextRestartSignal(first, false)).toEqual({
+      n: 2,
+      kind: "restart",
+      fresh: false,
+      driveRequest: null,
+    });
+  });
+
+  it("carries the driver request a reset belongs to, and drops it on the next bump", () => {
+    const first = nextRestartSignal(undefined, true, "drive-reset", 42);
+    expect(first).toEqual({ n: 1, kind: "drive-reset", fresh: true, driveRequest: 42 });
+    expect(nextRestartSignal(first, false).driveRequest).toBeNull();
+  });
+
+  it("carries a driver's wake, and drops it on the next bump", () => {
+    const first = nextRestartSignal(undefined, false, "drive-wake", 9);
+    expect(first).toEqual({ n: 1, kind: "drive-wake", fresh: false, driveRequest: 9 });
+    expect(nextRestartSignal(first, false).kind).toBe("restart");
   });
 });

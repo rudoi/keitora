@@ -10,7 +10,14 @@ import {
   cancelTransfer,
   cliAvailability,
   daemonStatus,
+  drivePause,
+  driveRelease,
+  driveRequestResolve,
+  driveSetOpenProjects,
+  drivesList,
+  driveTakeOver,
   injectHandoffSummary,
+  normalizeWorktreeActivity,
   type OutputMsg,
   onPtyPasteRefused,
   onPtyResume,
@@ -503,5 +510,77 @@ describe("cliAvailability", () => {
     transport.invoke.mockReset().mockResolvedValue(record);
     expect(await cliAvailability()).toEqual(record);
     expect(transport.invoke).toHaveBeenCalledWith("cli_availability", undefined);
+  });
+});
+
+describe("normalizeWorktreeActivity drive fields", () => {
+  const base = { project: "my-game", worktree: "bravo", cli: "claude", working: false };
+
+  it("defaults the drive fields when the wire omits them", () => {
+    const a = normalizeWorktreeActivity(base);
+    expect(a.drivenBy).toBeNull();
+    expect(a.drives).toEqual([]);
+    expect(a.pendingPrompts).toBe(0);
+    expect(a.drivePaused).toBe(false);
+  });
+
+  it("maps the drive fields when present", () => {
+    const a = normalizeWorktreeActivity({
+      ...base,
+      driven_by: "alpha",
+      drives: ["charlie"],
+      pending_prompts: 2,
+      drive_paused: true,
+    });
+    expect(a.drivenBy).toBe("alpha");
+    expect(a.drives).toEqual(["charlie"]);
+    expect(a.pendingPrompts).toBe(2);
+    expect(a.drivePaused).toBe(true);
+  });
+});
+
+describe("drive wrappers", () => {
+  beforeEach(() => {
+    transport.invoke.mockReset();
+    transport.invoke.mockResolvedValue(undefined);
+  });
+
+  it("pass the command names and keys the backend expects", async () => {
+    await drivesList("my-game");
+    expect(transport.invoke).toHaveBeenLastCalledWith("drives_list", { project: "my-game" });
+    await driveRelease("my-game", "bravo");
+    expect(transport.invoke).toHaveBeenLastCalledWith("drive_release", {
+      project: "my-game",
+      driven: "bravo",
+    });
+    await driveTakeOver("my-game", "bravo");
+    expect(transport.invoke).toHaveBeenLastCalledWith("drive_take_over", {
+      project: "my-game",
+      driven: "bravo",
+    });
+    await drivePause("my-game", "bravo", true);
+    expect(transport.invoke).toHaveBeenLastCalledWith("drive_pause", {
+      project: "my-game",
+      driven: "bravo",
+      paused: true,
+    });
+    await driveRequestResolve("my-game", 7, "refused", "no pane");
+    expect(transport.invoke).toHaveBeenLastCalledWith("drive_request_resolve", {
+      project: "my-game",
+      requestId: 7,
+      outcome: "refused",
+      reason: "no pane",
+    });
+    await driveRequestResolve("my-game", 8, "applied");
+    expect(transport.invoke).toHaveBeenLastCalledWith("drive_request_resolve", {
+      project: "my-game",
+      requestId: 8,
+      outcome: "applied",
+      reason: "",
+    });
+    await driveSetOpenProjects(["my-game"]);
+    expect(transport.invoke).toHaveBeenLastCalledWith("drive_set_open_projects", {
+      projects: ["my-game"],
+    });
   });
 });

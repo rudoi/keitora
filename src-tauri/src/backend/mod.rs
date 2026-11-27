@@ -818,6 +818,9 @@ pub fn apply_reconcile(
                 s.state = "offline".to_string();
                 s.current_task_id = None;
                 s.pid = None;
+                // An offline session isn't waiting on anything; the binding stays.
+                s.brokered = false;
+                s.escalated_reason = None;
             }
             match hints.get(&key).map(String::as_str) {
                 // Blocked on the user: idle or busy -> waiting.
@@ -913,6 +916,9 @@ mod tests {
             current_task_id: Some(7),
             pid: Some(1234),
             last_heartbeat: "now".to_string(),
+            driven_by: None,
+            brokered: false,
+            escalated_reason: None,
         }
     }
 
@@ -1173,6 +1179,26 @@ mod tests {
         let result = apply_reconcile(&sessions, &live, &HintMap::new(), "proj");
         assert_eq!(result[0].state, "idle");
         assert_eq!(result[0].current_task_id, Some(7));
+    }
+
+    #[test]
+    fn offline_downgrade_clears_brokered_state_but_keeps_the_driver() {
+        let mut waiting = session("bravo", "waiting");
+        waiting.driven_by = Some("alpha".to_string());
+        waiting.brokered = true;
+        waiting.escalated_reason = Some("driver paused".to_string());
+        let result = apply_reconcile(&[waiting.clone()], &HashSet::new(), &HintMap::new(), "proj");
+        assert_eq!(result[0].state, "offline");
+        assert!(!result[0].brokered);
+        assert_eq!(result[0].escalated_reason, None);
+        assert_eq!(result[0].driven_by.as_deref(), Some("alpha"));
+
+        // A live session passes the drive fields through unchanged.
+        let mut live = HashSet::new();
+        live.insert(key("proj", "bravo"));
+        let result = apply_reconcile(&[waiting], &live, &HintMap::new(), "proj");
+        assert!(result[0].brokered);
+        assert_eq!(result[0].escalated_reason.as_deref(), Some("driver paused"));
     }
 
     #[test]

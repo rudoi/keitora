@@ -256,6 +256,11 @@ Keitora polls/watches this table (with PTY ownership as a fallback signal) and e
 > **Update:** the suggestion pass (`dispatch_suggest`, the proposal strip/cards, and ⌘K) was
 > later removed. Manual board dispatch (`dispatch_apply`) remains. The text below is the
 > original design and is kept for history.
+>
+> **Update:** one worktree's agent session can now *drive* other worktrees of the same project
+> through the CLI (`keitora drive`/`release`, `send`, `wait`, `read`, `prompts`, `answer`,
+> `wake`, `reset`, `swap`), with permission prompts brokered to the driver through hooks and the
+> rail showing driver/driven badges. Design: `plans/0078-cross-worktree-driving/`.
 
 The LLM is **purely advisory**; Keitora performs the mechanical injection, gated on idle state.
 
