@@ -17,6 +17,7 @@ mod db_watch;
 mod deps;
 mod diff;
 mod dispatch;
+mod external_open;
 mod headroom;
 mod hooks;
 mod host;

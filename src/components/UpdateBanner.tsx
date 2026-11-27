@@ -1,8 +1,8 @@
 // One strip under the title chrome announcing an available update. Renders nothing
 // when there is no update or the user dismissed this version.
 
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { Loader2 } from "lucide-react";
+import { openUrl } from "../lib/openExternal";
 import { bannerOf, errorText } from "../lib/updates";
 import { useToast } from "./Toast";
 import { useUpdates } from "./UpdatesProvider";

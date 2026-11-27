@@ -661,6 +661,10 @@ impl HerdrEnv {
     /// every [`Self::env`] pair and the `PATH` ([`Self::path`]). Every herdr
     /// server, CLI and bridge spawn site must call this (before handing the
     /// command to a launcher), so they all talk to the same isolated instance.
+    ///
+    /// Run from an AppImage, herdr would otherwise inherit the image's library, Python and GTK
+    /// paths and hand them to every pane, and keep them after the image is unmounted; they are
+    /// stripped last, from the composed `PATH` too, since it starts from the inherited one.
     pub fn apply(&self, cmd: &mut std::process::Command) {
         for name in &self.env_remove {
             cmd.env_remove(name);
@@ -671,6 +675,8 @@ impl HerdrEnv {
         if let Some(path) = self.path() {
             cmd.env("PATH", path);
         }
+        #[cfg(target_os = "linux")]
+        keitora_tasks::appimage_env::scrub(cmd);
     }
 }
 

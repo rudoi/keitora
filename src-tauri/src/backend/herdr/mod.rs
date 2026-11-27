@@ -192,8 +192,10 @@ impl SizeMemory {
 }
 
 /// Apply the platform spawn flags for a short-lived, piped child (a herdr CLI
-/// call or bridge, a Codex probe): on Windows, `CREATE_NO_WINDOW` so no console
-/// flashes; a no-op elsewhere. The long-lived server launches through
+/// call or bridge, a Codex or Claude run, a dependency install): on Windows,
+/// `CREATE_NO_WINDOW` so no console flashes; on Linux, the AppImage runtime's
+/// environment is stripped (see [`keitora_tasks::appimage_env`]). Call it after the
+/// command's last `env`/`env_remove`. The long-lived server launches through
 /// [`crate::backend::launch`].
 pub(crate) fn configure_command(cmd: &mut Command) {
     #[cfg(windows)]
@@ -201,7 +203,9 @@ pub(crate) fn configure_command(cmd: &mut Command) {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(crate::backend::launch::CREATE_NO_WINDOW);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    keitora_tasks::appimage_env::scrub(cmd);
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = cmd;
     }
@@ -1884,6 +1888,7 @@ fn sample_process_stats(sys: &mut sysinfo::System, pid: Option<u32>) -> DaemonSt
         sysinfo::ProcessesToUpdate::Some(&[spid]),
         true, // remove dead
         sysinfo::ProcessRefreshKind::nothing()
+            .without_tasks()
             .with_cpu()
             .with_memory(),
     );

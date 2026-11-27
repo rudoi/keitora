@@ -159,7 +159,7 @@ export function toastFor(event: UpdateStatusEvent): string | null {
     case "failed":
       return `Update check failed: ${event.message}`;
     case "unsupported":
-      return "Updates aren't available on this platform.";
+      return event.message;
     default:
       return null;
   }
@@ -177,7 +177,7 @@ export function statusLine(status: UpdateStatus): string {
     case "failed":
       return `Last check failed: ${status.message}`;
     case "unsupported":
-      return "Updates aren't available on this platform.";
+      return status.message;
   }
 }
 

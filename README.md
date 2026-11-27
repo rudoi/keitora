@@ -30,8 +30,9 @@ waiting on you, and which are free for the next task.
 
 ## Setup
 
-Keitora runs on macOS and Windows. Prebuilt installers (a macOS Apple Silicon `.dmg` and a Windows
-installer) are on the [Releases page](https://github.com/rudoi/keitora/releases). You can also build
+Keitora runs on macOS, Windows and Linux (x64). Prebuilt installers (a macOS Apple Silicon `.dmg`, a
+Windows installer, and a Linux AppImage, `.deb` and `.rpm`) are on the
+[Releases page](https://github.com/rudoi/keitora/releases). You can also build
 from source; that means installing a couple of tools and building the app once.
 
 ### 1. Install Claude Code
@@ -48,7 +49,7 @@ your sessions alive when Keitora's window is closed. The
 manual downloads). The quickest routes are:
 
 ```sh
-# macOS
+# macOS and Linux
 curl -fsSL https://herdr.dev/install.sh | sh
 ```
 
@@ -75,6 +76,8 @@ You need:
 - **Node.js** (current LTS) and **Yarn** 1.x: `npm install -g yarn`.
 - **git**.
 - On **macOS**, the Xcode Command Line Tools: `xcode-select --install`.
+- On **Linux**, Tauri's system libraries (WebKitGTK 4.1 and friends). [CONTRIBUTING.md](CONTRIBUTING.md#setup)
+  lists the packages for Fedora and Debian/Ubuntu.
 - On **Windows**, the Microsoft C++ Build Tools ("Desktop development with C++") and Git for
   Windows. Tauri's [prerequisites page](https://v2.tauri.app/start/prerequisites/) walks through
   both.
@@ -98,6 +101,12 @@ The first build compiles a lot of Rust and can take several minutes. When it fin
   [macOS permissions](CONTRIBUTING.md#macos-permissions-screen-recording).
 - **Windows:** run the installer in `target/release/bundle/nsis/` (or the one you downloaded).
   It isn't code-signed, so SmartScreen may warn you; choose **More info**, then **Run anyway**.
+- **Linux:** install the package for your distribution from `target/release/bundle/`: `rpm/` (Fedora,
+  openSUSE: `sudo dnf install ./Keitora-*.rpm`), `deb/` (Debian, Ubuntu: `sudo apt install
+  ./Keitora_*.deb`), or run the AppImage in `appimage/` on anything else. Only the AppImage updates
+  itself; a `.deb` or `.rpm` install updates by installing the newer package. The AppImage needs
+  FUSE 2 (`fuse-libs` on Fedora, `libfuse2` on Debian/Ubuntu); without it, run it with
+  `APPIMAGE_EXTRACT_AND_RUN=1`.
 
 ### 5. Add your first project
 

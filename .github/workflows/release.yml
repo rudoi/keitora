@@ -2,12 +2,13 @@ name: Release
 
 # Only GitHub-authored actions (actions/*) are used, so no third-party code ever sees a secret. This workflow is the
 # only thing that publishes: scripts/release.ts bumps, commits, tags and pushes; the tag push lands here. A release
-# carries the Windows NSIS installer and the Apple Silicon dmg, plus the in-app updater's files: the installer's
-# .sig, and Keitora.app.tar.gz with its .sig. Tag runs use the `release` environment: they sign the dmg with the
+# carries the Windows NSIS installer, the Apple Silicon dmg and the Linux x64 AppImage, deb and rpm, plus the in-app
+# updater's files: the Windows installer's .sig, Keitora.app.tar.gz with its .sig, and the AppImage's .sig. Tag runs use the `release` environment: they sign the dmg with the
 # identity stored there (Developer ID or self-signed) and the updater artifacts with the updater key
 # (TAURI_SIGNING_PRIVATE_KEY*), check that each .sig was made by the key whose pubkey is in tauri.conf.json, and fail
 # if any of that is missing. Every other run (PR, schedule, dispatch) never sees a secret, builds unsigned without
-# updater artifacts, and publishes nothing.
+# updater artifacts, and publishes nothing. The Linux build downloads and runs linuxdeploy and its plugins without a
+# checksum, so it runs without the key; the AppImage is signed afterwards in a step that runs only the Tauri CLI.
 
 on:
   push:
@@ -178,6 +179,150 @@ jobs:
           path: |
             ${{ steps.installer.outputs.path }}
             ${{ steps.installer.outputs.path }}.sig
+          if-no-files-found: error
+          retention-days: 14
+
+  # Two Linux jobs for the same reason as the Windows and macOS pairs: only the tag job sees the updater key. Built on
+  # the oldest supported Ubuntu runner so the AppImage, deb and rpm need no newer glibc than 2.35 (Fedora, Debian 12,
+  # Ubuntu 22.04 and later). The bundle targets come from src-tauri/tauri.linux.conf.json.
+  build-linux:
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-linux-deps
+
+      - uses: ./.github/actions/setup-rust
+        id: cargo-cache
+        with:
+          key-prefix: cargo-release
+
+      - uses: ./.github/actions/setup-node-yarn
+
+      - name: Build the AppImage, deb and rpm
+        run: yarn tauri:bundle
+
+      - name: Collect the packages
+        id: collect
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/keitora-linux"
+          mkdir -p "$out"
+          for pattern in appimage/Keitora_*_amd64.AppImage deb/Keitora_*_amd64.deb rpm/Keitora-*.x86_64.rpm; do
+            files=(target/release/bundle/$pattern)
+            if [ "${#files[@]}" -ne 1 ] || [ ! -f "${files[0]}" ]; then
+              echo "Expected exactly one $pattern, found: ${files[*]}" >&2
+              exit 1
+            fi
+            cp "${files[0]}" "$out/"
+          done
+          echo "dir=$out" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: keitora-linux
+          path: ${{ steps.collect.outputs.dir }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Save cargo cache
+        if: env.SAVE_RELEASE_CACHE == 'true' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/save-rust-cache
+        with:
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+          trim: target/release/bundle
+
+  # Tag runs only. The AppImage is the Linux updater artifact; deb and rpm installs update through the package
+  # manager, so only the AppImage gets a .sig. This job never saves the cache.
+  build-linux-release:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    environment: release
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches the app version
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package.json version ${version}" >&2
+            exit 1
+          fi
+
+      # The expression evaluates to a bare true or false, so no secret value reaches this step or its shell.
+      - name: Detect the updater key
+        id: updater-key
+        env:
+          HAS_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && 'true' || 'false' }}
+        run: echo "has_key=$HAS_KEY" >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/setup-linux-deps
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          key-prefix: cargo-release
+
+      - uses: ./.github/actions/setup-node-yarn
+
+      # Fails on a tag without the key (UPDATER_KEY_MISSING) or with the placeholder pubkey.
+      - name: Compute the bundle overlay
+        env:
+          UPDATER_KEY: ${{ steps.updater-key.outputs.has_key }}
+        run: yarn --silent tsx scripts/bundle-overlay.ts --target linux --out "$RUNNER_TEMP/bundle-overlay.json"
+
+      # No key here: the AppImage bundler downloads and runs linuxdeploy, AppRun and linuxdeploy-plugin-appimage
+      # without verifying them, so nothing it runs may see the secret.
+      - name: Build the packages
+        run: yarn tauri:bundle --config "$RUNNER_TEMP/bundle-overlay.json"
+
+      # The only step that sees the updater key, and it runs nothing but the Tauri CLI from the lockfile. The version
+      # goes into the signed comment, as `tauri build` does for the artifacts it signs itself.
+      - name: Sign the AppImage for the updater
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          files=(target/release/bundle/appimage/Keitora_*_amd64.AppImage)
+          if [ "${#files[@]}" -ne 1 ] || [ ! -f "${files[0]}" ]; then
+            echo "Expected exactly one AppImage, found: ${files[*]}" >&2
+            exit 1
+          fi
+          yarn --silent tauri signer sign --app-version "$version" "${files[0]}" > /dev/null
+
+      - name: Collect the packages and the signature
+        id: collect
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/keitora-linux"
+          mkdir -p "$out"
+          for pattern in appimage/Keitora_*_amd64.AppImage appimage/Keitora_*_amd64.AppImage.sig \
+                         deb/Keitora_*_amd64.deb rpm/Keitora-*.x86_64.rpm; do
+            files=(target/release/bundle/$pattern)
+            if [ "${#files[@]}" -ne 1 ] || [ ! -f "${files[0]}" ]; then
+              echo "Expected exactly one $pattern, found: ${files[*]}" >&2
+              exit 1
+            fi
+            cp "${files[0]}" "$out/"
+          done
+          sig=("$out"/Keitora_*_amd64.AppImage.sig)
+          echo "dir=$out" >> "$GITHUB_OUTPUT"
+          echo "sig=${sig[0]}" >> "$GITHUB_OUTPUT"
+
+      # Tauri only warns when the key does not match the committed pubkey; installed copies would reject the update.
+      - name: Check the updater signature's key
+        env:
+          SIG: ${{ steps.collect.outputs.sig }}
+        run: yarn --silent tsx scripts/check-updater-sig.ts "$SIG"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: keitora-linux
+          path: ${{ steps.collect.outputs.dir }}
           if-no-files-found: error
           retention-days: 14
 
@@ -421,8 +566,8 @@ jobs:
   # Publishes only on a tag push (a manual dispatch on a tag never publishes). One job of each pair is always
   # skipped, so `needs` alone would skip this job too; the explicit result checks on the two tag jobs keep it strict.
   publish:
-    if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.build-windows-release.result == 'success' && needs.build-macos-release.result == 'success' }}
-    needs: [build-windows, build-windows-release, build-macos, build-macos-release]
+    if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.build-windows-release.result == 'success' && needs.build-macos-release.result == 'success' && needs.build-linux-release.result == 'success' }}
+    needs: [build-windows, build-windows-release, build-macos, build-macos-release, build-linux, build-linux-release]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -435,6 +580,10 @@ jobs:
         with:
           name: keitora-macos
           path: macos
+      - uses: actions/download-artifact@v8
+        with:
+          name: keitora-linux
+          path: linux
       - name: Create or update the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -448,9 +597,13 @@ jobs:
             macos/Keitora_*_aarch64.dmg
             macos/Keitora.app.tar.gz
             macos/Keitora.app.tar.gz.sig
+            linux/Keitora_*_amd64.AppImage
+            linux/Keitora_*_amd64.AppImage.sig
+            linux/Keitora_*_amd64.deb
+            linux/Keitora-*.x86_64.rpm
           )
-          if [ "${#files[@]}" -ne 5 ]; then
-            echo "Expected exactly five release files, found: ${files[*]}" >&2
+          if [ "${#files[@]}" -ne 9 ]; then
+            echo "Expected exactly nine release files, found: ${files[*]}" >&2
             exit 1
           fi
           for f in "${files[@]}"; do

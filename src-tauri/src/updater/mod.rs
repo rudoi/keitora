@@ -48,10 +48,19 @@ pub enum UpdateStatus {
         message: String,
     },
     /// No update artifacts are published for this platform.
-    Unsupported,
+    Unsupported {
+        /// For the user: why, and where this copy gets its updates instead.
+        message: &'static str,
+    },
 }
 
 impl UpdateStatus {
+    fn unsupported() -> Self {
+        UpdateStatus::Unsupported {
+            message: release::unsupported_message(std::env::consts::OS),
+        }
+    }
+
     fn available(c: &Candidate) -> Self {
         UpdateStatus::Available {
             version: c.version.to_string(),
@@ -68,7 +77,7 @@ impl UpdateStatus {
             UpdateStatus::UpToDate => "up_to_date".into(),
             UpdateStatus::Available { version, .. } => format!("available {version}"),
             UpdateStatus::Failed { message } => format!("failed: {message}"),
-            UpdateStatus::Unsupported => "unsupported".into(),
+            UpdateStatus::Unsupported { .. } => "unsupported".into(),
         }
     }
 }
@@ -221,7 +230,7 @@ impl<P: Clone> Updater<P> {
         let last = if platform.is_some() {
             UpdateStatus::Unchecked
         } else {
-            UpdateStatus::Unsupported
+            UpdateStatus::unsupported()
         };
         Updater {
             inner: Mutex::new(Inner {
@@ -285,7 +294,7 @@ impl<P: Clone> Updater<P> {
             let mut inner = self.lock();
             let status = match fresh {
                 Some(fresh) => inner.resolve(fresh),
-                None => UpdateStatus::Unsupported,
+                None => UpdateStatus::unsupported(),
             };
             inner.checks_done += 1;
             let changed = inner.last != status;
@@ -739,9 +748,12 @@ mod tests {
         let src = FakeSource::default();
         let calls = Arc::clone(&src.calls);
         let (u, rec) = updater_with(src, None);
-        assert_eq!(u.snapshot().status, UpdateStatus::Unsupported);
-        assert_eq!(u.check(true), UpdateStatus::Unsupported);
-        assert_eq!(rec.statuses(), vec![event(UpdateStatus::Unsupported, true)]);
+        assert_eq!(u.snapshot().status, UpdateStatus::unsupported());
+        assert_eq!(u.check(true), UpdateStatus::unsupported());
+        assert_eq!(
+            rec.statuses(),
+            vec![event(UpdateStatus::unsupported(), true)]
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 

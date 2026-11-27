@@ -4,16 +4,20 @@
 // quoting; the build passes it as a second `--config`, which merges after the bundle overlay.
 //
 //   UPDATER_KEY=true|false GITHUB_REF=refs/tags/vX.Y.Z \
-//     yarn --silent tsx scripts/bundle-overlay.ts --target windows|macos --out <path>
+//     yarn --silent tsx scripts/bundle-overlay.ts --target windows|macos|linux --out <path>
 //
 // UPDATER_KEY is a bare boolean saying whether the signing key secret is set; the key itself never
 // reaches this script. The pubkey comes from src-tauri/tauri.conf.json.
 
 import { writeFileSync } from "node:fs";
 import { committedUpdaterPubkey, failCli as fail } from "./cli.ts";
-import { type BundleTarget, bundleOverlay } from "./release.lib.ts";
+import { BUNDLE_TARGETS, type BundleTarget, bundleOverlay } from "./release.lib.ts";
 
-const USAGE = "usage: bundle-overlay.ts --target windows|macos --out <path>";
+const USAGE = `usage: bundle-overlay.ts --target ${BUNDLE_TARGETS.join("|")} --out <path>`;
+
+function isBundleTarget(value: string | undefined): value is BundleTarget {
+  return BUNDLE_TARGETS.includes(value as BundleTarget);
+}
 
 function parse(argv: string[]): { target: BundleTarget; out: string } {
   let target: BundleTarget | undefined;
@@ -22,7 +26,7 @@ function parse(argv: string[]): { target: BundleTarget; out: string } {
     const value = argv[i + 1];
     switch (argv[i]) {
       case "--target":
-        if (value !== "windows" && value !== "macos") fail(`--target must be windows or macos\n${USAGE}`, 2);
+        if (!isBundleTarget(value)) fail(`--target must be one of ${BUNDLE_TARGETS.join(", ")}\n${USAGE}`, 2);
         target = value;
         i++;
         break;

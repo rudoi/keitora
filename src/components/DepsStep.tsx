@@ -3,10 +3,10 @@
 // commands, Copy details), point Keitora at an existing herdr, or skip.
 
 import { open } from "@tauri-apps/plugin-dialog";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { useState } from "react";
 import { stepModel } from "../lib/deps";
 import { depsDetails, depsSetHerdrBin, type ManualRoute } from "../lib/ipc";
+import { openUrl } from "../lib/openExternal";
 import { errorText } from "../lib/updates";
 import { useDeps, useDepsInstall } from "./DepsProvider";
 import { useToast } from "./Toast";

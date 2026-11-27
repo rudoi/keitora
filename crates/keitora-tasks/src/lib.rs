@@ -5,6 +5,8 @@
 //! (TOCTOU-safe), dependency gating with cycle detection, and `done` reporting
 //! newly-unblocked tasks.
 
+#[cfg(target_os = "linux")]
+pub mod appimage_env;
 mod backend;
 mod config;
 pub mod config_edit;
