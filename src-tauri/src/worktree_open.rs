@@ -11,7 +11,6 @@ use std::process::Command;
 
 use keitora_tasks::{ProjectConfig, UserConfig};
 use tauri::AppHandle;
-use tauri_plugin_opener::OpenerExt;
 
 /// Open the worktree's root folder in the OS file manager.
 #[tauri::command(async)]
@@ -21,8 +20,7 @@ pub fn open_worktree_folder(
     worktree: String,
 ) -> Result<(), String> {
     let dir = resolve_worktree_dir(&project, &worktree)?;
-    app.opener()
-        .open_path(dir.to_string_lossy().into_owned(), None::<String>)
+    crate::external_open::open_path(&app, &dir.to_string_lossy())
         .map_err(|e| format!("Could not open folder: {e}"))
 }
 
@@ -86,19 +84,47 @@ fn spawn_shell(dir: &Path) -> std::io::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn spawn_shell(dir: &Path) -> std::io::Result<()> {
-    Command::new("open")
+    let child = Command::new("open")
         .arg("-a")
         .arg("Terminal")
         .arg(dir)
-        .spawn()
-        .map(|_| ())
+        .spawn()?;
+    reap(child);
+    Ok(())
 }
+
+/// Wait for `child` on a thread of its own, so once it exits it does not linger as a zombie
+/// until Keitora does.
+#[cfg(unix)]
+fn reap(mut child: std::process::Child) {
+    std::thread::spawn(move || child.wait());
+}
+
+/// How long a terminal gets to fail before it counts as started. A launcher such as
+/// `xdg-terminal-exec` with no terminal configured starts fine and exits with an error at once.
+#[cfg(all(unix, not(target_os = "macos")))]
+const START_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn spawn_shell(dir: &Path) -> std::io::Result<()> {
     let terminal = std::env::var("TERMINAL").ok();
-    let mut tried = Vec::new();
-    for (program, args) in terminal_candidates(terminal.as_deref(), dir) {
+    spawn_first(
+        terminal_candidates(terminal.as_deref(), dir),
+        dir,
+        START_GRACE,
+    )
+}
+
+/// Start the first of `candidates` that is installed and does not fail within `grace`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn spawn_first(
+    candidates: Vec<(String, Vec<std::ffi::OsString>)>,
+    dir: &Path,
+    grace: std::time::Duration,
+) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut failed = Vec::new();
+    for (program, args) in candidates {
         let mut cmd = Command::new(&program);
         // Detached stdio: the terminal's own logging would otherwise land in Keitora's log.
         cmd.args(&args)
@@ -109,15 +135,46 @@ fn spawn_shell(dir: &Path) -> std::io::Result<()> {
         #[cfg(target_os = "linux")]
         keitora_tasks::appimage_env::scrub(&mut cmd);
         match cmd.spawn() {
-            Ok(_) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => tried.push(program),
+            Ok(child) => match early_failure(child, grace) {
+                None => return Ok(()),
+                Some(status) => failed.push(format!("{program} ({status})")),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing.push(program),
             Err(e) => return Err(e),
         }
     }
-    Err(std::io::Error::other(format!(
-        "no terminal emulator found (tried {}); set $TERMINAL to yours",
-        tried.join(", ")
-    )))
+    let mut msg = String::from("no terminal emulator could be started");
+    if !failed.is_empty() {
+        msg.push_str(&format!("; {} exited with an error", failed.join(", ")));
+    }
+    if !missing.is_empty() {
+        msg.push_str(&format!("; not installed: {}", missing.join(", ")));
+    }
+    msg.push_str("; set $TERMINAL to yours");
+    Err(std::io::Error::other(msg))
+}
+
+/// The exit status of a `child` that fails within `grace`; `None` once it is still running at
+/// the deadline or has exited cleanly (a launcher that handed off to the terminal). A child
+/// still running is reaped in the background.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn early_failure(
+    mut child: std::process::Child,
+    grace: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return (!status.success()).then_some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                reap(child);
+                return None;
+            }
+        }
+    }
 }
 
 /// Terminals tried after `$TERMINAL`, in order: the freedesktop default-terminal launcher, the
@@ -277,6 +334,42 @@ mod terminal_tests {
     #[test]
     fn blank_terminal_env_is_ignored() {
         assert_eq!(candidates(Some("  ")), candidates(None));
+    }
+
+    fn sh(script: &str) -> (String, Vec<OsString>) {
+        ("sh".into(), args(&["-c", script]))
+    }
+
+    #[test]
+    fn a_launcher_that_fails_at_once_falls_through_to_the_next_terminal() {
+        let tmp = std::env::temp_dir();
+        let grace = std::time::Duration::from_secs(5);
+        let c = vec![
+            sh("exit 3"),
+            ("keitora-no-such-terminal-6f1c".into(), vec![]),
+            sh("exit 0"),
+        ];
+        assert!(super::spawn_first(c, &tmp, grace).is_ok());
+        // Still running at the deadline: started.
+        let c = vec![sh("sleep 2")];
+        let short = std::time::Duration::from_millis(50);
+        assert!(super::spawn_first(c, &tmp, short).is_ok());
+    }
+
+    #[test]
+    fn nothing_started_names_what_failed_and_what_is_missing() {
+        let tmp = std::env::temp_dir();
+        let grace = std::time::Duration::from_secs(5);
+        let c = vec![
+            sh("exit 3"),
+            ("keitora-no-such-terminal-6f1c".into(), vec![]),
+        ];
+        let err = super::spawn_first(c, &tmp, grace).unwrap_err().to_string();
+        assert!(err.contains("sh (exit status: 3)"), "{err}");
+        assert!(
+            err.contains("not installed: keitora-no-such-terminal-6f1c"),
+            "{err}"
+        );
     }
 }
 
