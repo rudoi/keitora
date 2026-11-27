@@ -8,19 +8,16 @@
 //!
 //! Wired into `HerdrBackend::spawn_agent` / `list_sessions`.
 
-use keitora_tasks::{is_safe_claude_session_id, CliKind};
+use keitora_tasks::{is_safe_session_id, CliKind, CLI_COUNT};
 
-use crate::backend::{SessionKey, HINT_BUSY};
+use crate::backend::{SessionKey, HINT_BUSY, HINT_WAITING};
 
 use super::ops::HerdrError;
 use super::resume::ResumeDecision;
 
 /// Keitora `CliKind` → the herdr `--kind` value.
 pub fn herdr_kind(cli: CliKind) -> &'static str {
-    match cli {
-        CliKind::Claude => "claude",
-        CliKind::Codex => "codex",
-    }
+    cli.spec().herdr_kind
 }
 
 /// Global codex flags that turn off its startup update check. Without them a codex
@@ -36,6 +33,8 @@ pub const CODEX_NO_UPDATE_CHECK: [&str; 2] = ["-c", "check_for_update_on_startup
 /// caller with [`next_fallback`]):
 /// - claude: `--dangerously-skip-permissions` when `autonomy`, then `--resume <id>`
 ///   / `--continue` / nothing.
+/// - agy: `--dangerously-skip-permissions` when `autonomy`, then `--conversation <id>`
+///   / `-c` / nothing.
 /// - codex: [`CODEX_NO_UPDATE_CHECK`] first (global flags precede any subcommand),
 ///   then the subcommand (`resume <id>` / `resume --last` / nothing), then
 ///   `--dangerously-bypass-approvals-and-sandbox` when `autonomy`, and ALWAYS
@@ -59,8 +58,11 @@ pub fn build_agent_args_opts(
     let resume = match resume {
         ResumeDecision::Resume { cli: for_cli, id } => {
             debug_assert_eq!(*for_cli, cli, "resume decision for another cli");
-            if is_safe_claude_session_id(id) {
+            if is_safe_session_id(id) {
                 Some(Some(id.as_str()))
+            } else if cli == CliKind::Antigravity {
+                // An unusable id starts fresh; `-c` is not trusted for this cli.
+                None
             } else {
                 Some(None)
             }
@@ -94,6 +96,16 @@ pub fn build_agent_args_opts(
                 args.push("--dangerously-bypass-hook-trust".into());
             }
         }
+        CliKind::Antigravity => {
+            if autonomy {
+                args.push("--dangerously-skip-permissions".into());
+            }
+            match resume {
+                Some(Some(id)) => args.extend(["--conversation".into(), id.to_string()]),
+                Some(None) => args.push("-c".into()),
+                None => {}
+            }
+        }
     }
     args
 }
@@ -101,6 +113,11 @@ pub fn build_agent_args_opts(
 /// The next, weaker launch after `d` failed: resume → continue → fresh → none.
 pub fn next_fallback(d: &ResumeDecision) -> Option<ResumeDecision> {
     match d {
+        // A failed Antigravity resume skips `-c` and starts fresh.
+        ResumeDecision::Resume {
+            cli: CliKind::Antigravity,
+            ..
+        } => Some(ResumeDecision::Fresh),
         ResumeDecision::Resume { .. } => Some(ResumeDecision::Continue),
         ResumeDecision::Continue => Some(ResumeDecision::Fresh),
         ResumeDecision::Fresh => None,
@@ -146,15 +163,17 @@ pub fn is_name_taken(e: &HerdrError) -> bool {
 
 /// Map a herdr `agent_status` (+ `launch_pending`) to Keitora's `state_hint`.
 ///
-/// A still-launching, `working`, or `blocked` agent is BUSY; `idle`/`done`/unknown
-/// (and any unrecognized status) are not. `apply_reconcile` only ever upgrades an
-/// `idle` session to busy, so this can withhold a dispatch but never force one.
+/// A still-launching or `working` agent is BUSY; a `blocked` one is WAITING on the
+/// user; `idle`/`done`/unknown (and any unrecognized status) carry no hint.
+/// `apply_reconcile` only ever moves a live session away from `idle` (to busy or
+/// waiting), so this can withhold a dispatch but never force one.
 pub fn agent_status_to_state_hint(status: &str, launch_pending: bool) -> Option<String> {
     if launch_pending {
         return Some(HINT_BUSY.to_string());
     }
     match status {
-        "working" | "blocked" => Some(HINT_BUSY.to_string()),
+        "working" => Some(HINT_BUSY.to_string()),
+        "blocked" => Some(HINT_WAITING.to_string()),
         _ => None, // idle, done, unknown, or anything unrecognized
     }
 }
@@ -169,13 +188,10 @@ pub fn agent_name(kind: &str, key: &SessionKey) -> String {
     format!("{kind}-{:08x}", fnv1a32(id.as_bytes()))
 }
 
-/// Both agent names (one per `CliKind`) a session key can hold, sharing the hash
-/// suffix: `[claude-<hash>, codex-<hash>]`.
-pub fn agent_names_for(key: &SessionKey) -> [String; 2] {
-    [
-        agent_name(herdr_kind(CliKind::Claude), key),
-        agent_name(herdr_kind(CliKind::Codex), key),
-    ]
+/// Every agent name (one per `CliKind`, in [`CliKind::ALL`] order) a session key can
+/// hold, sharing the hash suffix: `[claude-<hash>, codex-<hash>, agy-<hash>]`.
+pub fn agent_names_for(key: &SessionKey) -> [String; CLI_COUNT] {
+    CliKind::ALL.map(|c| agent_name(c.spec().herdr_kind, key))
 }
 
 /// FNV-1a 32-bit hash (stable across runs/platforms; no external dep).
@@ -196,6 +212,36 @@ mod tests {
     fn kind_mapping() {
         assert_eq!(herdr_kind(CliKind::Claude), "claude");
         assert_eq!(herdr_kind(CliKind::Codex), "codex");
+        assert_eq!(herdr_kind(CliKind::Antigravity), "agy");
+    }
+
+    #[test]
+    fn antigravity_args_and_fallback_chain() {
+        let args = |autonomy, d: &ResumeDecision| {
+            build_agent_args_opts(CliKind::Antigravity, autonomy, d, true)
+        };
+        assert_eq!(
+            args(true, &resume(CliKind::Antigravity, "abc-1")),
+            ["--dangerously-skip-permissions", "--conversation", "abc-1"]
+        );
+        assert_eq!(args(false, &ResumeDecision::Continue), ["-c"]);
+        assert!(args(false, &FRESH).is_empty());
+        // An unusable id starts fresh instead of `-c`.
+        assert!(args(false, &resume(CliKind::Antigravity, "a b")).is_empty());
+        // A failed resume skips `-c`; Claude and Codex still pass through `Continue`.
+        assert_eq!(
+            next_fallback(&resume(CliKind::Antigravity, "abc-1")),
+            Some(FRESH)
+        );
+        assert_eq!(
+            next_fallback(&resume(CliKind::Claude, "abc-1")),
+            Some(ResumeDecision::Continue)
+        );
+        assert_eq!(
+            next_fallback(&resume(CliKind::Codex, "abc-1")),
+            Some(ResumeDecision::Continue)
+        );
+        assert_eq!(next_fallback(&ResumeDecision::Continue), Some(FRESH));
     }
 
     const FRESH: ResumeDecision = ResumeDecision::Fresh;
@@ -240,6 +286,7 @@ mod tests {
         let id = "0b9e6c3e-1f2a-4c5d-8e7f-a1b2c3d4e5f6";
         let claude = CliKind::Claude;
         let codex = CliKind::Codex;
+        let ag = CliKind::Antigravity;
         let cases: Vec<(CliKind, bool, ResumeDecision, Vec<&str>)> = vec![
             (
                 claude,
@@ -328,6 +375,22 @@ mod tests {
                     "--dangerously-bypass-hook-trust",
                 ],
             ),
+            (
+                ag,
+                true,
+                resume(ag, id),
+                vec!["--dangerously-skip-permissions", "--conversation", id],
+            ),
+            (ag, false, resume(ag, id), vec!["--conversation", id]),
+            (
+                ag,
+                true,
+                ResumeDecision::Continue,
+                vec!["--dangerously-skip-permissions", "-c"],
+            ),
+            (ag, false, ResumeDecision::Continue, vec!["-c"]),
+            (ag, true, FRESH, vec!["--dangerously-skip-permissions"]),
+            (ag, false, FRESH, vec![]),
         ];
         for (cli, autonomy, decision, want) in cases {
             assert_eq!(
@@ -569,17 +632,64 @@ mod tests {
     }
 
     #[test]
-    fn status_map_busy_vs_idle() {
+    fn next_fallback_claude_and_codex_chains_pass_through_continue() {
+        for cli in [CliKind::Claude, CliKind::Codex] {
+            let mut chain = vec![resume(cli, "x")];
+            while let Some(next) = next_fallback(chain.last().unwrap()) {
+                chain.push(next);
+            }
+            assert_eq!(
+                chain,
+                vec![resume(cli, "x"), ResumeDecision::Continue, FRESH],
+                "{cli:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn next_fallback_antigravity_skips_continue() {
+        let id = "0b9e6c3e-1f2a-4c5d-8e7f-a1b2c3d4e5f6";
+        let r = resume(CliKind::Antigravity, id);
+        assert_eq!(next_fallback(&r), Some(FRESH));
+        assert_eq!(next_fallback(&FRESH), None);
+    }
+
+    #[test]
+    fn antigravity_ignores_hook_trust() {
+        let on = build_agent_args_opts(CliKind::Antigravity, false, &FRESH, true);
+        let off = build_agent_args_opts(CliKind::Antigravity, false, &FRESH, false);
+        assert_eq!(on, off);
+        assert!(on.is_empty());
+    }
+
+    #[test]
+    fn unsafe_antigravity_id_degrades_to_fresh() {
+        let r = resume(CliKind::Antigravity, "a b");
+        assert!(build_agent_args(CliKind::Antigravity, false, &r).is_empty());
+        assert_eq!(
+            build_agent_args(CliKind::Antigravity, true, &r),
+            vec!["--dangerously-skip-permissions"]
+        );
+    }
+
+    #[test]
+    fn agent_status_maps_blocked_to_waiting() {
         let busy = Some(HINT_BUSY.to_string());
         assert_eq!(agent_status_to_state_hint("working", false), busy);
-        assert_eq!(agent_status_to_state_hint("blocked", false), busy);
+        assert_eq!(
+            agent_status_to_state_hint("blocked", false),
+            Some(HINT_WAITING.to_string())
+        );
         // launch_pending is busy regardless of the status string
         assert_eq!(agent_status_to_state_hint("idle", true), busy);
+        assert_eq!(agent_status_to_state_hint("blocked", true), busy);
+        assert_eq!(agent_status_to_state_hint("bogus", true), busy);
         // idle/done/unknown are not busy
         assert_eq!(agent_status_to_state_hint("idle", false), None);
         assert_eq!(agent_status_to_state_hint("done", false), None);
         assert_eq!(agent_status_to_state_hint("unknown", false), None);
         assert_eq!(agent_status_to_state_hint("something-new", false), None);
+        assert_eq!(agent_status_to_state_hint("bogus", false), None);
     }
 
     #[test]
@@ -612,10 +722,14 @@ mod tests {
             project: "proj".into(),
             worktree: "alpha".into(),
         };
-        let [c, x] = agent_names_for(&k);
+        let [c, x, a] = agent_names_for(&k);
         assert_eq!(c, agent_name("claude", &k));
         assert_eq!(x, agent_name("codex", &k));
-        assert_eq!(c.split_once('-').unwrap().1, x.split_once('-').unwrap().1);
+        assert!(a.starts_with("agy-"));
+        let suffix = c.split_once('-').unwrap().1;
+        assert_eq!(suffix.len(), 8);
+        assert_eq!(suffix, x.split_once('-').unwrap().1);
+        assert_eq!(suffix, a.split_once('-').unwrap().1);
     }
 
     #[test]

@@ -10,7 +10,6 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  cliTitle,
   pendingRestartAction,
   restartNoticeCopy,
   sessionKey,
@@ -68,6 +67,7 @@ import {
 } from "../lib/paneStatus";
 import { isWindows } from "../lib/platform";
 import { chromeStart, stripPromptChrome } from "../lib/promptChrome";
+import { cliTitle } from "../lib/providers";
 import { paneRecoveryState, recoveryItem, recoveryPaneMessage } from "../lib/recovery";
 import {
   dimLine,

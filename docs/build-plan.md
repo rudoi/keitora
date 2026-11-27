@@ -555,6 +555,8 @@ Status: **Phase 0 ✅ done** · **Phase 1 ✅ done (PR #1)** · **Phase 2 ✅ do
   - The Windows stop-first flow.
   - The macOS brew and native update paths.
   - `codex update` for native codex installs and the brew cask names are unverified.
+
+  Antigravity joined the same machinery later (release manifest, `agy update`); see its entry.
 - **#0074 — Terminal link reach. ✅ done.** Two link bugs in agent panes:
   - Wrapped links only underlined and opened the hovered row's fragment. herdr repaints the
     screen, so xterm never marks rows wrapped. One provider now finds web and file links on a
@@ -592,6 +594,38 @@ Status: **Phase 0 ✅ done** · **Phase 1 ✅ done (PR #1)** · **Phase 2 ✅ do
   - A close during a start cancels it; a failed start closes its pane.
 
   Still owed: live updates with herdr on PowerShell and on Git Bash, and on macOS (zsh/fish).
+
+- **#0077 — Antigravity CLI as a third agent provider. ✅ done.** `agy` is now a first-class
+  agent beside `claude` and `codex`. Changes:
+  - A provider table drives every per-agent difference; settings and snapshots use provider-keyed
+    wire shapes in Rust and TypeScript, and config and the task DB persist the new provider.
+  - Discovery, launch, resume and trust: `agy` is found on `PATH` and in its installer folder, its
+    workspace trust is seeded, herdr's `antigravity-cli` integration is gated on `agy` being
+    installed, and a fresh install is noticed without a restart.
+  - Session state: a global hook in `~/.gemini/config/hooks.json` that only acts inside Keitora
+    panes, the `keitora session --stdin-payload --if-fully-idle` command, and herdr `blocked`
+    now reads as `waiting` for every provider.
+  - Updates and doctor: version probe, release-manifest latest version, install kind, `agy update`,
+    and a doctor row.
+  - Agent switching: a worktree can switch between agents (with a warning).
+  - UI: Antigravity glyph, a generic provider settings group and a default-agent picker.
+  - Dev isolation: isolated runs keep the integration opt-out, which every global writer honours,
+    so no real `~/.gemini` writes happen.
+  - Release notes: configs that name `antigravity` do not parse in older Keitora versions;
+    downgrading after using Antigravity needs those entries removed.
+
+  Still owed:
+  - Live smoke on Windows and macOS (needs an Antigravity sign-in first), including the global
+    hook firing in the interactive TUI.
+  - Confirm the seeded `trustedWorkspaces` string shape suppresses the `agy` trust prompt.
+  - Confirm herdr's session source is `herdr:antigravity_cli` in a live pane.
+  - An `agy` prompt-chrome detector (no screen sample yet).
+  - Confirm `agy -c` behaviour with no history, and the startup update-screen behaviour with a
+    pending update.
+  - Conversation transfer to/from `agy` (switching exists; transfer is tracked as a follow-up task).
+  - Real-app smoke of the switch flow, and macOS/Linux discovery.
+  - Before any dev-isolated run on a real machine, check that `KEITORA_HERDR_NO_INTEGRATION`
+    reaches the app process and that `~/.gemini` has no new files afterwards.
 
 - **Phase 5 — Polish & packaging. ✅ done (PR #7).** Scrollback search (xterm search addon + Cmd+F
   overlay); central keymap (`src/lib/keybindings.ts`: Cmd+↑/↓ worktree cycle, Cmd+F

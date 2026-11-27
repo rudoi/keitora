@@ -213,10 +213,14 @@ fn pane_not_found(pane_id: &str) -> HerdrError {
 }
 
 /// The session id an agent launched with `args` resumes: the value after
-/// `--resume` (claude) or `resume` (codex), unless it is itself a flag.
+/// `--resume` (claude), `resume` (codex) or `--conversation` (agy), unless it is
+/// itself a flag.
 fn resume_id_from(args: &[String]) -> Option<String> {
     args.windows(2)
-        .find(|w| (w[0] == "--resume" || w[0] == "resume") && !w[1].starts_with('-'))
+        .find(|w| {
+            (w[0] == "--resume" || w[0] == "resume" || w[0] == "--conversation")
+                && !w[1].starts_with('-')
+        })
         .map(|w| w[1].clone())
 }
 
@@ -1296,6 +1300,20 @@ impl CaptureOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_id_from_reads_conversation_flag() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            resume_id_from(&args(&[
+                "--dangerously-skip-permissions",
+                "--conversation",
+                "c1"
+            ])),
+            Some("c1".to_string())
+        );
+        assert_eq!(resume_id_from(&args(&["-c"])), None);
+    }
 
     fn session(agent: &str, id: &str) -> AgentSession {
         AgentSession {

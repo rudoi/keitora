@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::backend::EmitSink;
-use crate::backend::{DaemonStats, SessionKey, StatusPayload, HINT_BUSY};
+use crate::backend::{DaemonStats, SessionKey, StatusPayload};
 use crate::deps::floor::FloorSlot;
 use crate::headroom::{Headroom, HeadroomSnapshot, PHYS_MARGIN_BYTES};
 
@@ -241,8 +241,8 @@ pub fn observations_from(
         .filter_map(|(key, entry)| {
             let pane = panes.iter().find(|p| p.pane_id == entry.pane_id)?;
             let status = pane.agent_status.as_deref().unwrap_or("");
-            let busy =
-                agent::agent_status_to_state_hint(status, false).as_deref() == Some(HINT_BUSY);
+            // Any agent hint counts: a `blocked` (waiting) agent is still mid-turn.
+            let busy = agent::agent_status_to_state_hint(status, false).is_some();
             Some(Observation {
                 key: key.clone(),
                 busy,
@@ -1278,6 +1278,32 @@ mod tests {
                 ("d".to_string(), false)
             ]
         );
+    }
+
+    #[test]
+    fn status_loop_observation_counts_blocked_as_busy() {
+        let pane = PaneInfo {
+            workspace_id: "w".into(),
+            pane_id: "p1".into(),
+            terminal_id: "t-p1".into(),
+            cwd: Some("/x".into()),
+            agent: Some("claude".into()),
+            agent_status: Some("blocked".into()),
+            agent_session: None,
+            scroll: None,
+            viewport_rows: None,
+        };
+        let entry = HerdrPane {
+            workspace_id: "w".into(),
+            pane_id: "p1".into(),
+            terminal_id: "t-p1".into(),
+            gen: 1,
+            cwd: "/x".into(),
+            server_generation: Generation::default(),
+        };
+        let got = observations_from(&[(key("a"), entry)], &[pane]);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].busy, "a blocked agent still counts as busy");
     }
 
     // ── Failure ──────────────────────────────────────────────────────────────

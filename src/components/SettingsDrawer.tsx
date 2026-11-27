@@ -6,17 +6,13 @@
 
 import * as Dialog from "@radix-ui/react-dialog";
 import { AlertTriangle, Loader2, X } from "lucide-react";
-import { type ReactNode, useEffect, useRef, useState } from "react";
-import {
-  AGENT_CLIS,
-  entryStatusLine,
-  installKindLabel,
-  parseCheckHours,
-} from "../lib/agentUpdates";
+import { useEffect, useRef, useState } from "react";
+import { entryStatusLine, installKindLabel, parseCheckHours } from "../lib/agentUpdates";
 import { btnGhost, btnPrimary } from "../lib/buttonStyles";
 import type { CliKind, DiffBase, ProjectSummary } from "../lib/ipc";
 import { daemonRestart, daemonShutdown } from "../lib/ipc";
 import { LAYER_MODAL, MODAL_OVERLAY_CLS } from "../lib/layers";
+import { CLI_KINDS, cliTitle } from "../lib/providers";
 import { RESTART_FALLBACK_MS, restartOutcome } from "../lib/recovery";
 import { useDaemonStatus, useRecovery } from "../lib/sessions";
 import {
@@ -30,10 +26,19 @@ import {
   setSkipPermissions,
   setUpdateAutoCheck,
 } from "../lib/settings";
+import {
+  buildProviderSaves,
+  defaultCliButtons,
+  emptyForms,
+  type ProviderForm,
+  seedProjectForms,
+  seedUserForms,
+} from "../lib/settingsForm";
 import { isThemeMode, THEME_MODES, themeLabel, useTheme } from "../lib/theme";
 import { errorText, installLabel, isBusy, statusLine } from "../lib/updates";
 import { useAgentUpdates } from "./AgentUpdatesProvider";
 import { DepsSection } from "./DepsSection";
+import { type DispatchEditorRender, ProviderSettingsGroup } from "./ProviderSettingsGroup";
 import { RestartDaemonDialog } from "./RestartDaemonDialog";
 import { useToast } from "./Toast";
 import { useUpdates } from "./UpdatesProvider";
@@ -380,12 +385,12 @@ function AgentUpdatesSection({ hours: initialHours }: { hours: number }) {
   return (
     <section className="flex flex-col gap-3 border-t border-line pt-6">
       <div className={sectionTitle}>agent cli updates</div>
-      {AGENT_CLIS.map((cli) => {
-        const entry = snapshot?.[cli] ?? null;
+      {CLI_KINDS.map((cli) => {
+        const entry = snapshot?.agents[cli] ?? null;
         return (
           <div key={cli} className="flex flex-col gap-0.5">
             <div className="flex items-baseline justify-between gap-3">
-              <span className="text-[12px] font-semibold text-tx-1">{cli}</span>
+              <span className="text-[12px] font-semibold text-tx-1">{cliTitle(cli)}</span>
               <span className="text-[11px] text-tx-3">
                 {entry ? entryStatusLine(entry) : "not checked yet"}
               </span>
@@ -439,8 +444,7 @@ export function SettingsDrawer({
   onOpenChange,
   onSwitchProject,
   onAddProject: _onAddProject,
-  dispatchEditor,
-  codexDispatchEditor,
+  dispatchEditors,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -450,12 +454,9 @@ export function SettingsDrawer({
   onSwitchProject: (name: string, summary?: ProjectSummary) => Promise<void>;
   /** Opens the add-project dialog (single mount in App.tsx). */
   onAddProject?: () => void;
-  /** Mounts the Claude dispatch-steps editor here. Receives the current steps
-   * and an onChange to update them; until then a placeholder renders. */
-  dispatchEditor?: (steps: string[], onChange: (steps: string[]) => void) => ReactNode;
-  /** Mounts the Codex dispatch-steps editor — identical signature to
-   * `dispatchEditor`, edits the Codex group's own step list. */
-  codexDispatchEditor?: (steps: string[], onChange: (steps: string[]) => void) => ReactNode;
+  /** Per-provider dispatch-steps editors. Each receives the current steps and an
+   * onChange to update them; a provider without one shows a placeholder. */
+  dispatchEditors?: Partial<Record<CliKind, DispatchEditorRender>>;
 }) {
   const { showToast } = useToast();
   const [snap, setSnap] = useState<SettingsSnapshot | null>(null);
@@ -470,10 +471,10 @@ export function SettingsDrawer({
   const [worktreesDir, setWorktreesDir] = useState("");
   const [archiveDays, setArchiveDays] = useState("30");
   const [logRetentionDays, setLogRetentionDays] = useState("90");
-  const [projClaude, setProjClaude] = useState("");
-  const [projCodex, setProjCodex] = useState("");
-  const [dispatchSteps, setDispatchSteps] = useState<string[]>([]);
-  const [codexDispatchSteps, setCodexDispatchSteps] = useState<string[]>([]);
+  // Per-provider paths, dispatch steps and autonomy, for both sections.
+  const [forms, setForms] = useState(emptyForms);
+  const patchForm = (cli: CliKind, patch: Partial<ProviderForm>) =>
+    setForms((f) => ({ ...f, [cli]: { ...f[cli], ...patch } }));
   // Project default diff base: a kind select + the ref/parent text for ref/forkPoint.
   const [diffBaseKind, setDiffBaseKind] = useState<DiffBase["kind"]>("auto");
   const [diffBaseText, setDiffBaseText] = useState("");
@@ -482,41 +483,31 @@ export function SettingsDrawer({
   const [committingFile, setCommittingFile] = useState(false);
 
   // User form state.
-  const [userClaude, setUserClaude] = useState("");
-  const [userCodex, setUserCodex] = useState("");
   const [defaultCli, setDefaultCli] = useState<CliKind>("claude");
   const [savingUser, setSavingUser] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
 
-  // Per-CLI launch autonomy toggles. `skipRestart`
+  // The per-provider autonomy toggles live in `forms`. `skipRestart`
   // is local-only: it surfaces a non-destructive restart prompt after a toggle
   // and is intentionally NOT seeded from the snapshot so a settings reload can't
-  // dismiss it unexpectedly. One shared restart prompt covers either toggle since
-  // both are cleared by the same daemon restart.
-  const [skipPerms, setSkipPerms] = useState(false);
-  const [codexAutonomy, setCodexAutonomy] = useState(false);
+  // dismiss it unexpectedly. One shared restart prompt covers every toggle since
+  // all are cleared by the same daemon restart.
   const [skipRestart, setSkipRestart] = useState(false);
 
   const seedProject = (s: SettingsSnapshot) => {
     setWorktreesDir(s.project.worktrees_dir ?? "");
     setArchiveDays(String(s.project.archive_days));
     setLogRetentionDays(String(s.project.log_retention_days));
-    setProjClaude(s.project.claude_path ?? "");
-    setProjCodex(s.project.codex_path ?? "");
-    setDispatchSteps(s.project.dispatch_steps);
-    setCodexDispatchSteps(s.project.codex_dispatch_steps);
+    setForms((f) => seedProjectForms(f, s));
     const db = s.project.diff_base;
     setDiffBaseKind(db?.kind ?? "auto");
     setDiffBaseText(db?.kind === "ref" ? db.name : db?.kind === "forkPoint" ? db.parent : "");
   };
   const seedUser = (s: SettingsSnapshot) => {
-    setUserClaude(s.user.claude_path ?? "");
-    setUserCodex(s.user.codex_path ?? "");
+    // Paths and the autonomy toggles; clear any stale restart prompt on (re)open.
+    setForms((f) => seedUserForms(f, s));
     setDefaultCli(s.user.default_cli);
     setConfirmRemove(null);
-    // Seed the autonomy toggles; clear any stale restart prompt on (re)open.
-    setSkipPerms(s.user.skip_permissions);
-    setCodexAutonomy(s.user.codex_autonomy);
     setSkipRestart(false);
   };
 
@@ -569,10 +560,7 @@ export function SettingsDrawer({
         archiveDays: a,
         logRetentionDays: l,
         worktreesDir: nz(worktreesDir),
-        claudePath: nz(projClaude),
-        codexPath: nz(projCodex),
-        dispatchSteps: dispatchSteps.map((s) => s.trim()).filter((s) => s !== ""),
-        codexDispatchSteps: codexDispatchSteps.map((s) => s.trim()).filter((s) => s !== ""),
+        providers: buildProviderSaves(forms).project,
         diffBase: buildDiffBase(diffBaseKind, diffBaseText),
       });
       showToast("Project settings saved.");
@@ -588,11 +576,7 @@ export function SettingsDrawer({
     if (savingUser) return;
     setSavingUser(true);
     try {
-      await saveUserSettings({
-        claudePath: nz(userClaude),
-        codexPath: nz(userCodex),
-        defaultCli,
-      });
+      await saveUserSettings({ providers: buildProviderSaves(forms).user, defaultCli });
       showToast("User settings saved.");
       await refresh({ user: true });
     } catch (e) {
@@ -642,16 +626,12 @@ export function SettingsDrawer({
   // Generalized autonomy toggle: `cli` selects which provider's flag is
   // flipped, backed by the leading-discriminator `setSkipPermissions(cli, enabled)`.
   const toggleAutonomy = async (cli: CliKind) => {
-    const current = cli === "claude" ? skipPerms : codexAutonomy;
-    const seeded =
-      cli === "claude"
-        ? (snap?.user.skip_permissions ?? false)
-        : (snap?.user.codex_autonomy ?? false);
+    const current = forms[cli].autonomy;
+    const seeded = snap?.user.providers[cli].autonomy ?? false;
     const next = !current;
     try {
       await setSkipPermissions(cli, next);
-      if (cli === "claude") setSkipPerms(next);
-      else setCodexAutonomy(next);
+      patchForm(cli, { autonomy: next });
       // New sessions pick this up automatically; prompt to restart so running
       // sessions respawn with the new args — but only when the persisted value
       // actually changed (toggling back to the seeded value needs no restart).
@@ -825,9 +805,6 @@ export function SettingsDrawer({
                     </span>
                   </label>
 
-                  {/* Claude/Codex path overrides + dispatch rituals now render inline in
-                      the per-CLI provider groups below (Claude, Codex) — this button
-                      still saves them, since they're the same form state. */}
                   <div className="flex justify-end">
                     <button
                       className={btnPrimary}
@@ -903,29 +880,24 @@ export function SettingsDrawer({
                   <div className="flex items-center justify-between gap-3">
                     <span className={label}>Default CLI</span>
                     <div className="flex gap-1.5" role="group" aria-label="Default CLI">
-                      <button
-                        className={defaultCli === "claude" ? btnPrimary : btnGhost}
-                        aria-pressed={defaultCli === "claude"}
-                        onClick={() => setDefaultCli("claude")}
-                      >
-                        Claude
-                      </button>
-                      <button
-                        className={defaultCli === "codex" ? btnPrimary : btnGhost}
-                        aria-pressed={defaultCli === "codex"}
-                        onClick={() => setDefaultCli("codex")}
-                      >
-                        Codex
-                      </button>
+                      {defaultCliButtons(snap.user.available, defaultCli).map((b) => (
+                        <button
+                          key={b.cli}
+                          className={b.pressed ? btnPrimary : btnGhost}
+                          aria-pressed={b.pressed}
+                          disabled={b.disabled}
+                          title={b.disabled ? `${cliTitle(b.cli)} not found` : undefined}
+                          onClick={() => setDefaultCli(b.cli)}
+                        >
+                          {cliTitle(b.cli)}
+                        </button>
+                      ))}
                     </div>
                   </div>
                   <p className="text-[11px] text-tx-3">
                     Which CLI a worktree launches when it has no explicit CLI of its own.
                   </p>
 
-                  {/* Claude/Codex user-default paths now render inline in the per-CLI
-                      provider groups below — this button still saves them, since
-                      they're the same form state (along with Default CLI above). */}
                   <div className="flex justify-end">
                     <button
                       className={btnPrimary}
@@ -1022,176 +994,19 @@ export function SettingsDrawer({
                   </div>
                 </section>
 
-                {/* ── Claude ─────────────────────────────────────────────── */}
-                <section className="flex flex-col gap-3 border-t border-line pt-6">
-                  <div className={sectionTitle}>Claude</div>
-
-                  <label className="flex flex-col gap-1.5">
-                    <span className={label}>Claude path (user default)</span>
-                    <input
-                      className={field}
-                      value={userClaude}
-                      onChange={(e) => setUserClaude(e.target.value)}
-                      placeholder="(auto-discovered when empty)"
-                    />
-                  </label>
-
-                  <label className="flex flex-col gap-1.5">
-                    <span className={label}>Claude path (project override)</span>
-                    <input
-                      className={snap.project.has_committed_file ? field : fieldRo}
-                      value={projClaude}
-                      onChange={(e) => setProjClaude(e.target.value)}
-                      placeholder="(uses the user default when empty)"
-                      disabled={!snap.project.has_committed_file}
-                      readOnly={!snap.project.has_committed_file}
-                      tabIndex={snap.project.has_committed_file ? undefined : -1}
-                    />
-                    {!snap.project.has_committed_file && (
-                      <span className="text-[11px] text-tx-3">
-                        A project-level Claude override requires a committed{" "}
-                        <code>keitora.toml</code>. Commit a file below, or set the user-level
-                        default above.
-                      </span>
-                    )}
-                  </label>
-
-                  <div className="flex flex-col gap-1.5">
-                    <span className={label}>Dispatch ritual</span>
-                    {dispatchEditor ? (
-                      dispatchEditor(dispatchSteps, setDispatchSteps)
-                    ) : (
-                      <p className="text-[11px] text-tx-3">
-                        {dispatchSteps.length === 0
-                          ? "Using Keitora's built-in dispatch prompt."
-                          : `${dispatchSteps.length} step(s) configured.`}
-                      </p>
-                    )}
-                  </div>
-
-                  <div className="flex items-center justify-between gap-3">
-                    <span className={label}>Skip permission prompts</span>
-                    <button
-                      className={skipPerms ? btnPrimary : btnGhost}
-                      onClick={() => void toggleAutonomy("claude")}
-                    >
-                      {skipPerms ? "Enabled" : "Disabled"}
-                    </button>
-                  </div>
-                  {/* Icon + a single text child: keep the sentence (incl. <code>)
-                      out of the flex layout so it flows as one paragraph. */}
-                  <div className="flex items-start gap-1.5 text-[11px] text-tx-3">
-                    <AlertTriangle size={13} className="mt-0.5 flex-none" />
-                    <span>
-                      Launches Claude with <code>--dangerously-skip-permissions</code>, bypassing
-                      its per-action approval prompts. Only enable if you understand the risk.
-                    </span>
-                  </div>
-
-                  {snap?.project.skip_permissions && (
-                    <div className="flex items-start gap-1.5 text-[11px] text-busy">
-                      <AlertTriangle size={13} className="mt-0.5 flex-none" />
-                      <span>
-                        This project's <code>keitora.toml</code> enables skip-permissions, so its
-                        sessions launch with the flag regardless of the toggle above.
-                      </span>
-                    </div>
-                  )}
-                </section>
-
-                {/* ── Codex ──────────────────────────────────────── */}
-                <section className="flex flex-col gap-3 border-t border-line pt-6">
-                  <div className={sectionTitle}>Codex</div>
-
-                  {!snap.user.codex_available && (
-                    <p className="text-[11px] text-tx-3">
-                      Codex not found on PATH — install it, then reopen Settings.
-                    </p>
-                  )}
-
-                  <label className="flex flex-col gap-1.5">
-                    <span className={label}>Codex path (user default)</span>
-                    <input
-                      className={snap.user.codex_available ? field : fieldRo}
-                      value={userCodex}
-                      onChange={(e) => setUserCodex(e.target.value)}
-                      placeholder="(auto-discovered when empty)"
-                      disabled={!snap.user.codex_available}
-                      readOnly={!snap.user.codex_available}
-                      tabIndex={snap.user.codex_available ? undefined : -1}
-                    />
-                  </label>
-
-                  <label className="flex flex-col gap-1.5">
-                    <span className={label}>Codex path (project override)</span>
-                    <input
-                      className={
-                        snap.user.codex_available && snap.project.has_committed_file
-                          ? field
-                          : fieldRo
-                      }
-                      value={projCodex}
-                      onChange={(e) => setProjCodex(e.target.value)}
-                      placeholder="(uses the user default when empty)"
-                      disabled={!snap.user.codex_available || !snap.project.has_committed_file}
-                      readOnly={!snap.user.codex_available || !snap.project.has_committed_file}
-                      tabIndex={
-                        snap.user.codex_available && snap.project.has_committed_file
-                          ? undefined
-                          : -1
-                      }
-                    />
-                    {snap.user.codex_available && !snap.project.has_committed_file && (
-                      <span className="text-[11px] text-tx-3">
-                        A project-level Codex override requires a committed{" "}
-                        <code>keitora.toml</code>. Commit a file below, or set the user-level
-                        default above.
-                      </span>
-                    )}
-                  </label>
-
-                  <div className="flex flex-col gap-1.5">
-                    <span className={label}>Dispatch ritual</span>
-                    {codexDispatchEditor && snap.user.codex_available ? (
-                      codexDispatchEditor(codexDispatchSteps, setCodexDispatchSteps)
-                    ) : (
-                      <p className="text-[11px] text-tx-3">
-                        {codexDispatchSteps.length === 0
-                          ? "Using Keitora's built-in dispatch prompt."
-                          : `${codexDispatchSteps.length} step(s) configured.`}
-                      </p>
-                    )}
-                  </div>
-
-                  <div className="flex items-center justify-between gap-3">
-                    <span className={label}>Bypass approvals &amp; sandbox (danger)</span>
-                    <button
-                      className={codexAutonomy ? btnPrimary : btnGhost}
-                      onClick={() => void toggleAutonomy("codex")}
-                      disabled={!snap.user.codex_available}
-                    >
-                      {codexAutonomy ? "Enabled" : "Disabled"}
-                    </button>
-                  </div>
-                  <div className="flex items-start gap-1.5 text-[11px] text-tx-3">
-                    <AlertTriangle size={13} className="mt-0.5 flex-none" />
-                    <span>
-                      Launches Codex with <code>--dangerously-bypass-approvals-and-sandbox</code>,
-                      bypassing both its sandbox and its per-action approval prompts — broader than
-                      Claude's flag. Only enable if you understand the risk.
-                    </span>
-                  </div>
-
-                  {snap.project.codex_autonomy && (
-                    <div className="flex items-start gap-1.5 text-[11px] text-busy">
-                      <AlertTriangle size={13} className="mt-0.5 flex-none" />
-                      <span>
-                        This project's <code>keitora.toml</code> enables Codex autonomy, so its
-                        sessions launch with the flag regardless of the toggle above.
-                      </span>
-                    </div>
-                  )}
-                </section>
+                {CLI_KINDS.map((cli) => (
+                  <ProviderSettingsGroup
+                    key={cli}
+                    cli={cli}
+                    available={snap.user.available[cli]}
+                    hasCommittedFile={snap.project.has_committed_file}
+                    projectAutonomy={snap.project.providers[cli].autonomy}
+                    form={forms[cli]}
+                    onChange={(patch) => patchForm(cli, patch)}
+                    onToggleAutonomy={() => void toggleAutonomy(cli)}
+                    dispatchEditor={dispatchEditors?.[cli]}
+                  />
+                ))}
 
                 {/* Shared restart prompt: either autonomy toggle above can trigger it,
                     since both persist immediately and both need the same daemon

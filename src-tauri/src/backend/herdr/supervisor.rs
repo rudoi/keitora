@@ -27,6 +27,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use keitora_tasks::CliKind;
+
 use crate::backend::PtyBackendError;
 use crate::headroom::{Headroom, SystemHeadroom};
 use crate::lifecycle::{self, LifecycleEvent, ServerStartHow};
@@ -36,13 +38,37 @@ use super::ops::{ExitInfo, HerdrOps, ServerInstance, ServerProcess};
 use super::watchdog::{format_exit, Watchdog, UNKNOWN_INSTANCE};
 
 /// Opt-out env var (any value): never run `herdr integration install` (it writes the
-/// user's REAL ~/.claude / ~/.codex). Set by `yarn dev:herdr` and the gated tests.
+/// user's REAL ~/.claude / ~/.codex / ~/.gemini). Set by `yarn dev:herdr` and the
+/// gated tests.
 pub const NO_INTEGRATION_ENV: &str = "KEITORA_HERDR_NO_INTEGRATION";
 
 /// Pure opt-out check: integration install is enabled only when the opt-out env
 /// var is absent.
 pub fn integration_enabled(env_val: Option<String>) -> bool {
     env_val.is_none()
+}
+
+/// herdr integration targets to install: every provider's `herdr_integration`,
+/// Antigravity's only when `agy` was found (so users without `agy` never get
+/// `~/.gemini/config/hooks/*` written).
+pub fn integration_targets(agy_found: bool) -> Vec<&'static str> {
+    CliKind::ALL
+        .iter()
+        .filter(|c| **c != CliKind::Antigravity || agy_found)
+        .map(|c| c.spec().herdr_integration)
+        .collect()
+}
+
+/// Whether `agy` counts as installed for the integration gate: a configured
+/// `[antigravity].path` (project override, else user default) or a discovered
+/// executable. `discover` runs only when nothing is configured.
+pub fn agy_installed(
+    user: &keitora_tasks::UserConfig,
+    project: Option<&keitora_tasks::ProjectConfig>,
+    discover: impl FnOnce() -> bool,
+) -> bool {
+    keitora_tasks::resolve_provider_path(CliKind::Antigravity, project, user).is_some()
+        || discover()
 }
 
 /// Max time to wait for a freshly spawned server to answer its socket.
@@ -220,10 +246,11 @@ impl Supervisor {
         }
     }
 
-    /// Install herdr's claude/codex integrations (state hooks) once per process.
-    /// SKIPPED entirely when `KEITORA_HERDR_NO_INTEGRATION` is set (process env or
-    /// the herdr env pairs) and always under `cfg(test)`, since the install writes
-    /// the real global `~/.claude` / `~/.codex`. Every failure is non-fatal.
+    /// Install herdr's provider integrations (state hooks) once per process; the
+    /// Antigravity one only when `agy` is installed. SKIPPED entirely when
+    /// `KEITORA_HERDR_NO_INTEGRATION` is set (process env or the herdr env pairs)
+    /// and always under `cfg(test)`, since the install writes the real global
+    /// `~/.claude` / `~/.codex` / `~/.gemini`. Every failure is non-fatal.
     pub fn ensure_ready(&self, ops: &dyn HerdrOps) {
         if self.ready_done.swap(true, Ordering::SeqCst) {
             return;
@@ -240,7 +267,13 @@ impl Supervisor {
             log::info!("herdr: integration install skipped ({NO_INTEGRATION_ENV} / test)");
             return;
         }
-        for target in ["claude", "codex"] {
+        // Discovery runs only past the test / opt-out return above.
+        let user = keitora_tasks::UserConfig::load().unwrap_or_default();
+        let project = keitora_tasks::resolve_active().ok();
+        let agy_found = agy_installed(&user, project.as_ref(), || {
+            keitora_tasks::discover_cli_cached(CliKind::Antigravity).is_some()
+        });
+        for target in integration_targets(agy_found) {
             match ops.integration_status(target) {
                 Ok(IntegrationStatus::NotInstalled | IntegrationStatus::Outdated) => {
                     match ops.integration_install(target) {
@@ -1154,6 +1187,46 @@ mod tests {
                 start_time: 0
             },
             "the child's pid, start time unknown"
+        );
+    }
+
+    #[test]
+    fn integration_targets_omits_antigravity_without_agy() {
+        assert_eq!(integration_targets(false), vec!["claude", "codex"]);
+    }
+
+    #[test]
+    fn integration_targets_includes_antigravity_with_agy() {
+        assert_eq!(
+            integration_targets(true),
+            vec!["claude", "codex", "antigravity-cli"]
+        );
+    }
+
+    #[test]
+    fn agy_installed_counts_a_configured_path_without_discovery() {
+        let mut user = keitora_tasks::UserConfig::default();
+        assert!(!agy_installed(&user, None, || false));
+        assert!(agy_installed(&user, None, || true));
+
+        user.antigravity.path = Some("/opt/agy/bin/agy".into());
+        assert!(
+            agy_installed(&user, None, || panic!("discovery must not run")),
+            "a configured user path is enough"
+        );
+    }
+
+    #[test]
+    fn refresh_integration_is_skipped_under_test() {
+        let fake = FakeHerdr::new();
+        let sup = quiet_supervisor();
+        sup.refresh_integration(&*fake);
+        sup.refresh_integration(&*fake);
+        assert_eq!(sup.ready_runs(), 2, "each refresh gets past the latch");
+        assert!(
+            fake.calls().is_empty(),
+            "no integration status/install (and no agy discovery) under cfg(test): {:?}",
+            fake.calls()
         );
     }
 

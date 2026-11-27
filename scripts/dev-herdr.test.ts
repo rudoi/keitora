@@ -264,8 +264,12 @@ describe("herdrDevEnv", () => {
     expect(env.KEITORA_PTY_BACKEND).toBeUndefined();
   });
 
-  it("opts out of herdr integration install (it writes the real ~/.claude/~/.codex)", () => {
+  it("opts out of herdr integration and Keitora's global agent writers (they write the real ~/.claude, ~/.codex and ~/.gemini)", () => {
     expect(herdrDevEnv({}, opts).KEITORA_HERDR_NO_INTEGRATION).toBe("1");
+  });
+
+  it("never lets an isolated run clear the integration opt-out when the parent env sets it empty", () => {
+    expect(herdrDevEnv({ KEITORA_HERDR_NO_INTEGRATION: "" }, opts).KEITORA_HERDR_NO_INTEGRATION).toBe("1");
   });
 
   it("overrides an inherited real KEITORA_CONFIG_HOME (never reuses the shared registry)", () => {

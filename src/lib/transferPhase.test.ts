@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { TransferOutcome, TransferProgress } from "./ipc";
+import type { CliKind, TransferOutcome, TransferProgress } from "./ipc";
 import {
   blocksInput,
   canCancel,
@@ -7,6 +7,7 @@ import {
   formatElapsed,
   freshToastMessage,
   isMidTurn,
+  midTurnNote,
   progressLabel,
   RESTARTING_BACKSTOP_MS,
   restartAfterFailure,
@@ -65,6 +66,7 @@ function entry(over: Partial<TransferEntry> = {}): TransferEntry {
     project: "proj",
     worktree: "alpha",
     to: "codex",
+    mode: "transfer",
     phase: "importing",
     startedAt: 0,
     progress: null,
@@ -82,6 +84,7 @@ describe("transferReducer", () => {
       project: "proj",
       worktree: "alpha",
       to: "codex",
+      mode: "transfer",
       phase: "importing",
       startedAt: 1000,
       progress: null,
@@ -398,6 +401,118 @@ describe("transferReducer", () => {
   });
 });
 
+describe("transferReducer: switch", () => {
+  const beginSwitch = (to: CliKind = "antigravity") =>
+    ({ type: "begin", project: "proj", worktree: "alpha", to, now: 1000, mode: "switch" }) as const;
+  const switched: TransferOutcome = { kind: "switched", from: "claude", to: "antigravity" };
+
+  it("begin switch enters restarting with no result", () => {
+    const { map, effects } = run([beginSwitch()]);
+    expect(map.get(KEY)).toEqual({
+      project: "proj",
+      worktree: "alpha",
+      to: "antigravity",
+      mode: "switch",
+      phase: "restarting",
+      startedAt: 1000,
+      progress: null,
+      cancelling: false,
+      result: null,
+    });
+    expect(effects).toEqual([]);
+  });
+
+  it("switched outcome requests a fresh restart", () => {
+    const { map, effects } = run([beginSwitch(), { type: "outcome", key: KEY, outcome: switched }]);
+    expect(effects).toEqual([{ kind: "restart", project: "proj", worktree: "alpha", fresh: true }]);
+    expect(map.get(KEY)?.result).toEqual({ kind: "switched" });
+    expect(map.get(KEY)?.phase).toBe("restarting");
+  });
+
+  it("switched outcome is ignored for a transfer entry", () => {
+    const start = run([begin()]).map;
+    const step = transferReducer(start, { type: "outcome", key: KEY, outcome: switched });
+    expect(step.map).toBe(start);
+    expect(step.effects).toEqual([]);
+  });
+
+  it("a second outcome is ignored", () => {
+    const start = run([beginSwitch(), { type: "outcome", key: KEY, outcome: switched }]).map;
+    const step = transferReducer(start, { type: "outcome", key: KEY, outcome: switched });
+    expect(step.map).toBe(start);
+    expect(step.effects).toEqual([]);
+  });
+
+  it("switch failure finishes with the error and no diagnostics", () => {
+    const { map, effects } = run([
+      beginSwitch(),
+      { type: "failed", key: KEY, error: "Antigravity isn't installed" },
+    ]);
+    expect(map.size).toBe(0);
+    expect(effects).toEqual([
+      { kind: "toast", message: "Antigravity isn't installed", diagnostics: null },
+      { kind: "settle", project: "proj", worktree: "alpha" },
+    ]);
+  });
+
+  it("a switch to Codex gets no Codex diagnostics on failure", () => {
+    const start: TransferMap = new Map([
+      [
+        KEY,
+        entry({ mode: "switch", to: "codex", phase: "restarting", result: { kind: "switched" } }),
+      ],
+    ]);
+    const { effects } = run(
+      [{ type: "spawn_settled", key: KEY, result: { ok: false, error: "boom" } }],
+      start,
+    );
+    expect(effects[0]).toEqual({ kind: "toast", message: "boom", diagnostics: null });
+  });
+
+  it('switch spawn_settled ok toasts "Switched alpha to Antigravity." and settles', () => {
+    const { map, effects } = run([
+      beginSwitch(),
+      { type: "outcome", key: KEY, outcome: switched },
+      { type: "spawn_settled", key: KEY, result: { ok: true } },
+    ]);
+    expect(map.size).toBe(0);
+    expect(effects.slice(1)).toEqual([
+      { kind: "toast", message: "Switched alpha to Antigravity.", diagnostics: null },
+      { kind: "settle", project: "proj", worktree: "alpha" },
+    ]);
+  });
+
+  it("spawn_settled before the outcome is ignored", () => {
+    const start = run([beginSwitch()]).map;
+    const step = transferReducer(start, {
+      type: "spawn_settled",
+      key: KEY,
+      result: { ok: true },
+    });
+    expect(step.map).toBe(start);
+    expect(step.effects).toEqual([]);
+  });
+
+  it("cancel_requested is ignored for a switch", () => {
+    const start = run([beginSwitch("codex")]).map;
+    const step = transferReducer(start, { type: "cancel_requested", key: KEY });
+    expect(step.map).toBe(start);
+  });
+
+  it("switch backstop names the target", () => {
+    const { effects } = run([beginSwitch(), { type: "backstop", key: KEY }]);
+    expect(effects).toEqual([
+      {
+        kind: "toast",
+        message:
+          "Antigravity did not report that it started within 120 seconds. Check the alpha pane.",
+        diagnostics: null,
+      },
+      { kind: "settle", project: "proj", worktree: "alpha" },
+    ]);
+  });
+});
+
 describe("transfer helpers", () => {
   it("freshToastMessage uses reasonText verbatim and the null-reason fallback copy", () => {
     expect(freshToastMessage("Codex did not start in time")).toBe(
@@ -445,6 +560,12 @@ describe("transfer helpers", () => {
     expect(blocksInput(entry({ phase: "restarting" }))).toBe(false);
     expect(blocksInput(null)).toBe(false);
     expect(blocksInput(undefined)).toBe(false);
+  });
+
+  it("blocksInput is true while a switch awaits its outcome and false after", () => {
+    const awaiting = entry({ mode: "switch", to: "antigravity", phase: "restarting" });
+    expect(blocksInput(awaiting)).toBe(true);
+    expect(blocksInput({ ...awaiting, result: { kind: "switched" } })).toBe(false);
   });
 
   it("isMidTurn is true for busy and waiting only", () => {
@@ -531,6 +652,21 @@ describe("transfer helpers", () => {
       message: "Failed to launch codex — is it on PATH?",
       detail: claudeStrict,
     });
+  });
+
+  it("spawnFailedCopy names the provider's binary", () => {
+    expect(spawnFailedCopy("antigravity", null).message).toBe(
+      "Failed to launch agy — is it on PATH?",
+    );
+    const strict = "agy did not start: x";
+    expect(spawnFailedCopy("antigravity", strict)).toEqual({ message: strict, detail: null });
+  });
+
+  it("midTurnNote names the agent that is mid-turn", () => {
+    expect(midTurnNote("codex").startsWith("Codex is in the middle of a turn")).toBe(true);
+    expect(midTurnNote("claude")).toBe(
+      "Claude is in the middle of a turn. That in-flight turn will not be carried over.",
+    );
   });
 
   it("spawnFailedCopy names an update prompt instead of blaming PATH", () => {
@@ -668,6 +804,28 @@ describe("createTransferController", () => {
     expect(ctl.getMap().has(otherKey)).toBe(false);
   });
 
+  it("switch backstop fires after RESTARTING_BACKSTOP_MS, covering the backend call", () => {
+    const ctl = createTransferController({ run, onChange });
+    ctl.dispatch({
+      type: "begin",
+      project: "proj",
+      worktree: "alpha",
+      to: "antigravity",
+      now: 0,
+      mode: "switch",
+    });
+    expect(vi.getTimerCount()).toBe(1);
+    vi.advanceTimersByTime(RESTARTING_BACKSTOP_MS - 1);
+    expect(run).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(run.mock.calls.map(([e]) => e.kind)).toEqual(["toast", "settle"]);
+    const toast = run.mock.calls[0][0];
+    expect(toast.kind === "toast" && toast.message.startsWith("Antigravity did not report")).toBe(
+      true,
+    );
+    expect(ctl.getMap().size).toBe(0);
+  });
+
   it("a custom backstopMs is honoured", () => {
     const ctl = createTransferController({ run, onChange, backstopMs: 5_000 });
     ctl.dispatch(begin());
@@ -685,6 +843,7 @@ describe("shouldHonourSignal", () => {
     project: "proj",
     worktree: "alpha",
     to: "codex",
+    mode: "transfer",
     phase,
     startedAt: 0,
     progress: null,

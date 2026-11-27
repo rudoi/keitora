@@ -36,6 +36,7 @@ import {
   onAgentUpdatesStatus,
   type RunOutcome,
 } from "../lib/ipc";
+import { CLI_KINDS } from "../lib/providers";
 import { errorText } from "../lib/updates";
 import { useToast } from "./Toast";
 
@@ -213,7 +214,7 @@ export function AgentUpdatesProvider({ children }: { children: ReactNode }) {
   const closeDialog = useCallback(() => setDialogCli(null), []);
 
   const putOffUntilLater = useCallback((cli: CliKind) => {
-    const state = snapshotRef.current?.[cli].state;
+    const state = snapshotRef.current?.agents[cli]?.state;
     if (state?.type !== "available") return;
     setLater((l) => ({ ...l, [cli]: state.latest }));
   }, []);
@@ -291,12 +292,15 @@ export function AgentUpdatesProvider({ children }: { children: ReactNode }) {
       dismissOutcome,
     ],
   );
-  const codexVersion = snapshot?.codex.installed ?? undefined;
-  const claudeVersion = snapshot?.claude.installed ?? undefined;
-  const versions = useMemo(
-    () => ({ codex: codexVersion, claude: claudeVersion }),
-    [codexVersion, claudeVersion],
-  );
+  // Keyed on the installed versions alone, so a status change that leaves them alone
+  // does not re-render every pane.
+  const versionKey = CLI_KINDS.map((c) => snapshot?.agents[c]?.installed ?? "").join(" ");
+  const versions = useMemo(() => {
+    const installed = versionKey.split(" ");
+    return Object.fromEntries(CLI_KINDS.map((c, i) => [c, installed[i] || undefined])) as Partial<
+      Record<CliKind, string>
+    >;
+  }, [versionKey]);
   const paneValue = useMemo(
     () => ({
       pendingRestart,

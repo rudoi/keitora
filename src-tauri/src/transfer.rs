@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::State;
 
-use keitora_tasks::{CliKind, FieldIntent};
+use keitora_tasks::{CliKind, FieldIntent, ProviderIds};
 
 use crate::backend::herdr::recovery::RecoveryHandle;
 use crate::backend::herdr::{configure_command, truncate_at_char_boundary};
@@ -201,6 +201,9 @@ pub enum TransferOutcome {
     Done,
     /// The user cancelled during the import; nothing changed, still Claude.
     Cancelled,
+    /// A switch (not a transfer): the worktree now runs `to`, started fresh;
+    /// the `from` conversation was not carried over.
+    Switched { from: CliKind, to: CliKind },
 }
 
 /// Why a Claude → Codex import did not produce a thread. `message` and
@@ -384,6 +387,7 @@ pub async fn preview_claude_transfer(
     off_runtime(move || {
         let user = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
         let config = resolve_project(&user, &project)?;
+        preview_source_check(source_cli(&user, &config, &worktree))?;
         let cwd = config.worktree_path(&worktree);
         let path = find_live_claude_jsonl(&cwd)?;
         build_preview(&path)
@@ -391,9 +395,53 @@ pub async fn preview_claude_transfer(
     .await?
 }
 
+/// A transfer preview reads a Claude transcript: refuse any other source.
+fn preview_source_check(source: CliKind) -> Result<(), String> {
+    if source != CliKind::Claude {
+        return Err(format!(
+            "a transfer preview needs a Claude session; this worktree runs {}",
+            source.spec().title
+        ));
+    }
+    Ok(())
+}
+
+/// The worktree's effective provider: its registry entry's `cli`, else the user
+/// default, else Claude.
+pub(crate) fn source_cli(
+    user: &keitora_tasks::UserConfig,
+    config: &keitora_tasks::ProjectConfig,
+    worktree: &str,
+) -> CliKind {
+    let entry = config.worktree_entry(worktree);
+    keitora_tasks::resolve_cli(entry.as_ref(), user)
+}
+
+/// Only (Claude -> Codex) and (Codex -> Claude) are transfer pairs.
+/// Keep in sync with `TRANSFER_PAIRS` in src/lib/providers.ts.
+pub(crate) fn is_transfer_pair(from: CliKind, to: CliKind) -> bool {
+    matches!(
+        (from, to),
+        (CliKind::Claude, CliKind::Codex) | (CliKind::Codex, CliKind::Claude)
+    )
+}
+
+/// Refuse a transfer between providers that are not a transfer pair; such a
+/// change is a switch.
+pub(crate) fn check_transfer_pair(from: CliKind, to: CliKind) -> Result<(), String> {
+    if is_transfer_pair(from, to) {
+        return Ok(());
+    }
+    Err(format!(
+        "transfer isn't supported between {} and {}; use Switch",
+        from.spec().title,
+        to.spec().title
+    ))
+}
+
 /// Run blocking file/config work on the blocking pool instead of a runtime
 /// worker; a panic in it comes back as an error.
-async fn off_runtime<T: Send + 'static>(
+pub(crate) async fn off_runtime<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, String> {
     tauri::async_runtime::spawn_blocking(work)
@@ -402,7 +450,7 @@ async fn off_runtime<T: Send + 'static>(
 }
 
 /// Load the user config and resolve `project` in it, off the runtime.
-async fn load_project(
+pub(crate) async fn load_project(
     project: &str,
 ) -> Result<(keitora_tasks::UserConfig, keitora_tasks::ProjectConfig), String> {
     let project = project.to_string();
@@ -438,13 +486,17 @@ pub async fn transfer_worktree(
     // the marker unless the transfer committed.
     let guard = registry
         .begin(&project, &worktree)
-        .map_err(|_| "a transfer is already in progress for this worktree".to_string())?;
+        .map_err(|_| "a transfer or switch is already in progress for this worktree".to_string())?;
     let key = SessionKey {
         project: project.clone(),
         worktree: worktree.clone(),
     };
     // Before anything is held or rewritten: a terminated session is not moved.
-    refuse_terminated(client.inner().as_ref(), &key)?;
+    refuse_terminated(client.inner().as_ref(), &key, "transferring")?;
+    // Only the two transfer pairs run a transfer; the per-direction work loads
+    // the project again (a small file read).
+    let (user, config) = load_project(&project).await?;
+    check_transfer_pair(source_cli(&user, &config, &worktree), target_cli)?;
     let ctx = TransferCtx {
         project,
         worktree,
@@ -460,6 +512,7 @@ pub async fn transfer_worktree(
         match target_cli {
             CliKind::Codex => transfer_claude_to_codex(&ctx).await,
             CliKind::Claude => transfer_codex_to_claude(&ctx).await,
+            CliKind::Antigravity => unreachable!("check_transfer_pair rejects it"),
         }
     })
     .await;
@@ -472,17 +525,22 @@ pub async fn transfer_worktree(
     result
 }
 
-/// Refuse to transfer a session the user terminated: it must be launched first.
-fn refuse_terminated(client: &dyn PtyBackend, key: &SessionKey) -> Result<(), String> {
+/// Refuse to transfer or switch a session the user terminated: it must be
+/// launched first. `verb` names the refused action ("transferring").
+pub(crate) fn refuse_terminated(
+    client: &dyn PtyBackend,
+    key: &SessionKey,
+    verb: &str,
+) -> Result<(), String> {
     if client.terminated_keys(&key.project).contains(&key.worktree) {
-        return Err("session is terminated; launch it before transferring".into());
+        return Err(format!("session is terminated; launch it before {verb}"));
     }
     Ok(())
 }
 
 /// Run `transfer` with `key` held out of recovery's resume queue; the hold is
 /// released when it returns, whatever the outcome.
-async fn with_recovery_lock<T>(
+pub(crate) async fn with_recovery_lock<T>(
     recovery: Option<RecoveryHandle>,
     key: &SessionKey,
     transfer: impl std::future::Future<Output = T>,
@@ -693,7 +751,7 @@ pub(crate) fn commit_then_persist<T>(
 /// Overwrite the worktree's resume-store row after a persist. Best-effort: the
 /// store only matters to a later default launch, so a failure is logged and
 /// trailed, never an error.
-fn record_resume(client: &dyn PtyBackend, key: &SessionKey, record: ResumeRecord) {
+pub(crate) fn record_resume(client: &dyn PtyBackend, key: &SessionKey, record: ResumeRecord) {
     if let Err(e) = client.set_resume_record(key, record) {
         crate::transfer_registry::trail_warn(
             &key.project,
@@ -714,9 +772,7 @@ async fn transfer_claude_to_codex(ctx: &TransferCtx<'_>) -> Result<TransferOutco
     // The persisted Claude session id only goes to the trail: it is written by
     // transfers alone, so it can be stale and never chooses the file.
     let persisted = config
-        .worktree_entries()
-        .into_iter()
-        .find(|e| e.name == ctx.worktree)
+        .worktree_entry(&ctx.worktree)
         .and_then(|e| e.claude_session_id);
     // The transcript the user confirmed must be this worktree's; anything else is
     // refused before anything runs.
@@ -823,8 +879,11 @@ async fn transfer_claude_to_codex(ctx: &TransferCtx<'_>) -> Result<TransferOutco
                 &config,
                 &worktree,
                 plan.cli,
-                plan.codex_thread_id.clone(),
-                plan.claude_session_id.clone(),
+                ProviderIds {
+                    claude: plan.claude_session_id.clone(),
+                    codex: plan.codex_thread_id.clone(),
+                    antigravity: FieldIntent::Keep,
+                },
             )?;
             if let Some(record) = resume_record_for(&plan) {
                 record_resume(client.as_ref(), &key, record);
@@ -871,9 +930,7 @@ async fn transfer_codex_to_claude(ctx: &TransferCtx<'_>) -> Result<TransferOutco
     // `codex exec resume --last`, which (after the live session is killed) resolves
     // to this cwd's most-recent rollout.
     let thread_id = config
-        .worktree_entries()
-        .into_iter()
-        .find(|e| e.name == ctx.worktree)
+        .worktree_entry(&ctx.worktree)
         .and_then(|e| e.codex_thread_id);
 
     let cwd_s = cwd.to_string_lossy().into_owned();
@@ -919,13 +976,7 @@ async fn transfer_codex_to_claude(ctx: &TransferCtx<'_>) -> Result<TransferOutco
     let committed = persist_under_gate(ctx.gate, move || {
         commit_then_persist(&registry, &project, &worktree, CommitCancel::Ignore, || {
             write_handoff_summary(&project, &worktree, &summary)?;
-            persist_worktree_cli(
-                &config,
-                &worktree,
-                CliKind::Claude,
-                FieldIntent::Keep,
-                FieldIntent::Keep,
-            )
+            persist_worktree_cli(&config, &worktree, CliKind::Claude, ProviderIds::keep())
         })
     })
     .await?;
@@ -938,9 +989,9 @@ async fn transfer_codex_to_claude(ctx: &TransferCtx<'_>) -> Result<TransferOutco
 
 /// How long to wait for a killed Codex PTY session to actually exit (dropping its
 /// thread-store writer lock) before giving up.
-const WRITER_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const WRITER_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll cadence while waiting for the killed session to drop out of the live-set.
-const WRITER_RELEASE_POLL: Duration = Duration::from_millis(100);
+pub(crate) const WRITER_RELEASE_POLL: Duration = Duration::from_millis(100);
 
 /// Kill the worktree's live Codex PTY session — the interactive `codex resume` that
 /// holds the thread as its exclusive "active writer" — and block until it is gone.
@@ -954,12 +1005,13 @@ const WRITER_RELEASE_POLL: Duration = Duration::from_millis(100);
 /// process (and its `\r` grandchild tree on Windows) has fully exited, which is what
 /// releases the thread-store lock. Bounded by [`WRITER_RELEASE_TIMEOUT`].
 fn release_codex_session(client: &dyn PtyBackend, key: &SessionKey) -> Result<(), String> {
-    release_codex_session_with(client, key, WRITER_RELEASE_TIMEOUT, WRITER_RELEASE_POLL)
+    release_session_with(client, key, WRITER_RELEASE_TIMEOUT, WRITER_RELEASE_POLL)
 }
 
 /// [`release_codex_session`] with explicit timing, so the 5s-timeout path is
 /// testable in milliseconds against a [`crate::backend::fake::FakeBackend`].
-fn release_codex_session_with(
+/// Also stops the live pane of any provider before a switch.
+pub(crate) fn release_session_with(
     client: &dyn PtyBackend,
     key: &SessionKey,
     timeout: Duration,
@@ -2247,7 +2299,7 @@ fn selection_trail(picked: &Path, persisted: Option<&str>) -> Value {
 /// Empty ids must not be persisted because bare `--resume` opens an interactive picker.
 fn session_id_from_jsonl(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?.trim();
-    keitora_tasks::is_safe_claude_session_id(stem).then(|| stem.to_string())
+    keitora_tasks::is_safe_session_id(stem).then(|| stem.to_string())
 }
 
 /// Build the [`ConfirmPreview`] for a resolved JSONL path.
@@ -2458,26 +2510,18 @@ fn write_handoff_summary(
 /// Persist provider state for one worktree of the already-resolved `project`.
 /// Each id follows its intent (`Keep` leaves it, `Clear` removes it, `Set`
 /// writes it); `cli` is always written.
-fn persist_worktree_cli(
+pub(crate) fn persist_worktree_cli(
     project: &keitora_tasks::ProjectConfig,
     worktree: &str,
     cli: CliKind,
-    codex_thread_id: FieldIntent<String>,
-    claude_session_id: FieldIntent<String>,
+    ids: ProviderIds,
 ) -> Result<(), String> {
     // A load-modify-save of the registry holds the writer lock throughout.
     let _w = keitora_tasks::UserConfig::write_lock();
     let mut user = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
     let current = project.worktree_entries();
     let matched = user
-        .set_worktree_provider_state_by_root(
-            &project.root,
-            worktree,
-            cli,
-            codex_thread_id,
-            claude_session_id,
-            &current,
-        )
+        .set_worktree_provider_state_by_root(&project.root, worktree, cli, ids, &current)
         .map_err(|e| e.to_string())?;
     if !matched {
         return Err(format!(
@@ -3373,6 +3417,49 @@ mod tests {
     }
 
     #[test]
+    fn is_transfer_pair_is_exactly_the_two_pairs() {
+        for from in CliKind::ALL {
+            for to in CliKind::ALL {
+                let expected = matches!(
+                    (from, to),
+                    (CliKind::Claude, CliKind::Codex) | (CliKind::Codex, CliKind::Claude)
+                );
+                assert_eq!(is_transfer_pair(from, to), expected, "{from:?} -> {to:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn check_transfer_pair_refuses_antigravity_source() {
+        assert_eq!(
+            check_transfer_pair(CliKind::Antigravity, CliKind::Codex),
+            Err("transfer isn't supported between Antigravity and Codex; use Switch".to_string())
+        );
+        assert_eq!(
+            check_transfer_pair(CliKind::Claude, CliKind::Antigravity),
+            Err("transfer isn't supported between Claude and Antigravity; use Switch".to_string())
+        );
+        assert_eq!(check_transfer_pair(CliKind::Claude, CliKind::Codex), Ok(()));
+        assert_eq!(check_transfer_pair(CliKind::Codex, CliKind::Claude), Ok(()));
+    }
+
+    #[test]
+    fn preview_refuses_a_non_claude_source() {
+        assert_eq!(preview_source_check(CliKind::Claude), Ok(()));
+        assert_eq!(
+            preview_source_check(CliKind::Antigravity),
+            Err(
+                "a transfer preview needs a Claude session; this worktree runs Antigravity"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            preview_source_check(CliKind::Codex),
+            Err("a transfer preview needs a Claude session; this worktree runs Codex".to_string())
+        );
+    }
+
+    #[test]
     fn a_terminated_session_is_refused_before_anything_changes() {
         use crate::backend::fake::FakeBackend;
         let fake = FakeBackend::new();
@@ -3380,10 +3467,10 @@ mod tests {
             project: "proj".into(),
             worktree: "alpha".into(),
         };
-        assert_eq!(refuse_terminated(&fake, &key), Ok(()));
+        assert_eq!(refuse_terminated(&fake, &key, "transferring"), Ok(()));
         fake.insert_terminated(key.clone());
         assert_eq!(
-            refuse_terminated(&fake, &key),
+            refuse_terminated(&fake, &key, "transferring"),
             Err("session is terminated; launch it before transferring".to_string())
         );
         // Another worktree, or the same name in another project, is unaffected.
@@ -3391,7 +3478,7 @@ mod tests {
             project: "other".into(),
             worktree: "alpha".into(),
         };
-        assert_eq!(refuse_terminated(&fake, &other), Ok(()));
+        assert_eq!(refuse_terminated(&fake, &other, "transferring"), Ok(()));
         // The check only reads: no session call was made, nothing was killed.
         assert!(fake.calls().is_empty());
     }
@@ -6147,7 +6234,7 @@ while ($true) {
     }
 
     fn fast_release(client: &dyn PtyBackend, key: &SessionKey) -> Result<(), String> {
-        release_codex_session_with(
+        release_session_with(
             client,
             key,
             Duration::from_millis(150),
@@ -6429,6 +6516,10 @@ while ($true) {
         })));
         assert!(changes_worktrees(&Ok(fresh)));
         assert!(changes_worktrees(&Ok(TransferOutcome::Done)));
+        assert!(changes_worktrees(&Ok(TransferOutcome::Switched {
+            from: CliKind::Claude,
+            to: CliKind::Antigravity,
+        })));
         assert!(!changes_worktrees(&Ok(TransferOutcome::Cancelled)));
         assert!(!changes_worktrees(&Err("nope".into())));
     }
@@ -6584,8 +6675,7 @@ while ($true) {
             &config_b,
             "alpha",
             CliKind::Codex,
-            FieldIntent::Set("thread-a".into()),
-            FieldIntent::Keep,
+            ProviderIds::keep().with(CliKind::Codex, FieldIntent::Set("thread-a".into())),
         )
         .unwrap();
 
@@ -6604,8 +6694,9 @@ while ($true) {
             &config_b,
             "alpha",
             CliKind::Codex,
-            FieldIntent::Clear,
-            FieldIntent::Set("sess-1".into()),
+            ProviderIds::keep()
+                .with(CliKind::Codex, FieldIntent::Clear)
+                .with(CliKind::Claude, FieldIntent::Set("sess-1".into())),
         )
         .unwrap();
         let after = keitora_tasks::UserConfig::load().unwrap();
@@ -6635,8 +6726,7 @@ while ($true) {
             &config,
             "alpha",
             CliKind::Codex,
-            FieldIntent::Set("thread-a".into()),
-            FieldIntent::Keep,
+            ProviderIds::keep().with(CliKind::Codex, FieldIntent::Set("thread-a".into())),
         )
         .unwrap_err();
         assert_eq!(
@@ -6644,5 +6734,105 @@ while ($true) {
             "project other-proj is not registered; cannot persist transfer state"
         );
         assert_eq!(std::fs::read(&file).unwrap(), before, "nothing was written");
+    }
+
+    #[test]
+    fn switch_persists_cli_and_clears_target_id() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = ConfigHome::set(&tmp.path().join("config"));
+        two_projects(tmp.path()).save().unwrap();
+
+        let user = keitora_tasks::UserConfig::load().unwrap();
+        let config_b = resolve_project(&user, "proj-b").unwrap();
+        // On Claude with a session, plus a stale id from an earlier switch.
+        persist_worktree_cli(
+            &config_b,
+            "alpha",
+            CliKind::Claude,
+            ProviderIds::keep()
+                .with(CliKind::Claude, FieldIntent::Set("s1".into()))
+                .with(CliKind::Antigravity, FieldIntent::Set("old".into())),
+        )
+        .unwrap();
+
+        let plan = crate::agent_switch::switch_plan(CliKind::Antigravity);
+        persist_worktree_cli(&config_b, "alpha", plan.cli, plan.ids).unwrap();
+
+        let after = keitora_tasks::UserConfig::load().unwrap();
+        let alpha = entry(&after, "key-two", "alpha").unwrap();
+        assert_eq!(alpha.cli, Some(CliKind::Antigravity));
+        assert_eq!(alpha.claude_session_id.as_deref(), Some("s1"));
+        assert_eq!(alpha.antigravity_conversation_id, None);
+    }
+
+    #[test]
+    fn source_cli_follows_entry_then_default() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = ConfigHome::set(&tmp.path().join("config"));
+        two_projects(tmp.path()).save().unwrap();
+
+        let user = keitora_tasks::UserConfig::load().unwrap();
+        let config_b = resolve_project(&user, "proj-b").unwrap();
+        // No entry, no default: Claude.
+        assert_eq!(source_cli(&user, &config_b, "alpha"), CliKind::Claude);
+        // No entry: the user default.
+        let mut with_default = user.clone();
+        with_default.default_cli = Some(CliKind::Codex);
+        assert_eq!(
+            source_cli(&with_default, &config_b, "alpha"),
+            CliKind::Codex
+        );
+        // The entry's `cli` wins over the default.
+        persist_worktree_cli(
+            &config_b,
+            "alpha",
+            CliKind::Antigravity,
+            ProviderIds::keep(),
+        )
+        .unwrap();
+        let user = keitora_tasks::UserConfig::load().unwrap();
+        let config_b = resolve_project(&user, "proj-b").unwrap();
+        let mut with_default = user.clone();
+        with_default.default_cli = Some(CliKind::Codex);
+        assert_eq!(
+            source_cli(&with_default, &config_b, "alpha"),
+            CliKind::Antigravity
+        );
+    }
+
+    #[test]
+    fn persist_worktree_cli_writes_antigravity_and_keeps_other_ids() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = ConfigHome::set(&tmp.path().join("config"));
+        two_projects(tmp.path()).save().unwrap();
+
+        let user = keitora_tasks::UserConfig::load().unwrap();
+        let config_b = resolve_project(&user, "proj-b").unwrap();
+        persist_worktree_cli(
+            &config_b,
+            "alpha",
+            CliKind::Codex,
+            ProviderIds::keep()
+                .with(CliKind::Codex, FieldIntent::Set("thread-a".into()))
+                .with(CliKind::Claude, FieldIntent::Set("sess-1".into())),
+        )
+        .unwrap();
+        persist_worktree_cli(
+            &config_b,
+            "alpha",
+            CliKind::Antigravity,
+            ProviderIds::keep().with(CliKind::Antigravity, FieldIntent::Set("conv-1".into())),
+        )
+        .unwrap();
+
+        let after = keitora_tasks::UserConfig::load().unwrap();
+        let alpha = entry(&after, "key-two", "alpha").unwrap();
+        assert_eq!(alpha.cli, Some(CliKind::Antigravity));
+        assert_eq!(alpha.antigravity_conversation_id.as_deref(), Some("conv-1"));
+        assert_eq!(alpha.codex_thread_id.as_deref(), Some("thread-a"));
+        assert_eq!(alpha.claude_session_id.as_deref(), Some("sess-1"));
     }
 }

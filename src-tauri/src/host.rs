@@ -24,7 +24,7 @@ use crate::backend::{
     PtyBackendError, ScrollDirection, ScrollSource, SessionHint, SessionKey, SharedBackend,
     StatusPayload,
 };
-use crate::{bg_notifier, codex_hooks, dispatch, hooks, tasks};
+use crate::{antigravity_hooks, bg_notifier, codex_hooks, dispatch, hooks, tasks};
 
 /// A configured worktree as the rail sees it: the resolved worktree plus whether
 /// the user terminated its session. Tauri-layer only.
@@ -201,23 +201,23 @@ fn projects_overview(client: State<SharedBackend>) -> Result<Vec<ProjectOverview
     let user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
     let backend = client.inner().as_ref();
     let live = backend.live_set_snapshot();
-    let bg = crate::backend::cached_background_set(backend);
-    Ok(project_overviews(backend, &user_cfg, &live, &bg))
+    let hints = crate::backend::cached_agent_hints(backend);
+    Ok(project_overviews(backend, &user_cfg, &live, &hints))
 }
 
-/// [`projects_overview`] over an already-loaded registry and live/background sets.
+/// [`projects_overview`] over an already-loaded registry, live set and agent hints.
 fn project_overviews(
     client: &dyn PtyBackend,
     user_cfg: &keitora_tasks::UserConfig,
     live: &HashSet<SessionKey>,
-    bg: &HashSet<SessionKey>,
+    hints: &crate::backend::HintMap,
 ) -> Vec<ProjectOverview> {
     user_cfg
         .ordered_project_names()
         .into_iter()
         .filter_map(|key| {
             let pc = keitora_tasks::effective_config(&user_cfg.projects[&key]).ok()?;
-            project_overview(client, user_cfg, &key, pc, live, bg).ok()
+            project_overview(client, user_cfg, &key, pc, live, hints).ok()
         })
         .collect()
 }
@@ -233,14 +233,14 @@ fn project_overview(
     key: &str,
     pc: keitora_tasks::ProjectConfig,
     live: &HashSet<SessionKey>,
-    bg: &HashSet<SessionKey>,
+    hints: &crate::backend::HintMap,
 ) -> Result<ProjectOverview, String> {
     let resolved = pc.project.name.clone();
     let local = keitora_tasks::LocalStore::open_read_only(&pc.tasks.db_path.to_string_lossy());
     let mut sessions = local
         .as_ref()
         .map_err(|e| e.to_string())
-        .and_then(|local| crate::tasks::reconciled_sessions_in(local, live, bg, &resolved, &pc))
+        .and_then(|local| crate::tasks::reconciled_sessions_in(local, live, hints, &resolved, &pc))
         .unwrap_or_default();
     let active_tasks = local
         .as_ref()
@@ -512,6 +512,8 @@ fn set_worktrees(
     // Newly re-discovered / adopted worktrees have no session hooks yet — install
     // them for the active project so their status lights populate. Off-thread.
     thread::spawn(hooks::install_active_session_hooks);
+    // Antigravity worktrees (of any project) need the global agy hook and trust.
+    thread::spawn(antigravity_hooks::sync_registry);
     let _ = app.emit("project://changed", ());
     let _ = app.emit("worktrees://changed", ());
     Ok(())
@@ -563,6 +565,13 @@ fn worktree_create(
             codex_hooks::install_codex_hooks_for(&wt.path, &bin);
         }
     }
+    // Antigravity worktrees get the global agy hook and workspace trust; neither
+    // needs a resolved `keitora` binary (the hook runs `$KEITORA_BIN`). Done before
+    // returning (this command runs off the main thread) so the pane the UI starts
+    // next already finds them.
+    if wt.cli == keitora_tasks::CliKind::Antigravity {
+        antigravity_hooks::sync_worktree(&wt.path);
+    }
     let _ = app.emit("project://changed", ());
     let _ = app.emit("worktrees://changed", ());
     Ok(wt)
@@ -586,18 +595,9 @@ pub struct SettingsProject {
     pub worktrees_dir: Option<String>,
     pub archive_days: i64,
     pub log_retention_days: i64,
-    pub claude_path: Option<String>,
-    /// Project-level `[claude] skip_permissions`. `true` means this
-    /// project forces the flag on regardless of the user toggle; the drawer
-    /// surfaces a note so the effective state isn't a surprise.
-    pub skip_permissions: bool,
-    pub dispatch_steps: Vec<String>,
-    /// Project-level `[codex].path` override. Mirrors `claude_path`.
-    pub codex_path: Option<String>,
-    /// Project-level `[codex].autonomy`. Mirrors `skip_permissions`.
-    pub codex_autonomy: bool,
-    /// Project-level `[dispatch].codex_steps` override. Mirrors `dispatch_steps`.
-    pub codex_dispatch_steps: Vec<String>,
+    /// Project-level settings for every provider, keyed by provider (`"claude"`,
+    /// `"codex"`, `"antigravity"`).
+    pub providers: std::collections::BTreeMap<keitora_tasks::CliKind, SettingsProjectProvider>,
     /// Project default diff-view base (`[project].diff_base`). `None` ⇒ Auto. Per-worktree
     /// overrides win over this and are set from the diff header, not here.
     pub diff_base: Option<keitora_tasks::DiffBase>,
@@ -606,6 +606,28 @@ pub struct SettingsProject {
     /// live only in the user registry; the drawer offers "Commit to project file" and
     /// disables the project-level Claude override (which requires a committed file).
     pub has_committed_file: bool,
+}
+
+/// One provider's project-level settings.
+#[derive(serde::Serialize)]
+pub struct SettingsProjectProvider {
+    /// Project-level `[<provider>].path` override.
+    pub path: Option<String>,
+    /// Project-level `[<provider>].autonomy`. `true` means this project forces the
+    /// flag on regardless of the user toggle; the drawer surfaces a note so the
+    /// effective state isn't a surprise.
+    pub autonomy: bool,
+    /// Project-level `[dispatch].<provider>_steps`.
+    pub dispatch_steps: Vec<String>,
+}
+
+/// One provider's user-level settings.
+#[derive(serde::Serialize)]
+pub struct SettingsUserProvider {
+    /// User-level `[<provider>].path` default.
+    pub path: Option<String>,
+    /// User-level `[<provider>].autonomy` default. Seeds the drawer's toggle.
+    pub autonomy: bool,
 }
 
 /// One registered project in the user registry, for the user-section list.
@@ -619,24 +641,17 @@ pub struct SettingsUserProject {
 /// The editable fields of the user `keitora.toml` plus the project registry.
 #[derive(serde::Serialize)]
 pub struct SettingsUser {
-    pub claude_path: Option<String>,
     pub active: Option<String>,
     pub projects: Vec<SettingsUserProject>,
-    /// Whether interactive Claude sessions launch with
-    /// `--dangerously-skip-permissions` (persisted in `[claude] skip_permissions`
-    /// of the user keitora.toml). Seeds the toggle in SettingsDrawer on open.
-    pub skip_permissions: bool,
-    /// User-level `[codex].path` default. Mirrors `claude_path`.
-    pub codex_path: Option<String>,
-    /// User-level `[codex].autonomy` default. Mirrors `skip_permissions`.
-    pub codex_autonomy: bool,
+    /// User-level settings for every provider, keyed by provider.
+    pub providers: std::collections::BTreeMap<keitora_tasks::CliKind, SettingsUserProvider>,
     /// User-level default CLI: `UserConfig.default_cli`, falling back to
-    /// `CliKind::Claude` when unset. Serializes `"claude"` / `"codex"`.
+    /// `CliKind::Claude` when unset.
     pub default_cli: keitora_tasks::CliKind,
-    /// Whether a `codex` binary was found on this machine
-    /// (`discover_cli(CliKind::Codex).is_some()`). Gates the Codex group's
-    /// enabled state in the drawer.
-    pub codex_available: bool,
+    /// Per provider: whether its executable can be used — a configured path
+    /// resolves, or discovery finds it. Gates each provider group's autonomy and
+    /// dispatch controls in the drawer.
+    pub available: std::collections::BTreeMap<keitora_tasks::CliKind, bool>,
     /// Whether the app checks for updates by itself (`[updates] auto_check`;
     /// on unless explicitly disabled).
     pub auto_check_updates: bool,
@@ -657,8 +672,56 @@ pub struct SettingsSnapshot {
 /// opens with one active.
 #[tauri::command(async)]
 fn get_settings() -> Result<SettingsSnapshot, String> {
+    // The drawer is where a fresh install is confirmed: probe for agents that were
+    // missing a moment ago instead of serving the remembered miss.
+    keitora_tasks::invalidate_discovery_misses();
     let pc = keitora_tasks::resolve_active().map_err(|e| e.to_string())?;
     let user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
+    let available = cli_availability_for(&user_cfg, Some(&pc));
+    Ok(build_settings_snapshot(&pc, &user_cfg, available))
+}
+
+/// Per-provider availability alone, for callers that do not need the whole
+/// settings snapshot. Uses the active project's overrides when there is one.
+#[tauri::command(async)]
+fn cli_availability() -> Result<std::collections::BTreeMap<keitora_tasks::CliKind, bool>, String> {
+    let user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
+    let pc = keitora_tasks::resolve_active().ok();
+    Ok(cli_availability_for(&user_cfg, pc.as_ref()))
+}
+
+/// Per provider: a configured path resolves, or the cached discovery finds the
+/// executable. Claude is always available: its launch falls back to the bare
+/// `claude`, so nothing that targets it is ever disabled.
+fn cli_availability_for(
+    user: &keitora_tasks::UserConfig,
+    project: Option<&keitora_tasks::ProjectConfig>,
+) -> std::collections::BTreeMap<keitora_tasks::CliKind, bool> {
+    cli_availability_with(user, project, |cli| discover_for_launch(cli).is_some())
+}
+
+/// [`cli_availability_for`] with discovery injected.
+fn cli_availability_with(
+    user: &keitora_tasks::UserConfig,
+    project: Option<&keitora_tasks::ProjectConfig>,
+    discovered: impl Fn(keitora_tasks::CliKind) -> bool,
+) -> std::collections::BTreeMap<keitora_tasks::CliKind, bool> {
+    keitora_tasks::CliKind::ALL
+        .into_iter()
+        .map(|cli| {
+            let always = cli == keitora_tasks::CliKind::Claude;
+            let configured = keitora_tasks::resolve_provider_path(cli, project, user).is_some();
+            (cli, always || configured || discovered(cli))
+        })
+        .collect()
+}
+
+/// The settings snapshot for `pc` and `user_cfg`, with `available` precomputed.
+fn build_settings_snapshot(
+    pc: &keitora_tasks::ProjectConfig,
+    user_cfg: &keitora_tasks::UserConfig,
+    available: std::collections::BTreeMap<keitora_tasks::CliKind, bool>,
+) -> SettingsSnapshot {
     let active_name = user_cfg.active.clone();
     let projects = user_cfg
         .projects
@@ -669,7 +732,30 @@ fn get_settings() -> Result<SettingsSnapshot, String> {
             active: active_name.as_deref() == Some(name.as_str()),
         })
         .collect();
-    Ok(SettingsSnapshot {
+    let project_providers = keitora_tasks::CliKind::ALL
+        .into_iter()
+        .map(|cli| {
+            let p = keitora_tasks::project_provider(pc, cli);
+            let dto = SettingsProjectProvider {
+                path: p.path.clone(),
+                autonomy: p.autonomy.unwrap_or(false),
+                dispatch_steps: pc.dispatch.steps_for(cli).to_vec(),
+            };
+            (cli, dto)
+        })
+        .collect();
+    let user_providers = keitora_tasks::CliKind::ALL
+        .into_iter()
+        .map(|cli| {
+            let p = keitora_tasks::user_provider(user_cfg, cli);
+            let dto = SettingsUserProvider {
+                path: p.path.clone(),
+                autonomy: p.autonomy.unwrap_or(false),
+            };
+            (cli, dto)
+        })
+        .collect();
+    SettingsSnapshot {
         project: SettingsProject {
             name: pc.project.name.clone(),
             root: pc.root.display().to_string(),
@@ -677,12 +763,7 @@ fn get_settings() -> Result<SettingsSnapshot, String> {
             worktrees_dir: pc.project.worktrees_dir.clone(),
             archive_days: pc.tasks.archive_days,
             log_retention_days: pc.tasks.log_retention_days,
-            claude_path: pc.claude.path.clone(),
-            skip_permissions: pc.claude.autonomy.unwrap_or(false),
-            dispatch_steps: pc.dispatch.claude_steps.clone(),
-            codex_path: pc.codex.path.clone(),
-            codex_autonomy: pc.codex.autonomy.unwrap_or(false),
-            codex_dispatch_steps: pc.dispatch.codex_steps.clone(),
+            providers: project_providers,
             diff_base: pc.project.diff_base.clone(),
             // Effective list: a file-less project's committed `tasks.worktrees` is
             // empty, so read through `worktrees()` (registry/scaffold-aware).
@@ -690,23 +771,21 @@ fn get_settings() -> Result<SettingsSnapshot, String> {
             has_committed_file: pc.root.join("keitora.toml").exists(),
         },
         user: SettingsUser {
-            claude_path: user_cfg.claude.path.clone(),
             active: active_name,
             projects,
-            skip_permissions: user_cfg.skip_permissions(),
-            codex_path: user_cfg.codex.path.clone(),
-            codex_autonomy: user_cfg.codex.autonomy.unwrap_or(false),
+            providers: user_providers,
             default_cli: user_cfg.default_cli.unwrap_or_default(),
-            codex_available: keitora_tasks::discover_cli(keitora_tasks::CliKind::Codex).is_some(),
+            available,
             auto_check_updates: user_cfg.updates.auto_check(),
             agent_update_check_hours: user_cfg.updates.agent_check_hours(),
         },
-    })
+    }
 }
 
 /// Build the registry `ProjectSettingsPatch` from the drawer's full form state.
 /// The drawer always sends every field, so each maps to a definite intent:
-/// `worktrees_dir`/`dispatch_steps` clear (`Some(None)`) when empty, else set;
+/// `worktrees_dir` clears (`Some(None)`) when empty, else sets; every provider's
+/// dispatch steps are set (an absent provider counts as an empty list);
 /// retention fields always set. `db_path` is not editable from the drawer, so it is
 /// left untouched (`None`). `claude_path` is intentionally excluded — a project-level
 /// Claude override requires a committed file (decision 4) and is handled only on the
@@ -715,8 +794,7 @@ fn build_settings_patch(
     archive_days: i64,
     log_retention_days: i64,
     worktrees_dir: Option<String>,
-    dispatch_steps: &[String],
-    codex_dispatch_steps: &[String],
+    steps: &std::collections::BTreeMap<keitora_tasks::CliKind, Vec<String>>,
     diff_base: Option<keitora_tasks::DiffBase>,
 ) -> Result<keitora_tasks::ProjectSettingsPatch, String> {
     // Same day-floor + trim/clean rules as the committed-file write path — shared
@@ -724,6 +802,9 @@ fn build_settings_patch(
     keitora_tasks::check_days("archive_days", archive_days).map_err(|e| e.to_string())?;
     keitora_tasks::check_days("log_retention_days", log_retention_days)
         .map_err(|e| e.to_string())?;
+    let cleaned = |cli: keitora_tasks::CliKind| {
+        keitora_tasks::clean_dispatch_steps(steps.get(&cli).map(Vec::as_slice).unwrap_or(&[]))
+    };
     Ok(keitora_tasks::ProjectSettingsPatch {
         db_path: None,
         // Empty worktrees_dir clears the override (Some(None)) → falls back to the
@@ -737,44 +818,49 @@ fn build_settings_patch(
         // An empty step list is an EXPLICIT value — Some(Some([])), not a clear — so
         // emptying the dispatch editor actually clears dispatch instead of reverting
         // to the committed `[dispatch]` steps (the registry stays authoritative once
-        // a project's settings have been edited).
-        dispatch_steps: Some(Some(keitora_tasks::clean_dispatch_steps(dispatch_steps))),
-        // Codex dispatch steps mirror `dispatch_steps` exactly — same
-        // explicit-empty-clears semantics.
-        codex_dispatch_steps: Some(Some(keitora_tasks::clean_dispatch_steps(
-            codex_dispatch_steps,
-        ))),
+        // a project's settings have been edited). Same for every provider.
+        dispatch_steps: Some(Some(cleaned(keitora_tasks::CliKind::Claude))),
+        codex_dispatch_steps: Some(Some(cleaned(keitora_tasks::CliKind::Codex))),
+        antigravity_dispatch_steps: Some(Some(cleaned(keitora_tasks::CliKind::Antigravity))),
         // The drawer always sends the project default, so set it explicitly (None ⇒ Auto, which
         // is stored as a cleared override so it reverts to the committed/scaffold value).
         diff_base: Some(diff_base),
     })
 }
 
+/// One provider's project-level form values from the settings drawer.
+#[derive(serde::Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectProviderInput {
+    pub path: Option<String>,
+    pub dispatch_steps: Vec<String>,
+}
+
 /// Persist the editable project fields, then notify the UI. By default these live in
 /// the user registry: the patch is written to the active project's
 /// `ProjectRef` so no `keitora.toml` is required. An unregistered project (resolved via
 /// cwd/`$KEITORA_PROJECT`) falls back to the surgical committed-file write — which is
-/// also the only path that persists the project-level `claude_path` override.
+/// also the only path that persists the project-level provider path overrides.
 #[tauri::command(async)]
-#[allow(clippy::too_many_arguments)]
 fn save_project_settings(
     app: AppHandle,
     archive_days: i64,
     log_retention_days: i64,
     worktrees_dir: Option<String>,
-    claude_path: Option<String>,
-    codex_path: Option<String>,
-    dispatch_steps: Vec<String>,
-    codex_dispatch_steps: Vec<String>,
+    providers: std::collections::BTreeMap<keitora_tasks::CliKind, ProjectProviderInput>,
     diff_base: Option<keitora_tasks::DiffBase>,
 ) -> Result<(), String> {
     let pc = keitora_tasks::resolve_active().map_err(|e| e.to_string())?;
+    let input = |cli: keitora_tasks::CliKind| providers.get(&cli).cloned().unwrap_or_default();
+    let steps = keitora_tasks::CliKind::ALL
+        .into_iter()
+        .map(|cli| (cli, input(cli).dispatch_steps))
+        .collect();
     let patch = build_settings_patch(
         archive_days,
         log_retention_days,
         worktrees_dir.clone(),
-        &dispatch_steps,
-        &codex_dispatch_steps,
+        &steps,
         diff_base,
     )?;
     let matched = {
@@ -785,32 +871,42 @@ fn save_project_settings(
             .map_err(|e| e.to_string())?
     };
     if matched {
-        // The registry holds the task/dispatch settings. The project-level claude/
-        // codex overrides are committed-file-only (decision 4), so persist them to
+        // The registry holds the task/dispatch settings. The project-level provider
+        // path overrides are committed-file-only (decision 4), so persist them to
         // keitora.toml when one exists — otherwise they'd be silently dropped. For a
         // file-less project the drawer disables the fields, so a stray value is ignored.
         if pc.root.join("keitora.toml").exists() {
-            keitora_tasks::set_project_claude_path(&pc.root, claude_path)
-                .map_err(|e| e.to_string())?;
-            keitora_tasks::set_project_codex_path(&pc.root, codex_path)
-                .map_err(|e| e.to_string())?;
+            for cli in keitora_tasks::CliKind::ALL {
+                keitora_tasks::set_project_provider_path(&pc.root, cli, input(cli).path)
+                    .map_err(|e| e.to_string())?;
+            }
         }
     } else {
         // Unregistered project: surgical committed-file write (also carries the
-        // project-level claude_path/codex_path, which are not stored in the
-        // registry). Autonomy is round-tripped from the current file value (this
-        // form has no autonomy field yet, so it must not be perturbed).
+        // project-level provider paths, which are not stored in the registry).
+        // Autonomy is round-tripped from the current file value (this form has no
+        // project autonomy field, so it must not be perturbed).
+        let writes = keitora_tasks::CliKind::ALL
+            .into_iter()
+            .map(|cli| {
+                let ProjectProviderInput {
+                    path,
+                    dispatch_steps,
+                } = input(cli);
+                let write = keitora_tasks::ProviderWrite {
+                    path,
+                    autonomy: keitora_tasks::project_provider(&pc, cli).autonomy,
+                    dispatch_steps,
+                };
+                (cli, write)
+            })
+            .collect();
         keitora_tasks::write_project_settings(
             &pc.root,
             archive_days,
             log_retention_days,
             worktrees_dir,
-            claude_path,
-            codex_path,
-            pc.claude.autonomy,
-            pc.codex.autonomy,
-            &dispatch_steps,
-            &codex_dispatch_steps,
+            &writes,
         )
         .map_err(|e| e.to_string())?;
     }
@@ -853,21 +949,43 @@ fn set_worktree_diff_base(
 #[tauri::command(async)]
 fn commit_settings_to_project(app: AppHandle) -> Result<(), String> {
     let pc = keitora_tasks::resolve_active().map_err(|e| e.to_string())?;
+    commit_settings_to_file(&pc)?;
+    let _ = app.emit("project://changed", ());
+    Ok(())
+}
+
+/// Each provider's effective path, autonomy and dispatch steps in `pc`, as a
+/// committed-file write.
+fn provider_writes(
+    pc: &keitora_tasks::ProjectConfig,
+) -> std::collections::BTreeMap<keitora_tasks::CliKind, keitora_tasks::ProviderWrite> {
+    keitora_tasks::CliKind::ALL
+        .into_iter()
+        .map(|cli| {
+            let provider = keitora_tasks::project_provider(pc, cli);
+            let write = keitora_tasks::ProviderWrite {
+                path: provider.path.clone(),
+                autonomy: provider.autonomy,
+                dispatch_steps: pc.dispatch.steps_for(cli).to_vec(),
+            };
+            (cli, write)
+        })
+        .collect()
+}
+
+/// Write `pc`'s effective settings to `<root>/keitora.toml`: surgically when the
+/// file exists, else by seeding a scaffold.
+fn commit_settings_to_file(pc: &keitora_tasks::ProjectConfig) -> Result<(), String> {
     if pc.root.join("keitora.toml").exists() {
         // Existing file: surgically flush the effective values (preserves comments),
-        // including the Codex group so committing a file doesn't silently
-        // drop it.
+        // including every provider group so committing a file doesn't silently
+        // drop one.
         keitora_tasks::write_project_settings(
             &pc.root,
             pc.tasks.archive_days,
             pc.tasks.log_retention_days,
             pc.project.worktrees_dir.clone(),
-            pc.claude.path.clone(),
-            pc.codex.path.clone(),
-            pc.claude.autonomy,
-            pc.codex.autonomy,
-            &pc.dispatch.claude_steps,
-            &pc.dispatch.codex_steps,
+            &provider_writes(pc),
         )
         .map_err(|e| e.to_string())?;
     } else {
@@ -881,38 +999,91 @@ fn commit_settings_to_project(app: AppHandle) -> Result<(), String> {
         seed.project.worktrees_dir = pc.project.worktrees_dir.clone();
         seed.dispatch.claude_steps = pc.dispatch.claude_steps.clone();
         seed.dispatch.codex_steps = pc.dispatch.codex_steps.clone();
+        seed.dispatch.antigravity_steps = pc.dispatch.antigravity_steps.clone();
         seed.claude.path = pc.claude.path.clone();
         seed.codex.path = pc.codex.path.clone();
+        seed.antigravity.path = pc.antigravity.path.clone();
         seed.write_initial().map_err(|e| e.to_string())?;
     }
-    let _ = app.emit("project://changed", ());
     Ok(())
 }
 
-/// Write the user-level `claude.path`/`codex.path` and `default_cli` to the user
-/// `keitora.toml`, then notify the UI (so claude/codex-path consumers refresh).
-/// `None`/empty path clears that CLI's override.
+/// Write every provider's user-level path and `default_cli` to the user
+/// `keitora.toml`, then notify the UI (so provider-path consumers refresh).
+/// A `None`/empty or absent path clears that provider's override.
 #[tauri::command(async)]
 fn save_user_settings(
     app: AppHandle,
-    claude_path: Option<String>,
-    codex_path: Option<String>,
+    client: State<SharedBackend>,
+    providers: std::collections::BTreeMap<keitora_tasks::CliKind, Option<String>>,
     default_cli: keitora_tasks::CliKind,
 ) -> Result<(), String> {
-    keitora_tasks::set_user_claude_path(claude_path).map_err(|e| e.to_string())?;
-    keitora_tasks::set_user_codex_path(codex_path).map_err(|e| e.to_string())?;
-    {
-        // After the path setters: they take the registry lock themselves.
+    let paths_changed = {
         let _registry = keitora_tasks::UserConfig::write_lock();
         let mut user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
-        user_cfg.default_cli = Some(default_cli);
+        let changed = apply_user_settings(&mut user_cfg, &providers, default_cli);
         user_cfg.save().map_err(|e| e.to_string())?;
+        changed
+    };
+    let (sync, refresh) = antigravity_settings_triggers(default_cli, paths_changed);
+    if sync {
+        let backend = client.inner().clone();
+        thread::spawn(move || {
+            antigravity_hooks::sync_registry();
+            // A late `agy` install gets herdr's integration without a restart;
+            // the backend skips it under test and with the opt-out env var.
+            if refresh {
+                backend.refresh_integration();
+            }
+        });
     }
     let _ = app.emit("project://changed", ());
     Ok(())
 }
 
-/// Persist the user-level `[claude] autonomy` / `[codex] autonomy` flag: `cli` selects which provider's autonomy flag is
+/// Every provider's user-level path in `user`.
+fn user_provider_paths(user: &keitora_tasks::UserConfig) -> Vec<Option<String>> {
+    keitora_tasks::CliKind::ALL
+        .iter()
+        .map(|cli| keitora_tasks::resolve_provider_path(*cli, None, user))
+        .collect()
+}
+
+/// Apply a user-settings save to `user` in memory: each provider's path (trimmed;
+/// `None`, empty or absent clears it) and `default_cli`. Returns whether any
+/// provider path changed.
+fn apply_user_settings(
+    user: &mut keitora_tasks::UserConfig,
+    providers: &std::collections::BTreeMap<keitora_tasks::CliKind, Option<String>>,
+    default_cli: keitora_tasks::CliKind,
+) -> bool {
+    let before = user_provider_paths(user);
+    for cli in keitora_tasks::CliKind::ALL {
+        let path = providers
+            .get(&cli)
+            .and_then(|p| p.as_deref())
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        keitora_tasks::user_provider_mut(user, cli).path = path;
+    }
+    user.default_cli = Some(default_cli);
+    user_provider_paths(user) != before
+}
+
+/// What a user-settings save triggers for Antigravity: `(sync the registry's agy
+/// hook and trust, refresh herdr's integrations)`. The sync runs when Antigravity
+/// is the default or any provider path changed; the refresh only when Antigravity
+/// is the default.
+fn antigravity_settings_triggers(
+    default_cli: keitora_tasks::CliKind,
+    paths_changed: bool,
+) -> (bool, bool) {
+    let agy_default = default_cli == keitora_tasks::CliKind::Antigravity;
+    (agy_default || paths_changed, agy_default)
+}
+
+/// Persist the user-level `[<provider>] autonomy` flag: `cli` selects which provider's autonomy flag is
 /// written, so this single command replaces what would otherwise be a parallel
 /// `set_bypass_approvals` command. Persist-only: no `project://changed` emit,
 /// since nothing reacts at runtime — the flag is read only when building the next
@@ -922,11 +1093,17 @@ fn save_user_settings(
 fn set_skip_permissions(cli: keitora_tasks::CliKind, enabled: bool) -> Result<(), String> {
     let _registry = keitora_tasks::UserConfig::write_lock();
     let mut user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
-    match cli {
-        keitora_tasks::CliKind::Claude => user_cfg.claude.autonomy = Some(enabled),
-        keitora_tasks::CliKind::Codex => user_cfg.codex.autonomy = Some(enabled),
-    }
+    apply_skip_permissions(&mut user_cfg, cli, enabled);
     user_cfg.save().map_err(|e| e.to_string())
+}
+
+/// Set `cli`'s user-level autonomy flag in `user_cfg`.
+fn apply_skip_permissions(
+    user_cfg: &mut keitora_tasks::UserConfig,
+    cli: keitora_tasks::CliKind,
+    enabled: bool,
+) {
+    keitora_tasks::user_provider_mut(user_cfg, cli).autonomy = Some(enabled);
 }
 
 /// Persist the user-level `[updates] auto_check` flag. Persist-only: no
@@ -1132,6 +1309,7 @@ fn invalidate_active_project() {
 fn on_project_activated(app: AppHandle, project_root: std::path::PathBuf) {
     invalidate_active_project();
     thread::spawn(hooks::install_active_session_hooks);
+    thread::spawn(antigravity_hooks::sync_registry);
     // Best-effort off-thread repair: backfill any path-less worktree entries from
     // `git worktree list` so the rail shows correct paths immediately on activation
     // (decision #2 — the only repair trigger). On `Ok(true)` (something changed),
@@ -1373,7 +1551,7 @@ fn launch_for_spawn(launch: AgentLaunch, fresh: bool, transfer: bool) -> AgentLa
         LaunchPolicy::TransferStrict
     } else {
         if transfer {
-            log::info!("transfer: strict launch applies to codex only");
+            log::debug!("transfer: strict launch applies to codex only");
         }
         LaunchPolicy::Default
     };
@@ -1429,8 +1607,8 @@ fn discover_for_launch(cli: keitora_tasks::CliKind) -> Option<String> {
 }
 
 /// [`agent_launch_with`] with the executable discovery injected. The path is
-/// the configured one, else (Codex only) the discovered one, else the bare
-/// `claude`/`codex` name. A discovered absolute path also puts its directory on
+/// the configured one, else (Codex and Antigravity) the discovered one, else the
+/// bare `claude`/`codex`/`agy` name. A discovered absolute path also puts its directory on
 /// the pane's PATH.
 fn agent_launch_with_discovery(
     user: &keitora_tasks::UserConfig,
@@ -1438,27 +1616,23 @@ fn agent_launch_with_discovery(
     worktree: &str,
     discover: &dyn Fn(keitora_tasks::CliKind) -> Option<String>,
 ) -> AgentLaunch {
-    // The worktree's registry entry (found by name), carrying its `cli` and
-    // `codex_thread_id`.
-    let entry = project.and_then(|p| {
-        p.worktree_entries()
-            .into_iter()
-            .find(|e| e.name == worktree)
-    });
+    // The worktree's registry entry (found by name), carrying its `cli` and its
+    // stored conversation ids.
+    let entry = project.and_then(|p| p.worktree_entry(worktree));
     let cli = keitora_tasks::resolve_cli(entry.as_ref(), user);
     let path = keitora_tasks::resolve_provider_path(cli, project, user)
         .or_else(|| match cli {
-            keitora_tasks::CliKind::Codex => discover(cli),
+            keitora_tasks::CliKind::Codex | keitora_tasks::CliKind::Antigravity => discover(cli),
             keitora_tasks::CliKind::Claude => None,
         })
-        .unwrap_or_else(|| match cli {
-            keitora_tasks::CliKind::Claude => "claude".to_string(),
-            keitora_tasks::CliKind::Codex => "codex".to_string(),
-        });
+        .unwrap_or_else(|| cli.spec().binary.to_string());
     let autonomy = keitora_tasks::resolve_autonomy(cli, project, user);
     let resume_target = match cli {
         keitora_tasks::CliKind::Claude => entry.and_then(|e| e.claude_session_id.clone()),
         keitora_tasks::CliKind::Codex => entry.and_then(|e| e.codex_thread_id.clone()),
+        keitora_tasks::CliKind::Antigravity => {
+            entry.and_then(|e| e.antigravity_conversation_id.clone())
+        }
     };
     AgentLaunch {
         cli,
@@ -1492,8 +1666,8 @@ pub(crate) fn launch_for(
         if pc.project.name != key.project {
             continue;
         }
-        let listed = key.worktree == pc.main_worktree()
-            || pc.worktree_entries().iter().any(|e| e.name == key.worktree);
+        let listed =
+            key.worktree == pc.main_worktree() || pc.worktree_entry(&key.worktree).is_some();
         if !listed {
             continue;
         }
@@ -2360,6 +2534,15 @@ pub fn run() {
             // server-push loop (which delivers pane output to the attached panes and
             // emits `daemon://status`). That is `HerdrBackend`; if herdr cannot be
             // constructed, `UnavailableBackend` reports why so the app still starts.
+            // Resolve the `keitora` on PATH off-thread now (a login shell on unix),
+            // so the first pane spawns don't wait on it.
+            hooks::warm_keitora_on_path();
+            // Registry-wide: the global agy hook and trust for every Antigravity
+            // worktree of every project (including the user default). Done before
+            // the backend starts, because its boot resumes panes and a resumed
+            // `agy` must find both in place. Plain file I/O, so the window barely
+            // waits.
+            antigravity_hooks::sync_registry();
             let backend: SharedBackend = select_pty_backend(app.handle().clone());
             backend.start();
             app.manage(backend);
@@ -2490,6 +2673,7 @@ pub fn run() {
             keitora_cli_status,
             install_keitora_cli,
             get_settings,
+            cli_availability,
             save_project_settings,
             set_worktree_diff_base,
             commit_settings_to_project,
@@ -2534,6 +2718,7 @@ pub fn run() {
             dispatch::dispatch_apply,
             crate::transfer::preview_claude_transfer,
             crate::transfer::transfer_worktree,
+            crate::agent_switch::switch_worktree_cli,
             crate::transfer::inject_handoff_summary,
             crate::transfer::cancel_transfer,
             crate::transfer::transfer_settled,
@@ -2819,6 +3004,7 @@ mod tests {
                         cli: None,
                         codex_thread_id: None,
                         claude_session_id: None,
+                        antigravity_conversation_id: None,
                         diff_base: None,
                     })
                     .collect(),
@@ -2920,6 +3106,7 @@ mod tests {
                 cli: None,
                 codex_thread_id: None,
                 claude_session_id: None,
+                antigravity_conversation_id: None,
                 diff_base: None,
             }
         }
@@ -3197,6 +3384,7 @@ mod tests {
             },
             claude: ProviderConfig::default(),
             codex: ProviderConfig::default(),
+            antigravity: ProviderConfig::default(),
             cli: keitora_tasks::CliConfig::default(),
             dispatch: DispatchConfig::default(),
         };
@@ -3313,7 +3501,7 @@ mod tests {
             "registry-key",
             pc,
             &HashSet::new(),
-            &HashSet::new(),
+            &crate::backend::HintMap::new(),
         )
         .unwrap();
 
@@ -3352,7 +3540,7 @@ mod tests {
             worktree: "acme".into(),
         };
         let live: HashSet<_> = [key.clone()].into();
-        let bg: HashSet<_> = [key].into();
+        let hints: crate::backend::HintMap = [(key, crate::backend::HINT_BUSY.to_string())].into();
 
         let o = super::project_overview(
             &FakeBackend::new(),
@@ -3360,7 +3548,7 @@ mod tests {
             "registry-key",
             pc,
             &live,
-            &bg,
+            &hints,
         )
         .unwrap();
         assert_eq!(o.sessions.len(), 1, "only configured worktrees");
@@ -3400,7 +3588,7 @@ mod tests {
             "registry-key",
             pc,
             &HashSet::new(),
-            &HashSet::new(),
+            &crate::backend::HintMap::new(),
         )
         .unwrap();
         assert_eq!(
@@ -3431,7 +3619,7 @@ mod tests {
             "registry-key",
             pc,
             &HashSet::new(),
-            &HashSet::new(),
+            &crate::backend::HintMap::new(),
         )
         .unwrap();
         assert_eq!(o.worktrees.len(), 1);
@@ -3458,8 +3646,12 @@ mod tests {
         user.projects.insert("bad".into(), broken);
         user.set_project_order(vec!["beta".into(), "bad".into(), "alpha".into()]);
 
-        let all =
-            super::project_overviews(&FakeBackend::new(), &user, &HashSet::new(), &HashSet::new());
+        let all = super::project_overviews(
+            &FakeBackend::new(),
+            &user,
+            &HashSet::new(),
+            &crate::backend::HintMap::new(),
+        );
         let keys: Vec<(&str, &str)> = all
             .iter()
             .map(|o| (o.key.as_str(), o.resolved_name.as_str()))
@@ -3467,22 +3659,37 @@ mod tests {
         assert_eq!(keys, [("beta", "beta-dir"), ("alpha", "alpha-dir")]);
     }
 
+    fn steps(
+        claude: &[&str],
+        codex: &[&str],
+        antigravity: &[&str],
+    ) -> std::collections::BTreeMap<keitora_tasks::CliKind, Vec<String>> {
+        let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        [
+            (keitora_tasks::CliKind::Claude, v(claude)),
+            (keitora_tasks::CliKind::Codex, v(codex)),
+            (keitora_tasks::CliKind::Antigravity, v(antigravity)),
+        ]
+        .into_iter()
+        .collect()
+    }
+
     /// `build_settings_patch` maps the drawer form → registry patch:
     /// `db_path` untouched; populated values set; empty `worktrees_dir` clears
-    /// (`Some(None)` → default); empty `dispatch_steps`/`codex_dispatch_steps` is an
-    /// EXPLICIT empty override (`Some(Some([]))`, not a clear) so the user's deletion
-    /// sticks; sub-1 day counts rejected before any write. `codex_dispatch_steps`
-    /// mirrors `dispatch_steps` exactly — verified with independent values so
-    /// the two can't be accidentally swapped.
+    /// (`Some(None)` → default); each provider's steps are cleaned independently
+    /// (distinct values so they can't be accidentally swapped); sub-1 day counts
+    /// rejected before any write.
     #[test]
     fn build_settings_patch_maps_form_and_validates() {
-        // Populated form.
         let p = super::build_settings_patch(
             14,
             45,
             Some("  ~/wt  ".to_string()),
-            &["/clear".to_string(), "  ".to_string(), "/park".to_string()],
-            &["/codex-clear".to_string(), "  ".to_string()],
+            &steps(
+                &["/clear", "  ", "/park"],
+                &["/codex-clear", "  "],
+                &[" /agy "],
+            ),
             Some(keitora_tasks::DiffBase::Upstream),
         )
         .unwrap();
@@ -3505,21 +3712,264 @@ mod tests {
             Some(Some(vec!["/codex-clear".to_string()])),
             "codex steps cleaned independently of claude steps"
         );
+        assert_eq!(
+            p.antigravity_dispatch_steps,
+            Some(Some(vec!["/agy".to_string()])),
+            "antigravity steps cleaned independently"
+        );
 
-        // Empty worktrees_dir → clear (Some(None) → default). Empty dispatch steps →
-        // EXPLICIT empty override (Some(Some([]))), so clearing the editor actually
-        // clears dispatch instead of reverting to committed steps. Applies to both
-        // CLIs independently.
-        let p =
-            super::build_settings_patch(30, 90, Some("   ".to_string()), &[], &[], None).unwrap();
+        let none = std::collections::BTreeMap::new();
+        let p = super::build_settings_patch(30, 90, Some("   ".to_string()), &none, None).unwrap();
         assert_eq!(p.worktrees_dir, Some(None));
-        assert_eq!(p.dispatch_steps, Some(Some(vec![])));
-        assert_eq!(p.codex_dispatch_steps, Some(Some(vec![])));
         assert_eq!(p.diff_base, Some(None), "None form value clears to Auto");
 
         // Day floors rejected before any write.
-        assert!(super::build_settings_patch(0, 90, None, &[], &[], None).is_err());
-        assert!(super::build_settings_patch(30, 0, None, &[], &[], None).is_err());
+        assert!(super::build_settings_patch(0, 90, None, &none, None).is_err());
+        assert!(super::build_settings_patch(30, 0, None, &none, None).is_err());
+    }
+
+    /// An empty step list (or an absent provider) is an EXPLICIT empty override
+    /// (`Some(Some([]))`, not a clear) for every provider, so emptying the editor
+    /// clears dispatch instead of reverting to committed steps.
+    #[test]
+    fn build_settings_patch_sets_all_three_step_lists() {
+        let p = super::build_settings_patch(30, 90, None, &steps(&[], &[], &[]), None).unwrap();
+        assert_eq!(p.dispatch_steps, Some(Some(vec![])));
+        assert_eq!(p.codex_dispatch_steps, Some(Some(vec![])));
+        assert_eq!(p.antigravity_dispatch_steps, Some(Some(vec![])));
+
+        let absent = std::collections::BTreeMap::new();
+        let p = super::build_settings_patch(30, 90, None, &absent, None).unwrap();
+        assert_eq!(p.dispatch_steps, Some(Some(vec![])));
+        assert_eq!(p.codex_dispatch_steps, Some(Some(vec![])));
+        assert_eq!(p.antigravity_dispatch_steps, Some(Some(vec![])));
+    }
+
+    /// `providers` on both DTOs and `user.available` are JSON objects keyed by
+    /// exactly the three providers; only the project DTO carries `dispatch_steps`.
+    #[test]
+    fn settings_snapshot_serializes_providers_keyed_by_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut pc = keitora_tasks::ProjectConfig::scaffold(tmp.path());
+        pc.antigravity.path = Some("/home/u/bin/agy".to_string());
+        pc.antigravity.autonomy = Some(true);
+        pc.dispatch.antigravity_steps = vec!["/a".to_string()];
+        pc.dispatch.claude_steps = vec!["/clear".to_string()];
+        let mut user = keitora_tasks::UserConfig::default();
+        user.codex.path = Some("/home/u/bin/codex".to_string());
+        user.codex.autonomy = Some(true);
+        let available = super::cli_availability_with(&user, Some(&pc), |_| false);
+        let v =
+            serde_json::to_value(super::build_settings_snapshot(&pc, &user, available)).unwrap();
+
+        let keys = |v: &serde_json::Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let all = vec!["antigravity", "claude", "codex"];
+        assert_eq!(keys(&v["project"]["providers"]), all);
+        assert_eq!(keys(&v["user"]["providers"]), all);
+        assert_eq!(keys(&v["user"]["available"]), all);
+
+        let agy = &v["project"]["providers"]["antigravity"];
+        assert_eq!(agy["path"], "/home/u/bin/agy");
+        assert_eq!(agy["autonomy"], true);
+        assert_eq!(agy["dispatch_steps"], serde_json::json!(["/a"]));
+        assert_eq!(
+            v["project"]["providers"]["claude"]["dispatch_steps"],
+            serde_json::json!(["/clear"])
+        );
+        assert_eq!(
+            v["project"]["providers"]["codex"]["path"],
+            serde_json::Value::Null
+        );
+
+        let codex = &v["user"]["providers"]["codex"];
+        assert_eq!(codex["path"], "/home/u/bin/codex");
+        assert_eq!(codex["autonomy"], true);
+        assert!(
+            codex.get("dispatch_steps").is_none(),
+            "user DTO has no dispatch steps"
+        );
+        assert_eq!(v["user"]["providers"]["claude"]["autonomy"], false);
+
+        // Old flat wire names are gone.
+        for k in [
+            "claude_path",
+            "skip_permissions",
+            "codex_path",
+            "codex_autonomy",
+        ] {
+            assert!(v["user"].get(k).is_none(), "{k}");
+        }
+        assert!(v["user"].get("codex_available").is_none());
+        assert!(v["project"].get("dispatch_steps").is_none());
+    }
+
+    /// `available[cli]` is true when a configured path resolves (project or user
+    /// level) or discovery finds the executable; false only when neither holds,
+    /// and never for Claude.
+    #[test]
+    fn cli_availability_is_configured_path_or_discovery() {
+        use keitora_tasks::CliKind;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut pc = keitora_tasks::ProjectConfig::scaffold(tmp.path());
+        pc.antigravity.path = Some("/home/u/bin/agy".to_string());
+        let mut user = keitora_tasks::UserConfig::default();
+        user.codex.path = Some("/home/u/bin/codex".to_string());
+
+        let a = super::cli_availability_with(&user, Some(&pc), |_| false);
+        assert_eq!(a.len(), keitora_tasks::CLI_COUNT);
+        assert!(
+            a[&CliKind::Claude],
+            "Claude is available even when nothing is configured or discovered"
+        );
+        assert!(a[&CliKind::Codex], "user path counts");
+        assert!(a[&CliKind::Antigravity], "project path counts");
+
+        let a = super::cli_availability_with(&user, None, |cli| cli == CliKind::Antigravity);
+        assert!(a[&CliKind::Claude]);
+        assert!(a[&CliKind::Codex]);
+        assert!(a[&CliKind::Antigravity], "discovery counts");
+
+        let a = super::cli_availability_with(&user, None, |_| false);
+        assert!(
+            !a[&CliKind::Antigravity],
+            "project path ignored without a project"
+        );
+    }
+
+    /// The drawer's camelCase provider object deserializes into
+    /// `ProjectProviderInput`, keyed by provider.
+    #[test]
+    fn project_provider_input_deserializes_keyed_camel_case() {
+        let raw = serde_json::json!({
+            "claude": { "path": null, "dispatchSteps": ["/clear"] },
+            "codex": { "path": "/home/u/bin/codex", "dispatchSteps": [] },
+            "antigravity": { "path": null, "dispatchSteps": ["/a"] },
+        });
+        let m: std::collections::BTreeMap<keitora_tasks::CliKind, super::ProjectProviderInput> =
+            serde_json::from_value(raw).unwrap();
+        assert_eq!(m.len(), 3);
+        assert_eq!(
+            m[&keitora_tasks::CliKind::Claude].dispatch_steps,
+            vec!["/clear".to_string()]
+        );
+        assert_eq!(
+            m[&keitora_tasks::CliKind::Codex].path.as_deref(),
+            Some("/home/u/bin/codex")
+        );
+        assert_eq!(
+            m[&keitora_tasks::CliKind::Antigravity].dispatch_steps,
+            vec!["/a".to_string()]
+        );
+    }
+
+    fn antigravity_project(root: &std::path::Path) -> keitora_tasks::ProjectConfig {
+        let mut pc = keitora_tasks::ProjectConfig::scaffold(root);
+        pc.antigravity.path = Some("/usr/bin/agy".to_string());
+        pc.antigravity.autonomy = Some(true);
+        pc.dispatch.antigravity_steps = vec!["/a".to_string()];
+        pc.claude.path = Some("/usr/bin/claude".to_string());
+        pc
+    }
+
+    #[test]
+    fn commit_settings_to_project_writes_antigravity_table() {
+        // Scaffold branch: no committed file yet.
+        let tmp = tempfile::tempdir().unwrap();
+        let pc = antigravity_project(tmp.path());
+        super::commit_settings_to_file(&pc).unwrap();
+        let back = keitora_tasks::ProjectConfig::load(tmp.path()).unwrap();
+        assert_eq!(back.antigravity.path.as_deref(), Some("/usr/bin/agy"));
+        assert_eq!(back.dispatch.antigravity_steps, vec!["/a".to_string()]);
+        assert_eq!(back.claude.path.as_deref(), Some("/usr/bin/claude"));
+
+        // Existing-file branch: a file without the provider gains it.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("keitora.toml"),
+            "# keep\n[project]\nname = \"proj\"\n\n[tasks]\ndb_path = \"tasks.db\"\n",
+        )
+        .unwrap();
+        let pc = antigravity_project(tmp.path());
+        super::commit_settings_to_file(&pc).unwrap();
+        let raw = std::fs::read_to_string(tmp.path().join("keitora.toml")).unwrap();
+        assert!(raw.contains("# keep"), "{raw}");
+        assert!(raw.contains("[antigravity]"), "{raw}");
+        let back = keitora_tasks::ProjectConfig::load(tmp.path()).unwrap();
+        assert_eq!(back.antigravity.path.as_deref(), Some("/usr/bin/agy"));
+        assert_eq!(back.antigravity.autonomy, Some(true));
+        assert_eq!(back.dispatch.antigravity_steps, vec!["/a".to_string()]);
+    }
+
+    #[test]
+    fn set_skip_permissions_writes_antigravity_autonomy() {
+        let mut user = keitora_tasks::UserConfig::default();
+        super::apply_skip_permissions(&mut user, keitora_tasks::CliKind::Antigravity, true);
+        assert_eq!(user.antigravity.autonomy, Some(true));
+        assert_eq!(user.claude.autonomy, None);
+        assert_eq!(user.codex.autonomy, None);
+        super::apply_skip_permissions(&mut user, keitora_tasks::CliKind::Antigravity, false);
+        assert_eq!(user.antigravity.autonomy, Some(false));
+    }
+
+    #[test]
+    fn apply_user_settings_sets_paths_and_default_and_reports_change() {
+        use keitora_tasks::CliKind;
+        let mut user = keitora_tasks::UserConfig::default();
+        user.claude.path = Some("/usr/bin/claude".to_string());
+        user.claude.autonomy = Some(true);
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(CliKind::Claude, Some("/usr/bin/claude".to_string()));
+        providers.insert(CliKind::Codex, Some("  /usr/bin/codex  ".to_string()));
+        providers.insert(CliKind::Antigravity, Some("   ".to_string()));
+        assert!(super::apply_user_settings(
+            &mut user,
+            &providers,
+            CliKind::Antigravity
+        ));
+        assert_eq!(user.claude.path.as_deref(), Some("/usr/bin/claude"));
+        assert_eq!(user.claude.autonomy, Some(true), "autonomy untouched");
+        assert_eq!(user.codex.path.as_deref(), Some("/usr/bin/codex"));
+        assert_eq!(user.antigravity.path, None);
+        assert_eq!(user.default_cli, Some(CliKind::Antigravity));
+        // Same paths again: nothing changed. An absent provider clears its path.
+        assert!(!super::apply_user_settings(
+            &mut user,
+            &providers,
+            CliKind::Claude
+        ));
+        providers.remove(&CliKind::Codex);
+        assert!(super::apply_user_settings(
+            &mut user,
+            &providers,
+            CliKind::Claude
+        ));
+        assert_eq!(user.codex.path, None);
+    }
+
+    #[test]
+    fn antigravity_settings_triggers_gate_sync_and_refresh() {
+        use keitora_tasks::CliKind;
+        assert_eq!(
+            super::antigravity_settings_triggers(CliKind::Antigravity, false),
+            (true, true)
+        );
+        assert_eq!(
+            super::antigravity_settings_triggers(CliKind::Antigravity, true),
+            (true, true)
+        );
+        assert_eq!(
+            super::antigravity_settings_triggers(CliKind::Claude, true),
+            (true, false),
+            "a path change syncs but never refreshes herdr"
+        );
+        assert_eq!(
+            super::antigravity_settings_triggers(CliKind::Codex, false),
+            (false, false)
+        );
     }
 
     // ── Watcher stop/replace logic ────────────────────────────────────────────
@@ -3839,6 +4289,48 @@ mod tests {
         fn agent_launch_with_discovery_bare_codex_when_discovery_finds_nothing() {
             let launch = agent_launch_with_discovery(&codex_user(), None, "alpha", &|_| None);
             assert_eq!(launch.path, "codex");
+        }
+
+        fn antigravity_user() -> UserConfig {
+            UserConfig {
+                default_cli: Some(CliKind::Antigravity),
+                ..UserConfig::default()
+            }
+        }
+
+        #[test]
+        fn agent_launch_with_discovery_uses_discovered_path_for_antigravity_when_unconfigured() {
+            let launch = agent_launch_with_discovery(&antigravity_user(), None, "alpha", &|cli| {
+                assert_eq!(cli, CliKind::Antigravity);
+                Some("/home/u/.local/bin/agy".into())
+            });
+            assert_eq!(launch.cli, CliKind::Antigravity);
+            assert_eq!(launch.path, "/home/u/.local/bin/agy");
+            assert_eq!(launch.resume_target, None);
+            assert_eq!(launch.policy, LaunchPolicy::Default);
+        }
+
+        #[test]
+        fn agent_launch_with_discovery_bare_agy_when_discovery_finds_nothing() {
+            let launch = agent_launch_with_discovery(&antigravity_user(), None, "alpha", &|_| None);
+            assert_eq!(launch.path, "agy");
+        }
+
+        #[test]
+        fn agent_launch_with_discovery_antigravity_resume_target_is_the_conversation_id() {
+            let id = "0b9e6c3e-1f2a-4c5d-8e7f-a1b2c3d4e5f6";
+            let mut pc =
+                keitora_tasks::ProjectConfig::scaffold(std::path::Path::new("/repos/proj"));
+            let mut alpha = keitora_tasks::WorktreeEntry::name_only("alpha");
+            alpha.cli = Some(CliKind::Antigravity);
+            alpha.antigravity_conversation_id = Some(id.into());
+            alpha.claude_session_id = Some("claude-sess".into());
+            alpha.codex_thread_id = Some("thr-1".into());
+            pc.effective_worktrees = Some(vec![alpha]);
+            let launch =
+                agent_launch_with_discovery(&UserConfig::default(), Some(&pc), "alpha", &|_| None);
+            assert_eq!(launch.cli, CliKind::Antigravity);
+            assert_eq!(launch.resume_target.as_deref(), Some(id));
         }
     }
 }

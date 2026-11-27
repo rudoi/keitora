@@ -1,17 +1,13 @@
 // Covers a pane while its worktree is mid CLI-transfer: the import (with elapsed time and,
-// for Claude to Codex, a Cancel button) and then the restart into the target CLI. It is
+// for Claude to Codex, a Cancel button) and then the restart into the target CLI. A switch
+// has no import: it shows "Switching to …" until the backend answers, then the restart. It is
 // rendered regardless of the pane's status, because a running pane stays `running` for the
 // whole import and through the restart. Focus moves here on mount so keystrokes cannot
 // reach the terminal underneath.
 
 import { useEffect, useRef, useState } from "react";
-import {
-  canCancel,
-  cliLabel,
-  formatElapsed,
-  progressLabel,
-  type TransferEntry,
-} from "../lib/transferPhase";
+import { cliTitle } from "../lib/providers";
+import { canCancel, formatElapsed, progressLabel, type TransferEntry } from "../lib/transferPhase";
 
 export function TransferOverlay({
   entry,
@@ -23,7 +19,8 @@ export function TransferOverlay({
   const rootRef = useRef<HTMLDivElement | null>(null);
   const cancelRef = useRef<HTMLButtonElement | null>(null);
   const [now, setNow] = useState(() => Date.now());
-  const importing = entry.phase === "importing";
+  const switching = entry.mode === "switch";
+  const importing = !switching && entry.phase === "importing";
 
   // Only the importing view shows elapsed time, so only it ticks.
   useEffect(() => {
@@ -33,7 +30,7 @@ export function TransferOverlay({
     return () => window.clearInterval(id);
   }, [importing]);
 
-  const showCancel = importing && entry.to === "codex";
+  const showCancel = importing && entry.mode === "transfer" && entry.to === "codex";
 
   // Take focus whenever the phase changes (mount included): the Cancel button when there
   // is one, else the overlay itself.
@@ -46,10 +43,12 @@ export function TransferOverlay({
 
   return (
     <div className="pane-overlay" role="status" aria-live="polite" tabIndex={-1} ref={rootRef}>
-      <div className="pane-spinner" aria-label="Transferring" />
-      {importing ? (
+      <div className="pane-spinner" aria-label={switching ? "Switching" : "Transferring"} />
+      {switching && entry.result === null ? (
+        <div className="pane-msg">Switching to {cliTitle(entry.to)}…</div>
+      ) : importing ? (
         <>
-          <div className="pane-msg">Transferring to {cliLabel(entry.to)}…</div>
+          <div className="pane-msg">Transferring to {cliTitle(entry.to)}…</div>
           <div className="pane-msg">{progressLabel(entry.progress)}</div>
           {typeof detail === "string" && detail !== "" && (
             <div className="pane-msg pane-msg-detail">{detail}</div>
@@ -75,7 +74,7 @@ export function TransferOverlay({
           )}
         </>
       ) : (
-        <div className="pane-msg">Starting {cliLabel(entry.to)}…</div>
+        <div className="pane-msg">Starting {cliTitle(entry.to)}…</div>
       )}
     </div>
   );

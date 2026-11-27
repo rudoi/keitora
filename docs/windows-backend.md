@@ -20,6 +20,9 @@
   an update. If herdr can't be found or started, the app still opens with an
   unavailable backend and the rail shows the reason.
 - **`claude`** installed (npm global → `%APPDATA%\npm\claude.cmd`), or on `PATH`.
+- **`agy`** (optional): installed by the official PowerShell installer to
+  `%LOCALAPPDATA%\agy\bin\agy.exe`; Keitora checks that folder directly because the
+  installer does not update the PATH of running processes.
 - Rust MSVC toolchain; `cargo tauri build` (Tauri v2 cannot cross-compile Windows
   from macOS — build natively on Windows).
 
@@ -61,7 +64,7 @@ earlier design and are kept for the shell/PATH reasoning.
 
 **Agent PATH on Windows:** the bundled CLI ships as `keitora-cli.exe`, which is not
 on any pane's `PATH`. Keitora mirrors it to `%LOCALAPPDATA%\keitorain\keitora.exe`
-and prepends that directory (then the configured `claude`/`codex` directory) to each
+and prepends that directory (then the configured `claude`/`codex`/`agy` directory) to each
 agent pane's `PATH` via herdr's per-pane `--env`, so agents can run a bare `keitora`.
 
 ---

@@ -10,7 +10,6 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { Loader2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  cliTitle,
   closeInterruptsRun,
   interruptRunCopy,
   runOutcomeCopy,
@@ -32,6 +31,7 @@ import {
 } from "../lib/ipc";
 import { LAYER_MODAL, MODAL_OVERLAY_CLS } from "../lib/layers";
 import { isWindows } from "../lib/platform";
+import { cliTitle } from "../lib/providers";
 import { errorText } from "../lib/updates";
 import { useAgentUpdates } from "./AgentUpdatesProvider";
 import { TerminalPane } from "./TerminalPane";

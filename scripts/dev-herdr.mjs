@@ -338,8 +338,9 @@ export function herdrDevEnv(base, { keitoraHome, configHome, herdrBin }) {
     KEITORA_HOME: keitoraHome,
     KEITORA_CONFIG_HOME: configHome,
     KEITORA_HERDR_BIN: herdrBin,
-    // `herdr integration install` writes the REAL ~/.claude / ~/.codex (global, not
-    // sandboxable by XDG_*): never let a dev run install it.
+    // `herdr integration install` and Keitora's own agent hook/trust writers touch the
+    // REAL ~/.claude, ~/.codex and ~/.gemini (global, not sandboxable by XDG_*): never
+    // let a dev run write them.
     KEITORA_HERDR_NO_INTEGRATION: "1",
     XDG_CONFIG_HOME: join(herdrHome, "config"),
     XDG_STATE_HOME: join(herdrHome, "state"),

@@ -194,6 +194,48 @@ pub fn resolve_keitora_bin(
     None
 }
 
+/// Pure: the pane env pair list for an already-resolved `keitora` binary.
+pub fn keitora_bin_pair(bin: Option<String>) -> Vec<(String, String)> {
+    bin.map(|b| vec![("KEITORA_BIN".to_string(), b)])
+        .unwrap_or_default()
+}
+
+/// `[("KEITORA_BIN", bin)]` when a `keitora` binary resolves for `cwd`, else empty.
+/// Resolution is [`resolve_keitora_bin`] with the user's `[cli].path` override and
+/// the `keitora` on PATH (looked up once per process: on unix it runs a login shell).
+/// Empty under `cfg!(test)` (no login shell in unit tests).
+pub fn keitora_bin_extra_env(cwd: &Path) -> Vec<(String, String)> {
+    if cfg!(test) {
+        return Vec::new();
+    }
+    let on_path = keitora_on_path_cached();
+    let user = keitora_tasks::UserConfig::load().unwrap_or_default();
+    let user_override = keitora_tasks::resolve_keitora_path(None, &user);
+    keitora_bin_pair(resolve_keitora_bin(
+        cwd,
+        user_override.as_deref(),
+        on_path.as_deref(),
+    ))
+}
+
+/// The `keitora` on PATH, looked up once per process.
+fn keitora_on_path_cached() -> &'static Option<String> {
+    static ON_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ON_PATH.get_or_init(keitora_tasks::keitora_on_path)
+}
+
+/// Start the once-per-process `keitora` PATH lookup on a background thread, so
+/// the first pane spawn finds it done instead of running it (on unix, a login
+/// shell) while holding up every concurrent spawn. Skipped under `cfg!(test)`.
+pub fn warm_keitora_on_path() {
+    if cfg!(test) {
+        return;
+    }
+    std::thread::spawn(|| {
+        keitora_on_path_cached();
+    });
+}
+
 /// Install/refresh the session hooks for a single worktree at `wt_path`.
 ///
 /// Reads `.claude/settings.local.json`, merges our hooks in, and writes back only
@@ -311,6 +353,20 @@ fn install_hooks_into(config: Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keitora_bin_pair_sets_the_variable() {
+        assert_eq!(
+            keitora_bin_pair(Some("/x/keitora".into())),
+            vec![("KEITORA_BIN".to_string(), "/x/keitora".to_string())]
+        );
+        assert!(keitora_bin_pair(None).is_empty());
+    }
+
+    #[test]
+    fn keitora_bin_extra_env_is_empty_under_test() {
+        assert!(keitora_bin_extra_env(Path::new("/home/u/proj")).is_empty());
+    }
 
     fn commands_for(v: &Value, event: &str) -> Vec<String> {
         v["hooks"][event]

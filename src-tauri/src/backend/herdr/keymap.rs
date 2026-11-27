@@ -1571,7 +1571,7 @@ mod tests {
             live("w2", "w2:p2", "t2", "/repos/alpha"),
         ];
         // Even a pane holding the key's name does not beat the entry's own pane.
-        let [claude, _] = agent_names_for(&k);
+        let [claude, ..] = agent_names_for(&k);
         let agents = [agent_in("w1:p1", "claude", &claude, "idle")];
         for agents in [&agents[..], &[]] {
             let out = reconcile_panes(&persisted, &live_panes, agents, &no_kind, true);
@@ -1589,7 +1589,7 @@ mod tests {
             live("w1", "w1:p1", "t1", "/repos/alpha"), // a restored plain shell
             live("w2", "w2:p2", "t2", "/repos/alpha"), // the session's agent
         ];
-        let [claude, _] = agent_names_for(&k);
+        let [claude, ..] = agent_names_for(&k);
         let agents = vec![agent_in("w2:p2", "claude", &claude, "idle")];
         let unread =
             |_: &SessionKey| -> Option<CliKind> { panic!("one named agent needs no kind") };
@@ -1612,7 +1612,7 @@ mod tests {
             live("w1", "w1:p1", "t1", "/repos/alpha"), // a shell reusing the old id
             live("w1", "w1:p2", "t2", "/repos/alpha"), // the session's agent
         ];
-        let [claude, _] = agent_names_for(&k);
+        let [claude, ..] = agent_names_for(&k);
         let agents = vec![agent_in("w1:p2", "claude", &claude, "idle")];
         let out = reconcile_panes(&persisted, &live_panes, &agents, &no_kind, false);
         assert_eq!(out.len(), 1);
@@ -1634,7 +1634,7 @@ mod tests {
             live("w1", "w1:p1", "t1", "/repos/alpha"),
             live("w2", "w2:p2", "t2", "/repos/alpha"),
         ];
-        let [foreign, _] = agent_names_for(&key("proj", "bravo"));
+        let [foreign, ..] = agent_names_for(&key("proj", "bravo"));
         let agents = vec![agent_in("w2:p2", "claude", &foreign, "idle")];
         let out = reconcile_panes(&persisted, &live_panes, &agents, &no_kind, true);
         assert_eq!(out[0].1.pane_id, "w1:p1", "first cwd match");
@@ -1668,7 +1668,7 @@ mod tests {
             live("w1", "w1:p1", "t1", "/repos/shared"),
             live("w2", "w2:p2", "t2", "/repos/shared"),
         ];
-        let [b_name, _] = agent_names_for(&b);
+        let [b_name, ..] = agent_names_for(&b);
         let agents = vec![agent_in("w1:p1", "claude", &b_name, "idle")];
         let out = reconcile_panes(&persisted, &live_panes, &agents, &no_kind, true);
         let got: Vec<(&str, &str)> = out
@@ -1695,7 +1695,7 @@ mod tests {
             live("w1", "w1:p1", "t1", "/repos/alpha"),
             live("w2", "w2:p2", "t2", "/repos/alpha"),
         ];
-        let [claude, codex] = agent_names_for(&k);
+        let [claude, codex, _] = agent_names_for(&k);
         let agents = vec![
             agent_in("w1:p1", "claude", &claude, "idle"),
             agent_in("w2:p2", "codex", &codex, "idle"),
@@ -1716,7 +1716,7 @@ mod tests {
             live("w1", "w1:p1", "t1", "/repos/alpha"),
             live("w2", "w2:p2", "t2", "/repos/alpha"),
         ];
-        let [claude, codex] = agent_names_for(&k);
+        let [claude, codex, _] = agent_names_for(&k);
         let agents = vec![
             agent_in("w1:p1", "claude", &claude, "done"),
             agent_in("w2:p2", "codex", &codex, "working"),

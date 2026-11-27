@@ -746,7 +746,9 @@ fn pane_xdg_env_for(
 /// started by an older Keitora with a minimal `PATH` still gives new panes a good
 /// one. Windows: the base is the process `PATH` and `herdr_path` is ignored.
 ///
-/// Wired into `HerdrBackend::spawn_agent`.
+/// `HerdrBackend::spawn_agent` uses [`pane_env_with`] (adding `KEITORA_BIN`); this
+/// no-extra form pins the base environment in tests.
+#[cfg(test)]
 pub fn pane_env(
     exe: &str,
     original: &OriginalXdg,
@@ -1432,6 +1434,20 @@ mod tests {
         assert_eq!(with.len(), base.len() + 1);
         assert_eq!(with[..base.len()], base[..]);
         assert_eq!(with.last(), extra.last());
+    }
+
+    #[test]
+    fn pane_env_with_carries_keitora_bin_extra() {
+        let original = sample_original();
+        let extra = vec![
+            ("CODEX_HOME".to_string(), "/x/codex-home".to_string()),
+            ("KEITORA_BIN".to_string(), "/x".to_string()),
+        ];
+        let with = pane_env_with("agy", &original, Some("/base/bin"), &extra);
+        assert_eq!(
+            with.last(),
+            Some(&("KEITORA_BIN".to_string(), "/x".to_string()))
+        );
     }
 
     fn pairs(want: &[(&str, &str)]) -> Vec<(String, String)> {

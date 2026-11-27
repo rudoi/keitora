@@ -474,6 +474,8 @@ export interface SettingsRow {
   tone: "ok" | "warn" | "error" | "muted";
   path: string | null;
   action: { kind: DoctorAction | "restart_to_finish"; label: string } | null;
+  /** Install command for a missing agent CLI Keitora does not install itself. */
+  hint: string | null;
 }
 
 export interface SettingsModel {
@@ -512,7 +514,7 @@ export function settingsModel(
 ): SettingsModel {
   const restart = snapshot?.floor.type === "restart_to_finish" ? snapshot.floor : null;
   const out: SettingsRow[] = rows.map((row) => {
-    const base = { tool: row.tool, path: row.path, ...rowDetail(row) };
+    const base = { tool: row.tool, path: row.path, hint: row.hint, ...rowDetail(row) };
     if (row.tool === "herdr" && restart) {
       return {
         ...base,

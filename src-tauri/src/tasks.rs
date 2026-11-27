@@ -96,7 +96,7 @@ pub(crate) fn open_backend() -> Result<(Box<dyn TaskBackend>, ProjectConfig), St
 /// active project namespace.
 pub(crate) fn reconciled_sessions(
     live: &std::collections::HashSet<crate::backend::SessionKey>,
-    bg: &std::collections::HashSet<crate::backend::SessionKey>,
+    hints: &crate::backend::HintMap,
     project: &str,
     config: &ProjectConfig,
 ) -> Result<Vec<WorktreeSession>, String> {
@@ -105,14 +105,14 @@ pub(crate) fn reconciled_sessions(
     // Connection — FIX 6).
     let local =
         LocalStore::open(&config.tasks.db_path.to_string_lossy()).map_err(|e| e.to_string())?;
-    reconciled_sessions_in(&local, live, bg, project, config)
+    reconciled_sessions_in(&local, live, hints, project, config)
 }
 
 /// [`reconciled_sessions`] over an already-open store (e.g. a read-only handle).
 pub(crate) fn reconciled_sessions_in(
     local: &LocalStore,
     live: &std::collections::HashSet<crate::backend::SessionKey>,
-    bg: &std::collections::HashSet<crate::backend::SessionKey>,
+    hints: &crate::backend::HintMap,
     project: &str,
     config: &ProjectConfig,
 ) -> Result<Vec<WorktreeSession>, String> {
@@ -134,7 +134,7 @@ pub(crate) fn reconciled_sessions_in(
             .collect()
     };
     Ok(crate::backend::apply_reconcile(
-        &sessions, live, bg, project,
+        &sessions, live, hints, project,
     ))
 }
 
@@ -158,8 +158,8 @@ pub fn sessions_list(
     // open inside `reconciled_sessions` (FIX 6 — no duplicate resolve).
     let config = keitora_tasks::resolve_active().map_err(|e| e.to_string())?;
     let project = config.project.name.clone();
-    let bg = crate::backend::cached_background_set(client.inner().as_ref());
-    let mut sessions = reconciled_sessions(&client.live_set_snapshot(), &bg, &project, &config)?;
+    let hints = crate::backend::cached_agent_hints(client.inner().as_ref());
+    let mut sessions = reconciled_sessions(&client.live_set_snapshot(), &hints, &project, &config)?;
     // Stamp the active project onto each row so the frontend keys sessions by
     // `project/worktree` — DB rows carry no project column.
     for s in &mut sessions {

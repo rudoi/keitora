@@ -35,7 +35,7 @@ yarn dev:isolated
 
 It builds the app and the CLI and runs the app against a Vite server on port 1420, with its own
 herdr server, its own state (wiped on every run) and a throwaway git project. It doesn't install
-agent hooks into your real `~/.claude` or `~/.codex`. Its home is
+agent hooks into your real `~/.claude`, `~/.codex` or `~/.gemini`. Its home is
 `~/.keitora-dev/<checkout>-<hash>-herdr`, keyed per checkout so several worktrees can each run one.
 Set `KEITORA_DEV_HOME` to change the base.
 

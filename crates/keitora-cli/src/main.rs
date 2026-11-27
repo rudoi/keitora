@@ -12,6 +12,8 @@ use keitora_tasks::{
 };
 use serde_json::json;
 
+mod hook_payload;
+
 #[derive(Parser)]
 #[command(
     name = "keitora",
@@ -31,10 +33,17 @@ enum Cmd {
     /// Cross-worktree task tracking (list, claim, done, …)
     #[command(subcommand)]
     Task(TaskCmd),
-    /// Record this worktree's Claude session state (used by Claude Code hooks)
+    /// Record this worktree's agent session state (used by agent hooks)
     Session {
         /// One of: idle | busy | waiting | offline
         state: String,
+        /// Read the hook's JSON payload from stdin and take the worktree from its
+        /// `cwd` (else `workspacePaths[0]`); never fails the hook
+        #[arg(long)]
+        stdin_payload: bool,
+        /// With `--stdin-payload`: do nothing unless the payload has `fullyIdle: true`
+        #[arg(long, requires = "stdin_payload")]
+        if_fully_idle: bool,
     },
     /// Manage project configuration
     #[command(subcommand)]
@@ -245,6 +254,42 @@ async fn run() -> Result<(), Box<dyn Error>> {
         return run_config(sub, cli.json);
     }
 
+    // A hook invocation: move into the payload's directory before resolve(), and
+    // never fail the hook (an agent must not break on Keitora's account).
+    if let Cmd::Session {
+        stdin_payload: true,
+        if_fully_idle,
+        ..
+    } = cli.cmd
+    {
+        if !enter_payload_dir(if_fully_idle) {
+            return Ok(());
+        }
+        if let Err(e) = run_resolved(cli).await {
+            eprintln!("error: {e}");
+        }
+        return Ok(());
+    }
+
+    run_resolved(cli).await
+}
+
+/// Read the hook payload from stdin and change into its directory. `false` when
+/// the hook should do nothing (unreadable, oversize, filtered out, no such dir).
+fn enter_payload_dir(if_fully_idle: bool) -> bool {
+    use hook_payload::{interpret_payload, read_capped, PayloadAction, MAX_PAYLOAD_BYTES};
+    let Ok(Some(raw)) = read_capped(&mut std::io::stdin(), MAX_PAYLOAD_BYTES) else {
+        return false;
+    };
+    let PayloadAction::Run { cwd } = interpret_payload(&raw, if_fully_idle) else {
+        return false;
+    };
+    cwd.is_dir() && std::env::set_current_dir(&cwd).is_ok()
+}
+
+/// Everything after the config short-circuit: resolve the project, open the
+/// stores and run the task or session command.
+async fn run_resolved(cli: Cli) -> Result<(), Box<dyn Error>> {
     let config = resolve()
         .map(Config::from_project)
         .map_err(|e| -> Box<dyn Error> {
@@ -265,7 +310,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     match cli.cmd {
         Cmd::Config(_) => unreachable!("handled above"),
-        Cmd::Session { state } => {
+        Cmd::Session { state, .. } => {
             // The hook entry point — runs on every turn, so keep it cheap: one
             // targeted query for the active task id, no full list scan.
             let me = cli_actor();
@@ -1171,6 +1216,45 @@ mod tests {
     // `keitora-tasks`. Guard the clap parsing so the subcommands can't silently
     // change shape.
     #[test]
+    fn session_parses_stdin_flags() {
+        match Cli::try_parse_from([
+            "keitora",
+            "session",
+            "idle",
+            "--stdin-payload",
+            "--if-fully-idle",
+        ])
+        .unwrap()
+        .cmd
+        {
+            Cmd::Session {
+                state,
+                stdin_payload,
+                if_fully_idle,
+            } => {
+                assert_eq!(state, "idle");
+                assert!(stdin_payload && if_fully_idle);
+            }
+            _ => panic!("expected `session`"),
+        }
+        match Cli::try_parse_from(["keitora", "session", "busy", "--stdin-payload"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Session {
+                stdin_payload,
+                if_fully_idle,
+                ..
+            } => assert!(stdin_payload && !if_fully_idle),
+            _ => panic!("expected `session`"),
+        }
+        assert!(
+            Cli::try_parse_from(["keitora", "session", "idle", "--if-fully-idle"]).is_err(),
+            "--if-fully-idle requires --stdin-payload"
+        );
+    }
+
+    #[test]
     fn parses_config_subcommands() {
         match Cli::try_parse_from(["keitora", "config", "use", "myproj"])
             .unwrap()
@@ -1222,7 +1306,14 @@ mod tests {
             .unwrap()
             .cmd
         {
-            Cmd::Session { state } => assert_eq!(state, "idle"),
+            Cmd::Session {
+                state,
+                stdin_payload,
+                if_fully_idle,
+            } => {
+                assert_eq!(state, "idle");
+                assert!(!stdin_payload && !if_fully_idle);
+            }
             _ => panic!("expected `session`"),
         }
         // `--json` is global: valid before or after the subcommand path.

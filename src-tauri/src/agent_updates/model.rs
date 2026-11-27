@@ -72,8 +72,6 @@ pub enum RunOutcome {
 
 /// The per-CLI facts the install and update rules read.
 struct CliInfo {
-    /// The display name used in hints.
-    title: &'static str,
     /// The CLI's own install directory under the home directory, with a trailing `/`.
     native_dir: &'static str,
     npm: &'static str,
@@ -82,37 +80,76 @@ struct CliInfo {
     native_update: &'static str,
     /// Whether Keitora runs `native_update` itself; otherwise it is only suggested.
     native_update_runs: bool,
+    /// Whether a native update invokes the found executable by its path rather than
+    /// the bare name: the installer's directory may be missing from the update pane's
+    /// `PATH` (the Windows installer does not update the PATH of running processes).
+    native_by_path: bool,
 }
 
 const CLAUDE_INFO: CliInfo = CliInfo {
-    title: "Claude",
     native_dir: ".claude/local/",
     npm: "npm install -g @anthropic-ai/claude-code@latest",
     brew: "brew upgrade --cask claude-code",
     native_update: "claude update",
     native_update_runs: true,
+    native_by_path: false,
 };
 
 /// Codex's own updater could not be verified, so it is only suggested.
 const CODEX_INFO: CliInfo = CliInfo {
-    title: "Codex",
     native_dir: ".codex/bin/",
     npm: "npm install -g @openai/codex@latest",
     brew: "brew upgrade --cask codex",
     native_update: "codex update",
     native_update_runs: false,
+    native_by_path: false,
+};
+
+/// Antigravity ships its own installer and updater (`agy update`); there is no npm
+/// or Homebrew package to suggest, so those commands are empty.
+const ANTIGRAVITY_INFO: CliInfo = CliInfo {
+    // Lower-case: `classify_path` compares against the normalized (lower-cased) path.
+    native_dir: if cfg!(windows) {
+        "appdata/local/agy/bin/"
+    } else {
+        ".local/bin/"
+    },
+    npm: "",
+    brew: "",
+    native_update: "agy update",
+    native_update_runs: true,
+    native_by_path: true,
 };
 
 fn info(cli: CliKind) -> &'static CliInfo {
     match cli {
         CliKind::Claude => &CLAUDE_INFO,
         CliKind::Codex => &CODEX_INFO,
+        CliKind::Antigravity => &ANTIGRAVITY_INFO,
     }
 }
 
-/// The display name used in hints.
+/// The display name used in hints, from the provider spec.
 pub fn cli_title(cli: CliKind) -> &'static str {
-    info(cli).title
+    cli.spec().title
+}
+
+/// Official install command for Antigravity on Windows (PowerShell).
+const AGY_INSTALL_HINT_WINDOWS: &str = "irm https://antigravity.google/cli/install.ps1 | iex";
+/// Official install command for Antigravity on macOS and Linux.
+const AGY_INSTALL_HINT_UNIX: &str = "curl -fsSL https://antigravity.google/cli/install.sh | bash";
+
+/// Official install one-liner for a CLI Keitora does not install itself, for this OS.
+/// `Some` only for Antigravity.
+pub fn install_hint(cli: CliKind) -> Option<&'static str> {
+    match cli {
+        CliKind::Antigravity => Some(if cfg!(windows) {
+            AGY_INSTALL_HINT_WINDOWS
+        } else {
+            AGY_INSTALL_HINT_UNIX
+        }),
+        CliKind::Claude | CliKind::Codex => None,
+    }
 }
 
 /// `/`-separated, lower-cased, without a trailing `/`.
@@ -239,7 +276,14 @@ pub struct UpdateCommands {
 /// to an npm install (found beside it, see [`npm_candidates`]): it is invoked by its
 /// absolute path, so the update lands in the same Node as the CLI rather than in
 /// whichever `npm` comes first on `PATH`. Without one, the bare `npm` is used.
-pub fn update_commands(cli: CliKind, kind: InstallKind, npm: Option<&str>) -> UpdateCommands {
+/// `exe` is the CLI's executable as found: a native install of a CLI whose updater
+/// may be off the pane's `PATH` (Antigravity) runs it by that path.
+pub fn update_commands(
+    cli: CliKind,
+    kind: InstallKind,
+    npm: Option<&str>,
+    exe: Option<&str>,
+) -> UpdateCommands {
     let info = info(cli);
     let (cmd, runs) = match kind {
         InstallKind::Npm => (info.npm, true),
@@ -247,6 +291,13 @@ pub fn update_commands(cli: CliKind, kind: InstallKind, npm: Option<&str>) -> Up
         InstallKind::Native => (info.native_update, info.native_update_runs),
         InstallKind::Unknown => (info.npm, false),
     };
+    if cmd.is_empty() {
+        // No package to update through: point at the official installer instead.
+        return UpdateCommands {
+            run: None,
+            guidance: install_hint(cli).unwrap_or_default().to_string(),
+        };
+    }
     let (program, args) = cmd.split_once(' ').unwrap_or((cmd, ""));
     let command = match (kind, npm) {
         (InstallKind::Npm, Some(npm)) if program == "npm" => UpdateCommand {
@@ -254,6 +305,13 @@ pub fn update_commands(cli: CliKind, kind: InstallKind, npm: Option<&str>) -> Up
             program_is_path: true,
             args,
         },
+        (InstallKind::Native, _) if info.native_by_path && exe.is_some_and(|e| !e.is_empty()) => {
+            UpdateCommand {
+                program: exe.unwrap_or_default().replace('\\', "/"),
+                program_is_path: true,
+                args,
+            }
+        }
         _ => UpdateCommand {
             program: program.to_string(),
             program_is_path: false,
@@ -367,9 +425,10 @@ pub fn npm_candidates(exe_path: &str, resolved: &str, windows: bool) -> Vec<Stri
     out
 }
 
-/// `claude --version` output (`"2.1.328 (Claude Code)"`) to its version: the first
-/// token of the first non-empty line that starts with `N.N.N`.
-pub fn parse_claude_version_output(stdout: &str) -> Option<String> {
+/// `--version` output to its version: the first token of the first non-empty line that
+/// starts with `N.N.N`. Reads `claude --version` (`"2.1.328 (Claude Code)"`) and
+/// `agy --version` (a bare `"1.5.18"`).
+pub fn parse_first_semver(stdout: &str) -> Option<String> {
     let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
     line.split_whitespace()
         .find(|tok| crate::codex_env::starts_with_semver(tok))
@@ -388,6 +447,13 @@ pub fn parse_codex_version_json(text: &str, now: chrono::DateTime<chrono::Utc>) 
     let fresh = age < chrono::Duration::hours(VERSION_JSON_MAX_AGE_HOURS)
         && age > -chrono::Duration::hours(1);
     fresh.then(|| latest.to_string())
+}
+
+/// An Antigravity release manifest (`{"version":"1.5.18","url":…,"sha512":…}`) to its
+/// `version`, validated as a semver.
+pub fn parse_manifest_latest(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    parse_first_semver(v.get("version")?.as_str()?)
 }
 
 /// An npm registry `…/latest` document to its `version`.
@@ -586,11 +652,7 @@ mod tests {
             ("v2", None),
         ];
         for (out, want) in cases {
-            assert_eq!(
-                parse_claude_version_output(out).as_deref(),
-                *want,
-                "{out:?}"
-            );
+            assert_eq!(parse_first_semver(out).as_deref(), *want, "{out:?}");
         }
     }
 
@@ -857,6 +919,7 @@ mod tests {
             Codex,
             Npm,
             Some("/Users/me/.nvm/versions/node/v22.0.0/bin/npm"),
+            None,
         );
         assert_eq!(
             cmds.run,
@@ -871,7 +934,12 @@ mod tests {
             "'/Users/me/.nvm/versions/node/v22.0.0/bin/npm' install -g @openai/codex@latest"
         );
         // Spaces and quotes survive the POSIX shell.
-        let cmds = update_commands(Claude, Npm, Some("C:\\Program Files\\nodejs\\npm.cmd"));
+        let cmds = update_commands(
+            Claude,
+            Npm,
+            Some("C:\\Program Files\\nodejs\\npm.cmd"),
+            None,
+        );
         assert_eq!(
             cmds.guidance,
             "'C:/Program Files/nodejs/npm.cmd' install -g @anthropic-ai/claude-code@latest"
@@ -882,11 +950,11 @@ mod tests {
             "forward slashes, unquoted until the shell is known"
         );
         assert_eq!(
-            update_commands(Codex, Npm, Some("/opt/it's node/bin/npm")).guidance,
+            update_commands(Codex, Npm, Some("/opt/it's node/bin/npm"), None).guidance,
             r"'/opt/it'\''s node/bin/npm' install -g @openai/codex@latest"
         );
         // Not found: the bare npm on PATH.
-        let cmds = update_commands(Codex, Npm, None);
+        let cmds = update_commands(Codex, Npm, None, None);
         assert_eq!(
             cmds.run,
             Some(UpdateCommand {
@@ -898,7 +966,7 @@ mod tests {
         assert_eq!(cmds.guidance, "npm install -g @openai/codex@latest");
         // Other install kinds ignore it.
         assert_eq!(
-            update_commands(Codex, Brew, Some("/x/npm")).run,
+            update_commands(Codex, Brew, Some("/x/npm"), None).run,
             Some(UpdateCommand {
                 program: "brew".into(),
                 program_is_path: false,
@@ -906,7 +974,7 @@ mod tests {
             })
         );
         assert_eq!(
-            update_commands(Codex, Unknown, Some("/x/npm")).guidance,
+            update_commands(Codex, Unknown, Some("/x/npm"), None).guidance,
             "npm install -g @openai/codex@latest"
         );
     }
@@ -951,7 +1019,7 @@ mod tests {
             ),
         ];
         for (cli, kind, run, shown) in cases {
-            let cmds = update_commands(*cli, *kind, None);
+            let cmds = update_commands(*cli, *kind, None, None);
             assert_eq!(
                 cmds.run.as_ref().map(UpdateCommand::display).as_deref(),
                 *run,
@@ -1171,6 +1239,7 @@ mod tests {
             CliKind::Codex,
             InstallKind::Npm,
             Some("C:\\Program Files\\nodejs\\npm.cmd"),
+            None,
         );
         assert_eq!(
             render_run_line(cmds.run.as_ref().unwrap(), ShellFamily::Posix, true),
@@ -1451,5 +1520,137 @@ mod tests {
             sessions_of(keys, CliKind::Claude, cli_of),
             vec![key("proj", "bravo")]
         );
+    }
+
+    #[test]
+    fn parse_first_semver_reads_agy_output() {
+        assert_eq!(parse_first_semver("1.5.18\n").as_deref(), Some("1.5.18"));
+        assert_eq!(parse_first_semver("1.5.18").as_deref(), Some("1.5.18"));
+        assert_eq!(parse_first_semver(""), None);
+        assert_eq!(parse_first_semver("agy"), None);
+    }
+
+    #[test]
+    fn parse_manifest_latest_reads_version() {
+        assert_eq!(
+            parse_manifest_latest(r#"{"version":"1.5.18","url":"u","sha512":"s"}"#).as_deref(),
+            Some("1.5.18")
+        );
+    }
+
+    #[test]
+    fn parse_manifest_latest_rejects_bad_bodies() {
+        for body in ["{}", r#"{"version":3}"#, r#"{"version":"x"}"#, "not json"] {
+            assert_eq!(parse_manifest_latest(body), None, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn install_kind_native_for_agy_windows_path() {
+        #[cfg(windows)]
+        {
+            let exe = r"C:\Users\x\AppData\Local\agy\bin\agy.exe";
+            assert_eq!(
+                install_kind(CliKind::Antigravity, exe, exe, Some(HOME_WIN)),
+                InstallKind::Native
+            );
+        }
+        let exe = "/home/u/.local/bin/agy";
+        assert_eq!(
+            install_kind(CliKind::Antigravity, exe, exe, Some(HOME_LINUX)),
+            InstallKind::Native
+        );
+    }
+
+    #[test]
+    fn agy_has_no_npm_or_brew_update() {
+        let hint = install_hint(CliKind::Antigravity).unwrap();
+        for kind in [InstallKind::Npm, InstallKind::Brew, InstallKind::Unknown] {
+            let cmds = update_commands(
+                CliKind::Antigravity,
+                kind,
+                None,
+                Some("/home/u/.local/bin/agy"),
+            );
+            assert_eq!(cmds.run, None, "{kind:?}");
+            assert_eq!(cmds.guidance, hint, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn agy_native_update_runs_the_found_exe_by_path() {
+        let exe = "C:\\Users\\x\\AppData\\Local\\agy\\bin\\agy.exe";
+        let cmds = update_commands(CliKind::Antigravity, InstallKind::Native, None, Some(exe));
+        let run = cmds.run.clone().unwrap();
+        assert_eq!(
+            run,
+            UpdateCommand {
+                program: "C:/Users/x/AppData/Local/agy/bin/agy.exe".into(),
+                program_is_path: true,
+                args: "update",
+            }
+        );
+        assert_eq!(
+            cmds.guidance,
+            "'C:/Users/x/AppData/Local/agy/bin/agy.exe' update"
+        );
+        assert_eq!(
+            render_run_line(&run, ShellFamily::Posix, true),
+            "'C:/Users/x/AppData/Local/agy/bin/agy.exe' update; echo \"__KEITORA_AGENT_UPDATE_DONE:$?\""
+        );
+        assert_eq!(
+            render_run_line(&run, ShellFamily::Fish, true),
+            "'C:/Users/x/AppData/Local/agy/bin/agy.exe' update; echo \"__KEITORA_AGENT_UPDATE_DONE:$status\""
+        );
+        assert_eq!(
+            render_run_line(&run, ShellFamily::PowerShell, true),
+            "$LASTEXITCODE = 1; & 'C:/Users/x/AppData/Local/agy/bin/agy.exe' update; echo \"__KEITORA_AGENT_UPDATE_DONE:$(if ($?) {0} else {$LASTEXITCODE})\""
+        );
+
+        // A unix install path with a quote is escaped per shell.
+        let odd = "/home/it's me/.local/bin/agy";
+        let run = update_commands(CliKind::Antigravity, InstallKind::Native, None, Some(odd))
+            .run
+            .unwrap();
+        assert_eq!(
+            render_run_line(&run, ShellFamily::Posix, false),
+            r#"'/home/it'\''s me/.local/bin/agy' update; echo "__KEITORA_AGENT_UPDATE_DONE:$?""#
+        );
+        assert_eq!(
+            render_run_line(&run, ShellFamily::Fish, false),
+            r#"'/home/it\'s me/.local/bin/agy' update; echo "__KEITORA_AGENT_UPDATE_DONE:$status""#
+        );
+        assert_eq!(
+            render_run_line(&run, ShellFamily::PowerShell, false),
+            r#"$LASTEXITCODE = 1; & '/home/it''s me/.local/bin/agy' update; echo "__KEITORA_AGENT_UPDATE_DONE:$(if ($?) {0} else {$LASTEXITCODE})""#
+        );
+    }
+
+    #[test]
+    fn agy_native_update_without_an_exe_runs_agy_update() {
+        let cmds = update_commands(CliKind::Antigravity, InstallKind::Native, None, None);
+        assert_eq!(
+            cmds.run,
+            Some(UpdateCommand {
+                program: "agy".into(),
+                program_is_path: false,
+                args: "update",
+            })
+        );
+        assert_eq!(cmds.guidance, "agy update");
+    }
+
+    #[test]
+    fn cli_titles_come_from_the_spec() {
+        for cli in CliKind::ALL {
+            assert_eq!(cli_title(cli), cli.spec().title);
+        }
+    }
+
+    #[test]
+    fn install_hint_is_only_for_antigravity() {
+        assert_eq!(install_hint(CliKind::Claude), None);
+        assert_eq!(install_hint(CliKind::Codex), None);
+        assert!(install_hint(CliKind::Antigravity).is_some_and(|h| !h.is_empty()));
     }
 }

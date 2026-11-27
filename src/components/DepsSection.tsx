@@ -13,6 +13,7 @@ import {
   depsRestartToFinish,
   depsSetHerdrBin,
 } from "../lib/ipc";
+import { cliTitle, parseCliKind } from "../lib/providers";
 import { useDaemonStatus } from "../lib/sessions";
 import { errorText } from "../lib/updates";
 import { useDeps, useDepsInstall } from "./DepsProvider";
@@ -28,6 +29,12 @@ const TONE: Record<SettingsRow["tone"], string> = {
   error: "text-urgent",
   muted: "text-tx-3",
 };
+
+/** A doctor row's display name: the provider title for an agent CLI, else the tool name. */
+function toolTitle(tool: DoctorRow["tool"]): string {
+  const cli = parseCliKind(tool);
+  return cli ? cliTitle(cli) : tool;
+}
 
 export function DepsSection() {
   const { state, setUpgradeOpen } = useDeps();
@@ -105,7 +112,7 @@ export function DepsSection() {
       {model.rows.map(({ action, ...row }) => (
         <div key={row.tool} className="flex flex-col gap-0.5">
           <div className="flex items-center justify-between gap-3">
-            <span className="text-[12px] font-semibold text-tx-1">{row.tool}</span>
+            <span className="text-[12px] font-semibold text-tx-1">{toolTitle(row.tool)}</span>
             <span className="flex items-center gap-2">
               <span className={`text-[11px] ${TONE[row.tone]}`}>{row.detail}</span>
               {action && (
@@ -127,6 +134,11 @@ export function DepsSection() {
           {row.path && (
             <span className="truncate font-mono text-[10.5px] text-tx-3" title={row.path}>
               {row.path}
+            </span>
+          )}
+          {row.hint && row.detail === "not found" && (
+            <span className="break-all font-mono text-[10.5px] text-tx-3 select-text">
+              {row.hint}
             </span>
           )}
         </div>

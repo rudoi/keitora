@@ -1,5 +1,5 @@
-//! The doctor: one row per external tool Keitora shells out to (herdr, git, claude,
-//! codex), with where it is, its version, and what the UI can offer. Installs nothing.
+//! The doctor: one row per external tool Keitora shells out to (herdr, git, and the
+//! agent CLIs claude, codex and antigravity), with where it is, its version, and what the UI can offer. Installs nothing.
 
 use std::time::Duration;
 
@@ -32,7 +32,7 @@ pub enum DoctorAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorRow {
-    /// `"herdr"`, `"git"`, `"claude"` or `"codex"`.
+    /// `"herdr"`, `"git"`, `"claude"`, `"codex"` or `"antigravity"`.
     pub tool: String,
     pub path: Option<String>,
     pub version: Option<String>,
@@ -40,6 +40,9 @@ pub struct DoctorRow {
     pub floor: Option<String>,
     pub status: DoctorStatus,
     pub action: Option<DoctorAction>,
+    /// Install command shown for a missing agent CLI that Keitora does not install
+    /// itself; Antigravity only.
+    pub hint: Option<String>,
 }
 
 /// The version in `git --version` output (`git version 2.43.0.windows.1` -> `2.43.0`).
@@ -66,6 +69,7 @@ fn herdr_row(inner: &Inner) -> DoctorRow {
             floor,
             status: DoctorStatus::Missing,
             action: Some(DoctorAction::Install),
+            hint: None,
         };
     };
     let version = machine.current_version.as_ref().map(|v| v.to_string());
@@ -90,6 +94,7 @@ fn herdr_row(inner: &Inner) -> DoctorRow {
         floor,
         status,
         action,
+        hint: None,
     }
 }
 
@@ -115,6 +120,7 @@ fn git_row(inner: &Inner) -> DoctorRow {
         floor: None,
         status,
         action: None,
+        hint: None,
     }
 }
 
@@ -123,6 +129,7 @@ fn cli_row(inner: &Inner, cli: CliKind, cfg: &keitora_tasks::UserConfig) -> Doct
     let tool = match cli {
         CliKind::Claude => "claude",
         CliKind::Codex => "codex",
+        CliKind::Antigravity => "antigravity",
     };
     let Some(exe) = prober.exe(cli, cfg) else {
         return DoctorRow {
@@ -132,6 +139,7 @@ fn cli_row(inner: &Inner, cli: CliKind, cfg: &keitora_tasks::UserConfig) -> Doct
             floor: None,
             status: DoctorStatus::Missing,
             action: None,
+            hint: crate::agent_updates::model::install_hint(cli).map(String::from),
         };
     };
     let version = prober.installed(cli, &exe);
@@ -146,6 +154,7 @@ fn cli_row(inner: &Inner, cli: CliKind, cfg: &keitora_tasks::UserConfig) -> Doct
         version,
         floor: None,
         action: None,
+        hint: None,
     }
 }
 
@@ -154,12 +163,10 @@ pub(super) fn rows(inner: &Inner) -> Vec<DoctorRow> {
     let cfg = inner.ctx.prober.config();
     let cfg = &cfg;
     std::thread::scope(|s| {
-        let probes = [
-            s.spawn(|| herdr_row(inner)),
-            s.spawn(|| git_row(inner)),
-            s.spawn(|| cli_row(inner, CliKind::Claude, cfg)),
-            s.spawn(|| cli_row(inner, CliKind::Codex, cfg)),
-        ];
+        let mut probes = vec![s.spawn(|| herdr_row(inner)), s.spawn(|| git_row(inner))];
+        for cli in CliKind::ALL {
+            probes.push(s.spawn(move || cli_row(inner, cli, cfg)));
+        }
         probes
             .into_iter()
             .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))

@@ -13,14 +13,7 @@ import type {
   UpdateSession,
 } from "./ipc";
 import type { Status } from "./paneStatus";
-
-/** Banner order: codex first, then claude. */
-export const AGENT_CLIS: readonly CliKind[] = ["codex", "claude"];
-
-/** "Codex" / "Claude", for sentence-initial copy. */
-export function cliTitle(cli: CliKind): string {
-  return cli === "codex" ? "Codex" : "Claude";
-}
+import { CLI_KINDS, cliTitle, parseCliKind } from "./providers";
 
 /** The key a pane is tracked by in the provider's sets. */
 export function sessionKey(project: string, worktree: string): string {
@@ -40,7 +33,7 @@ const UPDATE_PROMPT_TOKEN = "AgentUpdatePrompt";
 export function updatePromptCliOf(error: string | null | undefined): CliKind | null {
   if (!error?.startsWith(UPDATE_PROMPT_TOKEN)) return null;
   const named = error.slice(UPDATE_PROMPT_TOKEN.length).replace(/^:\s*/, "").trim();
-  return named === "claude" || named === "codex" ? named : null;
+  return parseCliKind(named);
 }
 
 /** "Later" choices for this run, by CLI: the version the user put off. A newer release
@@ -60,12 +53,13 @@ export interface BannerRow {
 }
 
 /** One row per CLI with an update available that the user neither skipped nor put off
- *  until later this run. Codex first. */
+ *  until later this run, in provider display order. */
 export function bannerRows(snapshot: AgentUpdatesSnapshot | null, later: LaterMap): BannerRow[] {
   if (!snapshot) return [];
   const rows: BannerRow[] = [];
-  for (const cli of AGENT_CLIS) {
-    const entry = snapshot[cli];
+  for (const cli of CLI_KINDS) {
+    const entry = snapshot.agents[cli];
+    if (!entry) continue;
     const { state } = entry;
     if (state.type !== "available") continue;
     if (later[cli] === state.latest) continue;
@@ -84,7 +78,7 @@ export function bannerRows(snapshot: AgentUpdatesSnapshot | null, later: LaterMa
 
 function guidanceNote(cli: CliKind, kind: InstallKind | null): string {
   if (kind === "unknown" || kind === null) {
-    return `Keitora couldn't tell how ${cli} was installed. Run this in your own terminal:`;
+    return `Keitora couldn't tell how ${cliTitle(cli)} was installed. Run this in your own terminal:`;
   }
   return "Run this in your own terminal:";
 }
@@ -94,7 +88,7 @@ export function updateDisabledReason(
   row: BannerRow,
   recovery: RecoveryInfo["phase"],
 ): string | null {
-  if (!row.canRun) return `Keitora can't update this ${row.cli} install itself`;
+  if (!row.canRun) return `Keitora can't update this ${cliTitle(row.cli)} install itself`;
   if (recovery !== "Healthy") return "Wait for session recovery to finish";
   return null;
 }
@@ -119,8 +113,8 @@ export function runOutcomeCopy(cli: CliKind, outcome: RunOutcome): OutcomeCopy {
     case "unchanged":
       return {
         text: outcome.version
-          ? `The update finished but ${cli} is still ${outcome.version}`
-          : `The update finished but ${cli}'s version didn't change`,
+          ? `The update finished but ${cliTitle(cli)} is still ${outcome.version}`
+          : `The update finished but ${cliTitle(cli)}'s version didn't change`,
         tone: "info",
         canRestart: false,
       };
@@ -160,7 +154,7 @@ export function closeInterruptsRun(step: string, hasOutcome: boolean): boolean {
 
 /** The confirm shown before closing interrupts a run. */
 export function interruptRunCopy(cli: CliKind): string {
-  return `The ${cli} update is still running — closing will interrupt it.`;
+  return `The ${cliTitle(cli)} update is still running — closing will interrupt it.`;
 }
 
 /** "stop 1 session and update" / "stop N sessions and update". */
@@ -170,12 +164,12 @@ export function stopSessionsLabel(count: number): string {
 
 /** The pane-level hint while a launched pane sits on its CLI's update screen. */
 export function updatePromptHint(cli: CliKind): string {
-  return `${cli} is asking to update — answer in the terminal, or use keitora's updater`;
+  return `${cliTitle(cli)} is asking to update — answer in the terminal, or use keitora's updater`;
 }
 
 /** The ended overlay of a pane stopped so its CLI could be updated. */
 export function stoppedForUpdateCopy(cli: CliKind): string {
-  return `stopped for the ${cli} update`;
+  return `stopped for the ${cliTitle(cli)} update`;
 }
 
 const STATUS_LINES: Record<Exclude<AgentUpdateState["type"], "available" | "skipped">, string> = {

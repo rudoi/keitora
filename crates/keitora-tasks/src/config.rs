@@ -64,21 +64,87 @@ pub(crate) fn expand_tilde(s: &str) -> PathBuf {
 /// liveness source, and the rail glyph — everything currently hardcoded to
 /// "claude" routes through it.
 ///
-/// Serializes/deserializes as the bare TOML strings `"claude"` / `"codex"` (e.g.
+/// Serializes/deserializes as the bare TOML strings `"claude"` / `"codex"` /
+/// `"antigravity"` (e.g.
 /// `cli = "codex"` on a worktree table, `default_cli = "codex"` on `UserConfig`).
 /// Mirrors [`crate::model::WorktreeStatus`]'s `rename_all = "snake_case"`
 /// convention, extended to `Deserialize` since — unlike `WorktreeStatus` — this
 /// type must round-trip through TOML.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CliKind {
     #[default]
     Claude,
     Codex,
+    Antigravity,
 }
 
-/// Claude session ids are embedded as bare shell arguments on every platform.
-pub fn is_safe_claude_session_id(id: &str) -> bool {
+/// Number of providers; the length of [`CliKind::ALL`].
+pub const CLI_COUNT: usize = 3;
+
+/// Static facts about one provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderSpec {
+    pub cli: CliKind,
+    /// Display name: "Claude" / "Codex" / "Antigravity".
+    pub title: &'static str,
+    /// Config/serde name: "claude" / "codex" / "antigravity". Names the TOML
+    /// provider table, the `[dispatch] <key>_steps` key and the stored cli value.
+    pub config_key: &'static str,
+    /// Executable name: "claude" / "codex" / "agy".
+    pub binary: &'static str,
+    /// herdr `agent start --kind` value: "claude" / "codex" / "agy".
+    pub herdr_kind: &'static str,
+    /// herdr `integration install` target: "claude" / "codex" / "antigravity-cli".
+    pub herdr_integration: &'static str,
+    /// Agent names herdr may report in `agent_session.agent`.
+    pub herdr_agent_names: &'static [&'static str],
+}
+
+/// Indexed by `CliKind` discriminant (declaration order).
+static SPECS: [ProviderSpec; CLI_COUNT] = [
+    ProviderSpec {
+        cli: CliKind::Claude,
+        title: "Claude",
+        config_key: "claude",
+        binary: "claude",
+        herdr_kind: "claude",
+        herdr_integration: "claude",
+        herdr_agent_names: &["claude"],
+    },
+    ProviderSpec {
+        cli: CliKind::Codex,
+        title: "Codex",
+        config_key: "codex",
+        binary: "codex",
+        herdr_kind: "codex",
+        herdr_integration: "codex",
+        herdr_agent_names: &["codex"],
+    },
+    ProviderSpec {
+        cli: CliKind::Antigravity,
+        title: "Antigravity",
+        config_key: "antigravity",
+        binary: "agy",
+        herdr_kind: "agy",
+        herdr_integration: "antigravity-cli",
+        herdr_agent_names: &["antigravity_cli", "antigravity-cli", "agy"],
+    },
+];
+
+impl CliKind {
+    /// Display order, used everywhere providers are listed.
+    pub const ALL: [CliKind; CLI_COUNT] = [CliKind::Claude, CliKind::Codex, CliKind::Antigravity];
+
+    pub fn spec(self) -> &'static ProviderSpec {
+        &SPECS[self as usize]
+    }
+}
+
+/// Session ids are embedded as bare shell arguments on every platform.
+pub fn is_safe_session_id(id: &str) -> bool {
     id.len() <= 128
         && id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
         && id
@@ -175,13 +241,27 @@ pub struct DispatchConfig {
     /// Same, for a Codex session.
     #[serde(default)]
     pub codex_steps: Vec<String>,
+    /// Same, for an Antigravity session.
+    #[serde(default)]
+    pub antigravity_steps: Vec<String>,
 }
 
 impl DispatchConfig {
     /// True when no steps are configured for either CLI, so the whole `[dispatch]`
     /// table can be omitted from the serialized TOML rather than written empty.
     pub fn is_empty(&self) -> bool {
-        self.claude_steps.is_empty() && self.codex_steps.is_empty()
+        self.claude_steps.is_empty()
+            && self.codex_steps.is_empty()
+            && self.antigravity_steps.is_empty()
+    }
+
+    /// The configured ritual steps for `cli`.
+    pub fn steps_for(&self, cli: CliKind) -> &[String] {
+        match cli {
+            CliKind::Claude => &self.claude_steps,
+            CliKind::Codex => &self.codex_steps,
+            CliKind::Antigravity => &self.antigravity_steps,
+        }
     }
 }
 
@@ -248,6 +328,10 @@ pub struct UserConfig {
     /// when empty.
     #[serde(default, skip_serializing_if = "ProviderConfig::is_empty")]
     pub codex: ProviderConfig,
+    /// User-level `antigravity` location + autonomy default. Omitted from TOML
+    /// when empty.
+    #[serde(default, skip_serializing_if = "ProviderConfig::is_empty")]
+    pub antigravity: ProviderConfig,
     /// User-level default CLI: the fallback for a worktree whose entry has
     /// no explicit `cli`. `None` (unconfigured) resolves to `CliKind::Claude` via
     /// [`resolve_cli`]. Omitted from TOML when unset.
@@ -297,6 +381,10 @@ pub struct UpdatesConfig {
     /// `agent_skip_codex`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_skip_claude: Option<String>,
+    /// An Antigravity version the user chose to skip. Same rule as
+    /// `agent_skip_codex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_skip_antigravity: Option<String>,
 }
 
 impl UpdatesConfig {
@@ -312,6 +400,7 @@ impl UpdatesConfig {
             && self.agent_check_hours.is_none()
             && self.agent_skip_codex.is_none()
             && self.agent_skip_claude.is_none()
+            && self.agent_skip_antigravity.is_none()
     }
 
     /// The effective agent CLI check interval in hours: unset → 6, `0` stays
@@ -327,6 +416,24 @@ impl UpdatesConfig {
     /// Whether automatic update checks are enabled (unset → true).
     pub fn auto_check(&self) -> bool {
         self.auto_check.unwrap_or(true)
+    }
+
+    /// The version of `cli` the user chose to skip, if any.
+    pub fn skipped(&self, cli: CliKind) -> Option<&str> {
+        match cli {
+            CliKind::Claude => self.agent_skip_claude.as_deref(),
+            CliKind::Codex => self.agent_skip_codex.as_deref(),
+            CliKind::Antigravity => self.agent_skip_antigravity.as_deref(),
+        }
+    }
+
+    /// Mutable access to the skipped version of `cli`.
+    pub fn skipped_mut(&mut self, cli: CliKind) -> &mut Option<String> {
+        match cli {
+            CliKind::Claude => &mut self.agent_skip_claude,
+            CliKind::Codex => &mut self.agent_skip_codex,
+            CliKind::Antigravity => &mut self.agent_skip_antigravity,
+        }
     }
 }
 
@@ -560,6 +667,8 @@ pub struct WorktreeEntry {
     /// Claude session to resume after a Claude→Codex→Claude round-trip.
     /// Registry-only — never written to the committed `[tasks].worktrees` file.
     pub claude_session_id: Option<String>,
+    /// Last Antigravity conversation to resume on restart. Registry-only.
+    pub antigravity_conversation_id: Option<String>,
     /// Per-worktree diff-view base override. `None` ⇒ fall back to the project default
     /// ([`ProjectMeta::diff_base`]), then [`DiffBase::Auto`].
     /// Registry-only — never written to the committed `[tasks].worktrees` file.
@@ -586,6 +695,43 @@ impl<T> FieldIntent<T> {
     }
 }
 
+/// What a registry write does to each provider's stored conversation id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderIds {
+    pub claude: FieldIntent<String>,
+    pub codex: FieldIntent<String>,
+    pub antigravity: FieldIntent<String>,
+}
+
+impl ProviderIds {
+    /// Every id kept.
+    pub fn keep() -> Self {
+        ProviderIds {
+            claude: FieldIntent::Keep,
+            codex: FieldIntent::Keep,
+            antigravity: FieldIntent::Keep,
+        }
+    }
+
+    /// `self` with `cli`'s intent replaced.
+    pub fn with(mut self, cli: CliKind, intent: FieldIntent<String>) -> Self {
+        match cli {
+            CliKind::Claude => self.claude = intent,
+            CliKind::Codex => self.codex = intent,
+            CliKind::Antigravity => self.antigravity = intent,
+        }
+        self
+    }
+
+    pub fn get(&self, cli: CliKind) -> &FieldIntent<String> {
+        match cli {
+            CliKind::Claude => &self.claude,
+            CliKind::Codex => &self.codex,
+            CliKind::Antigravity => &self.antigravity,
+        }
+    }
+}
+
 impl WorktreeEntry {
     /// A legacy / unmigrated entry: name only, path to be backfilled by repair.
     pub fn name_only(name: impl Into<String>) -> Self {
@@ -595,6 +741,7 @@ impl WorktreeEntry {
             cli: None,
             codex_thread_id: None,
             claude_session_id: None,
+            antigravity_conversation_id: None,
             diff_base: None,
         }
     }
@@ -607,6 +754,7 @@ impl WorktreeEntry {
             cli: None,
             codex_thread_id: None,
             claude_session_id: None,
+            antigravity_conversation_id: None,
             diff_base: None,
         }
     }
@@ -633,6 +781,8 @@ enum WorktreeEntryRepr {
         #[serde(default)]
         claude_session_id: Option<String>,
         #[serde(default)]
+        antigravity_conversation_id: Option<String>,
+        #[serde(default)]
         diff_base: Option<DiffBase>,
     },
     /// Bare string: `"delta"` → legacy, path-less.
@@ -649,6 +799,7 @@ impl Serialize for WorktreeEntry {
             || self.cli.is_some()
             || self.codex_thread_id.is_some()
             || self.claude_session_id.is_some()
+            || self.antigravity_conversation_id.is_some()
             || self.diff_base.is_some()
         {
             WorktreeEntryRepr::Table {
@@ -657,6 +808,7 @@ impl Serialize for WorktreeEntry {
                 cli: self.cli,
                 codex_thread_id: self.codex_thread_id.clone(),
                 claude_session_id: self.claude_session_id.clone(),
+                antigravity_conversation_id: self.antigravity_conversation_id.clone(),
                 diff_base: self.diff_base.clone(),
             }
             .serialize(serializer)
@@ -678,6 +830,7 @@ impl<'de> Deserialize<'de> for WorktreeEntry {
                 cli: None,
                 codex_thread_id: None,
                 claude_session_id: None,
+                antigravity_conversation_id: None,
                 diff_base: None,
             },
             WorktreeEntryRepr::Table {
@@ -686,6 +839,7 @@ impl<'de> Deserialize<'de> for WorktreeEntry {
                 cli,
                 codex_thread_id,
                 claude_session_id,
+                antigravity_conversation_id,
                 diff_base,
             } => WorktreeEntry {
                 name,
@@ -693,6 +847,7 @@ impl<'de> Deserialize<'de> for WorktreeEntry {
                 cli,
                 codex_thread_id,
                 claude_session_id,
+                antigravity_conversation_id,
                 diff_base,
             },
         })
@@ -713,6 +868,7 @@ fn merge_worktree_registry_fields(
             if merged.cli.is_none()
                 || merged.codex_thread_id.is_none()
                 || merged.claude_session_id.is_none()
+                || merged.antigravity_conversation_id.is_none()
                 || merged.diff_base.is_none()
             {
                 if let Some(old) =
@@ -726,6 +882,10 @@ fn merge_worktree_registry_fields(
                     }
                     if merged.claude_session_id.is_none() {
                         merged.claude_session_id = old.claude_session_id.clone();
+                    }
+                    if merged.antigravity_conversation_id.is_none() {
+                        merged.antigravity_conversation_id =
+                            old.antigravity_conversation_id.clone();
                     }
                     if merged.diff_base.is_none() {
                         merged.diff_base = old.diff_base.clone();
@@ -770,6 +930,9 @@ pub struct ProjectRef {
     /// Per-machine `[dispatch].codex_steps` override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_dispatch_steps: Option<Vec<String>>,
+    /// Per-machine `[dispatch].antigravity_steps` override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antigravity_dispatch_steps: Option<Vec<String>>,
     /// Per-machine `[project].diff_base` override (diff-view comparison base).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_base: Option<DiffBase>,
@@ -788,6 +951,7 @@ impl ProjectRef {
             log_retention_days: None,
             dispatch_steps: None,
             codex_dispatch_steps: None,
+            antigravity_dispatch_steps: None,
             diff_base: None,
         }
     }
@@ -806,6 +970,7 @@ pub struct ProjectSettingsPatch {
     pub log_retention_days: Option<Option<i64>>,
     pub dispatch_steps: Option<Option<Vec<String>>>,
     pub codex_dispatch_steps: Option<Option<Vec<String>>>,
+    pub antigravity_dispatch_steps: Option<Option<Vec<String>>>,
     pub diff_base: Option<Option<DiffBase>>,
 }
 
@@ -829,6 +994,9 @@ impl ProjectSettingsPatch {
         }
         if let Some(v) = &self.codex_dispatch_steps {
             pref.codex_dispatch_steps = v.clone();
+        }
+        if let Some(v) = &self.antigravity_dispatch_steps {
+            pref.antigravity_dispatch_steps = v.clone();
         }
         if let Some(v) = &self.diff_base {
             pref.diff_base = v.clone();
@@ -909,6 +1077,7 @@ impl UserConfig {
                     entry.log_retention_days = None;
                     entry.dispatch_steps = None;
                     entry.codex_dispatch_steps = None;
+                    entry.antigravity_dispatch_steps = None;
                     entry.diff_base = None;
                 }
                 entry.path = path;
@@ -1023,8 +1192,7 @@ impl UserConfig {
         root: &Path,
         worktree: &str,
         cli: CliKind,
-        codex_thread_id: FieldIntent<String>,
-        claude_session_id: FieldIntent<String>,
+        ids: ProviderIds,
         current: &[WorktreeEntry],
     ) -> Result<bool, ResolveError> {
         let target = canonical_key(root);
@@ -1046,10 +1214,11 @@ impl UserConfig {
                 };
                 let entry = &mut list[idx];
                 entry.cli = Some(cli);
-                codex_thread_id.clone().apply(&mut entry.codex_thread_id);
-                claude_session_id
+                ids.codex.clone().apply(&mut entry.codex_thread_id);
+                ids.claude.clone().apply(&mut entry.claude_session_id);
+                ids.antigravity
                     .clone()
-                    .apply(&mut entry.claude_session_id);
+                    .apply(&mut entry.antigravity_conversation_id);
                 pref.worktrees = Some(list);
                 matched = true;
             }
@@ -1209,7 +1378,7 @@ impl UserConfig {
 ///   which is what the registry always used before.
 ///
 /// The temp file is removed when any step fails.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1289,6 +1458,9 @@ pub struct ProjectConfig {
     /// Optional per-project `codex` override. Omitted from TOML when empty.
     #[serde(default, skip_serializing_if = "ProviderConfig::is_empty")]
     pub codex: ProviderConfig,
+    /// Optional per-project `antigravity` override. Omitted from TOML when empty.
+    #[serde(default, skip_serializing_if = "ProviderConfig::is_empty")]
+    pub antigravity: ProviderConfig,
     /// Optional per-project `keitora` CLI override (for session hooks). Omitted from
     /// TOML when empty.
     #[serde(default, skip_serializing_if = "CliConfig::is_empty")]
@@ -1412,6 +1584,16 @@ impl ProjectConfig {
         self.effective_worktrees
             .clone()
             .unwrap_or_else(|| self.tasks.worktrees.clone())
+    }
+
+    /// The effective entry named `name`, if any (see [`Self::worktree_entries`]).
+    pub fn worktree_entry(&self, name: &str) -> Option<WorktreeEntry> {
+        self.effective_worktrees
+            .as_deref()
+            .unwrap_or(&self.tasks.worktrees)
+            .iter()
+            .find(|e| e.name == name)
+            .cloned()
     }
 
     /// The effective diff-view base for `worktree_name`: the per-worktree override
@@ -1595,6 +1777,7 @@ impl ProjectConfig {
             },
             claude: ProviderConfig::default(),
             codex: ProviderConfig::default(),
+            antigravity: ProviderConfig::default(),
             cli: CliConfig::default(),
             dispatch: DispatchConfig::default(),
         }
@@ -1882,6 +2065,9 @@ fn apply_registry_overrides(cfg: &mut ProjectConfig, pref: &ProjectRef) {
     if let Some(steps) = &pref.codex_dispatch_steps {
         cfg.dispatch.codex_steps = steps.clone();
     }
+    if let Some(steps) = &pref.antigravity_dispatch_steps {
+        cfg.dispatch.antigravity_steps = steps.clone();
+    }
     if let Some(b) = &pref.diff_base {
         cfg.project.diff_base = Some(b.clone());
     }
@@ -2011,18 +2197,38 @@ fn resolve_active_in(cwd: impl FnOnce() -> PathBuf) -> Result<ProjectConfig, Res
 // ---------------------------------------------------------------------------
 
 /// Select the per-CLI [`ProviderConfig`] on a [`ProjectConfig`] by [`CliKind`].
-fn project_provider(project: &ProjectConfig, cli: CliKind) -> &ProviderConfig {
+pub fn project_provider(project: &ProjectConfig, cli: CliKind) -> &ProviderConfig {
     match cli {
         CliKind::Claude => &project.claude,
         CliKind::Codex => &project.codex,
+        CliKind::Antigravity => &project.antigravity,
+    }
+}
+
+/// Mutable [`project_provider`].
+pub fn project_provider_mut(project: &mut ProjectConfig, cli: CliKind) -> &mut ProviderConfig {
+    match cli {
+        CliKind::Claude => &mut project.claude,
+        CliKind::Codex => &mut project.codex,
+        CliKind::Antigravity => &mut project.antigravity,
     }
 }
 
 /// Select the per-CLI [`ProviderConfig`] on a [`UserConfig`] by [`CliKind`].
-fn user_provider(user: &UserConfig, cli: CliKind) -> &ProviderConfig {
+pub fn user_provider(user: &UserConfig, cli: CliKind) -> &ProviderConfig {
     match cli {
         CliKind::Claude => &user.claude,
         CliKind::Codex => &user.codex,
+        CliKind::Antigravity => &user.antigravity,
+    }
+}
+
+/// Mutable [`user_provider`].
+pub fn user_provider_mut(user: &mut UserConfig, cli: CliKind) -> &mut ProviderConfig {
+    match cli {
+        CliKind::Claude => &mut user.claude,
+        CliKind::Codex => &mut user.codex,
+        CliKind::Antigravity => &mut user.antigravity,
     }
 }
 
@@ -2570,7 +2776,44 @@ pub fn discover_cli(cli: CliKind) -> Option<String> {
             )
             .map(|p| p.to_string_lossy().into_owned())
         }
+        // Only `agy`, never `antigravity` (that name is the IDE launcher). The installer's
+        // `~/.local/bin/agy` comes before the login `$PATH`.
+        CliKind::Antigravity => {
+            if let Some(found) = first_executable(
+                &agy_unix_candidates(dirs::home_dir().as_deref()),
+                &is_executable_file,
+            ) {
+                return Some(found.to_string_lossy().into_owned());
+            }
+            let path = login_path()?;
+            find_in_path(&path, "agy").map(|p| p.to_string_lossy().into_owned())
+        }
     }
+}
+
+/// unix install location for `agy`: `<home>/.local/bin/agy`. A `None` home gives an empty list.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn agy_unix_candidates(home: Option<&Path>) -> Vec<PathBuf> {
+    home.map(|h| vec![h.join(".local").join("bin").join("agy")])
+        .unwrap_or_default()
+}
+
+/// Windows install locations for `agy`, in priority order: `<local_app_data>/agy/bin/agy.exe`
+/// (the official installer, which does not update the PATH of running processes), then
+/// `<home>/.local/bin/agy.exe`. A `None` input drops its entry.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn agy_windows_candidates(
+    local_app_data: Option<&Path>,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Some(lad) = local_app_data {
+        v.push(lad.join("agy").join("bin").join("agy.exe"));
+    }
+    if let Some(h) = home {
+        v.push(h.join(".local").join("bin").join("agy.exe"));
+    }
+    v
 }
 
 /// Well-known unix install locations for `codex`, in priority order: Homebrew (Apple silicon),
@@ -2630,9 +2873,31 @@ fn discover_cached_with(
 /// so an install made mid-session is found without running the login shell on every call.
 /// Never call it on the app's setup thread (the first call may run the login shell).
 pub fn discover_cli_cached(cli: CliKind) -> Option<String> {
+    discover_cached_with(
+        discover_cache(),
+        cli,
+        std::time::Instant::now(),
+        &discover_cli,
+    )
+}
+
+/// The process-wide cache behind [`discover_cli_cached`].
+fn discover_cache() -> &'static CliCache {
     static CACHE: std::sync::OnceLock<CliCache> = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    discover_cached_with(cache, cli, std::time::Instant::now(), &discover_cli)
+    CACHE.get_or_init(Default::default)
+}
+
+/// Forget every remembered discovery miss, so the next [`discover_cli_cached`] call
+/// probes again (an agent installed moments ago is then found). Hits are kept.
+pub fn invalidate_discovery_misses() {
+    drop_misses(discover_cache());
+}
+
+fn drop_misses(cache: &CliCache) {
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, (_, found)| found.is_some());
 }
 
 /// Windows `codex` discovery, in priority order: native-installer
@@ -2668,6 +2933,17 @@ pub fn discover_cli(cli: CliKind) -> Option<String> {
                 &["codex.cmd", "codex.exe", "codex.bat"],
             )
             .map(|p| p.to_string_lossy().into_owned())
+        }
+        // Only `agy`, never `antigravity` (that name is the IDE launcher).
+        CliKind::Antigravity => {
+            let lad = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+            let candidates = agy_windows_candidates(lad.as_deref(), dirs::home_dir().as_deref());
+            if let Some(found) = candidates.iter().find(|p| is_executable_file(p)) {
+                return Some(found.to_string_lossy().into_owned());
+            }
+            let path = std::env::var_os("PATH")?;
+            find_on_path_windows(&path.to_string_lossy(), &["agy.exe", "agy.cmd", "agy.bat"])
+                .map(|p| p.to_string_lossy().into_owned())
         }
     }
 }
@@ -3338,8 +3614,7 @@ mod tests {
                     &root,
                     "feat",
                     CliKind::Codex,
-                    FieldIntent::Set("thr-1".into()),
-                    FieldIntent::Keep,
+                    ProviderIds::keep().with(CliKind::Codex, FieldIntent::Set("thr-1".into())),
                     &current,
                 )
                 .unwrap();
@@ -3361,8 +3636,7 @@ mod tests {
                 &root,
                 "feat",
                 CliKind::Codex,
-                FieldIntent::Clear,
-                FieldIntent::Keep,
+                ProviderIds::keep().with(CliKind::Codex, FieldIntent::Clear),
                 &current,
             )
             .unwrap();
@@ -3381,8 +3655,7 @@ mod tests {
                 &root,
                 "feat",
                 CliKind::Claude,
-                FieldIntent::Keep,
-                FieldIntent::Keep,
+                ProviderIds::keep(),
                 &current,
             )
             .unwrap();
@@ -3403,8 +3676,7 @@ mod tests {
                 &root,
                 "feat",
                 CliKind::Codex,
-                FieldIntent::Clear,
-                FieldIntent::Keep,
+                ProviderIds::keep().with(CliKind::Codex, FieldIntent::Clear),
                 &current,
             )
             .unwrap();
@@ -3424,8 +3696,7 @@ mod tests {
                 &root,
                 "feat",
                 CliKind::Codex,
-                FieldIntent::Set("thr-1".into()),
-                FieldIntent::Keep,
+                ProviderIds::keep().with(CliKind::Codex, FieldIntent::Set("thr-1".into())),
                 &current,
             )
             .unwrap();
@@ -3444,8 +3715,7 @@ mod tests {
                 &root,
                 "feat",
                 CliKind::Codex,
-                FieldIntent::Set("thr-1".into()),
-                FieldIntent::Keep,
+                ProviderIds::keep().with(CliKind::Codex, FieldIntent::Set("thr-1".into())),
                 &current,
             )
             .unwrap();
@@ -3464,8 +3734,7 @@ mod tests {
                     Path::new("/code/other"),
                     "feat",
                     CliKind::Codex,
-                    FieldIntent::Set("thr-1".into()),
-                    FieldIntent::Keep,
+                    ProviderIds::keep().with(CliKind::Codex, FieldIntent::Set("thr-1".into())),
                     &current,
                 )
                 .unwrap();
@@ -3483,8 +3752,7 @@ mod tests {
                 &root,
                 "feat",
                 CliKind::Codex,
-                FieldIntent::Set("thr-1".into()),
-                FieldIntent::Keep,
+                ProviderIds::keep().with(CliKind::Codex, FieldIntent::Set("thr-1".into())),
                 &current,
             )
             .unwrap();
@@ -3506,8 +3774,7 @@ mod tests {
                 Path::new("/code/b"),
                 "wt",
                 CliKind::Codex,
-                FieldIntent::Set("thr-1".into()),
-                FieldIntent::Keep,
+                ProviderIds::keep().with(CliKind::Codex, FieldIntent::Set("thr-1".into())),
                 &current,
             )
             .unwrap();
@@ -3534,6 +3801,49 @@ mod tests {
     }
 
     #[test]
+    fn agy_unix_candidates_is_home_local_bin() {
+        assert_eq!(
+            agy_unix_candidates(Some(Path::new("/home/u"))),
+            vec![Path::new("/home/u").join(".local").join("bin").join("agy")]
+        );
+        assert!(agy_unix_candidates(None).is_empty());
+    }
+
+    #[test]
+    fn agy_windows_candidates_prefers_localappdata_then_home() {
+        let lad = Path::new("C:/Users/x/AppData/Local");
+        let home = Path::new("C:/Users/x");
+        let lad_exe = lad.join("agy").join("bin").join("agy.exe");
+        let home_exe = home.join(".local").join("bin").join("agy.exe");
+        assert_eq!(
+            agy_windows_candidates(Some(lad), Some(home)),
+            vec![lad_exe.clone(), home_exe.clone()]
+        );
+        assert_eq!(agy_windows_candidates(Some(lad), None), vec![lad_exe]);
+        assert_eq!(agy_windows_candidates(None, Some(home)), vec![home_exe]);
+        assert!(agy_windows_candidates(None, None).is_empty());
+    }
+
+    #[test]
+    fn agy_candidates_never_name_the_ide_launcher() {
+        let home = Path::new("/home/u");
+        let all = agy_unix_candidates(Some(home))
+            .into_iter()
+            .chain(agy_windows_candidates(Some(Path::new("/lad")), Some(home)));
+        for c in all {
+            let name = c.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                name != "antigravity" && name != "antigravity.exe",
+                "IDE launcher candidate {c:?}"
+            );
+            assert!(
+                name == "agy" || name == "agy.exe",
+                "unexpected candidate {c:?}"
+            );
+        }
+    }
+
+    #[test]
     fn first_executable_picks_first_match() {
         let cands = codex_unix_candidates(Some(Path::new("/home/u")));
         let hit = first_executable(&cands, &|p| {
@@ -3541,6 +3851,46 @@ mod tests {
         });
         assert_eq!(hit, Some(PathBuf::from("/usr/local/bin/codex")));
         assert_eq!(first_executable(&cands, &|_| false), None);
+    }
+
+    #[test]
+    fn invalidating_misses_reprobes_misses_and_keeps_hits() {
+        use std::cell::Cell;
+        use std::time::Instant;
+        let cache = CliCache::default();
+        let now = Instant::now();
+        let calls = Cell::new(0);
+        let probe = |c: CliKind| {
+            calls.set(calls.get() + 1);
+            (c == CliKind::Codex).then(|| "/x/codex".to_string())
+        };
+        assert_eq!(
+            discover_cached_with(&cache, CliKind::Antigravity, now, &probe),
+            None
+        );
+        assert!(discover_cached_with(&cache, CliKind::Codex, now, &probe).is_some());
+        assert_eq!(calls.get(), 2);
+
+        // Within the miss TTL, nothing is probed again.
+        discover_cached_with(&cache, CliKind::Antigravity, now, &probe);
+        assert_eq!(calls.get(), 2);
+
+        drop_misses(&cache);
+        let found = |_c: CliKind| {
+            calls.set(calls.get() + 1);
+            Some("/x/agy".to_string())
+        };
+        assert_eq!(
+            discover_cached_with(&cache, CliKind::Antigravity, now, &found).as_deref(),
+            Some("/x/agy"),
+            "a dropped miss is probed again"
+        );
+        assert_eq!(
+            discover_cached_with(&cache, CliKind::Codex, now, &found).as_deref(),
+            Some("/x/codex"),
+            "a hit survives invalidation"
+        );
+        assert_eq!(calls.get(), 3);
     }
 
     #[test]
@@ -5076,6 +5426,7 @@ relay_url = \"https://relay.example\"
             },
             claude: ProviderConfig::default(),
             codex: ProviderConfig::default(),
+            antigravity: ProviderConfig::default(),
             cli: CliConfig::default(),
             dispatch: DispatchConfig::default(),
         };
@@ -5113,6 +5464,7 @@ relay_url = \"https://relay.example\"
             },
             claude: ProviderConfig::default(),
             codex: ProviderConfig::default(),
+            antigravity: ProviderConfig::default(),
             cli: CliConfig::default(),
             dispatch: DispatchConfig::default(),
         };
@@ -5152,6 +5504,7 @@ relay_url = \"https://relay.example\"
             },
             claude: ProviderConfig::default(),
             codex: ProviderConfig::default(),
+            antigravity: ProviderConfig::default(),
             cli: CliConfig::default(),
             dispatch: DispatchConfig::default(),
         };
@@ -5197,6 +5550,7 @@ relay_url = \"https://relay.example\"
             },
             claude: ProviderConfig::default(),
             codex: ProviderConfig::default(),
+            antigravity: ProviderConfig::default(),
             cli: CliConfig::default(),
             dispatch: DispatchConfig::default(),
         };
@@ -5235,6 +5589,7 @@ relay_url = \"https://relay.example\"
             },
             claude: ProviderConfig::default(),
             codex: ProviderConfig::default(),
+            antigravity: ProviderConfig::default(),
             cli: CliConfig::default(),
             dispatch: DispatchConfig::default(),
         };
@@ -5312,6 +5667,7 @@ relay_url = \"https://relay.example\"
             log_retention_days: Some(Some(14)),
             dispatch_steps: Some(Some(vec!["/clear".to_string()])),
             codex_dispatch_steps: None,
+            antigravity_dispatch_steps: None,
             diff_base: None,
         };
         let matched = reg.set_project_settings_by_root(&root, patch).unwrap();
@@ -5578,6 +5934,7 @@ db_path = \"tasks.db\"
         let cfg = DispatchConfig {
             claude_steps: vec!["/clear".to_string()],
             codex_steps: vec![],
+            antigravity_steps: vec![],
         };
         assert!(!cfg.is_empty());
     }
@@ -6216,6 +6573,7 @@ idle_shutdown_secs = 60
             },
             claude: ProviderConfig::default(),
             codex: ProviderConfig::default(),
+            antigravity: ProviderConfig::default(),
             cli: CliConfig::default(),
             dispatch: DispatchConfig::default(),
         }
@@ -6800,6 +7158,7 @@ owner = "acme-corp"
             cli: Some(CliKind::Codex),
             codex_thread_id: Some("thread-abc".to_string()),
             claude_session_id: None,
+            antigravity_conversation_id: None,
             diff_base: None,
         };
         let serialized = toml::to_string(&Wrap {
@@ -6871,6 +7230,7 @@ owner = "acme-corp"
             cli: Some(CliKind::Codex),
             codex_thread_id: Some("keep-me".to_string()),
             claude_session_id: Some("sid-keep".to_string()),
+            antigravity_conversation_id: None,
             diff_base: None,
         }]);
 
@@ -6911,6 +7271,7 @@ owner = "acme-corp"
             cli: Some(CliKind::Claude),
             codex_thread_id: None,
             claude_session_id: None,
+            antigravity_conversation_id: None,
             diff_base: None,
         }]);
 
@@ -6920,6 +7281,7 @@ owner = "acme-corp"
             cli: Some(CliKind::Codex),
             codex_thread_id: None,
             claude_session_id: None,
+            antigravity_conversation_id: None,
             diff_base: None,
         }];
         reg.set_project_worktrees_by_root(&root, &incoming).unwrap();
@@ -6996,10 +7358,9 @@ owner = "acme-corp"
 
     #[test]
     fn claude_session_id_accepts_only_safe_shell_tokens() {
-        assert!(is_safe_claude_session_id(
-            "1b4f1234-5678-90ab-cdef-1234567890ab"
-        ));
-        assert!(is_safe_claude_session_id("agent_session-1"));
+        assert!(is_safe_session_id("1b4f1234-5678-90ab-cdef-1234567890ab"));
+        assert!(is_safe_session_id("agent_session-1"));
+        assert!(is_safe_session_id("0b9e6c3e-1f2a-4c5d-8e7f-a1b2c3d4e5f6"));
 
         for invalid in [
             "",
@@ -7013,9 +7374,9 @@ owner = "acme-corp"
             "session/id",
             "session.id",
         ] {
-            assert!(!is_safe_claude_session_id(invalid), "accepted {invalid:?}");
+            assert!(!is_safe_session_id(invalid), "accepted {invalid:?}");
         }
-        assert!(!is_safe_claude_session_id(&"a".repeat(129)));
+        assert!(!is_safe_session_id(&"a".repeat(129)));
     }
 
     /// `resolve_cli` precedence: worktree entry `cli` → user `default_cli` → Claude.
@@ -7119,5 +7480,289 @@ owner = "acme-corp"
         apply_registry_overrides(&mut cfg, &over);
         assert_eq!(cfg.dispatch.claude_steps, vec!["/claude-step".to_string()]);
         assert_eq!(cfg.dispatch.codex_steps, vec!["/codex-step".to_string()]);
+    }
+
+    // --- provider model ---
+
+    #[test]
+    fn cli_kind_serde_round_trips_all_variants() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct W {
+            cli: CliKind,
+        }
+        for (cli, name) in [
+            (CliKind::Claude, "claude"),
+            (CliKind::Codex, "codex"),
+            (CliKind::Antigravity, "antigravity"),
+        ] {
+            let text = toml::to_string(&W { cli }).unwrap();
+            assert_eq!(text.trim(), format!("cli = \"{name}\""));
+            assert_eq!(toml::from_str::<W>(&text).unwrap(), W { cli });
+        }
+        assert!(toml::from_str::<W>("cli = \"gemini\"").is_err());
+    }
+
+    #[test]
+    fn cli_kind_all_is_display_order() {
+        assert_eq!(
+            CliKind::ALL,
+            [CliKind::Claude, CliKind::Codex, CliKind::Antigravity]
+        );
+        assert_eq!(CliKind::ALL.len(), CLI_COUNT);
+    }
+
+    #[test]
+    fn spec_config_key_is_the_serde_name() {
+        for c in CliKind::ALL {
+            assert_eq!(
+                serde_json::to_value(c).unwrap(),
+                serde_json::Value::String(c.spec().config_key.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn provider_specs_match_the_table() {
+        for c in CliKind::ALL {
+            assert_eq!(c.spec().cli, c);
+        }
+        let s = CliKind::Claude.spec();
+        assert_eq!(
+            (s.title, s.binary, s.herdr_kind, s.herdr_integration),
+            ("Claude", "claude", "claude", "claude")
+        );
+        assert_eq!(s.herdr_agent_names, ["claude"]);
+        let s = CliKind::Codex.spec();
+        assert_eq!(
+            (s.title, s.binary, s.herdr_kind, s.herdr_integration),
+            ("Codex", "codex", "codex", "codex")
+        );
+        assert_eq!(s.herdr_agent_names, ["codex"]);
+        let s = CliKind::Antigravity.spec();
+        assert_eq!(
+            (s.title, s.binary, s.herdr_kind, s.herdr_integration),
+            ("Antigravity", "agy", "agy", "antigravity-cli")
+        );
+        assert_eq!(
+            s.herdr_agent_names,
+            ["antigravity_cli", "antigravity-cli", "agy"]
+        );
+    }
+
+    #[test]
+    fn cli_kind_orders_by_declaration() {
+        assert!(CliKind::Claude < CliKind::Codex);
+        assert!(CliKind::Codex < CliKind::Antigravity);
+    }
+
+    #[test]
+    fn antigravity_table_round_trips() {
+        let user = UserConfig {
+            antigravity: ProviderConfig {
+                path: Some("/x/agy".to_string()),
+                autonomy: Some(true),
+            },
+            ..UserConfig::default()
+        };
+        let text = toml::to_string(&user).unwrap();
+        assert!(text.contains("[antigravity]"), "{text}");
+        let back = toml::from_str::<UserConfig>(&text).unwrap();
+        assert_eq!(back.antigravity.path.as_deref(), Some("/x/agy"));
+        assert_eq!(back.antigravity.autonomy, Some(true));
+        let empty = toml::to_string(&UserConfig::default()).unwrap();
+        assert!(!empty.contains("antigravity"), "{empty}");
+    }
+
+    #[test]
+    fn dispatch_is_empty_counts_antigravity_steps() {
+        let cfg = DispatchConfig {
+            antigravity_steps: vec!["a".into()],
+            ..Default::default()
+        };
+        assert!(!cfg.is_empty());
+    }
+
+    #[test]
+    fn updates_is_empty_counts_agent_skip_antigravity() {
+        let cfg = UpdatesConfig {
+            agent_skip_antigravity: Some("1.5.18".into()),
+            ..Default::default()
+        };
+        assert!(!cfg.is_empty());
+    }
+
+    #[test]
+    fn provider_selectors_cover_antigravity() {
+        let user = UserConfig {
+            antigravity: ProviderConfig {
+                path: Some("/user/agy".to_string()),
+                autonomy: Some(false),
+            },
+            ..UserConfig::default()
+        };
+        let mut proj = ProjectConfig::scaffold(Path::new("/tmp/p"));
+        proj.antigravity.path = Some("/proj/agy".to_string());
+        proj.antigravity.autonomy = Some(true);
+        assert_eq!(
+            resolve_provider_path(CliKind::Antigravity, None, &user).as_deref(),
+            Some("/user/agy")
+        );
+        assert_eq!(
+            resolve_provider_path(CliKind::Antigravity, Some(&proj), &user).as_deref(),
+            Some("/proj/agy")
+        );
+        assert!(!resolve_autonomy(CliKind::Antigravity, None, &user));
+        assert!(resolve_autonomy(CliKind::Antigravity, Some(&proj), &user));
+    }
+
+    // --- per-provider persistence ---
+
+    #[test]
+    fn project_antigravity_table_round_trips() {
+        let mut proj = ProjectConfig::scaffold(Path::new("/tmp/p"));
+        let without = toml::to_string(&proj).unwrap();
+        assert!(!without.contains("antigravity"), "{without}");
+        proj.antigravity.path = Some("/x/agy".to_string());
+        proj.dispatch.antigravity_steps = vec!["/a".to_string()];
+        let text = toml::to_string(&proj).unwrap();
+        assert!(text.contains("[antigravity]"), "{text}");
+        assert!(text.contains("antigravity_steps"), "{text}");
+        let back: ProjectConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.antigravity.path.as_deref(), Some("/x/agy"));
+        assert_eq!(back.dispatch.antigravity_steps, vec!["/a".to_string()]);
+    }
+
+    #[test]
+    fn worktree_entry_round_trips_antigravity_conversation_id() {
+        #[derive(Serialize, Deserialize)]
+        struct W {
+            wt: Vec<WorktreeEntry>,
+        }
+        let mut entry = WorktreeEntry::name_only("alpha");
+        entry.antigravity_conversation_id = Some("conv-1".to_string());
+        let text = toml::to_string(&W {
+            wt: vec![entry.clone()],
+        })
+        .unwrap();
+        assert!(
+            text.contains("antigravity_conversation_id = \"conv-1\""),
+            "path-less entry with an id must serialize as a table:\n{text}"
+        );
+        let back: W = toml::from_str(&text).unwrap();
+        assert_eq!(back.wt, vec![entry]);
+
+        let bare: W = toml::from_str("wt = [\"alpha\"]").unwrap();
+        assert_eq!(bare.wt[0].antigravity_conversation_id, None);
+    }
+
+    #[test]
+    fn merge_carries_forward_antigravity_conversation_id() {
+        let mut old = WorktreeEntry::new("alpha", "/code/alpha");
+        old.antigravity_conversation_id = Some("conv-1".to_string());
+        let incoming = vec![WorktreeEntry::new("alpha", "/code/alpha")];
+        let merged = merge_worktree_registry_fields(Some(&[old]), &incoming);
+        assert_eq!(
+            merged[0].antigravity_conversation_id.as_deref(),
+            Some("conv-1")
+        );
+    }
+
+    #[test]
+    fn provider_ids_with_and_get() {
+        let ids = ProviderIds::keep();
+        for cli in CliKind::ALL {
+            assert_eq!(ids.get(cli), &FieldIntent::Keep);
+        }
+        let ids = ProviderIds::keep().with(CliKind::Antigravity, FieldIntent::Set("c".into()));
+        assert_eq!(ids.get(CliKind::Antigravity), &FieldIntent::Set("c".into()));
+        assert_eq!(ids.get(CliKind::Claude), &FieldIntent::Keep);
+        assert_eq!(ids.get(CliKind::Codex), &FieldIntent::Keep);
+        let ids = ids.with(CliKind::Claude, FieldIntent::Clear);
+        assert_eq!(ids.claude, FieldIntent::Clear);
+        assert_eq!(ids.antigravity, FieldIntent::Set("c".into()));
+    }
+
+    #[test]
+    fn provider_state_set_and_clear_antigravity_id() {
+        with_config_home(|_| {
+            let (mut reg, root, mut current) = provider_fixture();
+            current[1].codex_thread_id = Some("thr-1".into());
+            current[1].claude_session_id = Some("sess-1".into());
+            reg.set_worktree_provider_state_by_root(
+                &root,
+                "feat",
+                CliKind::Antigravity,
+                ProviderIds::keep().with(CliKind::Antigravity, FieldIntent::Set("c1".into())),
+                &current,
+            )
+            .unwrap();
+            let reloaded = UserConfig::load().unwrap();
+            let e = entry_of(&reloaded, "acme", "feat");
+            assert_eq!(e.cli, Some(CliKind::Antigravity));
+            assert_eq!(e.antigravity_conversation_id.as_deref(), Some("c1"));
+            assert_eq!(e.codex_thread_id.as_deref(), Some("thr-1"));
+            assert_eq!(e.claude_session_id.as_deref(), Some("sess-1"));
+
+            reg.set_worktree_provider_state_by_root(
+                &root,
+                "feat",
+                CliKind::Antigravity,
+                ProviderIds::keep().with(CliKind::Antigravity, FieldIntent::Clear),
+                &current,
+            )
+            .unwrap();
+            let reloaded = UserConfig::load().unwrap();
+            let e = entry_of(&reloaded, "acme", "feat");
+            assert_eq!(e.antigravity_conversation_id, None);
+            assert_eq!(e.codex_thread_id.as_deref(), Some("thr-1"));
+            assert_eq!(e.claude_session_id.as_deref(), Some("sess-1"));
+        });
+    }
+
+    #[test]
+    fn antigravity_dispatch_override_flows_through_effective_config() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("keitora.toml"),
+            "[project]\nname = \"proj\"\n\n[tasks]\ndb_path = \"tasks.db\"\n\n\
+             [dispatch]\nantigravity_steps = [\"/committed\"]\n",
+        )
+        .unwrap();
+
+        let mut pref = ProjectRef::new(root.clone());
+        assert_eq!(
+            effective_config(&pref).unwrap().dispatch.antigravity_steps,
+            vec!["/committed".to_string()]
+        );
+
+        ProjectSettingsPatch {
+            antigravity_dispatch_steps: Some(Some(vec!["s".to_string()])),
+            ..Default::default()
+        }
+        .apply_to(&mut pref);
+        assert_eq!(
+            effective_config(&pref).unwrap().dispatch.antigravity_steps,
+            vec!["s".to_string()]
+        );
+
+        ProjectSettingsPatch {
+            antigravity_dispatch_steps: Some(None),
+            ..Default::default()
+        }
+        .apply_to(&mut pref);
+        assert_eq!(pref.antigravity_dispatch_steps, None);
+
+        let mut cfg = UserConfig::default();
+        cfg.register("p", PathBuf::from("/code/old"));
+        cfg.projects
+            .get_mut("p")
+            .unwrap()
+            .antigravity_dispatch_steps = Some(vec!["s".to_string()]);
+        cfg.register("p", PathBuf::from("/code/old"));
+        assert!(cfg.projects["p"].antigravity_dispatch_steps.is_some());
+        cfg.register("p", PathBuf::from("/code/new"));
+        assert!(cfg.projects["p"].antigravity_dispatch_steps.is_none());
     }
 }

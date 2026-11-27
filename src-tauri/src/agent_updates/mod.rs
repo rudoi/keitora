@@ -12,6 +12,7 @@ pub mod commands;
 pub mod model;
 pub mod probe;
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -122,8 +123,8 @@ impl AgentUpdateEntry {
 /// The `agent_updates_status` reply and the `agent-updates://status` payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentUpdatesSnapshot {
-    pub codex: AgentUpdateEntry,
-    pub claude: AgentUpdateEntry,
+    /// One entry per provider, always fully populated.
+    pub agents: BTreeMap<CliKind, AgentUpdateEntry>,
     /// RFC 3339 time of the last completed check.
     pub checked_at: Option<String>,
     pub stopped: Vec<StoppedSession>,
@@ -134,8 +135,10 @@ pub struct AgentUpdatesSnapshot {
 impl Default for AgentUpdatesSnapshot {
     fn default() -> Self {
         AgentUpdatesSnapshot {
-            codex: AgentUpdateEntry::unchecked(CliKind::Codex),
-            claude: AgentUpdateEntry::unchecked(CliKind::Claude),
+            agents: CliKind::ALL
+                .iter()
+                .map(|&cli| (cli, AgentUpdateEntry::unchecked(cli)))
+                .collect(),
             checked_at: None,
             stopped: Vec::new(),
             running: None,
@@ -145,17 +148,13 @@ impl Default for AgentUpdatesSnapshot {
 
 impl AgentUpdatesSnapshot {
     fn entry_mut(&mut self, cli: CliKind) -> &mut AgentUpdateEntry {
-        match cli {
-            CliKind::Codex => &mut self.codex,
-            CliKind::Claude => &mut self.claude,
-        }
+        self.agents
+            .get_mut(&cli)
+            .expect("every provider has an entry")
     }
 
     fn entry(&self, cli: CliKind) -> &AgentUpdateEntry {
-        match cli {
-            CliKind::Codex => &self.codex,
-            CliKind::Claude => &self.claude,
-        }
+        &self.agents[&cli]
     }
 }
 
@@ -200,14 +199,6 @@ pub enum WatchEnd {
     TimedOut,
     /// A newer run started or the pane was closed.
     Cancelled,
-}
-
-/// The version of `cli` the user skipped, from `cfg`.
-fn skipped_version(cfg: &UserConfig, cli: CliKind) -> Option<&str> {
-    match cli {
-        CliKind::Codex => cfg.updates.agent_skip_codex.as_deref(),
-        CliKind::Claude => cfg.updates.agent_skip_claude.as_deref(),
-    }
 }
 
 /// Managed state: the snapshot plus the seams it is computed through.
@@ -282,14 +273,14 @@ impl AgentUpdates {
                     .find(|p| self.prober.is_file(p))
             })
             .flatten();
-        let cmds = model::update_commands(cli, kind, npm.as_deref());
+        let cmds = model::update_commands(cli, kind, npm.as_deref(), Some(&exe));
         let command = cmds.run.as_ref().map(UpdateCommand::display);
         let latest = self.prober.latest(cli);
         let state = model::assess(
             true,
             installed.as_deref(),
             latest.as_deref(),
-            skipped_version(cfg, cli),
+            cfg.updates.skipped(cli),
             command.clone(),
         );
         AgentUpdateEntry {
@@ -305,7 +296,7 @@ impl AgentUpdates {
         }
     }
 
-    /// Check both CLIs (concurrently), store and emit the result. Unless `force`, a check
+    /// Check every provider's CLI (concurrently), store and emit the result. Unless `force`, a check
     /// within [`CHECK_COALESCE`] of the last completed one returns its snapshot unprobed.
     pub fn check(&self, force: bool) -> AgentUpdatesSnapshot {
         let mut last = lock(&self.check_lock);
@@ -313,22 +304,26 @@ impl AgentUpdates {
             return self.snapshot();
         }
         let cfg = self.prober.config();
-        let (codex, claude) = thread::scope(|s| {
-            let codex = s.spawn(|| self.probe_entry(CliKind::Codex, &cfg));
-            let claude = self.probe_entry(CliKind::Claude, &cfg);
-            let codex = codex
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            (codex, claude)
+        let cfg = &cfg;
+        let entries = thread::scope(|s| {
+            let handles: Vec<_> = CliKind::ALL
+                .iter()
+                .map(|&cli| s.spawn(move || self.probe_entry(cli, cfg)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect::<Vec<_>>()
         });
-        log::info!(
-            "[agent-updates] checked: codex {:?}, claude {:?}",
-            codex.state,
-            claude.state
-        );
+        let summary: Vec<String> = entries
+            .iter()
+            .map(|e| format!("{:?} {:?}", e.cli, e.state))
+            .collect();
+        log::info!("[agent-updates] checked: {}", summary.join(", "));
         let snap = self.update(|s| {
-            s.codex = codex;
-            s.claude = claude;
+            for entry in entries {
+                s.agents.insert(entry.cli, entry);
+            }
             s.checked_at = Some(chrono::Utc::now().to_rfc3339());
         });
         *last = Some(Instant::now());
@@ -338,7 +333,7 @@ impl AgentUpdates {
     /// Re-assess `cli` after its skipped version changed.
     pub fn skip_changed(&self, cli: CliKind) -> AgentUpdatesSnapshot {
         let cfg = self.prober.config();
-        let skipped = skipped_version(&cfg, cli);
+        let skipped = cfg.updates.skipped(cli);
         self.update(|s| s.entry_mut(cli).reassess(skipped))
     }
 
@@ -514,7 +509,7 @@ impl AgentUpdates {
             },
         );
         let cfg = self.prober.config();
-        let skipped = skipped_version(&cfg, cli);
+        let skipped = cfg.updates.skipped(cli);
         self.update(|s| {
             let entry = s.entry_mut(cli);
             if after.is_some() {
@@ -728,6 +723,8 @@ mod tests {
     struct FakeProber {
         /// The skipped codex version the config reports.
         skip_codex: Arc<Mutex<Option<String>>>,
+        /// The skipped antigravity version the config reports.
+        skip_antigravity: Arc<Mutex<Option<String>>>,
         config_calls: Arc<AtomicUsize>,
         exes: HashMap<CliKind, String>,
         /// Symlink targets; an exe not listed resolves to itself.
@@ -747,6 +744,7 @@ mod tests {
             self.config_calls.fetch_add(1, Ordering::SeqCst);
             let mut cfg = UserConfig::default();
             cfg.updates.agent_skip_codex = lock(&self.skip_codex).clone();
+            cfg.updates.agent_skip_antigravity = lock(&self.skip_antigravity).clone();
             cfg
         }
         fn exe(&self, cli: CliKind, _cfg: &UserConfig) -> Option<String> {
@@ -839,8 +837,14 @@ mod tests {
     fn starts_unchecked() {
         let (updates, rec) = updates_with(prober(), Arc::default());
         let snap = updates.snapshot();
-        assert_eq!(snap.codex.state, AgentUpdateState::Unchecked);
-        assert_eq!(snap.claude.state, AgentUpdateState::Unchecked);
+        assert_eq!(
+            snap.agents[&CliKind::Codex].state,
+            AgentUpdateState::Unchecked
+        );
+        assert_eq!(
+            snap.agents[&CliKind::Claude].state,
+            AgentUpdateState::Unchecked
+        );
         assert!(snap.checked_at.is_none());
         assert!(rec.named(STATUS_EVENT).is_empty());
     }
@@ -857,22 +861,34 @@ mod tests {
             "one config load per check"
         );
         assert_eq!(
-            snap.codex.state,
+            snap.agents[&CliKind::Codex].state,
             AgentUpdateState::Available {
                 installed: "0.160.0".into(),
                 latest: "0.163.0".into(),
                 command: Some("npm install -g @openai/codex@latest".into()),
             }
         );
-        assert_eq!(snap.codex.install_kind, Some(InstallKind::Npm));
-        assert_eq!(snap.claude.state, AgentUpdateState::UpToDate);
-        assert_eq!(snap.claude.install_kind, Some(InstallKind::Native));
-        assert_eq!(snap.claude.guidance.as_deref(), Some("claude update"));
+        assert_eq!(
+            snap.agents[&CliKind::Codex].install_kind,
+            Some(InstallKind::Npm)
+        );
+        assert_eq!(
+            snap.agents[&CliKind::Claude].state,
+            AgentUpdateState::UpToDate
+        );
+        assert_eq!(
+            snap.agents[&CliKind::Claude].install_kind,
+            Some(InstallKind::Native)
+        );
+        assert_eq!(
+            snap.agents[&CliKind::Claude].guidance.as_deref(),
+            Some("claude update")
+        );
         assert!(snap.checked_at.is_some());
         let statuses = rec.named(STATUS_EVENT);
         assert_eq!(statuses.len(), 1);
-        assert_eq!(statuses[0]["codex"]["state"]["type"], "available");
-        assert_eq!(statuses[0]["claude"]["cli"], "claude");
+        assert_eq!(statuses[0]["agents"]["codex"]["state"]["type"], "available");
+        assert_eq!(statuses[0]["agents"]["claude"]["cli"], "claude");
     }
 
     #[test]
@@ -882,8 +898,11 @@ mod tests {
         let calls = p.latest_calls.clone();
         let (updates, _rec) = updates_with(p, Arc::default());
         let snap = updates.check(true);
-        assert_eq!(snap.claude.state, AgentUpdateState::NotInstalled);
-        assert_eq!(snap.claude.exe, None);
+        assert_eq!(
+            snap.agents[&CliKind::Claude].state,
+            AgentUpdateState::NotInstalled
+        );
+        assert_eq!(snap.agents[&CliKind::Claude].exe, None);
         assert_eq!(calls.load(Ordering::SeqCst), 1, "codex only");
     }
 
@@ -921,7 +940,7 @@ mod tests {
         *lock(&skip) = Some("0.163.0".into());
         let snap = updates.skip_changed(CliKind::Codex);
         assert_eq!(
-            snap.codex.state,
+            snap.agents[&CliKind::Codex].state,
             AgentUpdateState::Skipped {
                 latest: "0.163.0".into()
             }
@@ -931,7 +950,7 @@ mod tests {
         p.latest.insert(CliKind::Codex, "0.164.0".into());
         let (updates, _rec) = updates_with(p, skip);
         assert!(matches!(
-            updates.check(true).codex.state,
+            updates.check(true).agents[&CliKind::Codex].state,
             AgentUpdateState::Available { .. }
         ));
     }
@@ -1261,17 +1280,20 @@ mod tests {
         p.files.push(format!("{bin}/{npm}"));
         let (updates, _rec) = updates_with(p, Arc::default());
         let snap = updates.check(true);
-        assert_eq!(snap.codex.install_kind, Some(InstallKind::Npm));
         assert_eq!(
-            snap.codex.command,
+            snap.agents[&CliKind::Codex].install_kind,
+            Some(InstallKind::Npm)
+        );
+        assert_eq!(
+            snap.agents[&CliKind::Codex].command,
             Some(format!("\"{bin}/{npm}\" install -g @openai/codex@latest")),
             "shown with the path double-quoted"
         );
         assert_eq!(
-            snap.codex.guidance,
+            snap.agents[&CliKind::Codex].guidance,
             Some(format!("'{bin}/{npm}' install -g @openai/codex@latest"))
         );
-        let run = snap.codex.run.unwrap();
+        let run = snap.agents[&CliKind::Codex].run.clone().unwrap();
         assert_eq!(run.program, format!("{bin}/{npm}"));
         assert!(run.program_is_path);
     }
@@ -1289,9 +1311,12 @@ mod tests {
         );
         let (updates, _rec) = updates_with(p, Arc::default());
         let snap = updates.check(true);
-        assert_eq!(snap.codex.install_kind, Some(InstallKind::Npm));
         assert_eq!(
-            snap.codex.command.as_deref(),
+            snap.agents[&CliKind::Codex].install_kind,
+            Some(InstallKind::Npm)
+        );
+        assert_eq!(
+            snap.agents[&CliKind::Codex].command.as_deref(),
             Some("npm install -g @openai/codex@latest")
         );
     }
@@ -1331,8 +1356,14 @@ mod tests {
             ]
         );
         let snap = updates.snapshot();
-        assert_eq!(snap.codex.state, AgentUpdateState::UpToDate);
-        assert_eq!(snap.codex.installed.as_deref(), Some("0.163.0"));
+        assert_eq!(
+            snap.agents[&CliKind::Codex].state,
+            AgentUpdateState::UpToDate
+        );
+        assert_eq!(
+            snap.agents[&CliKind::Codex].installed.as_deref(),
+            Some("0.163.0")
+        );
         assert_eq!(snap.running, None);
     }
 
@@ -1359,7 +1390,7 @@ mod tests {
         );
         assert_eq!(rec.named(RUN_EVENT).len(), 1);
         assert!(matches!(
-            updates.snapshot().codex.state,
+            updates.snapshot().agents[&CliKind::Codex].state,
             AgentUpdateState::Available { .. }
         ));
     }
@@ -1537,5 +1568,99 @@ mod tests {
             .unwrap(),
             serde_json::json!({"project": "proj", "worktree": "alpha", "cli": "codex"})
         );
+    }
+
+    /// [`prober`] plus `agy` at `exe`, installed 1.5.17 with 1.5.18 out.
+    fn prober_with_agy(exe: &str) -> FakeProber {
+        let mut p = prober();
+        p.exes.insert(CliKind::Antigravity, exe.to_string());
+        lock(&p.installed).insert(CliKind::Antigravity, "1.5.17".to_string());
+        p.latest.insert(CliKind::Antigravity, "1.5.18".to_string());
+        p
+    }
+
+    fn linux_updates(p: FakeProber) -> AgentUpdates {
+        AgentUpdates::new(
+            Box::new(p),
+            Arc::new(Recorder::default()),
+            Some("/home/u".into()),
+        )
+    }
+
+    #[test]
+    fn snapshot_default_has_an_unchecked_entry_per_provider() {
+        let snap = AgentUpdatesSnapshot::default();
+        assert_eq!(
+            snap.agents.keys().copied().collect::<Vec<_>>(),
+            vec![CliKind::Claude, CliKind::Codex, CliKind::Antigravity]
+        );
+        for (cli, entry) in &snap.agents {
+            assert_eq!(entry.cli, *cli);
+            assert_eq!(entry.state, AgentUpdateState::Unchecked);
+        }
+    }
+
+    #[test]
+    fn check_probes_every_provider() {
+        let updates = linux_updates(prober_with_agy("/home/u/.local/bin/agy"));
+        let snap = updates.check(true);
+        let agy = &snap.agents[&CliKind::Antigravity];
+        assert_eq!(
+            agy.state,
+            AgentUpdateState::Available {
+                installed: "1.5.17".into(),
+                latest: "1.5.18".into(),
+                // By path: the installer's directory may be off the pane's PATH.
+                command: Some("/home/u/.local/bin/agy update".into()),
+            }
+        );
+        assert_eq!(agy.install_kind, Some(InstallKind::Native));
+
+        // An install Keitora cannot place offers the official installer instead.
+        let updates = linux_updates(prober_with_agy("/srv/tools/agy"));
+        let snap = updates.check(true);
+        let agy = &snap.agents[&CliKind::Antigravity];
+        assert_eq!(
+            agy.state,
+            AgentUpdateState::Available {
+                installed: "1.5.17".into(),
+                latest: "1.5.18".into(),
+                command: None,
+            }
+        );
+        assert_eq!(agy.run, None);
+        assert_eq!(
+            agy.guidance.as_deref(),
+            model::install_hint(CliKind::Antigravity)
+        );
+    }
+
+    #[test]
+    fn skip_changed_uses_the_antigravity_skip() {
+        let p = prober_with_agy("/home/u/.local/bin/agy");
+        let skip = p.skip_antigravity.clone();
+        let updates = linux_updates(p);
+        updates.check(true);
+        *lock(&skip) = Some("1.5.18".into());
+        let snap = updates.skip_changed(CliKind::Antigravity);
+        assert_eq!(
+            snap.agents[&CliKind::Antigravity].state,
+            AgentUpdateState::Skipped {
+                latest: "1.5.18".into()
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_wire_shape_is_keyed_by_provider() {
+        let v = serde_json::to_value(AgentUpdatesSnapshot::default()).unwrap();
+        let agents = v["agents"].as_object().expect("agents is an object");
+        let mut keys: Vec<&str> = agents.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["antigravity", "claude", "codex"]);
+        for (key, entry) in agents {
+            assert_eq!(entry["cli"], key.as_str());
+        }
+        assert!(v.get("codex").is_none() && v.get("claude").is_none());
     }
 }
