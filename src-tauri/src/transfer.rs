@@ -2192,7 +2192,7 @@ fn confirmed_claude_jsonl(worktree_cwd: &Path, jsonl: &Path) -> Result<PathBuf, 
 /// Pure over the filesystem: `jsonl` is accepted only when it is an existing
 /// `.jsonl` regular file whose canonical parent is `dir`'s canonical form. Returns
 /// the path as given (the form the preview showed and the import sends).
-fn validate_jsonl_in_dir(dir: &Path, jsonl: &Path) -> Result<PathBuf, String> {
+pub(crate) fn validate_jsonl_in_dir(dir: &Path, jsonl: &Path) -> Result<PathBuf, String> {
     let reject = |why: &str| {
         Err(format!(
             "the confirmed transcript {} {why}",
@@ -2234,11 +2234,16 @@ fn find_live_claude_jsonl(worktree_cwd: &Path) -> Result<PathBuf, String> {
     let path = pick_jsonl(&dir)
         .ok_or_else(|| format!("no .jsonl session files under {}", dir.display()))?;
 
-    // Containment guard: the canonicalized pick must live under the canonicalized
-    // projects dir and still be a `.jsonl`.
-    let canon_path = std::fs::canonicalize(&path)
+    claude_jsonl_contained(&projects, &path)?;
+    Ok(path)
+}
+
+/// Containment guard for a picked Claude transcript: its canonical path must live
+/// under the canonical projects dir and still be a `.jsonl`.
+pub(crate) fn claude_jsonl_contained(projects: &Path, path: &Path) -> Result<(), String> {
+    let canon_path = std::fs::canonicalize(path)
         .map_err(|e| format!("canonicalize session {}: {e}", path.display()))?;
-    let canon_projects = std::fs::canonicalize(&projects)
+    let canon_projects = std::fs::canonicalize(projects)
         .map_err(|e| format!("canonicalize {}: {e}", projects.display()))?;
     if !canon_path.starts_with(&canon_projects)
         || canon_path.extension().and_then(|x| x.to_str()) != Some("jsonl")
@@ -2248,14 +2253,14 @@ fn find_live_claude_jsonl(worktree_cwd: &Path) -> Result<PathBuf, String> {
             canon_path.display()
         ));
     }
-    Ok(path)
+    Ok(())
 }
 
 /// The newest `*.jsonl` regular file in `dir` by mtime, skipping sub-agent
 /// transcripts (`agent-*.jsonl`). The persisted Claude session id is deliberately
 /// not preferred: only a transfer writes it, so a later `--resume`, `/clear` or new
 /// session makes it stale. Pure over the filesystem.
-fn pick_jsonl(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn pick_jsonl(dir: &Path) -> Option<PathBuf> {
     let mut newest: Option<(SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();

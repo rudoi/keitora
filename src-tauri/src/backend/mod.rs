@@ -13,8 +13,6 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use keitora_tasks::WorktreeSession;
-
 pub mod emit;
 pub mod herdr;
 pub mod launch;
@@ -644,6 +642,18 @@ pub trait PtyBackend: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// A fresh read of the agent entry herdr lists for `key`'s pane (one `agent list`,
+    /// never cached), for checks that cannot wait for the engine's next snapshot.
+    /// `None` when the key has no pane or the pane has no agent entry. Default: `None`.
+    #[allow(dead_code)] // read by the turn tracking
+    fn agent_snapshot(
+        &self,
+        key: &SessionKey,
+    ) -> Result<Option<crate::engine::model::AgentObs>, PtyBackendError> {
+        let _ = key;
+        Ok(None)
+    }
+
     /// Type `line` into a plain shell session and submit it, only while the session is
     /// still the one spawned at `gen` (a replaced or closed session is `NoSuchSession`).
     /// Default: unsupported.
@@ -786,65 +796,15 @@ pub trait PtyBackend: Send + Sync + 'static {
 /// Shared, type-erased backend handle managed in Tauri state.
 pub type SharedBackend = std::sync::Arc<dyn PtyBackend>;
 
-// ── Reconciliation (pure) ────────────────────────────────────────────────────
+// ── Agent hints ────────────────────────────────────────────────────────────────
 
 /// The agent hint per session key: [`HINT_BUSY`] or [`HINT_WAITING`].
+#[cfg(test)]
 pub type HintMap = HashMap<SessionKey, String>;
 
-/// Downgrade non-offline sessions absent from the live-set to `offline` (in-memory
-/// only); offline wins over every hint. Then, for a live session, a
-/// [`HINT_WAITING`] hint turns `idle` or `busy` into `waiting`, and a [`HINT_BUSY`]
-/// hint upgrades `idle` to `busy`. A session already `waiting` or `offline` is
-/// never changed by a hint.
-///
-/// Pure: `(&[WorktreeSession], &HashSet<SessionKey>, &HintMap, project) -> Vec<…>`.
-pub fn apply_reconcile(
-    sessions: &[WorktreeSession],
-    live_set: &HashSet<SessionKey>,
-    hints: &HintMap,
-    project: &str,
-) -> Vec<WorktreeSession> {
-    sessions
-        .iter()
-        .cloned()
-        .map(|mut s| {
-            let key = SessionKey {
-                project: project.to_string(),
-                worktree: s.worktree.clone(),
-            };
-            // Offline downgrade first — a session with no live PTY cannot have
-            // background work or be blocked (offline wins over every hint).
-            if s.state != "offline" && !live_set.contains(&key) {
-                s.state = "offline".to_string();
-                s.current_task_id = None;
-                s.pid = None;
-                // An offline session isn't waiting on anything; the binding stays.
-                s.brokered = false;
-                s.escalated_reason = None;
-            }
-            match hints.get(&key).map(String::as_str) {
-                // Blocked on the user: idle or busy -> waiting.
-                Some(HINT_WAITING) if s.state == "idle" || s.state == "busy" => {
-                    s.state = "waiting".to_string();
-                }
-                // Background work: upgrade hook-reported idle -> busy.
-                Some(HINT_BUSY) if s.state == "idle" => {
-                    s.state = "busy".to_string();
-                }
-                _ => {}
-            }
-            s
-        })
-        .collect()
-}
-
-/// The agent hint (busy or waiting) per session key the backend currently reports.
-/// Degrades gracefully to an empty map on any error — never blocks the UI or
-/// dispatch on a flaky backend.
-pub fn agent_hints(backend: &dyn PtyBackend) -> HintMap {
-    hint_map(backend.list_sessions())
-}
-
+/// The agent hint (busy or waiting) per session key in a session listing; an error
+/// degrades to an empty map.
+#[cfg(test)]
 fn hint_map(r: Result<Vec<SessionSummary>, PtyBackendError>) -> HintMap {
     r.map(|v| {
         v.into_iter()
@@ -855,12 +815,6 @@ fn hint_map(r: Result<Vec<SessionSummary>, PtyBackendError>) -> HintMap {
             .collect()
     })
     .unwrap_or_default()
-}
-
-/// [`agent_hints`] over [`PtyBackend::cached_sessions`]: the hints as last
-/// listed, never asking the server. Empty on any error.
-pub fn cached_agent_hints(backend: &dyn PtyBackend) -> HintMap {
-    hint_map(backend.cached_sessions())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -905,20 +859,6 @@ mod tests {
         SessionKey {
             project: project.to_string(),
             worktree: worktree.to_string(),
-        }
-    }
-
-    fn session(worktree: &str, state: &str) -> WorktreeSession {
-        WorktreeSession {
-            project: String::new(),
-            worktree: worktree.to_string(),
-            state: state.to_string(),
-            current_task_id: Some(7),
-            pid: Some(1234),
-            last_heartbeat: "now".to_string(),
-            driven_by: None,
-            brokered: false,
-            escalated_reason: None,
         }
     }
 
@@ -1159,100 +1099,6 @@ mod tests {
         assert_eq!(hints[1].worktree, "vesper");
     }
 
-    // ── apply_reconcile (offline downgrade) ───────────────────────────────────
-
-    #[test]
-    fn reconciled_sessions_downgrades_non_offline_when_absent_from_live_set() {
-        let live = HashSet::new();
-        let sessions = vec![session("sayo", "idle")];
-        let result = apply_reconcile(&sessions, &live, &HintMap::new(), "proj");
-        assert_eq!(result[0].state, "offline");
-        assert_eq!(result[0].current_task_id, None);
-        assert_eq!(result[0].pid, None);
-    }
-
-    #[test]
-    fn reconciled_sessions_preserves_live_session_state() {
-        let mut live = HashSet::new();
-        live.insert(key("proj", "sayo"));
-        let sessions = vec![session("sayo", "idle")];
-        let result = apply_reconcile(&sessions, &live, &HintMap::new(), "proj");
-        assert_eq!(result[0].state, "idle");
-        assert_eq!(result[0].current_task_id, Some(7));
-    }
-
-    #[test]
-    fn offline_downgrade_clears_brokered_state_but_keeps_the_driver() {
-        let mut waiting = session("bravo", "waiting");
-        waiting.driven_by = Some("alpha".to_string());
-        waiting.brokered = true;
-        waiting.escalated_reason = Some("driver paused".to_string());
-        let result = apply_reconcile(&[waiting.clone()], &HashSet::new(), &HintMap::new(), "proj");
-        assert_eq!(result[0].state, "offline");
-        assert!(!result[0].brokered);
-        assert_eq!(result[0].escalated_reason, None);
-        assert_eq!(result[0].driven_by.as_deref(), Some("alpha"));
-
-        // A live session passes the drive fields through unchanged.
-        let mut live = HashSet::new();
-        live.insert(key("proj", "bravo"));
-        let result = apply_reconcile(&[waiting], &live, &HintMap::new(), "proj");
-        assert!(result[0].brokered);
-        assert_eq!(result[0].escalated_reason.as_deref(), Some("driver paused"));
-    }
-
-    #[test]
-    fn reconciled_sessions_leaves_already_offline_untouched() {
-        let live = HashSet::new();
-        let sessions = vec![session("sayo", "offline")];
-        let result = apply_reconcile(&sessions, &live, &HintMap::new(), "proj");
-        assert_eq!(result[0].state, "offline");
-    }
-
-    // ── Agent-hint override ────────────────────────────────────────────
-
-    fn busy_hint(k: SessionKey) -> HintMap {
-        HintMap::from([(k, HINT_BUSY.to_string())])
-    }
-
-    #[test]
-    fn reconcile_table() {
-        let states = ["idle", "busy", "waiting", "offline"];
-        let hints = [None, Some(HINT_BUSY), Some(HINT_WAITING)];
-        for live in [false, true] {
-            for state in states {
-                for hint in hints {
-                    let k = key("proj", "sayo");
-                    let live_set: HashSet<SessionKey> = if live {
-                        HashSet::from([k.clone()])
-                    } else {
-                        HashSet::new()
-                    };
-                    let map: HintMap = hint
-                        .map(|h| HintMap::from([(k.clone(), h.to_string())]))
-                        .unwrap_or_default();
-                    let expected = match (live, state, hint) {
-                        (false, _, _) => "offline",
-                        (true, "offline", _) => "offline",
-                        (true, "waiting", _) => "waiting",
-                        (true, "idle" | "busy", Some(HINT_WAITING)) => "waiting",
-                        (true, "idle", Some(HINT_BUSY)) => "busy",
-                        (true, s, _) => s,
-                    };
-                    let out = apply_reconcile(&[session("sayo", state)], &live_set, &map, "proj");
-                    assert_eq!(
-                        out[0].state, expected,
-                        "live={live} state={state} hint={hint:?}"
-                    );
-                    if !live && state != "offline" {
-                        assert_eq!(out[0].current_task_id, None);
-                        assert_eq!(out[0].pid, None);
-                    }
-                }
-            }
-        }
-    }
-
     #[test]
     fn hint_map_keeps_busy_and_waiting_only() {
         let summary = |w: &str, hint: Option<&str>| SessionSummary {
@@ -1273,105 +1119,6 @@ mod tests {
                 (key("proj", "b"), HINT_WAITING.to_string()),
             ])
         );
-    }
-
-    #[test]
-    fn bg_override_idle_in_bg_and_live_becomes_busy() {
-        let mut live = HashSet::new();
-        live.insert(key("proj", "sayo"));
-        let bg = busy_hint(key("proj", "sayo"));
-        let sessions = vec![session("sayo", "idle")];
-        let result = apply_reconcile(&sessions, &live, &bg, "proj");
-        assert_eq!(result[0].state, "busy");
-    }
-
-    #[test]
-    fn bg_override_idle_not_in_bg_stays_idle() {
-        let mut live = HashSet::new();
-        live.insert(key("proj", "sayo"));
-        let bg = HintMap::new();
-        let sessions = vec![session("sayo", "idle")];
-        let result = apply_reconcile(&sessions, &live, &bg, "proj");
-        assert_eq!(result[0].state, "idle");
-    }
-
-    #[test]
-    fn bg_override_already_busy_in_bg_stays_busy() {
-        let mut live = HashSet::new();
-        live.insert(key("proj", "sayo"));
-        let bg = busy_hint(key("proj", "sayo"));
-        let sessions = vec![session("sayo", "busy")];
-        let result = apply_reconcile(&sessions, &live, &bg, "proj");
-        assert_eq!(result[0].state, "busy");
-    }
-
-    #[test]
-    fn bg_override_waiting_in_bg_stays_waiting() {
-        let mut live = HashSet::new();
-        live.insert(key("proj", "sayo"));
-        let bg = busy_hint(key("proj", "sayo"));
-        let sessions = vec![session("sayo", "waiting")];
-        let result = apply_reconcile(&sessions, &live, &bg, "proj");
-        assert_eq!(result[0].state, "waiting");
-    }
-
-    #[test]
-    fn bg_override_offline_wins_over_bg() {
-        let live = HashSet::new();
-        let bg = busy_hint(key("proj", "sayo"));
-        let sessions = vec![session("sayo", "idle")];
-        let result = apply_reconcile(&sessions, &live, &bg, "proj");
-        assert_eq!(result[0].state, "offline");
-        assert_eq!(result[0].current_task_id, None);
-        assert_eq!(result[0].pid, None);
-    }
-
-    // ── agent_hints over a FakeBackend ─────────────────────────────────────────
-
-    #[test]
-    fn agent_hints_filters_busy_and_degrades_to_empty_on_error() {
-        let busy = key("proj", "sayo");
-        let idle = key("proj", "umbra");
-        let fake = FakeBackend::new();
-        // One busy (HINT_BUSY) and one hintless session, then a scripted error.
-        fake.push_list_sessions(Ok(vec![
-            SessionSummary {
-                key: busy.clone(),
-                gen: 1,
-                state_hint: Some(HINT_BUSY.to_string()),
-            },
-            SessionSummary {
-                key: idle.clone(),
-                gen: 2,
-                state_hint: None,
-            },
-        ]));
-        fake.push_list_sessions(Err(PtyBackendError::NotConnected));
-
-        // First call: only the busy key is reported.
-        let set = agent_hints(&fake);
-        assert_eq!(set.len(), 1);
-        assert!(set.contains_key(&busy));
-        assert!(!set.contains_key(&idle));
-
-        // Second call errors -> degrade to an empty set (never block dispatch).
-        let set = agent_hints(&fake);
-        assert!(set.is_empty(), "an RPC error degrades to an empty set");
-    }
-
-    #[test]
-    fn cached_agent_hints_defaults_to_the_listed_sessions() {
-        let busy = key("proj", "sayo");
-        let fake = FakeBackend::new();
-        fake.push_list_sessions(Ok(vec![SessionSummary {
-            key: busy.clone(),
-            gen: 1,
-            state_hint: Some(HINT_BUSY.to_string()),
-        }]));
-        fake.push_list_sessions(Err(PtyBackendError::NotConnected));
-
-        assert_eq!(cached_agent_hints(&fake), busy_hint(busy));
-        assert!(cached_agent_hints(&fake).is_empty());
     }
 
     /// A sink that only counts what it got.

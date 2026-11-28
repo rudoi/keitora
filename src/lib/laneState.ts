@@ -55,6 +55,25 @@ export function blockAnimates(attn: AttentionKind | undefined): boolean {
   return attn === "waiting";
 }
 
+/**
+ * Class list for a lane's status block: its colour, the attention glow (`attn`) and pulse,
+ * and `is-stale` (dimmed) while its state could not be confirmed against herdr.
+ */
+export function blockClassName(
+  blockState: DotState,
+  opts: { animates: boolean; pulse: boolean; stale: boolean },
+): string {
+  return [
+    "wt-block",
+    blockState,
+    opts.animates ? "attn" : "",
+    opts.animates && opts.pulse ? "pulse" : "",
+    opts.stale ? "is-stale" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
 /** One entry of the worktree context menu. Transfer and switch entries carry their target. */
 export type WorktreeMenuItem =
   | { kind: "focus" | "restart" | "fresh" | "terminate" | "launch" | "launch-fresh" }

@@ -10,11 +10,13 @@
 //! The method bodies are moved verbatim from the original `Store` in
 //! [`lib.rs`](crate); the transitional `Store` façade now delegates to them.
 
+use std::collections::HashMap;
+
 use rusqlite::{params, OptionalExtension};
 
 use crate::config::CliKind;
 use crate::model::{self, ActiveTask, DispatchRequest, WorktreeSession};
-use crate::sqlite_backend::{init_schema, open_conn};
+use crate::sqlite_backend::{column_exists, init_schema, open_conn, table_exists};
 use crate::{Error, Result};
 
 /// Sync concrete store over the always-local tables. Holds its own
@@ -26,6 +28,12 @@ pub struct LocalStore {
     /// Set once the drive tables are seen; they are never dropped, so a positive
     /// answer is cached and the `sqlite_master` probe runs at most once.
     pub(crate) drive_tables_seen: std::cell::Cell<bool>,
+    /// Set once `worktree_sessions.session_id` is seen (columns are never dropped).
+    session_id_seen: std::cell::Cell<bool>,
+    /// Set once `drives.delivery_id` is seen.
+    pub(crate) delivery_columns_seen: std::cell::Cell<bool>,
+    /// Set once the `drive_turns` table is seen.
+    pub(crate) drive_turns_seen: std::cell::Cell<bool>,
 }
 
 /// One `resume_sessions` row: the agent conversation a (project, worktree)
@@ -59,6 +67,91 @@ fn cli_from_sql(s: &str) -> rusqlite::Result<CliKind> {
     })
 }
 
+/// Whether a table or column exists: `true` without probing once `seen` is set (a
+/// table or column, once there, is never dropped), else `probe`'s answer, remembered
+/// when positive.
+pub(crate) fn cached_exists(
+    seen: &std::cell::Cell<bool>,
+    probe: impl FnOnce() -> rusqlite::Result<bool>,
+) -> Result<bool> {
+    if seen.get() {
+        return Ok(true);
+    }
+    let exists = probe()?;
+    seen.set(exists);
+    Ok(exists)
+}
+
+/// Open an existing SQLite file read-only (never created, no PRAGMA writes) with the
+/// short [`LocalStore::READ_ONLY_BUSY_TIMEOUT`].
+pub(crate) fn open_ro_conn(path: &std::path::Path) -> rusqlite::Result<rusqlite::Connection> {
+    open_ro(path.as_os_str(), rusqlite::OpenFlags::empty())
+}
+
+/// [`open_ro_conn`] with SQLite's `immutable=1`: no locks are taken and no `-wal` or
+/// `-shm` file is ever created beside the file. Only for a file no one is writing
+/// through a write-ahead log (another process's file read while it is idle).
+pub(crate) fn open_ro_conn_immutable(
+    path: &std::path::Path,
+) -> rusqlite::Result<rusqlite::Connection> {
+    open_ro(
+        std::ffi::OsStr::new(&sqlite_file_uri(path, "immutable=1")),
+        rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+}
+
+fn open_ro(
+    target: &std::ffi::OsStr,
+    extra: rusqlite::OpenFlags,
+) -> rusqlite::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open_with_flags(
+        target,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | extra,
+    )?;
+    conn.busy_timeout(LocalStore::READ_ONLY_BUSY_TIMEOUT)?;
+    Ok(conn)
+}
+
+/// `path` as an SQLite `file:` URI with `query`. The authority is always empty: a UNC
+/// path (`\\server\share\..`, or verbatim `\\?\UNC\server\share\..`) keeps its two
+/// leading slashes in the URI path (`file:////server/share/..`), and a verbatim drive
+/// path (`\\?\C:\..`) loses its prefix. `%`, `?`, `#` and spaces are escaped.
+fn sqlite_file_uri(path: &std::path::Path, query: &str) -> String {
+    let raw = path.to_string_lossy();
+    let raw = if let Some(rest) = raw
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| raw.strip_prefix(r"\\.\UNC\"))
+    {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = raw
+        .strip_prefix(r"\\?\")
+        .or_else(|| raw.strip_prefix(r"\\.\"))
+    {
+        rest.to_string()
+    } else {
+        raw.into_owned()
+    };
+    let mut p = raw.replace('\\', "/");
+    if p.starts_with("//") {
+        // `file://` followed by a host is an authority; SQLite takes only an empty one.
+        p.insert_str(0, "//");
+    } else if !p.starts_with('/') {
+        p.insert(0, '/');
+    }
+    let mut out = String::from("file:");
+    for c in p.chars() {
+        match c {
+            '%' | '?' | '#' | ' ' => out.push_str(&format!("%{:02X}", c as u32)),
+            _ => out.push(c),
+        }
+    }
+    out.push('?');
+    out.push_str(query);
+    out
+}
+
 impl LocalStore {
     /// Open (creating if needed) the DB at `db_path`. Runs the same WAL PRAGMAs
     /// and full schema init as [`SqliteBackend::open`](crate::SqliteBackend::open),
@@ -71,6 +164,9 @@ impl LocalStore {
         Ok(LocalStore {
             conn,
             drive_tables_seen: std::cell::Cell::new(false),
+            session_id_seen: std::cell::Cell::new(false),
+            delivery_columns_seen: std::cell::Cell::new(false),
+            drive_turns_seen: std::cell::Cell::new(false),
         })
     }
 
@@ -85,14 +181,13 @@ impl LocalStore {
         let path = crate::config::normalize(&crate::config::strip_extended_prefix(
             std::path::PathBuf::from(db_path),
         ));
-        let conn = rusqlite::Connection::open_with_flags(
-            &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        conn.busy_timeout(Self::READ_ONLY_BUSY_TIMEOUT)?;
+        let conn = open_ro_conn(&path)?;
         Ok(LocalStore {
             conn,
             drive_tables_seen: std::cell::Cell::new(false),
+            session_id_seen: std::cell::Cell::new(false),
+            delivery_columns_seen: std::cell::Cell::new(false),
+            drive_turns_seen: std::cell::Cell::new(false),
         })
     }
 
@@ -108,16 +203,33 @@ impl LocalStore {
         current_task_id: Option<i64>,
         pid: Option<i64>,
     ) -> Result<()> {
+        self.session_upsert_with_id(worktree, state, current_task_id, pid, None)
+    }
+
+    /// [`Self::session_upsert`] that also records the agent session that wrote the
+    /// row (taken from the hook payload). `None` stores NULL: an id-less write (an
+    /// older hook command, a hook without a payload) never leaves a stale id behind,
+    /// so the app reads the row as evidence about whichever agent runs now.
+    pub fn session_upsert_with_id(
+        &self,
+        worktree: &str,
+        state: &str,
+        current_task_id: Option<i64>,
+        pid: Option<i64>,
+        session_id: Option<&str>,
+    ) -> Result<()> {
         if !model::SESSION_STATES.contains(&state) {
             return Err(Error::Conflict(format!("invalid session state: {state}")));
         }
         self.conn.execute(
-            "INSERT INTO worktree_sessions (worktree, state, current_task_id, pid, last_heartbeat) \
-             VALUES (?1, ?2, ?3, ?4, datetime('now')) \
+            "INSERT INTO worktree_sessions \
+               (worktree, state, current_task_id, pid, last_heartbeat, session_id) \
+             VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5) \
              ON CONFLICT(worktree) DO UPDATE SET \
                state = excluded.state, current_task_id = excluded.current_task_id, \
-               pid = excluded.pid, last_heartbeat = excluded.last_heartbeat",
-            params![worktree, state, current_task_id, pid],
+               pid = excluded.pid, last_heartbeat = excluded.last_heartbeat, \
+               session_id = excluded.session_id",
+            params![worktree, state, current_task_id, pid, session_id],
         )?;
         // A brokered prompt is answered while the session is `waiting` (the gate
         // writes that itself); any other state means the prompt is no longer live.
@@ -148,7 +260,8 @@ impl LocalStore {
             "INSERT INTO worktree_sessions (worktree, state, last_heartbeat) \
              VALUES (?1, 'offline', datetime('now')) \
              ON CONFLICT(worktree) DO UPDATE SET \
-               state = 'offline', current_task_id = NULL, pid = NULL, last_heartbeat = datetime('now')",
+               state = 'offline', current_task_id = NULL, pid = NULL, \
+               last_heartbeat = datetime('now'), session_id = NULL",
             params![worktree],
         )?;
         self.drive_prompts_withdraw(worktree)?;
@@ -222,9 +335,29 @@ impl LocalStore {
                     driven_by: r.get(5)?,
                     brokered: r.get(6)?,
                     escalated_reason: r.get(7)?,
+                    agent: None,
+                    herdr_status: None,
+                    stale: false,
                 })
             })?
             .collect::<rusqlite::Result<Vec<WorktreeSession>>>()?;
+        Ok(rows)
+    }
+
+    /// Each worktree's hook-written `session_id`, for rows that have one. Empty when
+    /// the DB predates the column (an old schema behind a read-only handle).
+    pub fn session_ids(&self) -> Result<HashMap<String, String>> {
+        if !cached_exists(&self.session_id_seen, || {
+            column_exists(&self.conn, "worktree_sessions", "session_id")
+        })? {
+            return Ok(HashMap::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT worktree, session_id FROM worktree_sessions WHERE session_id IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<HashMap<String, String>>>()?;
         Ok(rows)
     }
 
@@ -553,6 +686,31 @@ impl LocalStore {
         Ok(n == 1)
     }
 
+    /// Whether any dispatch request is `pending`. Reads only `status`, so it works on a
+    /// table of any age; a DB without the table has none.
+    pub fn dispatch_requests_has_pending(&self) -> Result<bool> {
+        if !table_exists(&self.conn, "dispatch_requests")? {
+            return Ok(false);
+        }
+        Ok(self
+            .conn
+            .prepare("SELECT 1 FROM dispatch_requests WHERE status = 'pending' LIMIT 1")?
+            .exists([])?)
+    }
+
+    /// How many dispatch requests are `pending`. Reads only `status`, like
+    /// [`Self::dispatch_requests_has_pending`]; a DB without the table has none.
+    pub fn dispatch_requests_pending_count(&self) -> Result<i64> {
+        if !table_exists(&self.conn, "dispatch_requests")? {
+            return Ok(0);
+        }
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM dispatch_requests WHERE status = 'pending'",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Refuse every `pending` request older than `max_age_secs`, so an app that starts
     /// long after a request was made doesn't act on it. Returns how many expired.
     pub fn dispatch_requests_expire(&self, max_age_secs: i64) -> Result<usize> {
@@ -599,8 +757,63 @@ fn row_to_resume_row(r: &rusqlite::Row) -> rusqlite::Result<ResumeRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn file_uri_escapes_and_roots_the_path() {
+        assert_eq!(
+            sqlite_file_uri(Path::new(r"C:\Users\x\a b#?%.db"), "immutable=1"),
+            "file:/C:/Users/x/a%20b%23%3F%25.db?immutable=1"
+        );
+        assert_eq!(
+            sqlite_file_uri(Path::new("/Users/me/c.db"), "mode=ro"),
+            "file:/Users/me/c.db?mode=ro"
+        );
+    }
+
+    #[test]
+    fn file_uri_keeps_unc_and_verbatim_paths_out_of_the_authority() {
+        for unc in [
+            r"\\srv\share\x.db",
+            r"\\?\UNC\srv\share\x.db",
+            "//srv/share/x.db",
+        ] {
+            assert_eq!(
+                sqlite_file_uri(Path::new(unc), "mode=ro"),
+                "file:////srv/share/x.db?mode=ro",
+                "{unc}"
+            );
+        }
+        assert_eq!(
+            sqlite_file_uri(Path::new(r"\\srv\my share\a#1.db"), "mode=ro"),
+            "file:////srv/my%20share/a%231.db?mode=ro"
+        );
+        assert_eq!(
+            sqlite_file_uri(Path::new(r"\\?\C:\Users\x\a.db"), "immutable=1"),
+            "file:/C:/Users/x/a.db?immutable=1"
+        );
+    }
+
+    /// SQLite itself accepts the URI of a verbatim path (what `canonicalize` gives on
+    /// Windows) and of a path needing escapes.
+    #[test]
+    fn file_uri_opens_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // `?` is no legal file name character on Windows.
+        let path = dir.path().join("a b#%.db");
+        std::fs::File::create(&path).unwrap();
+        let path = std::fs::canonicalize(&path).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE t (x)")
+            .unwrap();
+        let conn = open_ro_conn_immutable(&path).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -762,6 +975,99 @@ mod tests {
             .find(|s| s.worktree == "wt-b")
             .unwrap();
         assert_eq!(row_b.state, "offline");
+    }
+
+    #[test]
+    fn session_ids_are_empty_until_the_column_exists() {
+        let db = TempDb::new();
+        {
+            // A DB from before the column: a read-only handle never adds it.
+            let conn = rusqlite::Connection::open(&db.path).unwrap();
+            conn.execute_batch(OLD_WORKTREE_SESSIONS).unwrap();
+        }
+        let ro = LocalStore::open_read_only(db.path.to_str().unwrap()).unwrap();
+        assert!(ro.session_ids().unwrap().is_empty());
+
+        let ls = db.open();
+        ls.session_upsert_with_id("alpha", "busy", None, None, Some("s-1"))
+            .unwrap();
+        ls.session_upsert("bravo", "idle", None, None).unwrap();
+        let ids = ls.session_ids().unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids.get("alpha").map(String::as_str), Some("s-1"));
+        // A read-only handle reads the same once the column exists.
+        let ro = LocalStore::open_read_only(db.path.to_str().unwrap()).unwrap();
+        assert_eq!(ro.session_ids().unwrap(), ids);
+    }
+
+    /// `worktree_sessions` as created before it carried the writer's session id.
+    const OLD_WORKTREE_SESSIONS: &str = "CREATE TABLE worktree_sessions (
+           worktree TEXT PRIMARY KEY,
+           state TEXT NOT NULL DEFAULT 'idle',
+           current_task_id INTEGER,
+           pid INTEGER,
+           last_heartbeat TEXT NOT NULL DEFAULT (datetime('now'))
+         );
+         INSERT INTO worktree_sessions (worktree, state) VALUES ('old', 'busy');";
+
+    #[test]
+    fn session_upsert_with_id_round_trips() {
+        let db = TempDb::new();
+        let ls = db.open();
+        ls.session_upsert_with_id("alpha", "busy", None, None, Some("s-1"))
+            .unwrap();
+        assert_eq!(ls.session_ids().unwrap()["alpha"], "s-1");
+        assert_eq!(
+            ls.session_state_get("alpha").unwrap().as_deref(),
+            Some("busy")
+        );
+        // A later write from another session replaces the id.
+        ls.session_upsert_with_id("alpha", "idle", None, None, Some("s-2"))
+            .unwrap();
+        assert_eq!(ls.session_ids().unwrap()["alpha"], "s-2");
+        assert_eq!(
+            ls.session_state_get("alpha").unwrap().as_deref(),
+            Some("idle")
+        );
+    }
+
+    #[test]
+    fn session_upsert_without_id_clears_it() {
+        let db = TempDb::new();
+        let ls = db.open();
+        ls.session_upsert_with_id("alpha", "busy", None, None, Some("s-1"))
+            .unwrap();
+        ls.session_upsert("alpha", "idle", None, None).unwrap();
+        assert!(ls.session_ids().unwrap().is_empty(), "id-less write clears");
+        // The app's own offline write clears it too.
+        ls.session_upsert_with_id("alpha", "busy", None, None, Some("s-1"))
+            .unwrap();
+        ls.session_set_offline("alpha").unwrap();
+        assert!(ls.session_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn old_database_gains_the_session_id_column() {
+        let db = TempDb::new();
+        {
+            let conn = rusqlite::Connection::open(&db.path).unwrap();
+            conn.execute_batch(OLD_WORKTREE_SESSIONS).unwrap();
+        }
+        let ls = db.open();
+        assert!(column_exists(&ls.conn, "worktree_sessions", "session_id").unwrap());
+        let rows = ls.sessions_list().unwrap();
+        assert_eq!(rows.len(), 1, "old rows kept");
+        assert_eq!(
+            (rows[0].worktree.as_str(), rows[0].state.as_str()),
+            ("old", "busy")
+        );
+        assert!(ls.session_ids().unwrap().is_empty(), "old rows carry no id");
+        ls.session_upsert_with_id("old", "idle", None, None, Some("s-9"))
+            .unwrap();
+        assert_eq!(ls.session_ids().unwrap()["old"], "s-9");
+        // Reopening is idempotent.
+        drop(ls);
+        assert_eq!(db.open().session_ids().unwrap()["old"], "s-9");
     }
 
     #[tokio::test]
@@ -1390,15 +1696,7 @@ mod tests {
             .unwrap();
         }
         let ls = db.open();
-        let has_table: i64 = ls
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'resume_sessions'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(has_table, 1);
+        assert!(crate::sqlite_backend::table_exists(&ls.conn, "resume_sessions").unwrap());
         assert!(ls.sessions_list().is_ok(), "existing data still readable");
         observe(&ls, CliKind::Claude, Some("A"), true, 1);
         assert_eq!(row(&ls).unwrap().session_id.as_deref(), Some("A"));
@@ -1433,16 +1731,6 @@ mod tests {
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'resume_sessions'",
                 [],
-                |r| r.get(0),
-            )
-            .unwrap()
-    }
-
-    fn table_count(ls: &LocalStore, name: &str) -> i64 {
-        ls.conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                [name],
                 |r| r.get(0),
             )
             .unwrap()
@@ -1516,8 +1804,8 @@ mod tests {
             resume_sql(&ls)
         };
         let ls = db.open();
-        assert_eq!(table_count(&ls, "resume_sessions"), 1);
-        assert_eq!(table_count(&ls, "resume_sessions_new"), 0);
+        assert!(crate::sqlite_backend::table_exists(&ls.conn, "resume_sessions").unwrap());
+        assert!(!crate::sqlite_backend::table_exists(&ls.conn, "resume_sessions_new").unwrap());
         assert_eq!(resume_rows(&ls), 2);
         assert_eq!(resume_sql(&ls), sql_after_first);
     }

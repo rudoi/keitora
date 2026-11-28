@@ -3,9 +3,12 @@
 //! helpers; the store methods live on [`LocalStore`](crate::LocalStore) in
 //! `drive_store.rs`.
 //!
-//! All drive state is new tables (never new columns on existing ones), created on a
-//! read-write open. `init_schema` upgrades an older `drive_requests` in place (a missing
-//! column, a `kind` CHECK without `wake`).
+//! Drive state lives in its own tables, created on a read-write open. `init_schema`
+//! upgrades older tables in place: a missing `drive_requests` column, a `kind` CHECK
+//! without `wake`, and the delivery columns on `drives` (`delivery_id`,
+//! `baseline_json`, `delivered_at`). Read-only handles never see a column added after
+//! their DB was written, so the delivery columns are read by their own methods and
+//! never through the shared `drives` column list.
 
 use serde::{Deserialize, Serialize};
 
@@ -116,9 +119,69 @@ CREATE TABLE IF NOT EXISTS session_replies (
   worktree     TEXT PRIMARY KEY,
   turn         INTEGER NOT NULL DEFAULT 0,
   last_message TEXT NOT NULL DEFAULT '',
-  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  last_turn_id TEXT,
+  last_session_id TEXT
 );
 "#;
+
+/// Turn completions of driven worktrees, written by the app (the `status.db` lease
+/// holder) and acked by `wait`. Executed by `init_schema` right after [`DRIVE_DDL`].
+/// Not one of [`DRIVE_TABLES`]: an older DB without it must still read as driven.
+pub const DRIVE_TURNS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS drive_turns (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  driven           TEXT    NOT NULL,
+  kind             TEXT    NOT NULL CHECK (kind IN ('driver','human')),
+  delivery_id      INTEGER,
+  outcome          TEXT    NOT NULL DEFAULT 'finished' CHECK (outcome IN ('finished','restarted')),
+  signal           TEXT    NOT NULL CHECK (signal IN ('herdr','hook')),
+  clause           TEXT    NOT NULL CHECK (clause IN
+                     ('completion_seq','state_change_seq','observed_active','stop_hook','occupant_changed')),
+  completion_seq   INTEGER,
+  state_change_seq INTEGER,
+  completed_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+  reply            TEXT    NOT NULL DEFAULT '',
+  reply_source     TEXT    NOT NULL CHECK (reply_source IN ('hook','transcript','none')),
+  caveat           TEXT,
+  acked_at         TEXT,
+  CHECK ((kind = 'driver') = (delivery_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_drive_turns_delivery
+  ON drive_turns(delivery_id) WHERE delivery_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_drive_turns_driven_acked ON drive_turns(driven, acked_at);
+"#;
+
+/// The delivery columns `init_schema` adds to an older `drives` table, with their types.
+pub(crate) const DRIVES_DELIVERY_COLUMNS: [(&str, &str); 3] = [
+    ("delivery_id", "INTEGER"),
+    ("baseline_json", "TEXT"),
+    ("delivered_at", "TEXT"),
+];
+
+/// `drive_turns.kind`: the driver's delivery finished, or the human typed a turn.
+pub const DRIVE_TURN_KINDS: [&str; 2] = ["driver", "human"];
+/// `drive_turns.outcome`.
+pub const DRIVE_TURN_OUTCOMES: [&str; 2] = ["finished", "restarted"];
+/// `drive_turns.signal`: what detected the completion.
+pub const DRIVE_TURN_SIGNALS: [&str; 2] = ["herdr", "hook"];
+/// `drive_turns.clause`: which rule finished the turn.
+pub const DRIVE_TURN_CLAUSES: [&str; 5] = [
+    "completion_seq",
+    "state_change_seq",
+    "observed_active",
+    "stop_hook",
+    "occupant_changed",
+];
+/// `drive_turns.reply_source`: where the reply text came from.
+pub const DRIVE_TURN_REPLY_SOURCES: [&str; 3] = ["hook", "transcript", "none"];
+/// Turn rows kept per worktree regardless of age.
+pub const DRIVE_TURNS_KEEP_PER_WORKTREE: i64 = 50;
+/// Turn rows older than this (after ack, or after completion if never acked) are pruned.
+pub const DRIVE_TURNS_RETENTION_DAYS: i64 = 7;
+/// A delivery whose target stays settled idle at its baseline this long, with no turn
+/// recorded, saw no activity: the prompt may not have been submitted.
+pub const DRIVE_STALL_NO_ACTIVITY_S: i64 = 30;
 
 /// `drive_requests` under `name`: pane-affecting requests from the CLI that the app
 /// applies. Separate from `dispatch_requests` because that table's `task_id` is NOT
@@ -143,12 +206,39 @@ CREATE TABLE IF NOT EXISTS {name} (
   created_at   TEXT NOT NULL DEFAULT (datetime('now')),
   resolved_at  TEXT,
   -- When the request last entered pending_confirm (the human's confirm clock).
-  confirm_started_at TEXT
+  confirm_started_at TEXT,
+  -- First pass that examined the request; NULL until then.
+  seen_at            TEXT,
+  -- Why the app left it pending, as of the last pass; '' when it has no reason.
+  wait_reason        TEXT NOT NULL DEFAULT '',
+  wait_reason_at     TEXT
 );
 "#;
 
-/// Every `drive_requests` column, in table order (the rebuild copies them all).
-pub(crate) const DRIVE_REQUESTS_COLUMNS: &str = "id, kind, worktree, requested_by, payload,      queue, status, reason, result, created_at, resolved_at, confirm_started_at";
+/// The `drive_requests` columns it first shipped with, in table order.
+const DRIVE_REQUESTS_BASE_COLUMNS: [&str; 11] = [
+    "id",
+    "kind",
+    "worktree",
+    "requested_by",
+    "payload",
+    "queue",
+    "status",
+    "reason",
+    "result",
+    "created_at",
+    "resolved_at",
+];
+
+/// Every `drive_requests` column, in table order (the rebuild copies them all): the
+/// base ones, then [`DRIVE_REQUESTS_ADDED_COLUMNS`].
+pub(crate) fn drive_requests_columns() -> String {
+    DRIVE_REQUESTS_BASE_COLUMNS
+        .into_iter()
+        .chain(DRIVE_REQUESTS_ADDED_COLUMNS.map(|(col, _)| col))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// The `drive_requests` index, created once the table exists (and again after a rebuild).
 pub(crate) const DRIVE_REQUESTS_INDEX_DDL: &str =
@@ -227,7 +317,22 @@ pub struct DriveRequest {
     pub result: String,
     pub created_at: String,
     pub resolved_at: Option<String>,
+    /// When a pass first examined the request; `None` until then.
+    pub seen_at: Option<String>,
+    /// Why the app left it pending, as of its last pass; empty when it has none.
+    pub wait_reason: String,
+    /// When `wait_reason` was last set.
+    pub wait_reason_at: Option<String>,
 }
+
+/// The `drive_requests` columns added after the table first shipped, with their
+/// declarations, in table order. An older table gains them in place.
+pub(crate) const DRIVE_REQUESTS_ADDED_COLUMNS: [(&str, &str); 4] = [
+    ("confirm_started_at", "TEXT"),
+    ("seen_at", "TEXT"),
+    ("wait_reason", "TEXT NOT NULL DEFAULT ''"),
+    ("wait_reason_at", "TEXT"),
+];
 
 impl DriveRequest {
     /// Whether the app has finished with this request.
@@ -237,12 +342,81 @@ impl DriveRequest {
 }
 
 /// A worktree's last finished turn.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionReply {
     pub worktree: String,
     pub turn: i64,
     pub last_message: String,
     pub updated_at: String,
+}
+
+/// What herdr reported for the target right before a prompt was delivered. A later
+/// snapshot is compared against it to tell when the delivered turn finished.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Baseline {
+    /// herdr's agent label at delivery (`claude`, `codex`, `agy`).
+    pub agent: Option<String>,
+    pub pane_id: String,
+    pub terminal_id: String,
+    pub agent_session: Option<String>,
+    pub state_change_seq: u64,
+    /// herdr's stamp of the last completed-work idle; nullable and server-wide.
+    pub completion_seq: Option<u64>,
+    /// `idle` or `done`.
+    pub status: String,
+    /// Unix ms of the delivery.
+    pub delivered_at_ms: i64,
+}
+
+/// A drive's outstanding delivery, as stored on its `drives` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    pub driven: String,
+    pub driver: String,
+    pub awaiting_turn: Option<i64>,
+    /// `None` for a delivery an older app made.
+    pub delivery_id: Option<i64>,
+    /// `None` when absent or unparsable.
+    pub baseline: Option<Baseline>,
+    /// UTC text, `%Y-%m-%d %H:%M:%f`.
+    pub delivered_at: Option<String>,
+}
+
+/// One recorded turn completion of a driven worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriveTurn {
+    pub id: i64,
+    pub driven: String,
+    /// `driver` or `human`.
+    pub kind: String,
+    pub delivery_id: Option<i64>,
+    /// `finished` or `restarted`.
+    pub outcome: String,
+    /// `herdr` or `hook`.
+    pub signal: String,
+    pub clause: String,
+    pub completed_at: String,
+    pub reply: String,
+    /// `hook`, `transcript` or `none`.
+    pub reply_source: String,
+    pub caveat: Option<String>,
+    pub acked_at: Option<String>,
+}
+
+/// Input to `drive_turn_insert`. The reply is truncated to [`SESSION_REPLY_MAX`] bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewDriveTurn<'a> {
+    pub driven: &'a str,
+    pub kind: &'a str,
+    pub delivery_id: Option<i64>,
+    pub outcome: &'a str,
+    pub signal: &'a str,
+    pub clause: &'a str,
+    pub completion_seq: Option<u64>,
+    pub state_change_seq: Option<u64>,
+    pub reply: &'a str,
+    pub reply_source: &'a str,
+    pub caveat: Option<&'a str>,
 }
 
 /// The outcome of `drive_bind`.
@@ -330,6 +504,9 @@ mod tests {
             result: String::new(),
             created_at: String::new(),
             resolved_at: None,
+            seen_at: None,
+            wait_reason: String::new(),
+            wait_reason_at: None,
         };
         for s in ["pending", "running", "pending_confirm"] {
             r.status = s.into();
@@ -358,5 +535,21 @@ mod tests {
             "BETWEEN {DRIVE_ESCALATE_AFTER_MIN_S} AND {DRIVE_ESCALATE_AFTER_MAX_S}"
         )));
         assert!(DRIVE_DDL.contains(&format!("DEFAULT {DRIVE_DEFAULT_ESCALATE_AFTER_S} ")));
+    }
+
+    #[test]
+    fn baseline_round_trips_through_json() {
+        let b = Baseline {
+            agent: Some("codex".into()),
+            pane_id: "p-1".into(),
+            terminal_id: "t-1".into(),
+            agent_session: None,
+            state_change_seq: 11,
+            completion_seq: Some(4),
+            status: "idle".into(),
+            delivered_at_ms: 1_700_000_000_000,
+        };
+        let json = serde_json::to_string(&b).unwrap();
+        assert_eq!(serde_json::from_str::<Baseline>(&json).unwrap(), b);
     }
 }

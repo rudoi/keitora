@@ -60,6 +60,50 @@ pub(crate) fn open_conn(db_path: &str) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// Whether table `name` exists.
+pub(crate) fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?
+        .exists([name])
+}
+
+/// Whether `table` has column `column`.
+pub(crate) fn column_exists(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<bool> {
+    conn.prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?
+        .exists([table, column])
+}
+
+/// Add `column` (declared `decl`) to `table` when it lacks it.
+pub(crate) fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> rusqlite::Result<()> {
+    if column_exists(conn, table, column)? {
+        return Ok(());
+    }
+    add_column(conn, table, column, decl)
+}
+
+/// `ALTER TABLE ... ADD COLUMN`, succeeding when another connection added the column
+/// between the caller's check and this (two processes opening one old DB at once).
+fn add_column(conn: &Connection, table: &str, column: &str, decl: &str) -> rusqlite::Result<()> {
+    match conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}")) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if column_exists(conn, table, column)? {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 /// Create the full schema if absent. Shared by both [`SqliteBackend::open`] and
 /// `LocalStore::open` so each handle sees every table when pointed at the same DB
 /// file (WAL-safe concurrent opens). The DDL is `CREATE … IF NOT EXISTS`, so
@@ -115,7 +159,8 @@ pub(crate) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
                           CHECK(state IN ('idle','busy','waiting','offline')),
           current_task_id INTEGER,
           pid             INTEGER,
-          last_heartbeat  TEXT NOT NULL DEFAULT (datetime('now'))
+          last_heartbeat  TEXT NOT NULL DEFAULT (datetime('now')),
+          session_id      TEXT
         );
 
         -- Whether the user terminated a (project, worktree) session. Kept apart from
@@ -148,28 +193,37 @@ pub(crate) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         "#,
     )?;
 
+    // The agent session that wrote a hook row; an older table gains it in place.
+    ensure_column(conn, "worktree_sessions", "session_id", "TEXT")?;
+
     // Cross-worktree drive state: bindings, brokered prompts, pane requests, replies.
     conn.execute_batch(crate::drive::DRIVE_DDL)?;
+    conn.execute_batch(crate::drive::DRIVE_TURNS_DDL)?;
+    // The id of the turn a Stop recorded, for deduping a repeated Stop.
+    ensure_column(conn, "session_replies", "last_turn_id", "TEXT")?;
+    // The agent session of that turn: a new session reuses turn ids.
+    ensure_column(conn, "session_replies", "last_session_id", "TEXT")?;
+    // A `drives` table created before deliveries carried a baseline lacks these
+    // columns; add them in place (rows and `awaiting_turn` are kept).
+    for (col, ty) in crate::drive::DRIVES_DELIVERY_COLUMNS {
+        ensure_column(conn, "drives", col, ty)?;
+    }
     conn.execute_batch(&crate::drive::drive_requests_ddl("drive_requests"))?;
     conn.execute_batch(crate::drive::DRIVE_REQUESTS_INDEX_DDL)?;
-    // A `drive_requests` table created before `confirm_started_at` existed
-    // lacks the column; add it in place.
-    let has_confirm_col = conn
-        .prepare(
-            "SELECT 1 FROM pragma_table_info('drive_requests') WHERE name = 'confirm_started_at'",
-        )?
-        .exists([])?;
-    if !has_confirm_col {
-        conn.execute_batch("ALTER TABLE drive_requests ADD COLUMN confirm_started_at TEXT")?;
+    // A `drive_requests` table created before a column existed lacks it; add each in
+    // place. Before the rebuild below: it copies every listed column from the old table.
+    for (col, decl) in crate::drive::DRIVE_REQUESTS_ADDED_COLUMNS {
+        ensure_column(conn, "drive_requests", col, decl)?;
     }
     // One created before the `wake` kind rejects it; rebuild it with the new CHECK.
+    let drive_requests_columns = crate::drive::drive_requests_columns();
     rebuild_for_check(
         conn,
         &TableRebuild {
             table: "drive_requests",
             marker: "'wake'",
             ddl: crate::drive::drive_requests_ddl,
-            columns: crate::drive::DRIVE_REQUESTS_COLUMNS,
+            columns: &drive_requests_columns,
             after: crate::drive::DRIVE_REQUESTS_INDEX_DDL,
         },
     )?;
@@ -1370,6 +1424,24 @@ mod tests {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
     #[test]
+    fn a_column_another_connection_added_after_the_check_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let a = Connection::open(&path).unwrap();
+        let b = Connection::open(&path).unwrap();
+        a.execute_batch("PRAGMA busy_timeout = 3000; CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        // Both opens find the column missing; `b` adds it first.
+        assert!(!column_exists(&a, "t", "extra").unwrap());
+        ensure_column(&b, "t", "extra", "TEXT").unwrap();
+        // `a`, past its check, adds it too: already there, so fine.
+        add_column(&a, "t", "extra", "TEXT").unwrap();
+        ensure_column(&a, "t", "extra", "TEXT").unwrap();
+        // A real failure still surfaces.
+        assert!(add_column(&a, "missing_table", "extra", "TEXT").is_err());
+    }
+
+    #[test]
     fn init_schema_adds_confirm_column_to_an_older_drive_requests_table() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -1381,15 +1453,93 @@ mod tests {
                created_at TEXT NOT NULL DEFAULT (datetime('now')), resolved_at TEXT);",
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO drive_requests (kind, worktree, requested_by) VALUES ('send', 'b', 'a')",
+            [],
+        )
+        .unwrap();
         init_schema(&conn).unwrap();
         // Idempotent on a second run.
         init_schema(&conn).unwrap();
-        let has: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('drive_requests') WHERE name = 'confirm_started_at'")
-            .unwrap()
-            .exists([])
+        for col in [
+            "confirm_started_at",
+            "seen_at",
+            "wait_reason",
+            "wait_reason_at",
+        ] {
+            assert!(
+                column_exists(&conn, "drive_requests", col).unwrap(),
+                "{col}"
+            );
+        }
+        // The existing row reads the defaults.
+        let (seen, reason): (Option<String>, String) = conn
+            .query_row(
+                "SELECT seen_at, wait_reason FROM drive_requests WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        assert!(has);
+        assert_eq!((seen, reason.as_str()), (None, ""));
+        // An older CLI's explicit column lists still work against the migrated table.
+        conn.execute(
+            "INSERT INTO drive_requests (kind, worktree, requested_by, payload, queue)              VALUES ('read', 'b', 'a', '{}', 0)",
+            [],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (SELECT id, kind, worktree, requested_by, payload, queue,                  status, reason, result, created_at, resolved_at FROM drive_requests)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn init_schema_keeps_wait_columns_through_the_wake_rebuild() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The shape before `wake`, already carrying the wait columns with values.
+        conn.execute_batch(
+            "CREATE TABLE drive_requests (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               kind TEXT NOT NULL CHECK(kind IN ('send', 'read', 'reset', 'swap')),
+               worktree TEXT NOT NULL, requested_by TEXT NOT NULL,
+               payload TEXT NOT NULL DEFAULT '{}',
+               queue INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL DEFAULT 'pending',
+               reason TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL DEFAULT (datetime('now')), resolved_at TEXT,
+               seen_at TEXT, wait_reason TEXT NOT NULL DEFAULT '');
+             INSERT INTO drive_requests (kind, worktree, requested_by, seen_at, wait_reason)
+               VALUES ('send', 'bravo', 'alpha', '2026-01-02 03:04:05', 'waiting on the wake slot');",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap();
+        let row: (String, Option<String>, String, Option<String>) = conn
+            .query_row(
+                "SELECT kind, seen_at, wait_reason, wait_reason_at FROM drive_requests",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "send".to_string(),
+                Some("2026-01-02 03:04:05".to_string()),
+                "waiting on the wake slot".to_string(),
+                None
+            )
+        );
+        // Rebuilt: `wake` is accepted now.
+        conn.execute(
+            "INSERT INTO drive_requests (kind, worktree, requested_by) VALUES ('wake', 'b', 'a')",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1475,12 +1625,17 @@ mod tests {
             .exists([])
             .unwrap();
         assert!(has_index);
-        let has_confirm: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('drive_requests') WHERE name = 'confirm_started_at'")
-            .unwrap()
-            .exists([])
-            .unwrap();
-        assert!(has_confirm);
+        for col in [
+            "confirm_started_at",
+            "seen_at",
+            "wait_reason",
+            "wait_reason_at",
+        ] {
+            assert!(
+                column_exists(&conn, "drive_requests", col).unwrap(),
+                "{col}"
+            );
+        }
         let leftover: bool = conn
             .prepare("SELECT 1 FROM sqlite_master WHERE name = 'drive_requests_new'")
             .unwrap()

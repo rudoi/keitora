@@ -26,7 +26,7 @@
 
 use std::path::Path;
 
-use crate::hooks::{posix_fallback_command, posix_state_command};
+use crate::hooks::{merge_json_file, posix_fallback_command, FileWrite};
 use serde_json::{json, Value};
 
 /// (Codex event, session state). The Codex analog of `hooks::HOOK_MAP`, using the
@@ -112,8 +112,10 @@ fn build_command(bin: &str, cmd: CodexCmd, windows: bool) -> String {
         // Backslashes are literal inside PowerShell double-quotes (backtick is the
         // escape char, not backslash), so a native `C:\…\keitora.exe` is used as-is.
         match cmd {
+            // The primary records the payload's session id (and prints nothing); an
+            // older CLI that rejects the flag still records the state.
             CodexCmd::State(state) => format!(
-                "if (Test-Path -LiteralPath \"{bin}\") {{ & \"{bin}\" session {state} *> $null }} # {m}"
+                "if (Test-Path -LiteralPath \"{bin}\") {{ & \"{bin}\" session {state} --payload-session 2>$null; if ($LASTEXITCODE -ne 0) {{ & \"{bin}\" session {state} *> $null }} }}; exit 0 # {m}"
             ),
             CodexCmd::Gate => format!(
                 "if (Test-Path -LiteralPath \"{bin}\") {{ & \"{bin}\" session gate --provider codex 2>$null; if ($LASTEXITCODE -ne 0) {{ & \"{bin}\" session waiting *> $null }} }}; exit 0 # {m}"
@@ -124,7 +126,9 @@ fn build_command(bin: &str, cmd: CodexCmd, windows: bool) -> String {
         }
     } else {
         match cmd {
-            CodexCmd::State(state) => posix_state_command(bin, state, m),
+            CodexCmd::State(state) => {
+                posix_fallback_command(bin, &format!("{state} --payload-session"), state, m)
+            }
             CodexCmd::Gate => posix_fallback_command(bin, "gate --provider codex", "waiting", m),
             CodexCmd::Stop => posix_fallback_command(bin, "idle --stdin", "idle", m),
         }
@@ -184,47 +188,22 @@ pub fn merged_codex_hooks(existing: Value, task_bin: &str) -> Value {
     root
 }
 
+/// Whether a `.codex/hooks.json` value carries one of our entries on every event we
+/// register (read-only; for the hook diagnostics).
+pub fn hooks_installed(v: &Value) -> bool {
+    crate::hooks::every_event_has(v, CODEX_HOOK_MAP.iter().map(|(e, _)| *e), CODEX_HOOK_MARKER)
+}
+
 /// Install/refresh the Codex session hooks for a single worktree at `wt_path`.
 ///
 /// Reads `.codex/hooks.json`, merges our hooks in, and writes back only if the
 /// content actually changed (preserving a clean `git status` for unchanged
 /// worktrees). Callers gate this on the worktree's resolved `CliKind == Codex`.
-pub fn install_codex_hooks_for(wt_path: &Path, task_bin: &str) {
-    let dir = wt_path.join(".codex");
-    let file = dir.join("hooks.json");
-
-    let existing: Value = match std::fs::read_to_string(&file) {
-        Ok(s) => match serde_json::from_str(&s) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!(
-                    "[keitora] codex session hooks: skip {} (parse error: {e})",
-                    file.display()
-                );
-                return;
-            }
-        },
-        Err(_) => json!({}), // file absent → start fresh
-    };
-
-    let merged = merged_codex_hooks(existing.clone(), task_bin);
-    if merged == existing {
-        return; // already installed → no write (keep git status clean)
-    }
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!(
-            "[keitora] codex session hooks: mkdir {} failed: {e}",
-            dir.display()
-        );
-        return;
-    }
-    let pretty = serde_json::to_string_pretty(&merged).unwrap_or_default();
-    if let Err(e) = std::fs::write(&file, format!("{pretty}\n")) {
-        eprintln!(
-            "[keitora] codex session hooks: write {} failed: {e}",
-            file.display()
-        );
-    }
+pub fn install_codex_hooks_for(wt_path: &Path, task_bin: &str) -> FileWrite {
+    let file = wt_path.join(".codex").join("hooks.json");
+    merge_json_file(&file, "codex session hooks", |v| {
+        merged_codex_hooks(v, task_bin)
+    })
 }
 
 #[cfg(test)]
@@ -279,12 +258,16 @@ mod tests {
         {
             assert!(cmd.starts_with("if (Test-Path"), "guarded: {cmd}");
             assert!(cmd.contains("& \"/abs/keitora\""), "call operator: {cmd}");
-            assert!(cmd.contains("*> $null"), "silenced: {cmd}");
+            assert!(cmd.contains("*> $null"), "silenced fallback: {cmd}");
+            assert!(
+                cmd.ends_with(&format!("exit 0 # {CODEX_HOOK_MARKER}")),
+                "{cmd}"
+            );
         }
         #[cfg(not(windows))]
         {
             assert!(cmd.starts_with("[ -x \"/abs/keitora\" ]"), "guarded: {cmd}");
-            assert!(cmd.contains(">/dev/null 2>&1"), "silenced: {cmd}");
+            assert!(cmd.contains(">/dev/null 2>&1"), "silenced fallback: {cmd}");
             assert!(cmd.contains("|| true"), "never errors: {cmd}");
         }
     }
@@ -294,7 +277,7 @@ mod tests {
         let b = "/abs/keitora";
         assert_eq!(
             build_command(b, CodexCmd::State("busy"), false),
-            "[ -x \"/abs/keitora\" ] && \"/abs/keitora\" session busy >/dev/null 2>&1 || true # keitora:codex-session-hook"
+            "[ -x \"/abs/keitora\" ] && { \"/abs/keitora\" session busy --payload-session 2>/dev/null || \"/abs/keitora\" session busy >/dev/null 2>&1; } || true # keitora:codex-session-hook"
         );
         assert_eq!(
             build_command(b, CodexCmd::Gate, false),
@@ -311,7 +294,7 @@ mod tests {
         let b = "C:\\bin\\keitora.exe";
         assert_eq!(
             build_command(b, CodexCmd::State("busy"), true),
-            "if (Test-Path -LiteralPath \"C:\\bin\\keitora.exe\") { & \"C:\\bin\\keitora.exe\" session busy *> $null } # keitora:codex-session-hook"
+            "if (Test-Path -LiteralPath \"C:\\bin\\keitora.exe\") { & \"C:\\bin\\keitora.exe\" session busy --payload-session 2>$null; if ($LASTEXITCODE -ne 0) { & \"C:\\bin\\keitora.exe\" session busy *> $null } }; exit 0 # keitora:codex-session-hook"
         );
         assert_eq!(
             build_command(b, CodexCmd::Gate, true),

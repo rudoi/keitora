@@ -18,23 +18,23 @@ pub mod workflow;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::State;
 
 use crate::backend::herdr::keymap::normalize_either_separator;
-use crate::backend::{SessionSummary, SharedBackend, HINT_BUSY, HINT_WAITING};
+use crate::backend::{SessionKey, SharedBackend};
+use crate::engine::{SessionEngine, SharedEngine};
+use keitora_tasks::StatusSession;
 use progress::BuildProgress;
 use workflow::{WorkflowSlot, WorkflowState};
 
-/// Lock an activity mutex, recovering it if a previous holder panicked. Everything behind
-/// these locks is a cache that later ticks revalidate, so a panic costs one tick instead of
-/// poisoning the lock and failing every later poll, which leaves the rail blank until restart.
-pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+/// Activity mutexes recover from a panicked holder: everything behind them is a cache
+/// that later ticks revalidate, so a panic costs one tick instead of leaving the rail
+/// blank until restart.
+pub(crate) use crate::locks::lock;
 
 /// Re-enumerate the all-projects worktree set at most this often (each enumeration re-reads
 /// the user config + every project's `keitora.toml`).
@@ -97,82 +97,88 @@ struct DriveFields {
 #[cfg(test)]
 fn read_project_drives(db_path: &Path) -> Option<ProjectDrives> {
     let local = keitora_tasks::LocalStore::open_read_only(&db_path.to_string_lossy()).ok()?;
-    read_drives_from(&local)
+    read_drives_from(&local).ok()
 }
 
-fn read_drives_from(local: &keitora_tasks::LocalStore) -> Option<ProjectDrives> {
-    Some(ProjectDrives {
-        drives: local.drives_list().ok()?,
-        pending: local.drive_pending_prompt_counts().ok()?,
+fn read_drives_from(local: &keitora_tasks::LocalStore) -> keitora_tasks::Result<ProjectDrives> {
+    Ok(ProjectDrives {
+        drives: local.drives_list()?,
+        pending: local.drive_pending_prompt_counts()?,
     })
 }
 
-/// A project's long-lived read-only handle with its last read.
+/// A project's last drive read, with the handle and `data_version` it was read at.
 struct CachedDrives {
-    store: keitora_tasks::LocalStore,
+    /// The [`ReadStore`](crate::project_stores::ReadStore) id the read went through.
+    store_id: u64,
     /// `PRAGMA data_version` observed just before `info` was read.
     version: i64,
     info: ProjectDrives,
 }
 
-/// Per-DB read-only handles held across ticks. While a DB's `data_version` is
-/// unchanged the drive bindings are reused; pending-prompt counts are also
-/// time-sensitive (stale prompts drop out), so they are re-read while any are live.
-#[derive(Default)]
+/// Per-DB drive reads held across ticks, over the shared read-only handles. While a
+/// DB's `data_version` is unchanged the drive bindings are reused; pending-prompt
+/// counts are also time-sensitive (stale prompts drop out), so they are re-read while
+/// any are live.
 struct DriveCache {
+    stores: std::sync::Arc<crate::project_stores::ReadStores>,
     entries: HashMap<PathBuf, CachedDrives>,
     /// Full (drives + pending) reads performed; lets tests observe the skip.
     full_reads: usize,
 }
 
+impl Default for DriveCache {
+    fn default() -> Self {
+        Self::over(crate::project_stores::shared())
+    }
+}
+
 impl DriveCache {
-    /// Drop handles for DBs no longer in `keep`.
+    fn over(stores: std::sync::Arc<crate::project_stores::ReadStores>) -> Self {
+        DriveCache {
+            stores,
+            entries: HashMap::new(),
+            full_reads: 0,
+        }
+    }
+
+    /// Drop the reads of DBs no longer in `keep` (their handles go with the registry).
     fn retain_paths(&mut self, keep: &HashSet<&PathBuf>) {
         self.entries.retain(|p, _| keep.contains(p));
     }
 
     fn read(&mut self, db_path: &Path) -> Option<ProjectDrives> {
-        if !db_path.exists() {
-            self.entries.remove(db_path);
-            return None;
-        }
-        if let Some(entry) = self.entries.get_mut(db_path) {
-            match entry.store.data_version() {
-                Ok(v) if v == entry.version => {
-                    if entry.info.pending.is_empty() {
-                        return Some(entry.info.clone());
+        let entries = &mut self.entries;
+        let full_reads = &mut self.full_reads;
+        let r = self.stores.with(db_path, |rs| {
+            let v = rs.store.data_version()?;
+            if let Some(entry) = entries.get_mut(db_path) {
+                if entry.store_id == rs.id && entry.version == v {
+                    if !entry.info.pending.is_empty() {
+                        entry.info.pending = rs.store.drive_pending_prompt_counts()?;
                     }
-                    if let Ok(pending) = entry.store.drive_pending_prompt_counts() {
-                        entry.info.pending = pending;
-                        return Some(entry.info.clone());
-                    }
+                    return Ok(entry.info.clone());
                 }
-                Ok(v) => {
-                    self.full_reads += 1;
-                    if let Some(info) = read_drives_from(&entry.store) {
-                        entry.version = v;
-                        entry.info = info.clone();
-                        return Some(info);
-                    }
-                }
-                Err(_) => {}
             }
-            self.entries.remove(db_path);
-            return None;
+            *full_reads += 1;
+            let info = read_drives_from(&rs.store)?;
+            entries.insert(
+                db_path.to_path_buf(),
+                CachedDrives {
+                    store_id: rs.id,
+                    version: v,
+                    info: info.clone(),
+                },
+            );
+            Ok(info)
+        });
+        match r {
+            Ok(info) => Some(info),
+            Err(_) => {
+                self.entries.remove(db_path);
+                None
+            }
         }
-        let store = keitora_tasks::LocalStore::open_read_only(&db_path.to_string_lossy()).ok()?;
-        let version = store.data_version().ok()?;
-        self.full_reads += 1;
-        let info = read_drives_from(&store)?;
-        self.entries.insert(
-            db_path.to_path_buf(),
-            CachedDrives {
-                store,
-                version,
-                info: info.clone(),
-            },
-        );
-        Some(info)
     }
 }
 
@@ -296,18 +302,14 @@ fn enumerate_worktrees() -> Vec<WtRef> {
     out
 }
 
-/// Composite keys of the sessions that light the working dot: a busy agent, or one
-/// blocked on the user (a waiting lane keeps its dot; its colour comes from the state).
-fn working_keys(sessions: Vec<SessionSummary>) -> HashSet<String> {
-    sessions
+/// Composite keys of the sessions that light the working dot: the engine's view reads
+/// a busy agent, or one blocked on the user (a waiting lane keeps its dot; its colour
+/// comes from the state).
+fn working_keys(views: Vec<(SessionKey, StatusSession)>) -> HashSet<String> {
+    views
         .into_iter()
-        .filter(|s| {
-            matches!(
-                s.state_hint.as_deref(),
-                Some(HINT_BUSY) | Some(HINT_WAITING)
-            )
-        })
-        .map(|s| composite(&s.key.project, &s.key.worktree))
+        .filter(|(_, v)| matches!(v.state.as_str(), "busy" | "waiting"))
+        .map(|(k, _)| composite(&k.project, &k.worktree))
         .collect()
 }
 
@@ -318,7 +320,7 @@ fn composite(project: &str, worktree: &str) -> String {
 
 impl ActivityState {
     /// Compute activity for every project's worktree this tick.
-    pub fn compute(&self, client: &SharedBackend) -> Vec<WorktreeActivity> {
+    pub fn compute(&self, client: &SharedBackend, engine: &SessionEngine) -> Vec<WorktreeActivity> {
         let now_ms = workflow::now_ms();
 
         // Enumerate worktrees with NO lock held (config I/O), then read each one's branch and
@@ -354,8 +356,11 @@ impl ActivityState {
             .collect();
         let build = self.ubt.tick(&wt_paths, now_ms); // Option<(composite, BuildProgress)>
 
-        // Busy worktrees from herdr (all projects, one call). Failure → nobody busy.
-        let busy = working_keys(client.list_sessions().unwrap_or_default());
+        // Busy worktrees from the engine's views (all projects).
+        let busy = working_keys(engine.all_views());
+        // The listing's result is no longer read here, but the call keeps the
+        // backend's live set fresh for the consumers that still ask about panes.
+        let _ = client.list_sessions();
 
         // Drive state: one cached read-only handle per project DB, one read per tick.
         let mut project_drives: HashMap<PathBuf, Option<ProjectDrives>> = HashMap::new();
@@ -412,9 +417,10 @@ impl ActivityState {
 #[tauri::command(async)]
 pub fn worktree_activity(
     client: State<SharedBackend>,
+    engine: State<SharedEngine>,
     state: State<ActivityState>,
 ) -> Vec<WorktreeActivity> {
-    state.compute(&client)
+    state.compute(&client, &engine)
 }
 
 #[cfg(test)]
@@ -505,7 +511,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("tasks.db");
         let writer = keitora_tasks::LocalStore::open(&path.to_string_lossy()).unwrap();
-        let mut cache = DriveCache::default();
+        let mut cache = DriveCache::over(std::sync::Arc::default());
 
         // Missing DB: nothing cached, nothing read.
         assert!(cache.read(&tmp.path().join("absent.db")).is_none());
@@ -523,6 +529,29 @@ mod tests {
         let info = cache.read(&path).unwrap();
         assert_eq!(info.drives.len(), 1);
         assert_eq!(cache.full_reads, 2);
+    }
+
+    #[test]
+    fn drive_cache_reads_through_shared_handles_and_rereads_after_a_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tasks.db");
+        let _writer = keitora_tasks::LocalStore::open(&path.to_string_lossy()).unwrap();
+        let stores = std::sync::Arc::new(crate::project_stores::ReadStores::default());
+        let mut cache = DriveCache::over(std::sync::Arc::clone(&stores));
+
+        assert!(cache.read(&path).is_some());
+        assert!(
+            stores.contains(&path),
+            "the handle lives in the shared cache"
+        );
+        // The handle is evicted (its project left the registry) and reopened: the
+        // old data_version is never trusted on the new connection.
+        stores.retain(|_| false);
+        assert!(cache.read(&path).is_some());
+        assert_eq!(cache.full_reads, 2);
+        // Reads of DBs outside the keep set are dropped.
+        cache.retain_paths(&HashSet::new());
+        assert!(cache.entries.is_empty());
     }
 
     #[test]
@@ -583,22 +612,32 @@ mod tests {
     }
 
     #[test]
-    fn activity_working_dot_counts_waiting() {
-        let summary = |w: &str, hint: Option<&str>| SessionSummary {
-            key: crate::backend::SessionKey {
-                project: "proj".into(),
-                worktree: w.into(),
-            },
-            gen: 1,
-            state_hint: hint.map(str::to_string),
+    fn working_keys_come_from_engine_views() {
+        use crate::engine::model::{obs, AgentObs};
+        use crate::engine::tests::{ingest_settled, FakeEvidence};
+        let engine = crate::engine::SessionEngine::new_for_test(std::sync::Arc::new(
+            FakeEvidence::default(),
+        ));
+        let key = |w: &str| SessionKey {
+            project: "proj".into(),
+            worktree: w.into(),
         };
-        let keys = working_keys(vec![
-            summary("alpha", Some(HINT_BUSY)),
-            summary("bravo", Some(HINT_WAITING)),
-            summary("charlie", None),
-        ]);
+        let shell = AgentObs {
+            agent: None,
+            ..obs("w1:p4", "unknown", 0, None)
+        };
+        ingest_settled(
+            &engine,
+            vec![
+                (key("alpha"), Some(obs("w1:p1", "working", 1, None))),
+                (key("bravo"), Some(obs("w1:p2", "blocked", 1, None))),
+                (key("charlie"), Some(obs("w1:p3", "idle", 1, None))),
+                (key("delta"), Some(shell)),
+                (key("echo"), None),
+            ],
+        );
         assert_eq!(
-            keys,
+            working_keys(engine.all_views()),
             HashSet::from(["proj/alpha".to_string(), "proj/bravo".to_string()])
         );
     }

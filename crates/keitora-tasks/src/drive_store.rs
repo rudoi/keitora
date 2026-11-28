@@ -9,14 +9,16 @@ use std::collections::HashMap;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::drive::{
-    truncate_bytes, truncate_chars, Drive, DriveBind, DrivePrompt, DriveRequest, NewDrivePrompt,
-    PromptDecision, SessionReply, DRIVE_CONFIRM_MAX_AGE_SECS, DRIVE_DEFAULT_ESCALATE_AFTER_S,
-    DRIVE_ESCALATE_AFTER_MAX_S, DRIVE_ESCALATE_AFTER_MIN_S, DRIVE_PERMISSION_INPUT_MAX,
-    DRIVE_PROMPT_KINDS, DRIVE_PROMPT_STALE_SLACK_S, DRIVE_QUESTION_INPUT_MAX, DRIVE_READ_LINES_MAX,
+    truncate_bytes, truncate_chars, Baseline, Delivery, Drive, DriveBind, DrivePrompt,
+    DriveRequest, DriveTurn, NewDrivePrompt, NewDriveTurn, PromptDecision, SessionReply,
+    DRIVE_CONFIRM_MAX_AGE_SECS, DRIVE_DEFAULT_ESCALATE_AFTER_S, DRIVE_ESCALATE_AFTER_MAX_S,
+    DRIVE_ESCALATE_AFTER_MIN_S, DRIVE_PERMISSION_INPUT_MAX, DRIVE_PROMPT_KINDS,
+    DRIVE_PROMPT_STALE_SLACK_S, DRIVE_QUESTION_INPUT_MAX, DRIVE_READ_LINES_MAX,
     DRIVE_REQUEST_KINDS, DRIVE_REQUEST_OUTCOMES, DRIVE_SEND_TEXT_MAX, DRIVE_SUMMARY_MAX,
-    DRIVE_TABLES, SESSION_REPLY_MAX,
+    DRIVE_TABLES, DRIVE_TURNS_KEEP_PER_WORKTREE, DRIVE_TURNS_RETENTION_DAYS, SESSION_REPLY_MAX,
 };
-use crate::local_store::LocalStore;
+use crate::local_store::{cached_exists, LocalStore};
+use crate::sqlite_backend::{column_exists, table_exists};
 use crate::{Error, Result};
 
 const DRIVE_COLS: &str =
@@ -24,8 +26,14 @@ const DRIVE_COLS: &str =
 const PROMPT_COLS: &str = "id, driven, driver, provider, kind, tool_name, tool_input, summary, \
      status, decision_json, decided_by, reason, timeout_s, hook_pid, created_at, decided_at, \
      MAX(0, CAST(strftime('%s', 'now') - strftime('%s', created_at) AS INTEGER))";
+const DELIVERY_COLS: &str =
+    "driven, driver, awaiting_turn, delivery_id, baseline_json, delivered_at";
+const TURN_COLS: &str = "id, driven, kind, delivery_id, outcome, signal, clause, completed_at, \
+     reply, reply_source, caveat, acked_at";
+/// `strftime` text for "now" with milliseconds, as `drive_turns` stores it.
+const NOW_MS_SQL: &str = "strftime('%Y-%m-%d %H:%M:%f','now')";
 const REQUEST_COLS: &str = "id, kind, worktree, requested_by, payload, queue, status, reason, \
-     result, created_at, resolved_at";
+     result, created_at, resolved_at, seen_at, wait_reason, wait_reason_at";
 
 /// SQL predicate: the prompt row (columns qualified by `alias`, or bare when empty) is
 /// stale — older than its `timeout_s` plus the slack, so no live hook is polling it.
@@ -54,6 +62,49 @@ fn row_to_drive(r: &rusqlite::Row) -> rusqlite::Result<Drive> {
         escalate_after_s: r.get(5)?,
         awaiting_turn: r.get(6)?,
     })
+}
+
+fn row_to_session_reply(r: &rusqlite::Row) -> rusqlite::Result<SessionReply> {
+    Ok(SessionReply {
+        worktree: r.get(0)?,
+        turn: r.get(1)?,
+        last_message: r.get(2)?,
+        updated_at: r.get(3)?,
+    })
+}
+
+fn row_to_delivery(r: &rusqlite::Row) -> rusqlite::Result<Delivery> {
+    let json: Option<String> = r.get(4)?;
+    Ok(Delivery {
+        driven: r.get(0)?,
+        driver: r.get(1)?,
+        awaiting_turn: r.get(2)?,
+        delivery_id: r.get(3)?,
+        baseline: json.and_then(|j| serde_json::from_str::<Baseline>(&j).ok()),
+        delivered_at: r.get(5)?,
+    })
+}
+
+fn row_to_turn(r: &rusqlite::Row) -> rusqlite::Result<DriveTurn> {
+    Ok(DriveTurn {
+        id: r.get(0)?,
+        driven: r.get(1)?,
+        kind: r.get(2)?,
+        delivery_id: r.get(3)?,
+        outcome: r.get(4)?,
+        signal: r.get(5)?,
+        clause: r.get(6)?,
+        completed_at: r.get(7)?,
+        reply: r.get(8)?,
+        reply_source: r.get(9)?,
+        caveat: r.get(10)?,
+        acked_at: r.get(11)?,
+    })
+}
+
+/// A herdr sequence number as SQLite stores it (saturating at `i64::MAX`).
+fn seq_sql(v: Option<u64>) -> Option<i64> {
+    v.map(|n| i64::try_from(n).unwrap_or(i64::MAX))
 }
 
 fn row_to_prompt(r: &rusqlite::Row) -> rusqlite::Result<DrivePrompt> {
@@ -91,6 +142,9 @@ fn row_to_request(r: &rusqlite::Row) -> rusqlite::Result<DriveRequest> {
         result: r.get(8)?,
         created_at: r.get(9)?,
         resolved_at: r.get(10)?,
+        seen_at: r.get(11)?,
+        wait_reason: r.get(12)?,
+        wait_reason_at: r.get(13)?,
     })
 }
 
@@ -167,24 +221,19 @@ impl LocalStore {
     /// them has none (read-only opens never create tables); read paths then answer as
     /// if nothing were driven.
     pub(crate) fn drive_tables_exist(&self) -> Result<bool> {
-        if self.drive_tables_seen.get() {
-            return Ok(true);
-        }
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (?1, ?2, ?3, ?4)",
-            params![
-                DRIVE_TABLES[0],
-                DRIVE_TABLES[1],
-                DRIVE_TABLES[2],
-                DRIVE_TABLES[3]
-            ],
-            |r| r.get(0),
-        )?;
-        let exist = n == DRIVE_TABLES.len() as i64;
-        if exist {
-            self.drive_tables_seen.set(true);
-        }
-        Ok(exist)
+        cached_exists(&self.drive_tables_seen, || {
+            let n: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (?1, ?2, ?3, ?4)",
+                params![
+                    DRIVE_TABLES[0],
+                    DRIVE_TABLES[1],
+                    DRIVE_TABLES[2],
+                    DRIVE_TABLES[3]
+                ],
+                |r| r.get(0),
+            )?;
+            Ok(n == DRIVE_TABLES.len() as i64)
+        })
     }
 
     /// Mark `driven`'s pending prompts `escalated` (the native dialog takes over).
@@ -412,24 +461,8 @@ impl LocalStore {
         Ok(n)
     }
 
-    /// A `send` was applied: the drive now waits for the turn after the last finished
-    /// one. Returns the new value; `None` when `driven` isn't driven.
-    pub fn drive_set_awaiting_turn(&self, driven: &str) -> Result<Option<i64>> {
-        let v = self
-            .conn
-            .query_row(
-                "UPDATE drives SET awaiting_turn = \
-                   COALESCE((SELECT turn FROM session_replies WHERE worktree = ?1), 0) + 1 \
-                 WHERE driven = ?1 RETURNING awaiting_turn",
-                params![driven],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()?;
-        Ok(v)
-    }
-
-    /// Set `awaiting_turn` to exactly `value` (`None` clears it): restores the previous
-    /// value after a failed `send`, or clears it after a `reset`/`swap`. `false` when
+    /// Set `awaiting_turn` to exactly `value` (`None` clears it): clears it after a
+    /// `reset`/`swap`, whose turn no longer exists. `false` when
     /// `driven` isn't driven.
     pub fn drive_restore_awaiting_turn(&self, driven: &str, value: Option<i64>) -> Result<bool> {
         let n = self.conn.execute(
@@ -447,6 +480,305 @@ impl LocalStore {
             params![driven, turn],
         )?;
         Ok(n == 1)
+    }
+
+    // ---- Deliveries and turns ----
+
+    /// Whether `drives` has the delivery columns. An older DB opened read-only lacks
+    /// them (read-only opens never alter tables); a positive answer is cached.
+    pub fn drive_delivery_columns_exist(&self) -> Result<bool> {
+        if !self.delivery_columns_seen.get() && !self.drive_tables_exist()? {
+            return Ok(false);
+        }
+        cached_exists(&self.delivery_columns_seen, || {
+            column_exists(&self.conn, "drives", "delivery_id")
+        })
+    }
+
+    /// Whether the `drive_turns` table exists; a positive answer is cached.
+    pub fn drive_turns_exist(&self) -> Result<bool> {
+        cached_exists(&self.drive_turns_seen, || {
+            table_exists(&self.conn, "drive_turns")
+        })
+    }
+
+    /// `driven`'s delivery columns; `None` when it isn't driven or the DB predates them.
+    pub fn drive_delivery_get(&self, driven: &str) -> Result<Option<Delivery>> {
+        if !self.drive_delivery_columns_exist()? {
+            return Ok(None);
+        }
+        let row = self
+            .conn
+            .query_row(
+                &format!("SELECT {DELIVERY_COLS} FROM drives WHERE driven = ?1"),
+                params![driven],
+                row_to_delivery,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Every drive with a send outstanding (`awaiting_turn` set) and no turn recorded
+    /// for its delivery yet, by driven worktree. Empty when the DB predates the
+    /// delivery columns.
+    pub fn drive_deliveries(&self) -> Result<Vec<Delivery>> {
+        if !self.drive_delivery_columns_exist()? {
+            return Ok(Vec::new());
+        }
+        let unturned = if self.drive_turns_exist()? {
+            " AND NOT EXISTS (SELECT 1 FROM drive_turns t WHERE t.delivery_id = drives.delivery_id)"
+        } else {
+            ""
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {DELIVERY_COLS} FROM drives WHERE awaiting_turn IS NOT NULL{unturned} \
+             ORDER BY driven"
+        ))?;
+        let rows = stmt
+            .query_map([], row_to_delivery)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// A prompt is about to be typed into `driven`: in one write, wait for the turn
+    /// after the last hook-recorded one, take the next `delivery_id` (above every id on
+    /// a drive or a turn row, so ids never repeat across a release and rebind) and
+    /// store the baseline. Returns `(awaiting_turn, delivery_id)`; `None` when `driven`
+    /// isn't driven.
+    pub fn drive_begin_delivery(&self, driven: &str, b: &Baseline) -> Result<Option<(i64, i64)>> {
+        let json = serde_json::to_string(b)?;
+        let v = self
+            .conn
+            .query_row(
+                &format!(
+                    "UPDATE drives SET \
+                       awaiting_turn = COALESCE((SELECT turn FROM session_replies WHERE worktree = ?1), 0) + 1, \
+                       delivery_id = (SELECT COALESCE(MAX(x), 0) + 1 FROM \
+                         (SELECT delivery_id AS x FROM drives UNION ALL SELECT delivery_id FROM drive_turns)), \
+                       baseline_json = ?2, delivered_at = {NOW_MS_SQL} \
+                     WHERE driven = ?1 RETURNING awaiting_turn, delivery_id"
+                ),
+                params![driven, json],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// Put `prev`'s four delivery columns back (a delivery whose typing failed). `false`
+    /// when the drive is gone.
+    pub fn drive_restore_delivery(&self, prev: &Delivery) -> Result<bool> {
+        let json = match &prev.baseline {
+            Some(b) => Some(serde_json::to_string(b)?),
+            None => None,
+        };
+        let n = self.conn.execute(
+            "UPDATE drives SET awaiting_turn = ?2, delivery_id = ?3, baseline_json = ?4, \
+               delivered_at = ?5 WHERE driven = ?1",
+            params![
+                prev.driven,
+                prev.awaiting_turn,
+                prev.delivery_id,
+                json,
+                prev.delivered_at
+            ],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Record a turn. A `driver` turn is written only while its delivery is still
+    /// outstanding on the drive and only once per `delivery_id`. Returns the new row id,
+    /// or `None` when nothing was written.
+    pub fn drive_turn_insert(&self, t: &NewDriveTurn) -> Result<Option<i64>> {
+        let tx = self.drive_tx()?;
+        if t.kind == "driver" {
+            let outstanding = tx
+                .prepare(
+                    "SELECT 1 FROM drives \
+                     WHERE driven = ?1 AND delivery_id = ?2 AND awaiting_turn IS NOT NULL",
+                )?
+                .exists(params![t.driven, t.delivery_id])?;
+            if !outstanding {
+                return Ok(None);
+            }
+        }
+        let n = tx.execute(
+            // `ON CONFLICT DO NOTHING` covers the unique delivery index only; unlike
+            // `OR IGNORE` it still fails a CHECK.
+            "INSERT INTO drive_turns (driven, kind, delivery_id, outcome, signal, \
+               clause, completion_seq, state_change_seq, reply, reply_source, caveat) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT DO NOTHING",
+            params![
+                t.driven,
+                t.kind,
+                t.delivery_id,
+                t.outcome,
+                t.signal,
+                t.clause,
+                seq_sql(t.completion_seq),
+                seq_sql(t.state_change_seq),
+                truncate_bytes(t.reply, SESSION_REPLY_MAX),
+                t.reply_source,
+                t.caveat
+            ],
+        )?;
+        let id = (n == 1).then(|| self.conn.last_insert_rowid());
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// `driven`'s unacked turns, oldest first. Empty when the table is absent.
+    pub fn drive_turns_unacked(&self, driven: &str) -> Result<Vec<DriveTurn>> {
+        if !self.drive_turns_exist()? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TURN_COLS} FROM drive_turns WHERE driven = ?1 AND acked_at IS NULL ORDER BY id"
+        ))?;
+        let rows = stmt
+            .query_map(params![driven], row_to_turn)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// `driven`'s newest `limit` turns, newest first (acked or not, any outcome).
+    pub fn drive_turns_recent(&self, driven: &str, limit: usize) -> Result<Vec<DriveTurn>> {
+        if !self.drive_turns_exist()? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TURN_COLS} FROM drive_turns WHERE driven = ?1 ORDER BY id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt
+            .query_map(params![driven, limit as i64], row_to_turn)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// `driven`'s newest turn (acked or not, any outcome).
+    pub fn drive_turn_latest(&self, driven: &str) -> Result<Option<DriveTurn>> {
+        if !self.drive_turns_exist()? {
+            return Ok(None);
+        }
+        let row = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {TURN_COLS} FROM drive_turns WHERE driven = ?1 ORDER BY id DESC LIMIT 1"
+                ),
+                params![driven],
+                row_to_turn,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// The turn recorded for `delivery_id`, if any.
+    pub fn drive_turn_for_delivery(&self, delivery_id: i64) -> Result<Option<DriveTurn>> {
+        if !self.drive_turns_exist()? {
+            return Ok(None);
+        }
+        let row = self
+            .conn
+            .query_row(
+                &format!("SELECT {TURN_COLS} FROM drive_turns WHERE delivery_id = ?1"),
+                params![delivery_id],
+                row_to_turn,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// The turn `id` was delivered to the driver. A driver turn also ends its delivery:
+    /// `awaiting_turn` is cleared only while the drive still holds that `delivery_id`,
+    /// so a newer send is never cleared. `true` iff this call acked the row.
+    pub fn drive_turn_ack(&self, id: i64) -> Result<bool> {
+        let tx = self.drive_tx()?;
+        let n = tx.execute(
+            &format!(
+                "UPDATE drive_turns SET acked_at = {NOW_MS_SQL} WHERE id = ?1 AND acked_at IS NULL"
+            ),
+            params![id],
+        )?;
+        if n != 1 {
+            return Ok(false);
+        }
+        let (driven, kind, delivery_id): (String, String, Option<i64>) = tx.query_row(
+            "SELECT driven, kind, delivery_id FROM drive_turns WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        if let (true, Some(delivery_id)) = (kind == "driver", delivery_id) {
+            tx.execute(
+                "UPDATE drives SET awaiting_turn = NULL WHERE driven = ?1 AND delivery_id = ?2",
+                params![driven, delivery_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The legacy ack: [`LocalStore::drive_ack_turn`]'s compare-and-clear, plus, on
+    /// success, acking any turn row recorded for the same delivery so it is never
+    /// delivered a second time.
+    pub fn drive_ack_turn_legacy(&self, driven: &str, awaiting: i64) -> Result<bool> {
+        let tx = self.drive_tx()?;
+        let delivery_id: Option<i64> = if self.drive_delivery_columns_exist()? {
+            tx.query_row(
+                "SELECT delivery_id FROM drives WHERE driven = ?1",
+                params![driven],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten()
+        } else {
+            None
+        };
+        if !self.drive_ack_turn(driven, awaiting)? {
+            return Ok(false);
+        }
+        if let (Some(id), true) = (delivery_id, self.drive_turns_exist()?) {
+            tx.execute(
+                &format!(
+                    "UPDATE drive_turns SET acked_at = {NOW_MS_SQL} \
+                     WHERE driven = ?1 AND delivery_id = ?2 AND acked_at IS NULL"
+                ),
+                params![driven, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Delete turn rows older than [`DRIVE_TURNS_RETENTION_DAYS`] (counted from the ack,
+    /// or from completion when never acked) that are not among their worktree's newest
+    /// [`DRIVE_TURNS_KEEP_PER_WORKTREE`]. An unacked row for its drive's outstanding
+    /// delivery is kept: without it the delivery would read as unturned and its turn
+    /// would be recorded again. Returns the rows deleted.
+    pub fn drive_turns_prune(&self) -> Result<usize> {
+        if !self.drive_turns_exist()? {
+            return Ok(0);
+        }
+        let outstanding = if self.drive_delivery_columns_exist()? {
+            " AND NOT (acked_at IS NULL AND delivery_id IS NOT NULL AND EXISTS \
+               (SELECT 1 FROM drives d WHERE d.driven = drive_turns.driven \
+                  AND d.awaiting_turn IS NOT NULL AND d.delivery_id = drive_turns.delivery_id))"
+        } else {
+            ""
+        };
+        let n = self.conn.execute(
+            &format!(
+                "DELETE FROM drive_turns \
+                 WHERE COALESCE(acked_at, completed_at) \
+                         < strftime('%Y-%m-%d %H:%M:%f','now','-{DRIVE_TURNS_RETENTION_DAYS} days') \
+                   AND id NOT IN (SELECT t.id FROM drive_turns t \
+                                  WHERE t.driven = drive_turns.driven \
+                                  ORDER BY t.id DESC LIMIT {DRIVE_TURNS_KEEP_PER_WORKTREE})\
+                   {outstanding}"
+            ),
+            [],
+        )?;
+        Ok(n)
     }
 
     // ---- Prompts ----
@@ -851,6 +1183,12 @@ impl LocalStore {
         Ok(n == 1)
     }
 
+    /// Put a `running` request back to `pending` (a queued send deferred at the last
+    /// moment). `true` when this call moved it.
+    pub fn drive_request_requeue(&self, id: i64) -> Result<bool> {
+        self.drive_request_cas(id, "running", "pending")
+    }
+
     /// The human accepted the confirm; the request runs again.
     pub fn drive_request_resume(&self, id: i64) -> Result<bool> {
         self.drive_request_cas(id, "pending_confirm", "running")
@@ -893,7 +1231,36 @@ impl LocalStore {
         Ok(n == 1)
     }
 
-    /// Refuse `pending` requests older than `max_age_secs`, and `pending_confirm`
+    /// A pass examined pending request `id` and leaves it waiting for `reason`: stamp
+    /// `seen_at` once and record the reason. `true` when the row changed; the same
+    /// reason again (or a row that is no longer pending) writes nothing, so idle passes
+    /// leave the DB untouched.
+    pub fn drive_request_note_wait(&self, id: i64, reason: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE drive_requests \
+             SET seen_at = COALESCE(seen_at, datetime('now')), \
+                 wait_reason = ?2, wait_reason_at = datetime('now') \
+             WHERE id = ?1 AND status = 'pending' \
+               AND (seen_at IS NULL OR wait_reason <> ?2)",
+            params![id, reason],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Whether any drive request is `pending`. Reads only `status`, so it works on a
+    /// table of any age (and through a read-only handle that never migrated it).
+    pub fn drive_requests_has_pending(&self) -> Result<bool> {
+        if !self.drive_tables_exist()? {
+            return Ok(false);
+        }
+        Ok(self
+            .conn
+            .prepare("SELECT 1 FROM drive_requests WHERE status = 'pending' LIMIT 1")?
+            .exists([])?)
+    }
+
+    /// Refuse `pending` requests older than `max_age_secs` (the reason says why the
+    /// app left each one waiting, or that it never examined it), and `pending_confirm`
     /// requests whose confirm started over [`DRIVE_CONFIRM_MAX_AGE_SECS`] ago (a swap
     /// can queue and run a while before its confirm opens, so creation age would cut
     /// the human's confirm window short). `running` requests are never expired by
@@ -904,9 +1271,11 @@ impl LocalStore {
         let a = self.conn.execute(
             "UPDATE drive_requests \
              SET status = 'refused', resolved_at = datetime('now'), \
-                 reason = 'expired: no running Keitora app picked it up in time' \
+                 reason = 'expired after ' || ?2 || 's: ' || \
+                   CASE WHEN wait_reason = '' THEN 'the app never examined it' \
+                        ELSE wait_reason END \
              WHERE status = 'pending' AND created_at < datetime('now', ?1)",
-            params![age],
+            params![age, max_age_secs],
         )?;
         let b = self.conn.execute(
             "UPDATE drive_requests \
@@ -949,7 +1318,8 @@ impl LocalStore {
              VALUES (?1, 'busy', ?2, NULL, datetime('now')) \
              ON CONFLICT(worktree) DO UPDATE SET \
                state = 'busy', current_task_id = excluded.current_task_id, \
-               pid = excluded.pid, last_heartbeat = excluded.last_heartbeat",
+               pid = excluded.pid, last_heartbeat = excluded.last_heartbeat, \
+               session_id = NULL",
             params![worktree, current_task_id],
         )?;
         tx.commit()?;
@@ -959,17 +1329,76 @@ impl LocalStore {
     /// Record `worktree`'s finished turn: bumps `turn` (the first is 1) and keeps the
     /// last message, truncated. Returns the new turn.
     pub fn session_reply_record(&self, worktree: &str, last_message: &str) -> Result<i64> {
-        let turn = self.conn.query_row(
-            "INSERT INTO session_replies (worktree, turn, last_message, updated_at) \
-             VALUES (?1, 1, ?2, datetime('now')) \
+        self.session_reply_record_for_turn(worktree, last_message, None, None)
+    }
+
+    /// [`Self::session_reply_record`] for the Stop of turn `turn_id` in agent session
+    /// `session_id`. A repeat of the stored `turn_id` (a Stop that reached the CLI
+    /// twice) does not bump: it only fills a stored empty message with a non-empty
+    /// one, and returns the existing turn. With a `session_id` the stored session
+    /// must match too, since a new session (after a reset or wake) numbers its turns
+    /// afresh; without one the turn id alone decides. Any other call bumps and
+    /// stores both ids (`None` clears them).
+    pub fn session_reply_record_for_turn(
+        &self,
+        worktree: &str,
+        last_message: &str,
+        turn_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<i64> {
+        let message = truncate_bytes(last_message, SESSION_REPLY_MAX);
+        let tx = self.drive_tx()?;
+        if let Some(id) = turn_id {
+            let stored: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT turn, last_message FROM session_replies \
+                     WHERE worktree = ?1 AND last_turn_id = ?2 \
+                       AND (?3 IS NULL OR last_session_id IS ?3)",
+                    params![worktree, id, session_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((turn, stored)) = stored {
+                if stored.is_empty() && !message.is_empty() {
+                    tx.execute(
+                        "UPDATE session_replies SET last_message = ?2, updated_at = datetime('now') \
+                         WHERE worktree = ?1",
+                        params![worktree, message],
+                    )?;
+                }
+                tx.commit()?;
+                return Ok(turn);
+            }
+        }
+        let turn = tx.query_row(
+            "INSERT INTO session_replies \
+               (worktree, turn, last_message, updated_at, last_turn_id, last_session_id) \
+             VALUES (?1, 1, ?2, datetime('now'), ?3, ?4) \
              ON CONFLICT(worktree) DO UPDATE SET \
                turn = session_replies.turn + 1, last_message = excluded.last_message, \
-               updated_at = excluded.updated_at \
+               updated_at = excluded.updated_at, last_turn_id = excluded.last_turn_id, \
+               last_session_id = excluded.last_session_id \
              RETURNING turn",
-            params![worktree, truncate_bytes(last_message, SESSION_REPLY_MAX)],
+            params![worktree, message, turn_id, session_id],
             |r| r.get(0),
         )?;
+        tx.commit()?;
         Ok(turn)
+    }
+
+    /// The last finished turn of every driven worktree that has one, by worktree.
+    pub fn drive_session_replies(&self) -> Result<Vec<SessionReply>> {
+        if !self.drive_tables_exist()? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT r.worktree, r.turn, r.last_message, r.updated_at FROM session_replies r \
+             JOIN drives d ON d.driven = r.worktree ORDER BY r.worktree",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_session_reply)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// `worktree`'s last finished turn, if any.
@@ -980,14 +1409,7 @@ impl LocalStore {
                 "SELECT worktree, turn, last_message, updated_at FROM session_replies \
                  WHERE worktree = ?1",
                 params![worktree],
-                |r| {
-                    Ok(SessionReply {
-                        worktree: r.get(0)?,
-                        turn: r.get(1)?,
-                        last_message: r.get(2)?,
-                        updated_at: r.get(3)?,
-                    })
-                },
+                row_to_session_reply,
             )
             .optional()?;
         Ok(row)

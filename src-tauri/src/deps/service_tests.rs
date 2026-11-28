@@ -364,6 +364,15 @@ struct Rig {
     svc: DepsService,
 }
 
+/// An engine with no snapshot yet, falling back on `backend`'s live panes.
+fn engine_over(backend: &SharedBackend) -> crate::engine::SharedEngine {
+    let engine = crate::engine::SessionEngine::new_for_test(Arc::new(
+        crate::engine::tests::FakeEvidence::default(),
+    ));
+    engine.attach_backend(backend);
+    engine
+}
+
 struct Opts {
     platform: Option<Platform>,
     release_build: bool,
@@ -401,7 +410,8 @@ impl Rig {
             prober: Box::new(FakeProber),
         };
         let svc = DepsService::new(
-            backend,
+            Arc::clone(&backend),
+            engine_over(&backend),
             Arc::clone(&floor),
             Box::new(Shared(Arc::clone(&net))),
             Box::new(Shared(Arc::clone(&proc_))),
@@ -733,8 +743,10 @@ fn concurrent_installs_share_one_run_with_one_terminal_event() {
         config: Box::new(Shared(Arc::clone(&r.cfg))),
         prober: Box::new(FakeProber),
     };
+    let shared = Arc::clone(&backend) as SharedBackend;
     let svc = DepsService::new(
-        Arc::clone(&backend) as SharedBackend,
+        Arc::clone(&shared),
+        engine_over(&shared),
         Arc::clone(&r.floor),
         Box::new(Shared(Arc::clone(&gated))),
         Box::new(Shared(Arc::clone(&r.proc_))),

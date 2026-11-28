@@ -1,0 +1,8 @@
+{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{"id":"00000000-0000-4000-8000-000000000001","timestamp":"2026-01-01T00:00:00.000Z","originator":"codex-tui","cli_version":"0.0.0","source":"cli","cwd":"/Users/me/proj"}}
+{"timestamp":"2026-01-01T00:00:10.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}
+{"timestamp":"2026-01-01T00:00:10.100Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"delete the file"}]}}
+{"timestamp":"2026-01-01T00:00:11.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}","call_id":"c-1"}}
+{"timestamp":"2026-01-01T00:00:11.100Z","type":"event_msg","payload":{"type":"exec_approval_request","call_id":"c-1"}}
+{"timestamp":"2026-01-01T00:00:11.500Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c-1","output":"rejected by user"}}
+{"timestamp":"2026-01-01T00:00:12.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I was not allowed to delete it."}]}}
+{"timestamp":"2026-01-01T00:00:12.500Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1","last_agent_message":"I was not allowed to delete it."}}

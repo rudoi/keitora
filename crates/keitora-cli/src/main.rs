@@ -5,6 +5,8 @@
 
 mod drive;
 mod gate;
+mod hook_log;
+mod status;
 mod stop_capture;
 
 use std::error::Error;
@@ -60,6 +62,10 @@ enum Cmd {
         /// `idle` only (StopFailure hook): record that the turn ended with an error
         #[arg(long)]
         failed: bool,
+        /// Read the hook's JSON payload from stdin and record its `session_id` with
+        /// the state; prints nothing
+        #[arg(long, conflicts_with = "stdin_payload")]
+        payload_session: bool,
     },
     /// Manage project configuration
     #[command(subcommand)]
@@ -87,7 +93,25 @@ enum Cmd {
     Swap(drive::SwapArgs),
     /// Start a driven worktree's agent when it isn't running (resuming its conversation)
     Wake(drive::WakeArgs),
+    /// Show what the running Keitora app knows: herdr link, request pipeline,
+    /// each worktree's session, and health findings
+    #[command(long_about = STATUS_ABOUT)]
+    Status {
+        /// Show one worktree in detail (its findings and last turns)
+        worktree: Option<String>,
+    },
 }
+
+const STATUS_ABOUT: &str = "\
+Show what the running Keitora app knows about this project, read from its status \
+file and the project's task database: whether the app runs and sees herdr, whether \
+the request pipeline is alive, each worktree's session as the app sees it (and its \
+hook row), and the app's health findings. With a worktree, also that worktree's \
+findings in full and its last turns. Read-only: it never talks to herdr and never \
+writes. Without a running app it shows the hook rows only.
+
+Exit codes: 0 with output; 1 when the project can't be resolved; 4 for an unknown \
+worktree.";
 
 impl Cmd {
     /// The driver verb this command is, if it is one.
@@ -104,7 +128,9 @@ impl Cmd {
             Cmd::Reset(a) => drive::Verb::Reset(a),
             Cmd::Swap(a) => drive::Verb::Swap(a),
             Cmd::Wake(a) => drive::Verb::Wake(a),
-            Cmd::Task(_) | Cmd::Session { .. } | Cmd::Config(_) => return None,
+            Cmd::Task(_) | Cmd::Session { .. } | Cmd::Config(_) | Cmd::Status { .. } => {
+                return None
+            }
         })
     }
 }
@@ -330,41 +356,100 @@ async fn run() -> Result<(), Box<dyn Error>> {
         return run_config(sub, cli.json);
     }
 
-    // A hook invocation: move into the payload's directory before resolve(), and
-    // never fail the hook (an agent must not break on Keitora's account).
-    if let Cmd::Session {
-        stdin_payload: true,
+    let Cmd::Session {
+        stdin_payload,
         if_fully_idle,
         ..
     } = cli.cmd
-    {
-        let Some(raw) = enter_payload_dir(if_fully_idle) else {
-            return Ok(());
-        };
-        // A fully idle Stop ends the turn: it also records the turn's reply, so a
-        // driver's `wait` sees it finish.
-        let turn_end = if_fully_idle.then_some(raw);
-        if let Err(e) = run_resolved(cli, turn_end).await {
-            eprintln!("error: {e}");
-        }
-        return Ok(());
-    }
+    else {
+        return run_resolved(cli, None).await;
+    };
+    let invoked_by_hook = session_invoked_by_hook(&cli.cmd);
 
-    run_resolved(cli, None).await
+    // A session hook: its output is discarded, so failures go to the hook log.
+    let result = if stdin_payload {
+        // Move into the payload's directory before resolve(); a payload naming no
+        // usable directory is a deliberate skip.
+        match enter_payload_dir(if_fully_idle) {
+            Ok(raw) => {
+                // A fully idle Stop ends the turn: it also records the turn's reply,
+                // so a driver's `wait` sees it finish.
+                let turn_end = if_fully_idle.then_some(raw);
+                run_resolved(cli, turn_end).await
+            }
+            Err(skip) => {
+                if skip.logged() {
+                    hook_log::log(keitora_tasks::HookLogLevel::Warn, &skip.message());
+                }
+                Ok(())
+            }
+        }
+    } else {
+        run_resolved(cli, None).await
+    };
+    // `--stdin-payload` never fails the hook (an agent must not break on Keitora's
+    // account).
+    finish_session(result, stdin_payload, invoked_by_hook, |m| {
+        hook_log::log(keitora_tasks::HookLogLevel::Error, m)
+    })
+}
+
+/// Whether a `keitora session` command carries a flag only an agent hook passes.
+/// A bare `keitora session <state>` is taken as run by hand.
+fn session_invoked_by_hook(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Session {
+            stdin_payload,
+            stdin,
+            failed,
+            payload_session,
+            ..
+        } if *stdin_payload || *stdin || *failed || *payload_session
+    )
+}
+
+/// A session command's result: an error is logged to the hook log when a hook ran
+/// the command (`invoked_by_hook`), then swallowed in hook mode (the process exits
+/// 0) or propagated otherwise.
+fn finish_session(
+    result: Result<(), Box<dyn Error>>,
+    hook_mode: bool,
+    invoked_by_hook: bool,
+    log: impl FnOnce(&str),
+) -> Result<(), Box<dyn Error>> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if invoked_by_hook {
+                log(&e.to_string());
+            }
+            if hook_mode {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Read the hook payload from stdin and change into its directory, returning the
-/// payload. `None` when the hook should do nothing (unreadable, oversize, filtered
-/// out, no such dir).
-fn enter_payload_dir(if_fully_idle: bool) -> Option<Vec<u8>> {
-    use hook_payload::{interpret_payload, read_capped, PayloadAction, MAX_PAYLOAD_BYTES};
-    let Ok(Some(raw)) = read_capped(&mut std::io::stdin(), MAX_PAYLOAD_BYTES) else {
-        return None;
+/// payload, or why the hook does nothing (unreadable, oversize, filtered out, no
+/// such dir).
+fn enter_payload_dir(if_fully_idle: bool) -> Result<Vec<u8>, hook_payload::PayloadSkip> {
+    use hook_payload::{
+        interpret_payload, read_capped, read_outcome, PayloadAction, PayloadSkip, MAX_PAYLOAD_BYTES,
     };
-    let PayloadAction::Run { cwd } = interpret_payload(&raw, if_fully_idle) else {
-        return None;
+    let raw = read_outcome(read_capped(&mut std::io::stdin(), MAX_PAYLOAD_BYTES))?;
+    let cwd = match interpret_payload(&raw, if_fully_idle) {
+        PayloadAction::Run { cwd } => cwd,
+        PayloadAction::Skip(why) => return Err(why),
     };
-    (cwd.is_dir() && std::env::set_current_dir(&cwd).is_ok()).then_some(raw)
+    if cwd.is_dir() && std::env::set_current_dir(&cwd).is_ok() {
+        Ok(raw)
+    } else {
+        Err(PayloadSkip::NotADirectory(cwd))
+    }
 }
 
 /// Everything after the config short-circuit: resolve the project, open the
@@ -393,6 +478,7 @@ async fn run_resolved(cli: Cli, turn_end: Option<Vec<u8>>) -> Result<(), Box<dyn
             provider,
             stdin,
             failed,
+            payload_session,
             ..
         } => {
             return run_session(
@@ -403,11 +489,13 @@ async fn run_resolved(cli: Cli, turn_end: Option<Vec<u8>>) -> Result<(), Box<dyn
                     stdin,
                     failed,
                     turn_end: turn_end.as_deref(),
+                    payload_session,
                 },
                 cli.json,
             )
         }
         Cmd::Task(task) => task,
+        Cmd::Status { worktree } => return run_status(&config, worktree.as_deref(), cli.json),
         other => {
             let verb = other.into_verb().ok_or("not a driver verb")?;
             return run_drive(&config, verb, cli.json);
@@ -429,6 +517,8 @@ struct SessionCapture<'a> {
     /// Stop). Its reply text is usually empty: the payload carries no message and
     /// its transcript format isn't read, but the turn still counts as finished.
     turn_end: Option<&'a [u8]>,
+    /// `--payload-session`: read stdin only for the payload's `session_id`.
+    payload_session: bool,
 }
 
 /// The payload to record the turn's reply from, or `None` when this call records no
@@ -460,7 +550,7 @@ fn run_session(
     check_session_flags(state, provider, cap.stdin, cap.failed)?;
     let local = LocalStore::open(&config.db_path)?;
     let me = cli_actor();
-    let payload = reply_payload(state, &cap, || {
+    let quiet = record_session(&local, &me, state, &cap, || {
         let input = std::io::stdin();
         let terminal = input.is_terminal();
         gate::read_bounded(
@@ -469,20 +559,55 @@ fn run_session(
             stop_capture::STOP_STDIN_TIMEOUT,
             terminal,
         )
-    });
-    let capture = payload.is_some();
-    if let Some(payload) = payload {
-        // Reply first, state second: whoever sees `idle` already sees the turn.
-        let message = stop_capture::capture_message(cap.failed, &payload);
-        local.session_reply_record(&me, &message)?;
-    }
-    let current = local.active_task_id(&me).ok().flatten();
-    local.session_upsert(&me, state, current, None)?;
-    // The Stop hooks leave stdout attached, so the capture path prints nothing.
-    if !capture {
+    })?;
+    if !quiet {
         emit_ok(json, &format!("  {me} session → {state}"))?;
     }
     Ok(())
+}
+
+/// Record `me`'s session `state`, and the turn's reply when this call ends one,
+/// reading stdin through `read_stdin` at most once. Returns whether the command must
+/// print nothing: the reply-capture and `--payload-session` forms run with stdout
+/// attached to the agent (a `UserPromptSubmit` hook's stdout enters its context).
+fn record_session(
+    local: &LocalStore,
+    me: &str,
+    state: &str,
+    cap: &SessionCapture<'_>,
+    read_stdin: impl FnOnce() -> Vec<u8>,
+) -> Result<bool, Box<dyn Error>> {
+    let mut read_stdin = Some(read_stdin);
+    let mut stdin = || read_stdin.take().map(|f| f()).unwrap_or_default();
+    let payload = reply_payload(state, cap, &mut stdin);
+    let capture = payload.is_some();
+    // The writing agent's session: from the Stop payload already read, else from a
+    // `--payload-session` read. Antigravity's `--stdin-payload` records none: its
+    // payload's ids are not known to match the session herdr reports.
+    let session_id = match &payload {
+        Some(p) if cap.stdin => hook_payload::payload_session_id(p),
+        _ if cap.payload_session => hook_payload::payload_session_id(&stdin()),
+        _ => None,
+    };
+    if let Some(payload) = payload {
+        // Reply first, state second: whoever sees `idle` already sees the turn.
+        // Exactly one turn per call, whatever the payload holds; a Stop repeated for
+        // the same turn id is not a second turn.
+        let message = stop_capture::capture_message(cap.failed, &payload);
+        let turn_id = cap
+            .stdin
+            .then(|| stop_capture::payload_turn_id(&payload))
+            .flatten();
+        local.session_reply_record_for_turn(
+            me,
+            &message,
+            turn_id.as_deref(),
+            session_id.as_deref(),
+        )?;
+    }
+    let current = local.active_task_id(me).ok().flatten();
+    local.session_upsert_with_id(me, state, current, None, session_id.as_deref())?;
+    Ok(capture || cap.payload_session)
 }
 
 /// Run a driver verb against the project's local store and print its result. A
@@ -515,12 +640,36 @@ fn run_drive(config: &Config, verb: drive::Verb, json: bool) -> Result<(), Box<d
         registered: &registered,
         clock: &gate::RealClock,
         stdin: &read_stdin,
+        project: config.project_config().project.name.clone(),
+        status_db: Some(keitora_tasks::status_db_path()),
     };
     let out = drive::run(&ctx, verb)?;
     println!("{}", out.render(json));
     if out.code != 0 {
         return Err(Box::new(drive::ExitError::new(out.code, "")));
     }
+    Ok(())
+}
+
+/// `keitora status`: read-only over the project's task DB and the app's `status.db`.
+fn run_status(config: &Config, worktree: Option<&str>, json: bool) -> Result<(), Box<dyn Error>> {
+    let local = LocalStore::open_read_only(&config.db_path).map_err(drive::store_err)?;
+    let worktree_cli = |w: &str| {
+        let user = keitora_tasks::UserConfig::load().ok()?;
+        let entry = config.project_config().worktree_entry(w);
+        Some(keitora_tasks::resolve_cli(entry.as_ref(), &user))
+    };
+    let status_db = keitora_tasks::status_db_path();
+    let input = status::StatusInput {
+        local: &local,
+        project: config.project_config().project.name.clone(),
+        worktrees: config.worktrees.clone(),
+        worktree_cli: &worktree_cli,
+        status_db: Some(&status_db),
+        now_ms: keitora_tasks::now_ms(),
+    };
+    let out = status::status(&input, worktree)?;
+    println!("{}", out.render(json));
     Ok(())
 }
 
@@ -971,6 +1120,7 @@ async fn cmd_task_dispatch(
     }
 
     let mut req = local.dispatch_request_add(id, worktree, me)?;
+    let mut diagnosis: Option<drive::TimeoutDiag> = None;
     // One budget for the whole wait: the app's outcome, then (with --until-claimed)
     // the agent's claim.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
@@ -981,14 +1131,24 @@ async fn cmd_task_dispatch(
                 .dispatch_request_get(req.id)?
                 .ok_or_else(|| format!("dispatch request {} vanished", req.id))?;
         }
-        // Withdraw a request nobody picked up, so it can't fire later unexpectedly.
-        if req.status == "pending"
-            && local.dispatch_request_cancel(
-                req.id,
-                &format!("no running Keitora app picked it up within {wait}s"),
-            )?
-        {
-            req = local.dispatch_request_get(req.id)?.unwrap_or(req);
+        // Withdraw a request nobody picked up, so it can't fire later unexpectedly,
+        // saying why nobody did.
+        if req.status == "pending" {
+            let project = config.project_config().project.name.clone();
+            let what = format!("dispatch of #{id} to @{worktree} (request {})", req.id);
+            let d = drive::diagnose_dispatch_timeout(
+                &drive::presence_at(
+                    Some(&keitora_tasks::status_db_path()),
+                    &project,
+                    keitora_tasks::now_ms(),
+                ),
+                &project,
+                &what,
+            );
+            if local.dispatch_request_cancel(req.id, &d.cancel_reason(wait))? {
+                req = local.dispatch_request_get(req.id)?.unwrap_or(req);
+                diagnosis = Some(d);
+            }
         }
     }
 
@@ -1013,6 +1173,9 @@ async fn cmd_task_dispatch(
         let mut v = serde_json::to_value(&req)?;
         if let (Some(p), Some(obj)) = (&claim, v.as_object_mut()) {
             obj.insert("claimed".into(), json!(*p == ClaimProgress::Claimed));
+        }
+        if let (Some(d), Some(obj)) = (&diagnosis, v.as_object_mut()) {
+            obj.insert("diagnosis".into(), d.json());
         }
         println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
@@ -1202,13 +1365,48 @@ fn watch_line(ev: &serde_json::Value) -> String {
     line.trim_end().to_string()
 }
 
+/// The sessions `task watch` reports, scoped to `worktrees` (all when empty) as the
+/// app does: the engine's views of `project` overlaid on the hook rows while
+/// `status` is fresh, else the hook rows. The status file is reopened every poll.
+fn watch_sessions(
+    local: &LocalStore,
+    worktrees: &[String],
+    project: &str,
+    status: &std::path::Path,
+    now_ms: i64,
+) -> keitora_tasks::Result<Vec<WorktreeSession>> {
+    let views = keitora_tasks::StatusReader::open(status)
+        .ok()
+        .flatten()
+        .and_then(|r| r.fresh_sessions(project, now_ms));
+    let rows = local.sessions_list()?;
+    let Some(views) = views else {
+        // Hook rows as written, without the stale mark the overlay would add.
+        return Ok(rows
+            .into_iter()
+            .filter(|s| worktrees.is_empty() || worktrees.contains(&s.worktree))
+            .collect());
+    };
+    let drivers = local
+        .drives_list()?
+        .into_iter()
+        .map(|d| (d.driven, d.driver))
+        .collect();
+    Ok(keitora_tasks::overlay_sessions(
+        rows,
+        Some(&views),
+        worktrees,
+        &drivers,
+    ))
+}
+
 /// How many recent dispatch-log entries / requests each `task watch` poll reads.
 const WATCH_WINDOW: i64 = 100;
 
 /// `keitora task watch`: poll the project's `tasks.db` and print each change in
 /// `worktree_sessions`, the dispatch log and the dispatch requests, one line each
 /// (JSON lines with `--json`), until interrupted or stdout closes. Session states are
-/// what the agent hooks last wrote; only the app reconciles them with live panes.
+/// the app's engine view while it is fresh, else what the hooks last wrote.
 async fn cmd_task_watch(
     backend: &dyn TaskBackend,
     local: &LocalStore,
@@ -1225,13 +1423,13 @@ async fn cmd_task_watch(
         &local.dispatch_requests_list(WATCH_WINDOW)?,
     );
     loop {
-        // Scope sessions to this project's worktrees, as the app does; the table
-        // holds a row for every worktree that ever ran a session.
-        let sessions: Vec<_> = local
-            .sessions_list()?
-            .into_iter()
-            .filter(|s| config.worktrees.is_empty() || config.worktrees.contains(&s.worktree))
-            .collect();
+        let sessions = watch_sessions(
+            local,
+            &config.worktrees,
+            &config.project_config().project.name,
+            &keitora_tasks::status_db_path(),
+            keitora_tasks::now_ms(),
+        )?;
         let events = state.step(
             &sessions,
             &backend.dispatch_log_list(WATCH_WINDOW).await?,
@@ -1549,6 +1747,7 @@ mod tests {
             stdin,
             failed,
             turn_end,
+            payload_session: false,
         };
         let stdin = || b"from-stdin".to_vec();
         let agy_stop = br#"{"fullyIdle":true}"#.as_slice();
@@ -1575,6 +1774,311 @@ mod tests {
         );
         // Antigravity's Stop payload has no reply text: the turn counts, with no message.
         assert_eq!(stop_capture::capture_message(false, agy_stop), "");
+    }
+
+    fn temp_local() -> (tempfile::TempDir, LocalStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let local = LocalStore::open(dir.path().join("tasks.db").to_str().unwrap()).unwrap();
+        (dir, local)
+    }
+
+    fn capture(stdin: bool, payload_session: bool) -> SessionCapture<'static> {
+        SessionCapture {
+            stdin,
+            failed: false,
+            turn_end: None,
+            payload_session,
+        }
+    }
+
+    #[test]
+    fn payload_session_flag_prints_nothing() {
+        let (_dir, local) = temp_local();
+        let payload = || br#"{"session_id":"s-1","cwd":"/Users/me/proj"}"#.to_vec();
+        let quiet =
+            record_session(&local, "alpha", "busy", &capture(false, true), payload).unwrap();
+        assert!(quiet, "a --payload-session hook prints nothing");
+        assert_eq!(local.session_ids().unwrap()["alpha"], "s-1");
+        assert_eq!(
+            local.session_state_get("alpha").unwrap().as_deref(),
+            Some("busy")
+        );
+        // A payload without an id still records the state, quietly, with no id.
+        let quiet = record_session(&local, "alpha", "idle", &capture(false, true), || {
+            b"{}".to_vec()
+        })
+        .unwrap();
+        assert!(quiet);
+        assert!(local.session_ids().unwrap().is_empty());
+        // The plain form reads nothing and prints its confirmation.
+        let quiet = record_session(&local, "alpha", "busy", &capture(false, false), || {
+            panic!("stdin must not be read")
+        })
+        .unwrap();
+        assert!(!quiet);
+    }
+
+    #[test]
+    fn stop_capture_records_the_payload_session_from_one_read() {
+        let (_dir, local) = temp_local();
+        let reads = std::cell::Cell::new(0);
+        let payload = || {
+            reads.set(reads.get() + 1);
+            br#"{"session_id":"s-7","last_assistant_message":"done"}"#.to_vec()
+        };
+        // `--stdin --payload-session` (both given) still reads stdin once.
+        let quiet = record_session(&local, "alpha", "idle", &capture(true, true), payload).unwrap();
+        assert!(quiet);
+        assert_eq!(reads.get(), 1);
+        assert_eq!(local.session_ids().unwrap()["alpha"], "s-7");
+        assert_eq!(
+            local
+                .session_reply_get("alpha")
+                .unwrap()
+                .unwrap()
+                .last_message,
+            "done"
+        );
+    }
+
+    /// A reader that yields `first` and then blocks until dropped.
+    struct Stalls {
+        first: Option<Vec<u8>>,
+        hold: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl std::io::Read for Stalls {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(first) = self.first.take() {
+                buf[..first.len()].copy_from_slice(&first);
+                return Ok(first.len());
+            }
+            let _ = self.hold.recv();
+            Ok(0)
+        }
+    }
+
+    /// What `--stdin` reads for `raw` through the real bounded reader: an oversize
+    /// payload is cut at the cap; a stalled one is cut at the timeout.
+    fn bounded(raw: Vec<u8>) -> Vec<u8> {
+        gate::read_bounded(
+            std::io::Cursor::new(raw),
+            stop_capture::STOP_STDIN_CAP,
+            stop_capture::STOP_STDIN_TIMEOUT,
+            false,
+        )
+    }
+
+    fn stalled(first: &[u8]) -> Vec<u8> {
+        let (_tx, hold) = std::sync::mpsc::channel();
+        let r = Stalls {
+            first: Some(first.to_vec()),
+            hold,
+        };
+        let out = gate::read_bounded(
+            r,
+            stop_capture::STOP_STDIN_CAP,
+            Duration::from_millis(50),
+            false,
+        );
+        drop(_tx);
+        out
+    }
+
+    fn stop_payload(message: serde_json::Value, turn_id: Option<&str>) -> Vec<u8> {
+        let mut v = json!({
+            "session_id": "s-1",
+            "transcript_path": "/Users/me/.codex/sessions/missing.jsonl",
+            "cwd": "/Users/me/proj",
+            "hook_event_name": "Stop",
+            "last_assistant_message": message,
+        });
+        if let Some(t) = turn_id {
+            v["turn_id"] = json!(t);
+        }
+        v.to_string().into_bytes()
+    }
+
+    fn reply(local: &LocalStore) -> (i64, String) {
+        let r = local.session_reply_get("alpha").unwrap().unwrap();
+        (r.turn, r.last_message)
+    }
+
+    /// One `keitora session idle --stdin` run over `raw`.
+    fn stop(local: &LocalStore, raw: Vec<u8>) -> bool {
+        record_session(local, "alpha", "idle", &capture(true, false), move || raw).unwrap()
+    }
+
+    use std::time::Duration;
+
+    #[test]
+    fn one_turn_per_invocation_for_every_payload_shape() {
+        let big = json!({ "last_assistant_message": "x".repeat(stop_capture::STOP_STDIN_CAP as usize * 2) });
+        let shapes: Vec<(&str, Vec<u8>, &str)> = vec![
+            ("full payload", stop_payload(json!("done"), None), "done"),
+            (
+                "null message",
+                stop_payload(serde_json::Value::Null, None),
+                "",
+            ),
+            ("empty-string message", stop_payload(json!(""), None), ""),
+            ("JSON null", b"null".to_vec(), ""),
+            ("JSON array", b"[1,2]".to_vec(), ""),
+            ("garbage bytes", b"\x00\x01not json".to_vec(), ""),
+            (
+                "invalid UTF-8",
+                b"{\"last_assistant_message\":\"\xff\xfe\"}".to_vec(),
+                "",
+            ),
+            ("empty stdin", Vec::new(), ""),
+            (
+                "oversize payload",
+                bounded(big.to_string().into_bytes()),
+                "",
+            ),
+            (
+                "read timeout",
+                stalled(br#"{"last_assistant_message":"cut"#),
+                "",
+            ),
+        ];
+        for (name, raw, want) in shapes {
+            let (_dir, local) = temp_local();
+            assert!(
+                local.session_reply_get("alpha").unwrap().is_none(),
+                "{name}"
+            );
+            assert!(stop(&local, raw.clone()), "{name}: prints nothing");
+            assert_eq!(reply(&local), (1, want.to_string()), "{name}: first");
+            assert!(stop(&local, raw), "{name}");
+            assert_eq!(reply(&local).0, 2, "{name}: exactly one more turn");
+            assert_eq!(
+                local.session_state_get("alpha").unwrap().as_deref(),
+                Some("idle"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_stop_records_one_turn_with_the_fixed_message() {
+        let (_dir, local) = temp_local();
+        let cap = SessionCapture {
+            failed: true,
+            ..capture(false, false)
+        };
+        let quiet =
+            record_session(&local, "alpha", "idle", &cap, || panic!("no stdin read")).unwrap();
+        assert!(quiet);
+        assert_eq!(reply(&local), (1, stop_capture::FAILED_MESSAGE.to_string()));
+        record_session(&local, "alpha", "idle", &cap, Vec::new).unwrap();
+        assert_eq!(reply(&local).0, 2);
+    }
+
+    #[test]
+    fn repeated_stop_with_the_same_turn_id_does_not_bump_twice() {
+        let (_dir, local) = temp_local();
+        stop(&local, stop_payload(json!("a"), Some("t-1")));
+        stop(&local, stop_payload(json!("a"), Some("t-1")));
+        assert_eq!(reply(&local).0, 1, "same turn id: one turn");
+        stop(&local, stop_payload(json!("b"), Some("t-2")));
+        assert_eq!(reply(&local), (2, "b".to_string()), "a new turn id bumps");
+        // Claude's Stop has no turn id: every call is a turn (the old behaviour).
+        stop(&local, stop_payload(json!("c"), None));
+        stop(&local, stop_payload(json!("c"), None));
+        assert_eq!(reply(&local).0, 4);
+    }
+
+    #[test]
+    fn repeated_stop_fills_an_empty_message_but_never_replaces_text() {
+        let (_dir, local) = temp_local();
+        stop(&local, stop_payload(serde_json::Value::Null, Some("t-1")));
+        assert_eq!(reply(&local), (1, String::new()));
+        stop(&local, stop_payload(json!("the text"), Some("t-1")));
+        assert_eq!(reply(&local), (1, "the text".to_string()), "filled");
+        stop(&local, stop_payload(json!("other text"), Some("t-1")));
+        assert_eq!(reply(&local), (1, "the text".to_string()), "kept");
+    }
+
+    #[test]
+    fn dedupe_keeps_state_idle_and_prints_nothing() {
+        let (_dir, local) = temp_local();
+        assert!(stop(&local, stop_payload(json!("a"), Some("t-1"))));
+        local.session_upsert("alpha", "busy", None, None).unwrap();
+        assert!(
+            stop(&local, stop_payload(json!("a"), Some("t-1"))),
+            "prints nothing"
+        );
+        assert_eq!(reply(&local).0, 1);
+        assert_eq!(
+            local.session_state_get("alpha").unwrap().as_deref(),
+            Some("idle"),
+            "the deduped Stop still records idle"
+        );
+        assert_eq!(local.session_ids().unwrap()["alpha"], "s-1");
+    }
+
+    #[test]
+    fn session_failure_is_logged_and_still_exits_zero_in_hook_mode() {
+        let logged = std::cell::RefCell::new(Vec::<String>::new());
+        let fail = || -> Result<(), Box<dyn Error>> { Err("database is locked".into()) };
+        let log = |m: &str| logged.borrow_mut().push(m.into());
+        // `--stdin-payload`: logged, then swallowed (exit 0).
+        assert!(finish_session(fail(), true, true, log).is_ok());
+        // Another hook form: logged, then propagated (the shell fallback runs on the
+        // exit code).
+        let err = finish_session(fail(), false, true, log);
+        assert_eq!(err.unwrap_err().to_string(), "database is locked");
+        assert_eq!(
+            *logged.borrow(),
+            ["database is locked", "database is locked"]
+        );
+        // Success logs nothing.
+        assert!(finish_session(Ok(()), true, true, |_| panic!("logged a success")).is_ok());
+    }
+
+    #[test]
+    fn a_hand_run_session_failure_is_not_logged_as_a_hook_error() {
+        let fail = || -> Result<(), Box<dyn Error>> { Err("database is locked".into()) };
+        let err = finish_session(fail(), false, false, |m| panic!("logged: {m}"));
+        assert_eq!(err.unwrap_err().to_string(), "database is locked");
+    }
+
+    #[test]
+    fn only_hook_flags_mark_a_session_command_as_a_hook() {
+        let hook = |args: &[&str]| {
+            let mut argv = vec!["keitora", "session"];
+            argv.extend_from_slice(args);
+            session_invoked_by_hook(&Cli::try_parse_from(argv).unwrap().cmd)
+        };
+        assert!(!hook(&["busy"]));
+        assert!(!hook(&["idle"]));
+        assert!(hook(&["busy", "--payload-session"]));
+        assert!(hook(&["idle", "--stdin"]));
+        assert!(hook(&["idle", "--failed"]));
+        assert!(hook(&["idle", "--stdin-payload"]));
+        assert!(hook(&["idle", "--stdin-payload", "--if-fully-idle"]));
+    }
+
+    #[test]
+    fn payload_session_parses_and_excludes_stdin_payload() {
+        match Cli::try_parse_from(["keitora", "session", "busy", "--payload-session"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Session {
+                payload_session, ..
+            } => assert!(payload_session),
+            _ => panic!("expected `session`"),
+        }
+        assert!(Cli::try_parse_from([
+            "keitora",
+            "session",
+            "idle",
+            "--payload-session",
+            "--stdin-payload"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -1688,6 +2192,83 @@ mod tests {
         }
     }
 
+    #[test]
+    fn task_watch_overlays_engine_state_when_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = LocalStore::open(dir.path().join("tasks.db").to_str().unwrap()).unwrap();
+        local.drive_bind("alpha", "bravo", None, false).unwrap();
+        local
+            .session_upsert("bravo", "offline", None, None)
+            .unwrap();
+        local.session_upsert("charlie", "busy", None, None).unwrap();
+        local.session_upsert("other", "busy", None, None).unwrap();
+        let status = dir.path().join("status.db");
+        let worktrees: Vec<String> = ["alpha", "bravo", "charlie"].map(String::from).to_vec();
+        let now = 1_800_000_000_000;
+        let view = |wt: &str, state: &str| keitora_tasks::StatusSession {
+            project: "proj".into(),
+            worktree: wt.into(),
+            state: state.into(),
+            agent: "present".into(),
+            agent_kind: Some("agy".into()),
+            herdr_status: Some("idle".into()),
+            settled: true,
+            stale: false,
+            interactive_ready: Some(true),
+            pane_id: Some("w1:p1".into()),
+            terminal_id: Some("t-1".into()),
+            agent_session: None,
+            state_change_seq: Some(2),
+            completion_seq: None,
+            brokered: false,
+            escalated_reason: None,
+            last_change_at: now,
+        };
+        let writer = keitora_tasks::WriterRow {
+            instance_id: "app-1".into(),
+            pid: 1,
+            version: "test".into(),
+            started_at: now,
+            heartbeat_at: now,
+            last_snapshot_at: Some(now),
+            herdr_link: "up".into(),
+            herdr_link_since: now,
+        };
+        keitora_tasks::status_store::write_status_for_test(
+            &status,
+            writer,
+            &[view("bravo", "idle"), view("alpha", "busy")],
+        )
+        .unwrap();
+        let states = |now_ms: i64| -> Vec<(String, String)> {
+            watch_sessions(&local, &worktrees, "proj", &status, now_ms)
+                .unwrap()
+                .into_iter()
+                .map(|s| (s.worktree, s.state))
+                .collect()
+        };
+        let pair = |w: &str, s: &str| (w.to_string(), s.to_string());
+        // Fresh: the engine's answers; a row without a view reads offline.
+        assert_eq!(
+            states(now),
+            vec![
+                pair("alpha", "busy"),
+                pair("bravo", "idle"),
+                pair("charlie", "offline")
+            ]
+        );
+        // Stale: the hook rows as written, scoped to the project's worktrees.
+        assert_eq!(
+            states(now + 16_000),
+            vec![pair("bravo", "offline"), pair("charlie", "busy")]
+        );
+        // No status.db: the same.
+        let none =
+            watch_sessions(&local, &worktrees, "proj", &dir.path().join("nope.db"), now).unwrap();
+        assert_eq!(none.len(), 2);
+        assert!(none.iter().all(|s| !s.stale));
+    }
+
     fn session(worktree: &str, state: &str, task: Option<i64>, beat: &str) -> WorktreeSession {
         WorktreeSession {
             project: String::new(),
@@ -1699,6 +2280,9 @@ mod tests {
             driven_by: None,
             brokered: false,
             escalated_reason: None,
+            agent: None,
+            herdr_status: None,
+            stale: false,
         }
     }
 

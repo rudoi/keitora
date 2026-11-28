@@ -4,8 +4,9 @@
 //! `sysinfo` sample of the server (the rail card's CPU/memory, pushed as
 //! `daemon://stats`), a `herdr status server` probe (liveness + version, fed to the
 //! [`Watchdog`]), a `pane list` that keeps the resume store and the recovery
-//! controller's busy/recency view fresh, and the `daemon://status` push (on change
-//! plus a heartbeat). On a loaded machine (low headroom) it slows down, so Keitora
+//! controller's busy/recency view fresh, the `daemon://status` push (on change
+//! plus a heartbeat), and the session engine's `agent list` snapshot at the
+//! engine's own hot/warm/cold cadence. On a loaded machine (low headroom) it slows down, so Keitora
 //! spawns fewer herdr processes exactly when memory is short.
 //!
 //! [`StatusLoop::tick`] takes `now` and every dependency is injected, so the whole
@@ -19,13 +20,15 @@ use std::time::{Duration, Instant};
 use crate::backend::EmitSink;
 use crate::backend::{DaemonStats, SessionKey, StatusPayload};
 use crate::deps::floor::FloorSlot;
+use crate::engine::model::AgentObs;
+use crate::engine::{HerdrLink, HerdrSnapshot, SharedEngine};
 use crate::headroom::{Headroom, HeadroomSnapshot, PHYS_MARGIN_BYTES};
 
-use super::cli::{PaneInfo, ServerStatus};
+use super::cli::{AgentInfo, PaneInfo, ServerStatus};
 use super::exe_missing::ExeMissing;
 use super::gate::ServerGate;
 use super::keymap::{HerdrPane, KeyMap};
-use super::ops::{HerdrError, HerdrOps};
+use super::ops::{Generation, HerdrError, HerdrOps};
 use super::recovery::machine::Observation;
 use super::recovery::RecoveryHandle;
 use super::resume::{observation_pairs, trusted_observations, ResumeStore};
@@ -251,6 +254,38 @@ pub fn observations_from(
         .collect()
 }
 
+/// The engine's snapshot of one `agent list`: one entry per keymap key of the
+/// current server `generation` (reserved keys left out), each matched by pane id to
+/// its agent entry (`None` when herdr lists no agent for the pane).
+pub fn engine_snapshot(
+    entries: &[(SessionKey, HerdrPane)],
+    generation: Generation,
+    agents: &[AgentInfo],
+    at: Instant,
+    at_ms: i64,
+) -> HerdrSnapshot {
+    let keys = entries
+        .iter()
+        .filter(|(k, p)| p.server_generation == generation && !k.is_reserved())
+        .map(|(k, p)| {
+            let obs = agents
+                .iter()
+                .find(|a| a.pane_id == p.pane_id)
+                .map(AgentObs::from_info);
+            (k.clone(), obs)
+        })
+        .collect();
+    HerdrSnapshot {
+        at,
+        at_ms,
+        generation,
+        keys,
+    }
+}
+
+/// Unix epoch milliseconds, injectable for tests.
+pub type WallMs = Arc<dyn Fn() -> i64 + Send + Sync>;
+
 /// Sleep `d` in short slices, returning early once `stop` is set.
 fn sleep_unless(stop: &AtomicBool, d: Duration) {
     const SLICE: Duration = Duration::from_millis(100);
@@ -290,6 +325,10 @@ pub struct StatusLoopDeps {
     pub boot_ready: Arc<dyn Fn() -> bool + Send + Sync>,
     /// Where each running probe's version/protocol judgement goes.
     pub floor: Arc<FloorSlot>,
+    /// The session engine fed by the `agent list` step (`None`: no engine step).
+    pub engine: Option<SharedEngine>,
+    /// The wall clock the engine's snapshots and link changes are stamped with.
+    pub wall_ms: WallMs,
 }
 
 /// The merged status loop. See the module docs.
@@ -351,6 +390,7 @@ impl StatusLoop {
     pub fn tick(&mut self, now: Instant) {
         // 1. The user stopped the server: say so once, touch nothing.
         if self.deps.explicit_stop.load(Ordering::SeqCst) {
+            self.mark_link(HerdrLink::Down);
             if !self.stop_reported {
                 self.stop_reported = true;
                 self.was_unhealthy = true;
@@ -376,6 +416,7 @@ impl StatusLoop {
 
         // 2. Recovery owns the server: no herdr calls at all.
         if self.deps.gate.admit(None).is_err() {
+            self.mark_link(HerdrLink::Recovering);
             self.was_unhealthy = true;
             if due(now, self.last_sample, cadence.sample) {
                 self.last_sample = Some(now);
@@ -410,6 +451,54 @@ impl StatusLoop {
         {
             self.last_observe = Some(now);
             self.observe(now);
+        }
+
+        // 8. Engine snapshot, at the engine's cadence.
+        self.engine_step(now);
+    }
+
+    /// Mark the engine's herdr link (no engine: nothing).
+    fn mark_link(&self, link: HerdrLink) {
+        if let Some(engine) = &self.deps.engine {
+            engine.mark_link(link, (self.deps.wall_ms)());
+        }
+    }
+
+    /// One `agent list` for the engine when it is due; a failure feeds the
+    /// watchdog like a failed `pane list`.
+    fn engine_step(&mut self, now: Instant) {
+        let Some(engine) = self.deps.engine.clone() else {
+            return;
+        };
+        if self.cached_running().is_none() {
+            // No probe result yet: herdr is still coming up, not down.
+            let probed = self.deps.cache.lock().unwrap().server.is_some();
+            self.mark_link(if probed {
+                HerdrLink::Down
+            } else {
+                HerdrLink::Starting
+            });
+            return;
+        }
+        if !(self.deps.boot_ready)() {
+            self.mark_link(HerdrLink::Starting);
+            return;
+        }
+        if !engine.due(now, self.low.is_low()) {
+            return;
+        }
+        match self.deps.ops.agent_list() {
+            Ok(agents) => {
+                let generation = self.deps.keymap.generation();
+                let entries = self.deps.keymap.entries();
+                let at_ms = (self.deps.wall_ms)();
+                engine.ingest(engine_snapshot(&entries, generation, &agents, now, at_ms));
+            }
+            Err(e) => {
+                log::debug!("herdr: agent list failed: {e}");
+                engine.poll_failed(now);
+                self.report(&Err(e));
+            }
         }
     }
 
@@ -616,6 +705,7 @@ mod tests {
     use std::sync::mpsc::Receiver;
 
     const GIB: u64 = 1024 * MIB;
+    const WALL_T0: i64 = 1_800_000_000_000;
     const BASE: u64 = 4 * GIB;
 
     fn snap(commit: u64, phys: u64) -> HeadroomSnapshot {
@@ -791,6 +881,7 @@ mod tests {
         ready: Arc<AtomicBool>,
         exe_missing: Arc<ExeMissing>,
         floor: Arc<FloorSlot>,
+        engine: Option<SharedEngine>,
         t0: Instant,
         status_loop: StatusLoop,
     }
@@ -801,6 +892,22 @@ mod tests {
         }
 
         fn with_headroom(headroom: FakeHeadroom) -> Rig {
+            Self::build(headroom, None)
+        }
+
+        /// A rig whose loop feeds an engine over empty evidence.
+        fn with_engine(headroom: FakeHeadroom) -> Rig {
+            let engine = crate::engine::SessionEngine::new_for_test(Arc::new(
+                crate::engine::tests::FakeEvidence::default(),
+            ));
+            Self::build(headroom, Some(engine))
+        }
+
+        fn engine(&self) -> &SharedEngine {
+            self.engine.as_ref().expect("an engine rig")
+        }
+
+        fn build(headroom: FakeHeadroom, engine: Option<SharedEngine>) -> Rig {
             let fake = FakeHerdr::new();
             let gate = Arc::new(TestGate::default());
             let events: Emitted = Arc::default();
@@ -844,6 +951,8 @@ mod tests {
                 exe_missing: Arc::clone(&exe_missing),
                 boot_ready: Arc::new(move || ready_in.load(Ordering::SeqCst)),
                 floor: Arc::clone(&floor),
+                engine: engine.clone(),
+                wall_ms: Arc::new(|| WALL_T0),
             });
             Rig {
                 fake,
@@ -860,6 +969,7 @@ mod tests {
                 ready,
                 exe_missing,
                 floor,
+                engine,
                 t0: Instant::now(),
                 status_loop,
             }
@@ -1231,6 +1341,227 @@ mod tests {
         // list's timeout was counted.
         r.watchdog.report_probe(&Err(HerdrError::Timeout), false);
         assert!(r.deaths.try_recv().is_ok());
+    }
+
+    // ── Engine step ──────────────────────────────────────────────────────────
+
+    fn agent_lists(r: &Rig) -> usize {
+        r.count(Op::AgentList)
+    }
+
+    fn link(r: &Rig) -> HerdrLink {
+        r.engine().link_state().link
+    }
+
+    #[test]
+    fn engine_polls_agent_list_at_the_hot_cadence() {
+        let mut r = Rig::with_engine(FakeHeadroom::constant(plenty()));
+        r.engine().set_pending("p", true);
+        for s in 0..10 {
+            r.at(s);
+        }
+        assert_eq!(agent_lists(&r), 10);
+        assert_eq!(link(&r), HerdrLink::Up);
+
+        let mut r = Rig::with_engine(FakeHeadroom::constant(snap(GIB, 32 * GIB)));
+        r.engine().set_pending("p", true);
+        for s in 0..10 {
+            r.at(s);
+        }
+        assert_eq!(agent_lists(&r), 5, "2 s under low headroom");
+    }
+
+    #[test]
+    fn engine_polls_at_the_warm_and_cold_cadences() {
+        let minute = |r: &mut Rig| {
+            for s in 0..60 {
+                r.at(s);
+            }
+        };
+        let mut warm = Rig::with_engine(FakeHeadroom::constant(plenty()));
+        warm.engine().set_window_open(true);
+        minute(&mut warm);
+        assert_eq!(agent_lists(&warm), 12);
+
+        let mut cold = Rig::with_engine(FakeHeadroom::constant(plenty()));
+        minute(&mut cold);
+        assert_eq!(agent_lists(&cold), 4);
+
+        let mut low_warm = Rig::with_engine(FakeHeadroom::constant(snap(GIB, 32 * GIB)));
+        low_warm.engine().set_window_open(true);
+        minute(&mut low_warm);
+        assert_eq!(agent_lists(&low_warm), 4);
+    }
+
+    #[test]
+    fn no_agent_list_while_the_gate_refuses() {
+        let mut r = Rig::with_engine(FakeHeadroom::constant(plenty()));
+        r.engine().set_pending("p", true);
+        r.at(0);
+        assert_eq!(link(&r), HerdrLink::Up);
+        r.gate.refuse(true);
+        for s in 1..10 {
+            r.at(s);
+        }
+        assert_eq!(agent_lists(&r), 1);
+        assert_eq!(link(&r), HerdrLink::Recovering);
+        assert!(!r.engine().is_ready());
+        r.gate.refuse(false);
+        r.at(10);
+        assert_eq!(agent_lists(&r), 2);
+        assert_eq!(link(&r), HerdrLink::Up);
+    }
+
+    #[test]
+    fn no_agent_list_before_boot_ready() {
+        let mut r = Rig::with_engine(FakeHeadroom::constant(plenty()));
+        r.engine().set_pending("p", true);
+        r.ready.store(false, Ordering::SeqCst);
+        for s in 0..5 {
+            r.at(s);
+        }
+        assert_eq!(agent_lists(&r), 0);
+        assert_eq!(link(&r), HerdrLink::Starting);
+        r.ready.store(true, Ordering::SeqCst);
+        r.at(5);
+        assert_eq!(agent_lists(&r), 1);
+        assert_eq!(link(&r), HerdrLink::Up);
+    }
+
+    #[test]
+    fn explicit_stop_and_a_stopped_server_mark_the_link_down() {
+        let mut r = Rig::with_engine(FakeHeadroom::constant(plenty()));
+        r.at(0);
+        r.stop.store(true, Ordering::SeqCst);
+        r.at(1);
+        assert_eq!(link(&r), HerdrLink::Down);
+        r.stop.store(false, Ordering::SeqCst);
+        r.at(2);
+        assert_eq!(link(&r), HerdrLink::Up);
+        // A probe that finds the server gone.
+        r.fake.fail_next(Op::StatusServer, HerdrError::Timeout);
+        r.at(12);
+        assert_eq!(link(&r), HerdrLink::Down);
+    }
+
+    #[test]
+    fn the_link_reads_starting_until_the_first_probe_answers() {
+        let mut r = Rig::with_engine(FakeHeadroom::constant(plenty()));
+        // The first probe fails before anything was cached: still starting.
+        r.fake.fail_next(Op::StatusServer, HerdrError::Timeout);
+        r.at(0);
+        assert!(r.cache.lock().unwrap().server.is_none());
+        assert_eq!(link(&r), HerdrLink::Starting);
+        assert_eq!(agent_lists(&r), 0);
+        // A probe answers: up.
+        r.at(10);
+        assert_eq!(link(&r), HerdrLink::Up);
+    }
+
+    #[test]
+    fn a_failed_agent_list_reaches_the_watchdog() {
+        let mut r = Rig::with_engine(FakeHeadroom::constant(plenty()));
+        // No server process to be seen: a timeout counts.
+        *r.pid.lock().unwrap() = None;
+        r.fake.fail_next(Op::AgentList, HerdrError::Timeout);
+        r.at(0);
+        assert_eq!(agent_lists(&r), 1);
+        assert!(!r.engine().is_ready(), "no snapshot taken");
+        r.watchdog.report_probe(&Err(HerdrError::Timeout), false);
+        assert!(r.deaths.try_recv().is_err());
+        // The third consecutive failure declares the server dead, so the agent
+        // list's timeout was counted.
+        r.watchdog.report_probe(&Err(HerdrError::Timeout), false);
+        assert!(r.deaths.try_recv().is_ok());
+    }
+
+    #[test]
+    fn engine_snapshot_matches_by_pane_id_and_skips_other_generations() {
+        let mut r = Rig::with_engine(FakeHeadroom::constant(plenty()));
+        let old = r
+            .fake
+            .add_pane("/repos/old", Some(("claude", session("sess-0"))));
+        record(&r, "old", &old, "/repos/old");
+        r.keymap.note_death_bump();
+        let pane = r
+            .fake
+            .add_pane("/repos/wt", Some(("codex", session("sess-1"))));
+        record(&r, "wt", &pane, "/repos/wt");
+        r.fake.set_agent_status(&pane.pane_id, "working");
+        let shell = r.fake.add_pane("/repos/sh", None);
+        record(&r, "sh", &shell, "/repos/sh");
+        r.at(0);
+
+        let views = r.engine().views("p");
+        assert!(views.ready);
+        let mut names: Vec<&str> = views.views.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["sh", "wt"],
+            "the older generation's key is left out"
+        );
+        let wt = &views.views["wt"];
+        assert_eq!(wt.state, "busy");
+        assert_eq!(wt.agent_kind.as_deref(), Some("codex"));
+        assert_eq!(wt.pane_id.as_deref(), Some(pane.pane_id.as_str()));
+        assert_eq!(wt.agent_session.as_deref(), Some("sess-1"));
+        assert_eq!(wt.last_change_at, WALL_T0);
+        assert_eq!(views.views["sh"].state, "offline");
+    }
+
+    #[test]
+    fn engine_snapshot_is_pure_over_the_keymap_entries() {
+        let pane = |id: &str, generation: u64| HerdrPane {
+            workspace_id: "w".into(),
+            pane_id: id.into(),
+            terminal_id: format!("t-{id}"),
+            gen: 1,
+            cwd: "/repos/wt".into(),
+            server_generation: Generation(generation),
+        };
+        let reserved = SessionKey {
+            project: SessionKey::RESERVED_PROJECT.into(),
+            worktree: "util".into(),
+        };
+        let entries = vec![
+            (key("a"), pane("w:1", 2)),
+            (key("b"), pane("w:2", 1)),
+            (key("c"), pane("w:3", 2)),
+            (reserved, pane("w:4", 2)),
+        ];
+        let info = |id: &str| AgentInfo {
+            pane_id: id.into(),
+            terminal_id: format!("t-{id}"),
+            agent: Some("claude".into()),
+            agent_status: "idle".into(),
+            launch_pending: false,
+            interactive_ready: Some(true),
+            screen_detection_skipped: false,
+            completion_seq: Some(4),
+            state_change_seq: 9,
+            agent_session: None,
+            revision: 0,
+            name: None,
+            cwd: None,
+        };
+        let at = Instant::now();
+        let snap = engine_snapshot(
+            &entries,
+            Generation(2),
+            &[info("w:1"), info("w:2"), info("w:4")],
+            at,
+            WALL_T0,
+        );
+        assert_eq!(snap.generation, Generation(2));
+        assert_eq!(snap.at_ms, WALL_T0);
+        let keys: Vec<(&str, Option<&str>)> = snap
+            .keys
+            .iter()
+            .map(|(k, o)| (k.worktree.as_str(), o.as_ref().map(|o| o.pane_id.as_str())))
+            .collect();
+        assert_eq!(keys, [("a", Some("w:1")), ("c", None)]);
+        assert_eq!(snap.keys[0].1.as_ref().unwrap().state_change_seq, 9);
     }
 
     #[test]

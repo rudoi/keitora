@@ -130,6 +130,8 @@ struct FakeState {
     rediscoveries: u32,
     agent_scripts: VecDeque<AgentStartScript>,
     pane_get_scripts: VecDeque<PaneGetScript>,
+    /// What `integration_status` answers, by target (`Installed` when unset).
+    integration_status: HashMap<String, IntegrationStatus>,
     /// Exit of each server process by pid, once it has exited.
     exits: HashMap<u32, ExitInfo>,
     /// Server processes whose exit was collected (`wait`, or `try_wait`
@@ -157,6 +159,19 @@ struct FakeState {
     bridge_kill_hook: Option<CallHook>,
     /// What `status_server` reports as the running server's version and protocol.
     server_version: (Option<String>, Option<u64>),
+    /// `agent list` fields beyond what a [`PaneIdentity`] carries, by pane id; a
+    /// pane without an entry reports the defaults.
+    agent_fields: HashMap<String, FakeAgentFields>,
+}
+
+/// The per-pane `agent list` state the fake reports and tests set.
+#[derive(Clone, Debug, Default)]
+struct FakeAgentFields {
+    launch_pending: bool,
+    interactive_ready: Option<bool>,
+    completion_seq: Option<u64>,
+    state_change_seq: u64,
+    screen_detection_skipped: bool,
 }
 
 /// A test callback attached to one op.
@@ -263,6 +278,11 @@ impl FakeState {
             .ok_or_else(|| pane_not_found(pane_id))
     }
 
+    /// The `agent list` fields of `pane_id`, created with defaults on first use.
+    fn agent_fields_mut(&mut self, pane_id: &str) -> &mut FakeAgentFields {
+        self.agent_fields.entry(pane_id.to_string()).or_default()
+    }
+
     /// The live pane (other than `except`) currently holding agent `name`.
     fn name_holder(&self, name: &str, except: &str) -> Option<PaneIdentity> {
         let id = self.names.get(name).filter(|id| *id != except)?;
@@ -319,6 +339,8 @@ impl FakeState {
         self.running = true;
         let old = std::mem::take(&mut self.panes);
         let old_names = std::mem::take(&mut self.names);
+        // A new server starts its agent counters afresh.
+        self.agent_fields.clear();
         self.next_workspace = 0;
         for p in old {
             let old_id = p.pane_id.clone();
@@ -397,6 +419,7 @@ impl FakeHerdr {
                     rediscoveries: 0,
                     agent_scripts: VecDeque::new(),
                     pane_get_scripts: VecDeque::new(),
+                    integration_status: HashMap::new(),
                     exits: HashMap::new(),
                     reaped: HashSet::new(),
                     bridges: HashMap::new(),
@@ -412,6 +435,7 @@ impl FakeHerdr {
                         Some(crate::deps::floor::HERDR_FLOOR.to_string()),
                         Some(crate::deps::floor::HERDR_PROTOCOL),
                     ),
+                    agent_fields: HashMap::new(),
                 }),
                 exited: Condvar::new(),
                 input: Condvar::new(),
@@ -491,9 +515,11 @@ impl FakeHerdr {
         self.state().process_names.insert(pid, name.to_string());
     }
 
-    /// Simulate the agent exiting in (or returning to) its shell.
+    /// Simulate the agent exiting in (or returning to) its shell. A return
+    /// counts as a state change (bumps `state_change_seq`).
     pub fn set_agent_present(&self, pane_id: &str, present: bool) {
-        if let Ok(p) = self.state().pane_mut(pane_id) {
+        let mut st = self.state();
+        if let Ok(p) = st.pane_mut(pane_id) {
             if present {
                 let kind = p
                     .agent_session
@@ -502,11 +528,51 @@ impl FakeHerdr {
                     .unwrap_or_else(|| "claude".into());
                 p.agent = Some(kind);
                 p.agent_status = Some("idle".into());
+                st.agent_fields_mut(pane_id).state_change_seq += 1;
             } else {
                 p.agent = None;
                 p.agent_status = None;
             }
         }
+    }
+
+    /// Set the agent status herdr reports for `pane_id`; a different status
+    /// bumps `state_change_seq` by one.
+    pub fn set_agent_status(&self, pane_id: &str, status: &str) {
+        let mut st = self.state();
+        if let Ok(p) = st.pane_mut(pane_id) {
+            if p.agent_status.as_deref() != Some(status) {
+                p.agent_status = Some(status.to_string());
+                st.agent_fields_mut(pane_id).state_change_seq += 1;
+            }
+        }
+    }
+
+    /// Set (or clear) the `completion_seq` herdr reports for `pane_id`.
+    pub fn set_completion_seq(&self, pane_id: &str, seq: Option<u64>) {
+        self.state().agent_fields_mut(pane_id).completion_seq = seq;
+    }
+
+    /// Set the `state_change_seq` herdr reports for `pane_id`.
+    pub fn set_state_change_seq(&self, pane_id: &str, seq: u64) {
+        self.state().agent_fields_mut(pane_id).state_change_seq = seq;
+    }
+
+    /// Set whether herdr reports `pane_id`'s agent launch as still pending.
+    pub fn set_launch_pending(&self, pane_id: &str, pending: bool) {
+        self.state().agent_fields_mut(pane_id).launch_pending = pending;
+    }
+
+    /// Set (or clear) whether herdr reports `pane_id`'s agent as ready for input.
+    pub fn set_interactive_ready(&self, pane_id: &str, ready: Option<bool>) {
+        self.state().agent_fields_mut(pane_id).interactive_ready = ready;
+    }
+
+    /// Set whether herdr reports screen detection as skipped for `pane_id`.
+    pub fn set_screen_detection_skipped(&self, pane_id: &str, skipped: bool) {
+        self.state()
+            .agent_fields_mut(pane_id)
+            .screen_detection_skipped = skipped;
     }
 
     /// What `server_instance` reports while the server runs.
@@ -623,6 +689,13 @@ impl FakeHerdr {
     /// Outcomes of the next `agent start` calls (FIFO; `Ok` once exhausted).
     pub fn script_agent_start(&self, results: Vec<AgentStartScript>) {
         self.state().agent_scripts.extend(results);
+    }
+
+    /// Make `integration_status` answer `status` for `target`.
+    pub fn set_integration_status(&self, target: &str, status: IntegrationStatus) {
+        self.state()
+            .integration_status
+            .insert(target.to_string(), status);
     }
 
     /// Answers of the next `pane_get` calls (FIFO; `Live` once exhausted).
@@ -894,6 +967,7 @@ impl HerdrOps for FakeHerdr {
             .position(|p| p.pane_id == pane_id)
             .ok_or_else(|| pane_not_found(pane_id))?;
         let pane = st.panes.remove(idx);
+        st.agent_fields.remove(&pane.pane_id);
         st.closed.push(pane.pane_id.clone());
         let freed: Vec<String> = st
             .names
@@ -1087,28 +1161,42 @@ impl HerdrOps for FakeHerdr {
             .panes
             .iter()
             .filter(|p| p.agent.is_some())
-            .map(|p| AgentInfo {
-                name: st
-                    .names
-                    .iter()
-                    .find(|(_, id)| **id == p.pane_id)
-                    .map(|(n, _)| n.clone()),
-                cwd: p.cwd.clone(),
-                pane_id: p.pane_id.clone(),
-                agent: p.agent.clone(),
-                agent_status: p.agent_status.clone().unwrap_or_else(|| "unknown".into()),
-                launch_pending: false,
+            .map(|p| {
+                let extra = st.agent_fields.get(&p.pane_id).cloned().unwrap_or_default();
+                AgentInfo {
+                    name: st
+                        .names
+                        .iter()
+                        .find(|(_, id)| **id == p.pane_id)
+                        .map(|(n, _)| n.clone()),
+                    cwd: p.cwd.clone(),
+                    pane_id: p.pane_id.clone(),
+                    agent: p.agent.clone(),
+                    terminal_id: p.terminal_id.clone(),
+                    agent_status: p.agent_status.clone().unwrap_or_else(|| "unknown".into()),
+                    launch_pending: extra.launch_pending,
+                    interactive_ready: extra.interactive_ready,
+                    screen_detection_skipped: extra.screen_detection_skipped,
+                    completion_seq: extra.completion_seq,
+                    state_change_seq: extra.state_change_seq,
+                    agent_session: p.agent_session.clone(),
+                    revision: 0,
+                }
             })
             .collect())
     }
 
-    /// Integrations need no server; always reported installed.
+    /// Integrations need no server; reported installed unless set otherwise.
     fn integration_status(&self, target: &str) -> Result<IntegrationStatus, HerdrError> {
         let mut st = self.state();
         st.record(Op::IntegrationStatus, target.to_string());
         match st.scripted(Op::IntegrationStatus) {
             Some(e) => Err(e),
-            None => Ok(IntegrationStatus::Installed),
+            None => Ok(st
+                .integration_status
+                .get(target)
+                .copied()
+                .unwrap_or(IntegrationStatus::Installed)),
         }
     }
 
@@ -1850,5 +1938,88 @@ mod tests {
             fake.spawn_server().err().map(|e| e.kind()),
             Some(std::io::ErrorKind::OutOfMemory)
         );
+    }
+
+    #[test]
+    fn agent_list_reports_default_agent_fields() {
+        let fake = FakeHerdr::new();
+        let p = fake.add_pane("/repos/alpha", Some(("claude", session("claude", "s1"))));
+        let a = &fake.agent_list().unwrap()[0];
+        assert_eq!(a.terminal_id, p.terminal_id);
+        assert_eq!(a.agent_session, Some(session("claude", "s1")));
+        assert!(!a.launch_pending);
+        assert_eq!(a.interactive_ready, None);
+        assert!(!a.screen_detection_skipped);
+        assert_eq!(a.completion_seq, None);
+        assert_eq!(a.state_change_seq, 0);
+        assert_eq!(a.revision, 0);
+    }
+
+    #[test]
+    fn agent_field_setters_show_in_agent_list() {
+        let fake = FakeHerdr::new();
+        let p = fake.add_pane("/repos/alpha", Some(("claude", session("claude", "s1"))));
+        fake.set_launch_pending(&p.pane_id, true);
+        fake.set_interactive_ready(&p.pane_id, Some(false));
+        fake.set_completion_seq(&p.pane_id, Some(4));
+        fake.set_state_change_seq(&p.pane_id, 9);
+        fake.set_screen_detection_skipped(&p.pane_id, true);
+        let a = &fake.agent_list().unwrap()[0];
+        assert!(a.launch_pending);
+        assert_eq!(a.interactive_ready, Some(false));
+        assert_eq!(a.completion_seq, Some(4));
+        assert_eq!(a.state_change_seq, 9);
+        assert!(a.screen_detection_skipped);
+        fake.set_completion_seq(&p.pane_id, None);
+        assert_eq!(fake.agent_list().unwrap()[0].completion_seq, None);
+    }
+
+    #[test]
+    fn set_agent_status_bumps_state_change_seq_only_on_a_change() {
+        let fake = FakeHerdr::new();
+        let p = fake.add_pane("/repos/alpha", Some(("claude", session("claude", "s1"))));
+        let scs = |f: &FakeHerdr| f.agent_list().unwrap()[0].state_change_seq;
+        fake.set_agent_status(&p.pane_id, "working");
+        assert_eq!(fake.agent_list().unwrap()[0].agent_status, "working");
+        assert_eq!(scs(&fake), 1);
+        fake.set_agent_status(&p.pane_id, "working");
+        assert_eq!(scs(&fake), 1, "same status is not a change");
+        fake.set_agent_status(&p.pane_id, "idle");
+        assert_eq!(scs(&fake), 2);
+        fake.set_state_change_seq(&p.pane_id, 10);
+        fake.set_agent_status(&p.pane_id, "blocked");
+        assert_eq!(scs(&fake), 11);
+        // An unknown pane is ignored.
+        fake.set_agent_status("w9:p9", "working");
+    }
+
+    #[test]
+    fn set_agent_present_bumps_state_change_seq_on_return() {
+        let fake = FakeHerdr::new();
+        let p = fake.add_pane("/repos/alpha", Some(("claude", session("claude", "s1"))));
+        fake.set_agent_present(&p.pane_id, false);
+        assert!(fake.agent_list().unwrap().is_empty());
+        fake.set_agent_present(&p.pane_id, true);
+        assert_eq!(fake.agent_list().unwrap()[0].state_change_seq, 1);
+        fake.set_agent_present(&p.pane_id, true);
+        assert_eq!(fake.agent_list().unwrap()[0].state_change_seq, 2);
+    }
+
+    #[test]
+    fn closing_a_pane_or_restarting_drops_its_agent_fields() {
+        let fake = FakeHerdr::new();
+        let p = fake.add_pane("/repos/alpha", Some(("claude", session("claude", "s1"))));
+        fake.set_completion_seq(&p.pane_id, Some(3));
+        fake.pane_close(&p.pane_id).unwrap();
+        assert!(fake.state().agent_fields.is_empty());
+
+        fake.set_restore_mode(RestoreMode::Agents);
+        let q = fake.add_pane("/repos/bravo", Some(("claude", session("claude", "s2"))));
+        fake.set_state_change_seq(&q.pane_id, 5);
+        fake.kill_server(Some(1));
+        fake.spawn_server().unwrap();
+        let a = &fake.agent_list().unwrap()[0];
+        assert_eq!(a.state_change_seq, 0);
+        assert_eq!(a.completion_seq, None);
     }
 }

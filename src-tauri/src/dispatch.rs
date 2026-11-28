@@ -12,7 +12,8 @@
 //! reserved (the board, not the request table, is the queue).
 //!
 //! The IPC-facing command is thin; the testable core is pure functions:
-//! `decide` (dispatch-vs-queue), `render_steps` (the ritual lines),
+//! `dispatch_gate` (the engine's send gate, read for dispatch), `render_steps` (the
+//! ritual lines),
 //! `injection_outcome` (the write result → audit decision), and for requests
 //! `request_refusal` (the lane rule) and `request_outcome` (result → row status).
 
@@ -25,9 +26,11 @@ use keitora_tasks::dispatch::{interpolate, DispatchContext};
 use keitora_tasks::{CliKind, DispatchConfig, ReserveOutcome};
 
 use crate::backend::{
-    agent_hints, map_write_line_result, PtyBackend, PtyBackendError, SessionKey, SharedBackend,
-    WriteLineOutcome,
+    map_write_line_result, PtyBackend, PtyBackendError, SessionKey, SharedBackend, WriteLineOutcome,
 };
+use crate::drive::{DriveRuntime, SEND_SETTLE_TIMEOUT};
+use crate::engine::gate::{self, Hold, Verdict};
+use crate::engine::{ProjectViews, SessionEngine, SharedEngine};
 use crate::transfer_registry::TransferRegistry;
 
 /// Serializes `dispatch_apply` so its idempotency check, reserve, PTY inject, and
@@ -52,22 +55,61 @@ pub struct DispatchOutcome {
     pub reason: Option<String>,
 }
 
-/// The dispatch-vs-defer decision (internal; never crosses IPC).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Decision {
-    Dispatched,
-    Queued,
+/// What dispatch may do with a worktree now: the engine's send gate (the one drive
+/// sends use), read for dispatch. Only `Go` injects; a board drag queues on anything
+/// else and a request is refused (internal; never crosses IPC).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Gate {
+    /// A fresh, settled, input-ready idle agent with no send still settling.
+    Go,
+    /// A fresh view that is not idle (`busy`, `waiting` or `offline`).
+    NotIdle(String),
+    /// herdr's answer is stale or missing; names the link.
+    Stale(&'static str),
+    /// The agent is starting, settling, or still taking a send just typed into it.
+    NotReady(Hold),
 }
 
-/// Pure: dispatch (inject now) iff the worktree is idle AND we hold a live PTY for
-/// it; otherwise queue (reserve only). Encodes the safety rule "never write into a
-/// busy PTY" — the only state we ever inject into is a live, idle session.
-fn decide(state: &str, has_live_pty: bool) -> Decision {
-    if state == "idle" && has_live_pty {
-        Decision::Dispatched
-    } else {
-        Decision::Queued
+/// Pure: the [`Gate`] for `worktree` from the project's engine `views`. A worktree
+/// outside a non-empty `configured` list has no session dispatch can see (offline).
+/// `settling` says whether a send just typed into the view still holds it.
+fn dispatch_gate(
+    views: &ProjectViews,
+    worktree: &str,
+    configured: &[String],
+    settling: impl FnOnce(&keitora_tasks::StatusSession) -> bool,
+) -> Gate {
+    if unknown_worktree_refusal(worktree, configured).is_some() {
+        return Gate::NotIdle("offline".to_string());
     }
+    match gate::send_gate(views, worktree, settling) {
+        Verdict::Go => Gate::Go,
+        Verdict::Wait(hold) if hold.is_stale() => Gate::Stale(views.link.as_str()),
+        Verdict::Wait(hold) => Gate::NotReady(hold),
+        Verdict::Refuse(r) => Gate::NotIdle(r.state().to_string()),
+    }
+}
+
+/// Input reached `key`'s pane: hold the worktree until its turn is seen starting
+/// (herdr's `state_change_seq` moves off the one in `views`), exactly as a drive send
+/// does, so later drive sends and dispatches wait for it; and poll hot until the next
+/// snapshot.
+fn note_dispatch_delivery(
+    engine: &SessionEngine,
+    drive: Option<&DriveRuntime>,
+    key: &SessionKey,
+    views: &ProjectViews,
+) {
+    let baseline = views
+        .views
+        .get(&key.worktree)
+        .and_then(|v| v.state_change_seq)
+        .and_then(|s| u64::try_from(s).ok())
+        .unwrap_or(0);
+    if let Some(rt) = drive {
+        rt.mark_sent(&key.project, &key.worktree, 0, baseline);
+    }
+    engine.note_delivery(key);
 }
 
 /// Pure: map the AUTHORITATIVE final `write_line` outcome (D6) of a dispatch's
@@ -257,8 +299,10 @@ pub async fn dispatch_apply(
     worktree: String,
     task_id: i64,
     client: State<'_, SharedBackend>,
+    engine: State<'_, SharedEngine>,
     gate: State<'_, DispatchGate>,
     registry: State<'_, TransferRegistry>,
+    drive: State<'_, DriveRuntime>,
 ) -> Result<DispatchOutcome, String> {
     apply(
         &worktree,
@@ -266,8 +310,10 @@ pub async fn dispatch_apply(
         ApplyMode::Board,
         None,
         client.inner(),
+        engine.inner(),
         &gate,
         &registry,
+        Some(drive.inner()),
     )
     .await
 }
@@ -276,14 +322,17 @@ pub async fn dispatch_apply(
 /// ([`run_dispatch_requests`]) so both go through one gate, one reserve, one
 /// inject and one audit log. `project` is the project to dispatch in; `None` means
 /// the active one (the board's).
+#[allow(clippy::too_many_arguments)] // the command's managed state, passed through
 async fn apply(
     worktree: &str,
     task_id: i64,
     mode: ApplyMode,
     project: Option<keitora_tasks::ProjectConfig>,
     client: &SharedBackend,
+    engine: &SessionEngine,
     gate: &DispatchGate,
     registry: &TransferRegistry,
+    drive: Option<&DriveRuntime>,
 ) -> Result<DispatchOutcome, String> {
     let worktree = worktree.to_string();
     // Hold the dispatch gate for the whole command so the guard-check → reserve →
@@ -304,32 +353,22 @@ async fn apply(
         return Err(reason);
     }
 
-    // Live state via the shared reconciled view, so the idle rule matches
-    // `sessions_list`. `decide` is a pre-filter on the idle rule;
-    // the AUTHORITATIVE liveness check is the daemon's `write_line` result below
-    // (D6). A reconciled non-`offline` session is one the daemon holds live, so we
-    // feed `state != "offline"` for `has_live_pty` — but the daemon is the final
-    // word on whether the write actually landed. Read before the reserve, so a
-    // failure here is an `Err` with nothing reserved.
-    // Reuse the `config` already resolved by `open_backend` for both the project
-    // name and the LocalStore open inside `reconciled_sessions` (FIX 6).
+    // Live state via the engine's send gate, the one drive sends use: only a fresh,
+    // settled, input-ready idle agent that no send is still settling into is injected
+    // into. The backend's `write_line` result below stays the final word on whether
+    // the write landed. Read before the reserve, so nothing is reserved on a refusal.
     let project = config.project.name.clone();
-    let live = client.live_set_snapshot();
-    let hints = agent_hints(client.as_ref()); // on-demand, exact; empty on RPC error
-    let sessions = crate::tasks::reconciled_sessions(&live, &hints, &project, &config)?;
-    let state = sessions
-        .iter()
-        .find(|s| s.worktree == worktree)
-        .map(|s| s.state.clone())
-        .unwrap_or_else(|| "offline".to_string());
-    let has_live_pty = state != "offline";
+    let views = engine.views(&project);
+    let state = dispatch_gate(&views, &worktree, &config.worktrees(), |view| {
+        drive.is_some_and(|rt| rt.send_settling(&project, &worktree, view, SEND_SETTLE_TIMEOUT))
+    });
 
     // Request mode: refuse up front, and note whether the task was already reserved
     // here (a card queued on this lane), so a failed inject leaves it as it was.
     let mut reserved_before = false;
     if mode == ApplyMode::Request {
         let twd = backend.get(task_id).await.map_err(|e| e.to_string())?;
-        if let Some(reason) = request_refusal(
+        if let Some(reason) = gated_request_refusal(
             twd.as_ref(),
             task_id,
             &worktree,
@@ -364,21 +403,16 @@ async fn apply(
 
     // Why an inject sent nothing, for a request's refusal reason.
     let mut inject_detail = String::new();
-    let mut outcome = match decide(&state, has_live_pty) {
-        Decision::Dispatched => {
+    let mut outcome = match state {
+        Gate::Go => {
             let ctx = DispatchContext {
                 task: &task,
                 worktree: &worktree,
             };
             // Resolve the target worktree's CLI so the injected ritual matches it:
             // worktree entry `cli` → user `default_cli` →
-            // `CliKind::Claude`. Dispatching INTO a Codex worktree is safe here
-            // specifically because `decide` above already gated this branch on
-            // idle + live state, and stage 030 landed Codex's own liveness signal
-            // (`.codex/hooks.json`) — before 030, a Codex worktree's reconciled
-            // state was always Claude-hook-derived (never meaningfully idle+live),
-            // so this injection path was effectively unreachable for Codex until
-            // that liveness signal landed.
+            // `CliKind::Claude`. The gate above already held this branch to a
+            // settled, input-ready idle agent, whichever CLI it runs.
             let user = keitora_tasks::UserConfig::load().unwrap_or_default();
             let entry = config.worktree_entry(&worktree);
             let resolved_cli = keitora_tasks::resolve_cli(entry.as_ref(), &user);
@@ -416,6 +450,9 @@ async fn apply(
             let detail = injection_detail(&result, terminated);
             let (decision, outcome) =
                 injection_outcome(map_write_line_result(&result), sent_any, &worktree, &detail);
+            if outcome.dispatched {
+                note_dispatch_delivery(engine, drive, &key, &views);
+            }
             // Best-effort audit: a failed log must not flip us to Err (which would
             // prompt a re-inject of an already-dispatched task).
             let _ = backend
@@ -424,7 +461,7 @@ async fn apply(
             inject_detail = detail;
             outcome
         }
-        Decision::Queued => {
+        Gate::NotIdle(_) | Gate::Stale(_) | Gate::NotReady(_) => {
             // Best-effort audit, matching the Dispatched branch: the task is already
             // reserved, so a failed log must NOT flip us to Err (a retried
             // dispatch_apply would re-reserve / re-inject). never-Err-after-reserve.
@@ -480,6 +517,42 @@ fn request_refusal(
         .or_else(|| keitora_tasks::dispatch::session_refusal(state, worktree))
 }
 
+/// Pure: [`request_refusal`] against the dispatch [`Gate`]. A stale gate (herdr's
+/// answer is old or missing) or an agent not ready for input is refused as such
+/// rather than by its last known state; the task's own refusals still come first.
+fn gated_request_refusal(
+    task: Option<&keitora_tasks::TaskWithDeps>,
+    task_id: i64,
+    worktree: &str,
+    configured: &[String],
+    gate: &Gate,
+) -> Option<String> {
+    let state = match gate {
+        Gate::NotIdle(state) => state.as_str(),
+        Gate::Go | Gate::Stale(_) | Gate::NotReady(_) => "idle",
+    };
+    request_refusal(task, task_id, worktree, configured, state).or_else(|| match gate {
+        Gate::Stale(link) => Some(format!(
+            "@{worktree}: herdr status is stale ({link}); try again shortly"
+        )),
+        Gate::NotReady(hold) => Some(format!(
+            "@{worktree} is not ready for input yet ({}); try again shortly",
+            not_ready_why(*hold)
+        )),
+        Gate::Go | Gate::NotIdle(_) => None,
+    })
+}
+
+/// Pure: a request's words for an agent the send gate holds.
+fn not_ready_why(hold: Hold) -> &'static str {
+    match hold {
+        Hold::Starting => "starting",
+        Hold::Unsettled => "settling",
+        Hold::SendSettling => "a send to it is still settling",
+        Hold::Link(_) | Hold::FirstSnapshot | Hold::Stale => "herdr status is stale",
+    }
+}
+
 /// Pure: `Some(reason)` when `worktree` is not one of the project's `configured`
 /// worktrees. An empty list doesn't restrict, matching how `reconciled_sessions`
 /// scopes. Shared by dispatch and drive requests so both word it the same.
@@ -531,35 +604,18 @@ fn request_outcome(result: &Result<DispatchOutcome, String>) -> (&'static str, S
     }
 }
 
-/// If `local` (the DB of registered project `project`) holds pending CLI dispatch
-/// requests, start [`run_dispatch_requests`] for it; if it holds pending drive
-/// requests, start [`crate::drive::run_drive_requests`]. Called from the tasks-DB
-/// watchers on each debounced write; cheap indexed reads when there are none.
-pub(crate) fn spawn_pending_requests<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    local: &keitora_tasks::LocalStore,
-    project: &str,
-) {
-    let has_pending = local
-        .dispatch_requests_pending()
-        .is_ok_and(|p| !p.is_empty());
-    if has_pending {
-        tauri::async_runtime::spawn(run_dispatch_requests(app.clone(), project.to_string()));
-    }
-    let has_drive = local.drive_requests_pending().is_ok_and(|p| !p.is_empty());
-    if has_drive {
-        tauri::async_runtime::spawn(crate::drive::run_drive_requests(
-            app.clone(),
-            project.to_string(),
-        ));
-    }
+/// Whether `local` holds pending dispatch or drive requests: the engine polls hot for
+/// the project while so. Reads only `status`.
+pub(crate) fn has_pending_requests(local: &keitora_tasks::LocalStore) -> bool {
+    local.dispatch_requests_has_pending().unwrap_or(false)
+        || local.drive_requests_has_pending().unwrap_or(false)
 }
 
 /// Execute `project`'s pending CLI dispatch requests (`keitora task dispatch`),
 /// oldest first, each through [`apply`] in request mode, and record each outcome on
-/// its row. `project` is a resolved `[project].name` from the app's registry; the
-/// tasks-DB watchers call this when they see a pending row in that project's DB (the
-/// active project's watcher, and each registered project's background watcher).
+/// its row. `project` is a resolved `[project].name` from the app's registry; a
+/// requested pass runs this (see `crate::pipeline`) when that project's DB holds a
+/// pending row.
 ///
 /// Safe to run concurrently with itself and with board dispatches: each request is
 /// taken with a compare-and-set (`dispatch_request_begin`), so it executes once,
@@ -570,13 +626,15 @@ pub(crate) async fn run_dispatch_requests<R: tauri::Runtime>(
 ) {
     use tauri::Manager;
 
-    let (Some(client), Some(gate), Some(registry)) = (
+    let (Some(client), Some(engine), Some(gate), Some(registry)) = (
         app.try_state::<SharedBackend>(),
+        app.try_state::<SharedEngine>(),
         app.try_state::<DispatchGate>(),
         app.try_state::<TransferRegistry>(),
     ) else {
         return; // still starting up; the next DB event retries
     };
+    let drive = app.try_state::<DriveRuntime>();
     let Some(config) = keitora_tasks::UserConfig::load()
         .ok()
         .and_then(|u| u.project_config_by_name(&project))
@@ -604,6 +662,8 @@ pub(crate) async fn run_dispatch_requests<R: tauri::Runtime>(
             return;
         }
     };
+    // Poll hot while the project has requests; re-read once they are served.
+    engine.set_pending(&project, has_pending_requests(&local));
     for req in pending {
         match local.dispatch_request_begin(req.id) {
             Ok(true) => {}
@@ -619,8 +679,10 @@ pub(crate) async fn run_dispatch_requests<R: tauri::Runtime>(
             ApplyMode::Request,
             Some(config.clone()),
             client.inner(),
+            engine.inner(),
             &gate,
             &registry,
+            drive.as_ref().map(|d| d.inner()),
         )
         .await;
         let (status, reason) = request_outcome(&result);
@@ -635,6 +697,7 @@ pub(crate) async fn run_dispatch_requests<R: tauri::Runtime>(
             log::warn!("dispatch request {}: cannot record outcome: {e}", req.id);
         }
     }
+    engine.set_pending(&project, has_pending_requests(&local));
 }
 
 /// `Some(error)` when `worktree` of `project` is mid-transfer or mid-switch;
@@ -817,95 +880,219 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decide_truth_table() {
-        // Only idle + live PTY dispatches; everything else queues.
-        assert_eq!(decide("idle", true), Decision::Dispatched);
-        assert_eq!(decide("idle", false), Decision::Queued);
-        assert_eq!(decide("busy", true), Decision::Queued);
-        assert_eq!(decide("waiting", true), Decision::Queued);
-        assert_eq!(decide("offline", true), Decision::Queued);
-        assert_eq!(decide("offline", false), Decision::Queued);
+    fn gate_of(views: &ProjectViews) -> Gate {
+        dispatch_gate(views, "alpha", &[], |_| false)
     }
 
-    /// Gate test: a session that is `idle` per the DB but carrying a busy agent
-    /// hint reconciles to `busy`, and `decide("busy", true)` returns `Queued` — so
-    /// the dispatcher never injects into a session running background work.
+    /// An engine view of `worktree` in `state`: settled and ready for input when idle.
+    fn view(worktree: &str, state: &str, stale: bool) -> keitora_tasks::StatusSession {
+        keitora_tasks::StatusSession {
+            project: "proj".to_string(),
+            worktree: worktree.to_string(),
+            state: state.to_string(),
+            agent: if state == "offline" {
+                "absent"
+            } else {
+                "present"
+            }
+            .to_string(),
+            agent_kind: None,
+            herdr_status: None,
+            settled: true,
+            stale,
+            interactive_ready: None,
+            pane_id: None,
+            terminal_id: None,
+            agent_session: None,
+            state_change_seq: None,
+            completion_seq: None,
+            brokered: false,
+            escalated_reason: None,
+            last_change_at: 0,
+        }
+    }
+
+    fn views_of(
+        ready: bool,
+        link: crate::engine::HerdrLink,
+        v: Option<keitora_tasks::StatusSession>,
+    ) -> ProjectViews {
+        ProjectViews {
+            ready,
+            link,
+            views: v.map(|v| (v.worktree.clone(), v)).into_iter().collect(),
+        }
+    }
+
+    fn up(v: keitora_tasks::StatusSession) -> ProjectViews {
+        views_of(true, crate::engine::HerdrLink::Up, Some(v))
+    }
+
+    /// A session herdr reports working reads `busy` and is never injected into, so the
+    /// dispatcher never writes into a session running background work.
     #[test]
     fn idle_with_background_task_gates_dispatch() {
-        use crate::backend::{apply_reconcile, HintMap, SessionKey, HINT_BUSY};
-        use keitora_tasks::WorktreeSession;
-        use std::collections::HashSet;
-
-        // Build a session that the DB reports as idle.
-        let session = WorktreeSession {
-            project: String::new(),
-            worktree: "sayo".to_string(),
-            state: "idle".to_string(),
-            current_task_id: Some(5),
-            pid: Some(9999),
-            last_heartbeat: "2026-06-22T00:00:00Z".to_string(),
-            driven_by: None,
-            brokered: false,
-            escalated_reason: None,
-        };
-
-        let key = SessionKey {
-            project: "proj".to_string(),
-            worktree: "sayo".to_string(),
-        };
-
-        // Session is live (present in the daemon live-set) …
-        let mut live: HashSet<SessionKey> = HashSet::new();
-        live.insert(key.clone());
-
-        // … and the daemon reports it is running a background task.
-        let hints = HintMap::from([(key.clone(), HINT_BUSY.to_string())]);
-
-        // Override: idle + busy hint in live-set → busy.
-        let reconciled = apply_reconcile(&[session], &live, &hints, "proj");
         assert_eq!(
-            reconciled[0].state, "busy",
-            "idle+bg session must reconcile to busy"
-        );
-
-        // Gate: busy → Queued, so the dispatcher never injects.
-        assert_eq!(
-            decide("busy", true),
-            Decision::Queued,
-            "decide must queue a busy session even with a live PTY"
+            gate_of(&up(view("alpha", "busy", false))),
+            Gate::NotIdle("busy".into())
         );
     }
 
-    /// A session `idle` in the DB whose agent herdr reports `blocked` (a waiting
-    /// hint) reconciles to `waiting`, which `decide` treats as not idle.
+    /// A session whose agent herdr reports `blocked` reads `waiting`: not idle.
     #[test]
     fn dispatch_refuses_a_blocked_lane() {
-        use crate::backend::{apply_reconcile, HintMap, SessionKey, HINT_WAITING};
-        use keitora_tasks::WorktreeSession;
-        use std::collections::HashSet;
+        assert_eq!(
+            gate_of(&up(view("alpha", "waiting", false))),
+            Gate::NotIdle("waiting".into())
+        );
+    }
 
-        let session = WorktreeSession {
-            project: String::new(),
-            worktree: "alpha".to_string(),
-            state: "idle".to_string(),
-            current_task_id: None,
-            pid: Some(9999),
-            last_heartbeat: "2026-06-22T00:00:00Z".to_string(),
-            driven_by: None,
-            brokered: false,
-            escalated_reason: None,
-        };
+    #[test]
+    fn dispatch_gates_on_idle_and_offline_views() {
+        assert_eq!(gate_of(&up(view("alpha", "idle", false))), Gate::Go);
+        assert_eq!(
+            gate_of(&up(view("alpha", "offline", false))),
+            Gate::NotIdle("offline".into())
+        );
+        // No session at all, once the engine is ready: offline.
+        assert_eq!(
+            gate_of(&views_of(true, crate::engine::HerdrLink::Up, None)),
+            Gate::NotIdle("offline".into())
+        );
+        // A worktree outside the configured list has no session dispatch can see.
+        let wts = vec!["bravo".to_string()];
+        assert_eq!(
+            dispatch_gate(&up(view("alpha", "idle", false)), "alpha", &wts, |_| false),
+            Gate::NotIdle("offline".into())
+        );
+    }
+
+    /// A delivered dispatch holds its worktree like a drive send: the next drive send
+    /// or dispatch waits for the turn to start, and the engine polls hot meanwhile.
+    #[test]
+    fn a_delivered_dispatch_holds_the_worktree_until_its_turn_starts() {
+        let engine = crate::engine::SessionEngine::new_for_test(std::sync::Arc::new(
+            crate::engine::tests::FakeEvidence::default(),
+        ));
+        let rt = DriveRuntime::default();
         let key = SessionKey {
-            project: "proj".to_string(),
-            worktree: "alpha".to_string(),
+            project: "proj".into(),
+            worktree: "alpha".into(),
         };
-        let live: HashSet<SessionKey> = HashSet::from([key.clone()]);
-        let hints = HintMap::from([(key, HINT_WAITING.to_string())]);
+        let mut idle = view("alpha", "idle", false);
+        idle.state_change_seq = Some(7);
+        let views = up(idle.clone());
+        assert_eq!(engine.mode(), crate::engine::Mode::Cold);
 
-        let reconciled = apply_reconcile(&[session], &live, &hints, "proj");
-        assert_eq!(reconciled[0].state, "waiting");
-        assert_eq!(decide(&reconciled[0].state, true), Decision::Queued);
+        note_dispatch_delivery(&engine, Some(&rt), &key, &views);
+        assert_eq!(engine.mode(), crate::engine::Mode::Hot);
+        let settling = |v: &keitora_tasks::StatusSession| {
+            rt.send_settling("proj", "alpha", v, SEND_SETTLE_TIMEOUT)
+        };
+        assert_eq!(
+            dispatch_gate(&views, "alpha", &[], settling),
+            Gate::NotReady(Hold::SendSettling),
+            "the next dispatch waits"
+        );
+        let drive_sets = crate::drive::SessionSets {
+            views: views.clone(),
+            terminated: Default::default(),
+            hooks: Default::default(),
+            at_ms: 0,
+        };
+        assert!(
+            matches!(
+                drive_sets.send_gate("alpha", false, settling),
+                crate::drive::SendGate::Wait(_)
+            ),
+            "a drive send waits too"
+        );
+        // The turn starts (state_change_seq moves): the hold ends.
+        let mut moved = idle;
+        moved.state_change_seq = Some(8);
+        assert_eq!(dispatch_gate(&up(moved), "alpha", &[], settling), Gate::Go);
+    }
+
+    /// An agent drive would make wait (starting, not settled, not ready for input, or
+    /// a send still settling into it) gets nothing injected either.
+    #[test]
+    fn dispatch_waits_wherever_a_drive_send_would() {
+        let mut starting = view("alpha", "busy", false);
+        starting.agent = "starting".into();
+        assert_eq!(gate_of(&up(starting)), Gate::NotReady(Hold::Starting));
+        let mut not_ready = view("alpha", "idle", false);
+        not_ready.interactive_ready = Some(false);
+        assert_eq!(gate_of(&up(not_ready)), Gate::NotReady(Hold::Starting));
+        let mut unsettled = view("alpha", "idle", false);
+        unsettled.settled = false;
+        assert_eq!(gate_of(&up(unsettled)), Gate::NotReady(Hold::Unsettled));
+        assert_eq!(
+            dispatch_gate(&up(view("alpha", "idle", false)), "alpha", &[], |_| true),
+            Gate::NotReady(Hold::SendSettling)
+        );
+
+        let wts = vec!["alpha".to_string()];
+        let card = open_card(None, vec![]);
+        assert_eq!(
+            gated_request_refusal(
+                Some(&card),
+                5,
+                "alpha",
+                &wts,
+                &Gate::NotReady(Hold::Unsettled)
+            ),
+            Some("@alpha is not ready for input yet (settling); try again shortly".to_string())
+        );
+        // The task's own refusals still come first.
+        assert_eq!(
+            gated_request_refusal(None, 9, "alpha", &wts, &Gate::NotReady(Hold::Starting)),
+            Some("task #9 not found".to_string())
+        );
+    }
+
+    #[test]
+    fn dispatch_treats_a_stale_session_as_not_idle() {
+        use crate::engine::HerdrLink;
+        let gate = gate_of(&up(view("alpha", "idle", true)));
+        assert_eq!(gate, Gate::Stale("up"), "a board drag queues");
+        // Before the first snapshot even a missing session is stale.
+        assert_eq!(
+            gate_of(&views_of(false, HerdrLink::Up, None)),
+            Gate::Stale("up")
+        );
+        assert_eq!(
+            gate_of(&views_of(
+                false,
+                HerdrLink::Recovering,
+                Some(view("alpha", "idle", false))
+            )),
+            Gate::Stale("recovering")
+        );
+
+        let wts = vec!["alpha".to_string()];
+        let card = open_card(None, vec![]);
+        assert_eq!(
+            gated_request_refusal(Some(&card), 5, "alpha", &wts, &Gate::Stale("recovering")),
+            Some("@alpha: herdr status is stale (recovering); try again shortly".to_string())
+        );
+        // The task's own refusals still come first.
+        assert_eq!(
+            gated_request_refusal(None, 9, "alpha", &wts, &gate),
+            Some("task #9 not found".to_string())
+        );
+        // A fresh session refuses by its state as before.
+        assert!(gated_request_refusal(
+            Some(&card),
+            5,
+            "alpha",
+            &wts,
+            &Gate::NotIdle("busy".into())
+        )
+        .is_some_and(|r| r.starts_with("@alpha is busy")));
+        assert_eq!(
+            gated_request_refusal(Some(&card), 5, "alpha", &wts, &Gate::Go),
+            None
+        );
     }
 
     fn task_fixture(id: i64, title: &str, desc: &str) -> keitora_tasks::Task {

@@ -19,6 +19,8 @@ type SleepHook = Box<dyn FnMut(u32)>;
 
 struct FakeClock {
     base: Instant,
+    /// Wall ms at `base`.
+    wall0: i64,
     t: Cell<Duration>,
     sleeps: Cell<u32>,
     /// Runs after each sleep with the sleep count (another connection's writes).
@@ -29,6 +31,7 @@ impl FakeClock {
     fn new() -> Self {
         FakeClock {
             base: Instant::now(),
+            wall0: keitora_tasks::now_ms(),
             t: Cell::new(Duration::ZERO),
             sleeps: Cell::new(0),
             hook: RefCell::new(None),
@@ -39,6 +42,9 @@ impl FakeClock {
 impl Clock for FakeClock {
     fn now(&self) -> Instant {
         self.base + self.t.get()
+    }
+    fn wall_ms(&self) -> i64 {
+        self.wall0 + self.t.get().as_millis() as i64
     }
     fn sleep(&self, d: Duration) {
         self.t.set(self.t.get() + d);
@@ -83,6 +89,11 @@ impl Env {
         LocalStore::open(&self.path).unwrap()
     }
 
+    /// Where this fixture's `status.db` lives.
+    fn status_path(&self) -> PathBuf {
+        self.dir.path().join("status.db")
+    }
+
     fn wt_dir(&self, w: &str) -> PathBuf {
         self.dir.path().join(w)
     }
@@ -116,6 +127,8 @@ impl Env {
             registered: &reg,
             clock: &self.clock,
             stdin: &stdin,
+            project: PROJECT.into(),
+            status_db: Some(self.status_path()),
         };
         run(&ctx, verb)
     }
@@ -189,7 +202,10 @@ fn app_resolve(ls: &LocalStore, id: i64, status: &str, reason: &str, result: &st
 /// The app applying a `send`: bump `awaiting_turn` and report it.
 fn app_apply_send(ls: &LocalStore, id: i64, wt: &str) -> i64 {
     ls.drive_request_begin(id).unwrap();
-    let n = ls.drive_set_awaiting_turn(wt).unwrap().unwrap();
+    let (n, _) = ls
+        .drive_begin_delivery(wt, &codex_baseline(Some(4), 11, 0))
+        .unwrap()
+        .unwrap();
     ls.drive_request_resolve(
         id,
         "applied",
@@ -650,6 +666,10 @@ fn input(w: &str) -> WaitInput {
         state: None,
         idle_secs: None,
         refused_send: None,
+        delivery: None,
+        unacked: Vec::new(),
+        engine: EngineRead::Stale { heartbeat_at: None },
+        now_ms: 0,
     }
 }
 
@@ -688,6 +708,7 @@ fn kind(e: &Option<WaitEvent>) -> (&'static str, String) {
     match e {
         Some(WaitEvent::Prompt { worktree, .. }) => ("prompt", worktree.clone()),
         Some(WaitEvent::TurnFinished { worktree, .. }) => ("turn_finished", worktree.clone()),
+        Some(WaitEvent::HumanTurn { worktree, .. }) => ("human_turn", worktree.clone()),
         Some(WaitEvent::Stalled { worktree, .. }) => ("stalled", worktree.clone()),
         Some(WaitEvent::SendRefused { worktree, .. }) => ("send_refused", worktree.clone()),
         None => ("none", String::new()),
@@ -730,7 +751,8 @@ fn wait_turn_finished_requires_turn_ge_awaiting_and_missing_reply_is_zero() {
     i.reply = Some(reply("bravo", 1));
     match select_event(&[i.clone()], 120, 0) {
         Some(WaitEvent::TurnFinished {
-            awaiting, reply, ..
+            turn: Finished::Legacy { awaiting, reply },
+            ..
         }) => assert_eq!((awaiting, reply.turn), (1, 1)),
         other => panic!("{other:?}"),
     }
@@ -746,7 +768,20 @@ fn wait_stale_idle_before_turn_bump_does_not_finish() {
     i.reply = Some(reply("bravo", 3));
     i.state = Some("idle".into());
     i.idle_secs = Some(1000);
-    assert_eq!(kind(&select_event(&[i], 120, 1000)).0, "none");
+    assert_eq!(kind(&select_event(&[i.clone()], 120, 100)).0, "none");
+    // With no app it ends as a stall, never as that old turn.
+    assert_eq!(
+        stall_reason(&select_event(&[i], 120, 1000)),
+        "no Keitora app is updating status"
+    );
+}
+
+/// The reason of a `stalled` event (panics on anything else).
+fn stall_reason(e: &Option<WaitEvent>) -> String {
+    match e {
+        Some(WaitEvent::Stalled { reason, .. }) => reason.clone(),
+        other => panic!("expected a stall, got {other:?}"),
+    }
 }
 
 #[test]
@@ -758,23 +793,34 @@ fn wait_stalled_only_when_busy_and_awaiting_and_clamped_to_call_start() {
     // Idle long enough, but this call only started 30s ago.
     assert_eq!(kind(&select_event(&[i.clone()], 120, 30)).0, "none");
     match select_event(&[i.clone()], 120, 125) {
-        Some(WaitEvent::Stalled { idle_s, state, .. }) => {
-            assert_eq!((idle_s, state.as_str()), (125, "busy"))
-        }
+        Some(WaitEvent::Stalled {
+            idle_s,
+            state,
+            reason,
+            ..
+        }) => assert_eq!(
+            (idle_s, state.as_str(), reason.as_str()),
+            (125, "busy", "no hook activity for 125s")
+        ),
         other => panic!("{other:?}"),
     }
-    // Recent heartbeat: not stalled however long the call has run.
+    // With no app updating status every outstanding send ends in a stall once the
+    // call has run --stall-after; the hook rule only names a busy row's silence.
+    let no_app = "no Keitora app is updating status";
+    // Recent heartbeat.
     i.idle_secs = Some(10);
-    assert_eq!(kind(&select_event(&[i.clone()], 120, 1000)).0, "none");
-    // Not busy, or nothing awaited: never stalled.
+    assert_eq!(kind(&select_event(&[i.clone()], 120, 119)).0, "none");
+    assert_eq!(stall_reason(&select_event(&[i.clone()], 120, 1000)), no_app);
+    // Not busy.
     i.idle_secs = Some(1000);
     i.state = Some("waiting".into());
-    assert_eq!(kind(&select_event(&[i.clone()], 120, 1000)).0, "none");
+    assert_eq!(stall_reason(&select_event(&[i.clone()], 120, 1000)), no_app);
+    // No heartbeat at all.
     i.state = Some("busy".into());
-    i.awaiting_turn = None;
-    assert_eq!(kind(&select_event(&[i.clone()], 120, 1000)).0, "none");
-    i.awaiting_turn = Some(1);
     i.idle_secs = None;
+    assert_eq!(stall_reason(&select_event(&[i.clone()], 120, 1000)), no_app);
+    // Nothing awaited: never stalled.
+    i.awaiting_turn = None;
     assert_eq!(kind(&select_event(&[i], 120, 1000)).0, "none");
 }
 
@@ -921,7 +967,7 @@ fn wait_acks_turn_so_it_is_not_redelivered() {
     assert_eq!(out.value["event"], "turn_finished");
     assert_eq!(out.value["turn"], 1);
     assert_eq!(out.value["last_message"], "all done");
-    assert_eq!(out.human, "  @bravo finished turn 1\nall done");
+    assert_eq!(out.human, "  @bravo finished its turn\nall done");
     assert_eq!(
         env.local.drive_get("bravo").unwrap().unwrap().awaiting_turn,
         None
@@ -1010,6 +1056,8 @@ fn counting_wait(env: &Env, timeout: u64) -> (Output, u32) {
         registered: &reg,
         clock: &env.clock,
         stdin: &stdin,
+        project: PROJECT.into(),
+        status_db: Some(env.status_path()),
     };
     let args = WaitArgs {
         worktrees: vec!["bravo".into()],
@@ -1255,6 +1303,7 @@ fn send_wait_timeout_cancels_pending_request_and_exits_2() {
     assert_eq!(r.status, "refused");
     assert_eq!(r.reason, "no running Keitora app picked it up within 2s");
     assert_eq!(out.value["timed_out"], true);
+    assert!(out.value.get("findings").is_none(), "no app: no findings");
     assert_eq!(
         out.human,
         format!(
@@ -1658,16 +1707,20 @@ fn human_lines_for_each_verb() {
     );
     let stalled = event_output(&WaitEvent::Stalled {
         worktree: "bravo".into(),
+        reason: "no hook activity for 125s".into(),
         state: "busy".into(),
         idle_s: 125,
+        delivery_id: Some(7),
+        turn_id: None,
     });
     assert_eq!(
         stalled.human,
-        "  @bravo looks stalled (busy, no activity for 125s); try: keitora read bravo"
+        "  @bravo looks stalled: no hook activity for 125s; try: keitora read bravo"
     );
     assert_eq!(
         stalled.value,
-        json!({"event": "stalled", "worktree": "bravo", "state": "busy", "idle_s": 125})
+        json!({"event": "stalled", "worktree": "bravo", "reason": "no hook activity for 125s",
+               "state": "busy", "idle_s": 125, "delivery_id": 7})
     );
 
     let out = env.cli("alpha", &["reset", "bravo"]).unwrap();
@@ -2029,4 +2082,1394 @@ fn drive_help_explains_wake() {
     for needle in ["keitora wake bravo", "--no-wake", "already awake"] {
         assert!(help.contains(needle), "missing {needle:?} in:\n{help}");
     }
+}
+
+// ---- status.db fixtures ----
+
+/// The project name the status rows are keyed by.
+const PROJECT: &str = "proj";
+
+/// A writer row whose heartbeat is `at_ms`, herdr up, with a snapshot.
+fn writer_at(at_ms: i64) -> keitora_tasks::WriterRow {
+    keitora_tasks::WriterRow {
+        instance_id: "app-1".into(),
+        pid: 4242,
+        version: "test".into(),
+        started_at: at_ms - 60_000,
+        heartbeat_at: at_ms,
+        last_snapshot_at: Some(at_ms),
+        herdr_link: "up".into(),
+        herdr_link_since: at_ms - 60_000,
+    }
+}
+
+/// The engine's published view of `wt`.
+fn view(
+    wt: &str,
+    herdr_status: &str,
+    scs: i64,
+    cs: Option<i64>,
+    settled: bool,
+    at_ms: i64,
+) -> keitora_tasks::StatusSession {
+    let state = match herdr_status {
+        "idle" | "done" if settled => "idle",
+        "blocked" => "waiting",
+        _ => "busy",
+    };
+    keitora_tasks::StatusSession {
+        project: PROJECT.into(),
+        worktree: wt.into(),
+        state: state.into(),
+        agent: "present".into(),
+        agent_kind: Some("codex".into()),
+        herdr_status: Some(herdr_status.into()),
+        settled,
+        stale: false,
+        interactive_ready: Some(true),
+        pane_id: Some("p-1".into()),
+        terminal_id: Some("t-1".into()),
+        agent_session: Some("s-1".into()),
+        state_change_seq: Some(scs),
+        completion_seq: cs,
+        brokered: false,
+        escalated_reason: None,
+        last_change_at: at_ms,
+    }
+}
+
+fn codex_baseline(cs: Option<u64>, scs: u64, at_ms: i64) -> keitora_tasks::Baseline {
+    keitora_tasks::Baseline {
+        agent: Some("codex".into()),
+        pane_id: "p-1".into(),
+        terminal_id: "t-1".into(),
+        agent_session: Some("s-1".into()),
+        state_change_seq: scs,
+        completion_seq: cs,
+        status: "idle".into(),
+        delivered_at_ms: at_ms,
+    }
+}
+
+// ---- reproductions ----
+
+#[test]
+fn codex_answer_without_stop_returns_turn_finished() {
+    let env = Env::new();
+    let app = env.other();
+    let status = env.status_path();
+    let t0 = env.clock.wall_ms();
+    // 1. bravo drives alpha; the app delivered a prompt over a baseline with cs 4.
+    env.bind("bravo", "alpha");
+    let (_, delivery) = app
+        .drive_begin_delivery("alpha", &codex_baseline(Some(4), 11, t0))
+        .unwrap()
+        .unwrap();
+    // 2-3. Codex works; the engine publishes it.
+    keitora_tasks::status_store::write_status_for_test(
+        &status,
+        writer_at(t0),
+        &[view("alpha", "working", 12, Some(4), false, t0)],
+    )
+    .unwrap();
+    // 4-5. Codex goes idle with cs 5, seen at +0 s and again at +1 s (settled).
+    keitora_tasks::status_store::write_status_for_test(
+        &status,
+        writer_at(t0),
+        &[view("alpha", "idle", 13, Some(5), false, t0)],
+    )
+    .unwrap();
+    keitora_tasks::status_store::write_status_for_test(
+        &status,
+        writer_at(t0 + 1_000),
+        &[view("alpha", "idle", 13, Some(5), true, t0)],
+    )
+    .unwrap();
+    // The engine records the herdr-detected completion (no reply text).
+    app.drive_turn_insert(&keitora_tasks::NewDriveTurn {
+        driven: "alpha",
+        kind: "driver",
+        delivery_id: Some(delivery),
+        outcome: "finished",
+        signal: "herdr",
+        clause: "completion_seq",
+        completion_seq: Some(5),
+        state_change_seq: Some(13),
+        reply: "",
+        reply_source: "none",
+        caveat: None,
+    })
+    .unwrap()
+    .unwrap();
+    // 6. No Stop row is ever written.
+    assert!(app.session_reply_get("alpha").unwrap().is_none());
+    // 7. wait, for up to 10 fake minutes.
+    let out = env
+        .cli("bravo", &["wait", "alpha", "--timeout", "600"])
+        .unwrap();
+    assert_eq!(out.value["event"], "turn_finished", "{}", out.value);
+    assert_eq!(out.value["reply_source"], "none");
+    assert!(
+        env.clock.t.get() <= Duration::from_secs(1),
+        "within one hot tick, took {:?}",
+        env.clock.t.get()
+    );
+    let last = env.cli("bravo", &["read", "alpha", "--last"]);
+    assert_eq!(code(last), 0, "read --last finds the turn");
+}
+
+// ---- engine-backed wait ----
+
+/// A live app publishing `views` (its heartbeat stays fresh for an hour of fake time).
+fn app_publishes(env: &Env, views: &[keitora_tasks::StatusSession]) {
+    let live = env.clock.wall_ms() + 3_600_000;
+    keitora_tasks::status_store::write_status_for_test(&env.status_path(), writer_at(live), views)
+        .unwrap();
+}
+
+/// The app delivering a prompt to `wt` over a codex baseline at the fake clock's now.
+fn app_delivers(env: &Env, wt: &str) -> (i64, i64) {
+    env.other()
+        .drive_begin_delivery(wt, &codex_baseline(Some(4), 11, env.clock.wall_ms()))
+        .unwrap()
+        .unwrap()
+}
+
+/// The app recording a turn of `wt`.
+fn app_records(
+    env: &Env,
+    wt: &str,
+    kind: &str,
+    delivery_id: Option<i64>,
+    outcome: &str,
+    reply: &str,
+) -> i64 {
+    let (clause, source) = match outcome {
+        "restarted" => ("occupant_changed", "none"),
+        _ if reply.is_empty() => ("completion_seq", "none"),
+        _ => ("completion_seq", "hook"),
+    };
+    env.other()
+        .drive_turn_insert(&keitora_tasks::NewDriveTurn {
+            driven: wt,
+            kind,
+            delivery_id,
+            outcome,
+            signal: "herdr",
+            clause,
+            completion_seq: Some(5),
+            state_change_seq: Some(13),
+            reply,
+            reply_source: source,
+            caveat: None,
+        })
+        .unwrap()
+        .unwrap()
+}
+
+fn turn_row(id: i64, kind: &str, outcome: &str) -> DriveTurn {
+    DriveTurn {
+        id,
+        driven: "bravo".into(),
+        kind: kind.into(),
+        delivery_id: (kind == "driver").then_some(7),
+        outcome: outcome.into(),
+        signal: "herdr".into(),
+        clause: "completion_seq".into(),
+        completed_at: "2026-01-01 10:00:00.123".into(),
+        reply: "the reply".into(),
+        reply_source: "hook".into(),
+        caveat: None,
+        acked_at: None,
+    }
+}
+
+const T: i64 = 1_800_000_000_000;
+
+/// `bravo` awaiting delivery 7 (baseline cs 4, scs 11, at `T`), with `engine`.
+fn delivered(engine: EngineRead, now_ms: i64) -> WaitInput {
+    let mut i = input("bravo");
+    i.awaiting_turn = Some(1);
+    i.delivery = Some(Delivery {
+        driven: "bravo".into(),
+        driver: "alpha".into(),
+        awaiting_turn: Some(1),
+        delivery_id: Some(7),
+        baseline: Some(codex_baseline(Some(4), 11, T)),
+        delivered_at: Some("2026-01-01 10:00:00.000".into()),
+    });
+    i.engine = engine;
+    i.now_ms = now_ms;
+    i
+}
+
+fn fresh(view: keitora_tasks::StatusSession) -> EngineRead {
+    EngineRead::Fresh {
+        view: Some(view),
+        writer: writer_at(T),
+    }
+}
+
+#[test]
+fn engine_read_classifies_the_store() {
+    let env = Env::new();
+    let now = env.clock.wall_ms();
+    let open = || keitora_tasks::StatusReader::open(&env.status_path()).unwrap();
+    assert_eq!(
+        EngineRead::of(None, PROJECT, "bravo", now),
+        EngineRead::Stale { heartbeat_at: None }
+    );
+    let idle = view("bravo", "idle", 11, Some(4), true, now);
+    keitora_tasks::status_store::write_status_for_test(
+        &env.status_path(),
+        writer_at(now),
+        std::slice::from_ref(&idle),
+    )
+    .unwrap();
+    let r = open();
+    assert_eq!(
+        EngineRead::of(r.as_ref(), PROJECT, "bravo", now),
+        EngineRead::Fresh {
+            view: Some(idle.clone()),
+            writer: writer_at(now)
+        }
+    );
+    assert!(matches!(
+        EngineRead::of(r.as_ref(), PROJECT, "charlie", now),
+        EngineRead::Fresh { view: None, .. }
+    ));
+    assert!(matches!(
+        EngineRead::of(r.as_ref(), "other-proj", "bravo", now),
+        EngineRead::Fresh { view: None, .. }
+    ));
+    // A stale view is not ready.
+    let stale = keitora_tasks::StatusSession {
+        stale: true,
+        ..idle.clone()
+    };
+    keitora_tasks::status_store::write_status_for_test(
+        &env.status_path(),
+        writer_at(now),
+        std::slice::from_ref(&stale),
+    )
+    .unwrap();
+    assert!(matches!(
+        EngineRead::of(open().as_ref(), PROJECT, "bravo", now),
+        EngineRead::NotReady { view: Some(_), .. }
+    ));
+    // herdr down.
+    let down = keitora_tasks::WriterRow {
+        herdr_link: "down".into(),
+        ..writer_at(now)
+    };
+    keitora_tasks::status_store::write_status_for_test(&env.status_path(), down, &[idle]).unwrap();
+    assert!(matches!(
+        EngineRead::of(open().as_ref(), PROJECT, "bravo", now),
+        EngineRead::NotReady { .. }
+    ));
+    // No heartbeat for 15 s.
+    assert_eq!(
+        EngineRead::of(open().as_ref(), PROJECT, "bravo", now + 15_001),
+        EngineRead::Stale {
+            heartbeat_at: Some(now)
+        }
+    );
+}
+
+#[test]
+fn turn_row_is_delivered_as_turn_finished_with_reply_source_none() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    app_publishes(&env, &[view("bravo", "working", 12, None, false, 0)]);
+    let (_, delivery) = app_delivers(&env, "bravo");
+    let other = env.other();
+    env.on_sleep(move |n| {
+        if n == 3 {
+            other
+                .drive_turn_insert(&keitora_tasks::NewDriveTurn {
+                    driven: "bravo",
+                    kind: "driver",
+                    delivery_id: Some(delivery),
+                    outcome: "finished",
+                    signal: "herdr",
+                    clause: "completion_seq",
+                    completion_seq: Some(5),
+                    state_change_seq: Some(13),
+                    reply: "",
+                    reply_source: "none",
+                    caveat: None,
+                })
+                .unwrap();
+        }
+    });
+    let out = env.cli("alpha", &["wait", "bravo"]).unwrap();
+    assert_eq!(out.code, 0);
+    assert_eq!(out.value["event"], "turn_finished");
+    assert_eq!(out.value["reply_source"], "none");
+    assert_eq!(out.value["delivery_id"], delivery);
+    assert_eq!(out.value["clause"], "completion_seq");
+    assert_eq!(
+        out.human,
+        "  @bravo finished its turn\n(no reply text captured; run: keitora read bravo)"
+    );
+    // Acked: the delivery is over.
+    assert_eq!(
+        env.local.drive_get("bravo").unwrap().unwrap().awaiting_turn,
+        None
+    );
+    assert_eq!(err(env.cli("alpha", &["wait", "bravo"])).code, 4);
+}
+
+#[test]
+fn stall_after_30s_with_no_seq_change() {
+    let idle = view("bravo", "idle", 11, Some(4), true, T - 5_000);
+    let i = delivered(fresh(idle), T + 30_000);
+    match select_event(&[i], 120, 30) {
+        Some(WaitEvent::Stalled {
+            reason,
+            state,
+            idle_s,
+            delivery_id,
+            turn_id,
+            ..
+        }) => assert_eq!(
+            (
+                reason.as_str(),
+                state.as_str(),
+                idle_s,
+                delivery_id,
+                turn_id
+            ),
+            (
+                "no activity observed since delivery",
+                "idle",
+                30,
+                Some(7),
+                None
+            )
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn no_stall_at_29s() {
+    let idle = view("bravo", "idle", 11, Some(4), true, T - 5_000);
+    let i = delivered(fresh(idle.clone()), T + 29_999);
+    assert_eq!(kind(&select_event(&[i], 120, 29)).0, "none");
+    // Clamped to this call: a re-wait at 40 s of idle waits its own 30 s.
+    let i = delivered(fresh(idle), T + 40_000);
+    assert_eq!(kind(&select_event(&[i], 120, 5)).0, "none");
+}
+
+#[test]
+fn working_for_10_minutes_never_stalls() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    app_delivers(&env, "bravo");
+    app_publishes(&env, &[view("bravo", "working", 12, None, false, 0)]);
+    let out = env
+        .cli(
+            "alpha",
+            &["wait", "bravo", "--timeout", "600", "--stall-after", "10"],
+        )
+        .unwrap();
+    assert_eq!(out.code, 2, "{}", out.value);
+    assert_eq!(out.value["event"], "timeout");
+}
+
+#[test]
+fn blocked_unbrokered_for_10s_stalls() {
+    let blocked = view("bravo", "blocked", 12, None, false, T);
+    let i = delivered(fresh(blocked.clone()), T + 9_999);
+    assert_eq!(kind(&select_event(&[i], 120, 60)).0, "none");
+    let i = delivered(fresh(blocked), T + 10_000);
+    assert_eq!(
+        stall_reason(&select_event(&[i], 120, 60)),
+        "blocked on a dialog nothing brokers"
+    );
+}
+
+#[test]
+fn brokered_blocked_is_a_prompt_not_a_stall() {
+    let brokered = keitora_tasks::StatusSession {
+        brokered: true,
+        ..view("bravo", "blocked", 12, None, false, T)
+    };
+    let i = delivered(fresh(brokered.clone()), T + 60_000);
+    assert_eq!(
+        kind(&select_event(std::slice::from_ref(&i), 120, 60)).0,
+        "none"
+    );
+    let mut with_prompt = i;
+    with_prompt.prompt = Some(fake_prompt(3, "bravo"));
+    assert_eq!(kind(&select_event(&[with_prompt], 120, 60)).0, "prompt");
+
+    // Through the DB: the gate's prompt row is what wait reports.
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    app_delivers(&env, "bravo");
+    app_publishes(&env, &[brokered]);
+    permission(&env.other(), "bravo");
+    let out = env.cli("alpha", &["wait", "bravo"]).unwrap();
+    assert_eq!(out.value["event"], "prompt");
+}
+
+#[test]
+fn restarted_row_is_a_stall_and_resolves_the_delivery() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    app_publishes(&env, &[view("bravo", "idle", 2, None, true, 0)]);
+    let (_, delivery) = app_delivers(&env, "bravo");
+    app_records(&env, "bravo", "driver", Some(delivery), "restarted", "");
+    let out = env.cli("alpha", &["wait", "bravo"]).unwrap();
+    assert_eq!(out.code, 0);
+    assert_eq!(out.value["event"], "stalled");
+    assert_eq!(
+        out.value["reason"],
+        "agent restarted mid-turn; result unknown"
+    );
+    assert_eq!(out.value["idle_s"], 0);
+    assert_eq!(out.value["delivery_id"], delivery);
+    let e = err(env.cli("alpha", &["wait", "bravo"]));
+    assert_eq!(e.code, 4, "{}", e.msg);
+}
+
+#[test]
+fn herdr_unavailable_stalls_after_stall_after() {
+    let down = keitora_tasks::WriterRow {
+        herdr_link: "down".into(),
+        herdr_link_since: T,
+        ..writer_at(T)
+    };
+    let not_ready = |w: keitora_tasks::WriterRow| EngineRead::NotReady {
+        writer: w,
+        view: None,
+    };
+    let i = delivered(not_ready(down.clone()), T + 119_000);
+    assert_eq!(kind(&select_event(&[i], 120, 500)).0, "none");
+    let i = delivered(not_ready(down), T + 120_000);
+    assert_eq!(
+        stall_reason(&select_event(&[i], 120, 500)),
+        "herdr unavailable for 120s (down)"
+    );
+    // Up, but the last snapshot is old.
+    let old_snapshot = keitora_tasks::WriterRow {
+        last_snapshot_at: Some(T),
+        herdr_link_since: T - 600_000,
+        ..writer_at(T)
+    };
+    let i = delivered(not_ready(old_snapshot), T + 130_000);
+    assert_eq!(
+        stall_reason(&select_event(&[i], 120, 500)),
+        "herdr unavailable for 130s (stale snapshot)"
+    );
+}
+
+#[test]
+fn no_app_uses_the_legacy_hook_turn_then_stalls_with_no_app() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    app_delivers(&env, "bravo");
+    env.other()
+        .session_reply_record("bravo", "from the hook")
+        .unwrap();
+    let out = env.cli("alpha", &["wait", "bravo"]).unwrap();
+    assert_eq!(out.value["event"], "turn_finished");
+    assert_eq!(out.value["reply_source"], "hook");
+    assert_eq!(out.value["signal"], "hook");
+    assert_eq!(out.value["turn_id"], Value::Null);
+    assert_eq!(out.value["last_message"], "from the hook");
+    assert_eq!(
+        env.local.drive_get("bravo").unwrap().unwrap().awaiting_turn,
+        None
+    );
+    // The next delivery's turn never comes: a stall once --stall-after has passed.
+    app_delivers(&env, "bravo");
+    let out = env
+        .cli("alpha", &["wait", "bravo", "--stall-after", "10"])
+        .unwrap();
+    assert_eq!(out.value["event"], "stalled");
+    assert_eq!(out.value["reason"], "no Keitora app is updating status");
+    assert_eq!(out.value["idle_s"], 10);
+}
+
+#[test]
+fn fresh_app_ignores_session_replies_for_a_new_delivery() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    let (_, delivery) = app_delivers(&env, "bravo");
+    app_publishes(&env, &[view("bravo", "working", 12, None, false, 0)]);
+    // The hook bumps its turn, but the app records this delivery's turns.
+    env.other().session_reply_record("bravo", "hook").unwrap();
+    let out = env
+        .cli("alpha", &["wait", "bravo", "--timeout", "3"])
+        .unwrap();
+    assert_eq!(out.code, 2, "{}", out.value);
+    app_records(&env, "bravo", "driver", Some(delivery), "finished", "hook");
+    let out = env.cli("alpha", &["wait", "bravo"]).unwrap();
+    assert_eq!(out.value["event"], "turn_finished");
+    assert!(out.value["turn_id"].is_i64());
+    assert_eq!(out.value["turn"], 1, "the hook's counter rides along");
+    // Delivered once.
+    assert_eq!(err(env.cli("alpha", &["wait", "bravo"])).code, 4);
+}
+
+#[test]
+fn legacy_check_applies_to_a_delivery_without_delivery_id() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    app_publishes(&env, &[view("bravo", "idle", 13, Some(5), true, 0)]);
+    // An older app set awaiting_turn without a delivery id.
+    env.other()
+        .drive_restore_awaiting_turn("bravo", Some(1))
+        .unwrap();
+    env.other()
+        .session_reply_record("bravo", "old app")
+        .unwrap();
+    let out = env.cli("alpha", &["wait", "bravo"]).unwrap();
+    assert_eq!(out.value["event"], "turn_finished");
+    assert_eq!(out.value["reply_source"], "hook");
+    assert_eq!(out.value["last_message"], "old app");
+}
+
+#[test]
+fn legacy_hook_turn_finishes_when_the_engine_sees_no_agent() {
+    let finished = |engine: EngineRead| {
+        let mut i = delivered(engine, T);
+        i.reply = Some(reply("bravo", 1));
+        kind(&select_event(&[i], 120, 0)).0
+    };
+    // No view of the worktree at all: only the hook can report this turn.
+    let none = EngineRead::Fresh {
+        view: None,
+        writer: writer_at(T),
+    };
+    assert_eq!(finished(none), "turn_finished");
+    let absent = keitora_tasks::StatusSession {
+        agent: "absent".into(),
+        state: "offline".into(),
+        ..view("bravo", "idle", 11, Some(4), false, T)
+    };
+    assert_eq!(finished(fresh(absent)), "turn_finished");
+    // An agent the engine sees: it records the turn, the hook reply is ignored.
+    let present = view("bravo", "idle", 12, Some(5), true, T);
+    assert_eq!(finished(fresh(present)), "none");
+}
+
+#[test]
+fn human_turn_is_delivered_once() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    app_records(&env, "bravo", "human", None, "finished", "typed by hand");
+    let out = env.cli("alpha", &["wait", "bravo"]).unwrap();
+    assert_eq!(out.code, 0);
+    assert_eq!(out.value["event"], "human_turn");
+    assert_eq!(out.value["reply"], "typed by hand");
+    assert_eq!(out.value["reply_source"], "hook");
+    assert_eq!(
+        out.human,
+        "  @bravo: the human finished a turn\ntyped by hand"
+    );
+    assert_eq!(err(env.cli("alpha", &["wait", "bravo"])).code, 4);
+}
+
+#[test]
+fn event_priority_prompt_turn_human_refused_stalled() {
+    let mut prompt = input("alpha");
+    prompt.prompt = Some(fake_prompt(1, "alpha"));
+    let mut finished = input("bravo");
+    finished.unacked = vec![turn_row(4, "driver", "finished")];
+    let mut human = input("charlie");
+    human.unacked = vec![turn_row(5, "human", "finished")];
+    let mut refused = input("wt");
+    refused.refused_send = Some(RefusedSend {
+        request_id: 2,
+        reason: "no".into(),
+    });
+    let mut stalled = input("main");
+    stalled.awaiting_turn = Some(1);
+    stalled.unacked = vec![turn_row(6, "driver", "restarted")];
+    let all = [stalled, refused, human, finished, prompt];
+    let order = [
+        "prompt",
+        "turn_finished",
+        "human_turn",
+        "send_refused",
+        "stalled",
+    ];
+    for (n, want) in order.iter().enumerate() {
+        let got = select_event(&all[..all.len() - n], 120, 0);
+        assert_eq!(kind(&got).0, *want, "with {} inputs", all.len() - n);
+    }
+    // A worktree's own human turn waits behind its driver turn.
+    let mut both = input("bravo");
+    both.unacked = vec![
+        turn_row(3, "human", "finished"),
+        turn_row(4, "driver", "finished"),
+    ];
+    match select_event(&[both], 120, 0) {
+        Some(WaitEvent::TurnFinished {
+            turn: Finished::Recorded { row, .. },
+            ..
+        }) => assert_eq!(row.id, 4),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn nothing_to_wait_for_requires_no_unacked_turn() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    assert_eq!(err(env.cli("alpha", &["wait", "bravo"])).code, 4);
+    let id = app_records(&env, "bravo", "human", None, "finished", "");
+    assert_eq!(
+        env.cli("alpha", &["wait", "bravo"]).unwrap().value["turn_id"],
+        id
+    );
+    assert_eq!(err(env.cli("alpha", &["wait", "bravo"])).code, 4);
+}
+
+#[test]
+fn a_lost_ack_race_keeps_polling() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    let id = app_records(&env, "bravo", "human", None, "finished", "");
+    let rival = env.other();
+    let wp = |w: &str| env.wt_dir(w);
+    let reg = || Ok(());
+    let stdin = |_: usize| Ok(Vec::new());
+    let cli_of = |_: &str| None;
+    let ctx = Ctx {
+        local: &env.local,
+        me: "alpha".into(),
+        worktrees: env.worktrees.clone(),
+        worktree_path: &wp,
+        worktree_cli: &cli_of,
+        registered: &reg,
+        clock: &env.clock,
+        stdin: &stdin,
+        project: PROJECT.into(),
+        status_db: Some(env.status_path()),
+    };
+    let args = WaitArgs {
+        worktrees: vec!["bravo".into()],
+        timeout: 3,
+        stall_after: 120,
+    };
+    // Another wait acks the row between this one's read and its ack.
+    let out = wait_with(&ctx, &args, &mut |i, s, e| {
+        let ev = select_event(i, s, e);
+        if ev.is_some() {
+            rival.drive_turn_ack(id).unwrap();
+        }
+        ev
+    })
+    .unwrap();
+    assert_eq!(out.code, 2, "{}", out.value);
+}
+
+#[test]
+fn a_lost_legacy_ack_race_keeps_polling() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    // No app: the hook's reply finishes the turn through the legacy path.
+    let (turn, _) = app_delivers(&env, "bravo");
+    env.other().session_reply_record("bravo", "hook").unwrap();
+    let rival = env.other();
+    let wp = |w: &str| env.wt_dir(w);
+    let reg = || Ok(());
+    let stdin = |_: usize| Ok(Vec::new());
+    let cli_of = |_: &str| None;
+    let ctx = Ctx {
+        local: &env.local,
+        me: "alpha".into(),
+        worktrees: env.worktrees.clone(),
+        worktree_path: &wp,
+        worktree_cli: &cli_of,
+        registered: &reg,
+        clock: &env.clock,
+        stdin: &stdin,
+        project: PROJECT.into(),
+        status_db: Some(env.status_path()),
+    };
+    let args = WaitArgs {
+        worktrees: vec!["bravo".into()],
+        timeout: 3,
+        stall_after: 120,
+    };
+    // Another wait acks the turn between this one's read and its ack.
+    let out = wait_with(&ctx, &args, &mut |i, s, e| {
+        let ev = select_event(i, s, e);
+        if ev.is_some() {
+            assert!(rival.drive_ack_turn_legacy("bravo", turn).unwrap());
+        }
+        ev
+    })
+    .unwrap();
+    assert_eq!(out.code, 2, "{}", out.value);
+}
+
+#[test]
+fn drives_reads_engine_state_when_fresh() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    // No hook row for bravo; the engine sees its agent idle.
+    app_publishes(&env, &[view("bravo", "idle", 11, Some(4), true, 0)]);
+    let (_, delivery) = app_delivers(&env, "bravo");
+    app_records(&env, "bravo", "human", None, "finished", "");
+    let out = env.cli("alpha", &["drives"]).unwrap();
+    let d = &out.value["drives"][0];
+    assert_eq!(d["state"], "idle");
+    assert_eq!(d["state_source"], "engine");
+    assert_eq!(d["agent"], "present");
+    assert_eq!(d["herdr_status"], "idle");
+    assert_eq!(d["stale"], false);
+    assert_eq!(d["delivery_id"], delivery);
+    assert!(d["delivered_at"].is_string());
+    assert_eq!(d["unacked_turns"], 1);
+    // A stale engine view is marked.
+    let stale = keitora_tasks::StatusSession {
+        stale: true,
+        ..view("bravo", "idle", 11, Some(4), true, 0)
+    };
+    app_publishes(&env, &[stale]);
+    let out = env.cli("alpha", &["drives"]).unwrap();
+    assert_eq!(out.value["drives"][0]["stale"], true);
+    assert!(out.human.contains("[stale]"), "{}", out.human);
+}
+
+#[test]
+fn drives_falls_back_to_rows_when_stale() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    env.other()
+        .session_upsert("bravo", "busy", None, None)
+        .unwrap();
+    let out = env.cli("alpha", &["drives"]).unwrap();
+    let d = &out.value["drives"][0];
+    assert_eq!(d["state"], "busy");
+    assert_eq!(d["state_source"], "hooks");
+    assert_eq!(d["stale"], false);
+    assert_eq!(d["delivery_id"], Value::Null);
+    assert_eq!(d["unacked_turns"], 0);
+}
+
+#[test]
+fn read_last_picks_the_newer_of_turn_and_reply() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    env.other()
+        .session_reply_record("bravo", "older hook reply")
+        .unwrap();
+    // Recorded in the same second or later (the turn has milliseconds): the turn wins.
+    let id = app_records(&env, "bravo", "human", None, "finished", "the turn's reply");
+    let out = env.cli("alpha", &["read", "bravo", "--last"]).unwrap();
+    assert_eq!(out.value["source"], "turn");
+    assert_eq!(out.value["turn_id"], id);
+    assert_eq!(out.value["kind"], "human");
+    assert_eq!(out.value["turn"], 1);
+    assert_eq!(out.human, "the turn's reply");
+    assert!(
+        !env.local.drive_turns_unacked("bravo").unwrap().is_empty(),
+        "read never acks"
+    );
+
+    // The comparison itself.
+    let t = turn_row(1, "driver", "finished");
+    let at = |s: &str| SessionReply {
+        worktree: "bravo".into(),
+        turn: 2,
+        last_message: "x".into(),
+        updated_at: s.into(),
+    };
+    assert!(newer_reply(&t, &at("2026-01-01 10:00:01")));
+    assert!(!newer_reply(&t, &at("2026-01-01 10:00:00")));
+    assert!(!newer_reply(&t, &at("2026-01-01 10:00:00.123")), "a tie");
+    assert!(!newer_reply(&t, &at("garbage")));
+}
+
+#[test]
+fn read_last_none_reply_prints_the_hint() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    app_records(&env, "bravo", "human", None, "finished", "");
+    let out = env.cli("alpha", &["read", "bravo", "--last"]).unwrap();
+    assert_eq!(out.code, 0);
+    assert_eq!(out.value["source"], "turn");
+    assert_eq!(out.value["reply_source"], "none");
+    assert_eq!(
+        out.human,
+        "(no reply text captured for this turn; run: keitora read bravo)"
+    );
+}
+
+#[test]
+fn turn_finished_json_keeps_the_legacy_keys() {
+    let row = DriveTurn {
+        caveat: Some("agy may still run background tasks".into()),
+        ..turn_row(12, "driver", "finished")
+    };
+    let out = event_output(&WaitEvent::TurnFinished {
+        worktree: "bravo".into(),
+        turn: Finished::Recorded {
+            row: Box::new(row),
+            reply_turn: Some(3),
+        },
+    });
+    assert_eq!(
+        out.value,
+        json!({"event": "turn_finished", "worktree": "bravo", "turn_id": 12, "delivery_id": 7,
+               "kind": "driver", "reply": "the reply", "reply_source": "hook",
+               "caveat": "agy may still run background tasks", "signal": "herdr",
+               "clause": "completion_seq", "completed_at": "2026-01-01 10:00:00.123",
+               "turn": 3, "last_message": "the reply", "updated_at": "2026-01-01 10:00:00.123"})
+    );
+    assert_eq!(
+        out.human,
+        "  @bravo finished its turn\nthe reply\nagy may still run background tasks"
+    );
+    let legacy = event_output(&WaitEvent::TurnFinished {
+        worktree: "bravo".into(),
+        turn: Finished::Legacy {
+            awaiting: 3,
+            reply: reply("bravo", 3),
+        },
+    });
+    assert_eq!(
+        legacy.value,
+        json!({"event": "turn_finished", "worktree": "bravo", "turn_id": null,
+               "delivery_id": null, "kind": "driver", "reply": "reply 3",
+               "reply_source": "hook", "caveat": null, "signal": "hook", "clause": null,
+               "completed_at": "2026-01-01 10:00:00", "turn": 3, "last_message": "reply 3",
+               "updated_at": "2026-01-01 10:00:00"})
+    );
+}
+
+#[test]
+fn an_absent_agent_with_a_delivery_stalls_after_stall_after() {
+    let absent = keitora_tasks::StatusSession {
+        agent: "absent".into(),
+        state: "offline".into(),
+        ..view("bravo", "idle", 11, Some(4), false, T)
+    };
+    let i = delivered(fresh(absent), T + 120_000);
+    assert_eq!(
+        stall_reason(&select_event(&[i], 120, 500)),
+        "no agent is running; result unknown"
+    );
+    let gone = delivered(
+        EngineRead::Fresh {
+            view: None,
+            writer: writer_at(T),
+        },
+        T + 119_000,
+    );
+    assert_eq!(kind(&select_event(&[gone], 120, 500)).0, "none");
+}
+
+// ---- timeout diagnosis ----
+
+/// An `app_projects` row for `proj`, open and reported, with a running watcher.
+fn app_row() -> keitora_tasks::AppProject {
+    keitora_tasks::AppProject {
+        project: PROJECT.into(),
+        registry_key: PROJECT.into(),
+        db_path: "D:/repos/proj/tasks.db".into(),
+        open: true,
+        open_reported_at: Some(1),
+        watcher_state: "running".into(),
+        watcher_started_at: Some(1),
+        watcher_last_event_at: None,
+        last_pass_at: None,
+        last_pass_trigger: None,
+        pending_count: 1,
+        oldest_pending_at: None,
+        restarts: 0,
+        last_error: String::new(),
+        last_error_at: None,
+    }
+}
+
+/// A live app (heartbeat well ahead of the fake clock) with `row` for the project.
+fn app_presence(env: &Env, row: Option<keitora_tasks::AppProject>) {
+    app_publishes(env, &[]);
+    if let Some(row) = row {
+        keitora_tasks::status_store::write_app_project_for_test(&env.status_path(), &row).unwrap();
+    }
+}
+
+/// `send bravo --wait --timeout 2`, timed out; the outcome and the withdrawn row.
+fn timed_out_send(env: &Env) -> (Output, DriveRequest) {
+    timed_out_send_after(env, 2)
+}
+
+/// [`timed_out_send`] with `--timeout {secs}`.
+fn timed_out_send_after(env: &Env, secs: u64) -> (Output, DriveRequest) {
+    env.bind("alpha", "bravo");
+    let secs = secs.to_string();
+    let out = env
+        .cli(
+            "alpha",
+            &["send", "bravo", "hi", "--wait", "--timeout", &secs],
+        )
+        .unwrap();
+    assert_eq!(out.code, 2);
+    assert_eq!(out.value["timed_out"], true);
+    let r = last_request(&env.local);
+    assert_eq!(r.status, "refused");
+    (out, r)
+}
+
+/// The row's stored reason, the printed line and the JSON code all name `cause`.
+fn assert_diagnosed(out: &Output, r: &DriveRequest, code: &str, cause: &str) {
+    assert_diagnosed_after(out, r, code, cause, 2);
+}
+
+/// [`assert_diagnosed`] for a `--timeout {secs}` wait.
+fn assert_diagnosed_after(out: &Output, r: &DriveRequest, code: &str, cause: &str, secs: u64) {
+    assert_eq!(out.value["diagnosis"]["code"], code, "{}", out.value);
+    assert_eq!(out.value["diagnosis"]["cause"], cause);
+    assert_eq!(r.reason, format!("timed out after {secs}s: {cause}"));
+    assert_eq!(
+        out.human,
+        format!(
+            "  timed out after {secs}s: {cause} (send of @bravo (request {}))",
+            r.id
+        )
+    );
+}
+
+/// A wait long enough that the app's throttled presence columns have caught up.
+const PAST_LAG_S: u64 = (keitora_tasks::PRESENCE_TOUCH_LAG_MS / 1000 + 2) as u64;
+
+#[test]
+fn timeout_without_a_status_db_keeps_the_legacy_wording() {
+    let env = Env::new();
+    let (out, r) = timed_out_send(&env);
+    assert_eq!(out.value["diagnosis"]["code"], "no_status");
+    assert_eq!(r.reason, "no running Keitora app picked it up within 2s");
+    assert_eq!(
+        out.human,
+        format!(
+            "  timed out after 2s: no running Keitora app picked up the send of @bravo (request {})",
+            r.id
+        )
+    );
+}
+
+#[test]
+fn timeout_with_a_stale_app_says_when_it_last_updated() {
+    let env = Env::new();
+    keitora_tasks::status_store::write_status_for_test(
+        &env.status_path(),
+        writer_at(env.clock.wall_ms() - 300_000),
+        &[],
+    )
+    .unwrap();
+    let (out, r) = timed_out_send(&env);
+    assert_diagnosed(
+        &out,
+        &r,
+        "app_stale",
+        "no Keitora app is updating status (last update 5m ago); start Keitora, then retry",
+    );
+}
+
+#[test]
+fn timeout_with_no_app_ever_reporting_says_so() {
+    let env = Env::new();
+    // A status.db with no writer row.
+    drop(keitora_tasks::StatusWriter::open(&env.status_path()).unwrap());
+    let (out, r) = timed_out_send(&env);
+    assert_diagnosed(
+        &out,
+        &r,
+        "app_stale",
+        "no Keitora app has reported status on this machine; start Keitora, then retry",
+    );
+}
+
+#[test]
+fn timeout_with_the_project_unknown_to_the_app() {
+    let env = Env::new();
+    app_presence(&env, None);
+    let (out, r) = timed_out_send(&env);
+    assert_diagnosed(
+        &out,
+        &r,
+        "project_unknown",
+        "Keitora is running but hasn't reported project proj yet (it may predate this check or have just been registered)",
+    );
+}
+
+#[test]
+fn timeout_before_the_window_reported() {
+    let env = Env::new();
+    app_presence(
+        &env,
+        Some(keitora_tasks::AppProject {
+            open: false,
+            open_reported_at: None,
+            ..app_row()
+        }),
+    );
+    let (out, r) = timed_out_send(&env);
+    assert_diagnosed(
+        &out,
+        &r,
+        "window_unreported",
+        "Keitora is running but its window hasn't reported open projects",
+    );
+}
+
+#[test]
+fn timeout_with_the_project_not_open_in_the_window() {
+    let env = Env::new();
+    app_presence(
+        &env,
+        Some(keitora_tasks::AppProject {
+            open: false,
+            ..app_row()
+        }),
+    );
+    let (out, r) = timed_out_send(&env);
+    assert_diagnosed(
+        &out,
+        &r,
+        "project_not_open",
+        "Keitora is running but project proj is not open in its window; open it in Keitora, then retry",
+    );
+}
+
+#[test]
+fn timeout_with_the_watcher_not_running() {
+    let env = Env::new();
+    app_presence(
+        &env,
+        Some(keitora_tasks::AppProject {
+            watcher_state: "exited".into(),
+            ..app_row()
+        }),
+    );
+    let (out, r) = timed_out_send(&env);
+    assert_diagnosed(
+        &out,
+        &r,
+        "watcher_not_running",
+        "Keitora is running but its watcher for proj is not running (it restarts on its own)",
+    );
+}
+
+#[test]
+fn timeout_with_a_watcher_that_never_fired() {
+    let env = Env::new();
+    app_presence(&env, Some(app_row()));
+    let (out, r) = timed_out_send_after(&env, PAST_LAG_S);
+    assert_diagnosed_after(
+        &out,
+        &r,
+        "watcher_silent",
+        "Keitora is running but its watcher for proj hasn't fired since it started",
+        PAST_LAG_S,
+    );
+}
+
+#[test]
+fn a_young_request_is_not_blamed_on_a_watcher_column_that_trails() {
+    // The app queues the watcher's last event for its next heartbeat: a request
+    // this young may have fired it already, unwritten.
+    let env = Env::new();
+    let last = env.clock.wall_ms() - 600_000;
+    app_presence(
+        &env,
+        Some(keitora_tasks::AppProject {
+            watcher_last_event_at: Some(last),
+            ..app_row()
+        }),
+    );
+    let (out, r) = timed_out_send(&env);
+    assert_diagnosed(
+        &out,
+        &r,
+        "not_examined",
+        "Keitora is running but has not examined the request (last pass never)",
+    );
+}
+
+#[test]
+fn timeout_with_a_watcher_silent_since_before_the_request() {
+    let env = Env::new();
+    let last = env.clock.wall_ms() - 600_000;
+    app_presence(
+        &env,
+        Some(keitora_tasks::AppProject {
+            watcher_last_event_at: Some(last),
+            ..app_row()
+        }),
+    );
+    let (out, r) = timed_out_send_after(&env, PAST_LAG_S);
+    assert_diagnosed_after(
+        &out,
+        &r,
+        "watcher_silent",
+        &format!(
+            "Keitora is running but its watcher for proj hasn't fired since {}",
+            clock_text(last)
+        ),
+        PAST_LAG_S,
+    );
+}
+
+#[test]
+fn timeout_with_the_request_never_examined() {
+    let env = Env::new();
+    let later = env.clock.wall_ms() + 600_000;
+    app_presence(
+        &env,
+        Some(keitora_tasks::AppProject {
+            watcher_last_event_at: Some(later),
+            ..app_row()
+        }),
+    );
+    let (out, r) = timed_out_send(&env);
+    assert_diagnosed(
+        &out,
+        &r,
+        "not_examined",
+        "Keitora is running but has not examined the request (last pass never)",
+    );
+
+    // With a pass on record, its time.
+    let env = Env::new();
+    let pass = env.clock.wall_ms() - 5_000;
+    app_presence(
+        &env,
+        Some(keitora_tasks::AppProject {
+            watcher_last_event_at: Some(later),
+            last_pass_at: Some(pass),
+            ..app_row()
+        }),
+    );
+    let (out, r) = timed_out_send(&env);
+    assert_diagnosed(
+        &out,
+        &r,
+        "not_examined",
+        &format!(
+            "Keitora is running but has not examined the request (last pass {})",
+            clock_text(pass)
+        ),
+    );
+}
+
+#[test]
+fn timeout_of_a_request_the_app_saw_names_its_wait_reason() {
+    let env = Env::new();
+    app_presence(&env, Some(app_row()));
+    let app = env.other();
+    env.on_sleep(move |_| {
+        for r in app.drive_requests_pending().unwrap() {
+            app.drive_request_note_wait(r.id, "waiting for @bravo to be idle (herdr: working)")
+                .unwrap();
+        }
+    });
+    let (out, r) = timed_out_send(&env);
+    assert_diagnosed(
+        &out,
+        &r,
+        "waiting",
+        "Keitora saw it: waiting for @bravo to be idle (herdr: working)",
+    );
+}
+
+#[test]
+fn timeout_of_a_request_the_app_saw_without_a_reason() {
+    let env = Env::new();
+    app_presence(&env, Some(app_row()));
+    let app = env.other();
+    env.on_sleep(move |_| {
+        for r in app.drive_requests_pending().unwrap() {
+            app.drive_request_note_wait(r.id, "").unwrap();
+        }
+    });
+    let (out, r) = timed_out_send(&env);
+    assert_diagnosed(
+        &out,
+        &r,
+        "no_reason",
+        "Keitora examined it but recorded no reason",
+    );
+}
+
+#[test]
+fn a_read_and_a_wake_carry_the_diagnosis_too() {
+    let env = Env::new();
+    app_presence(&env, Some(app_row()));
+    env.bind("alpha", "bravo");
+    let secs = PAST_LAG_S.to_string();
+    let out = env
+        .cli("alpha", &["read", "bravo", "--timeout", &secs])
+        .unwrap();
+    let r = last_request(&env.local);
+    assert_eq!(out.code, 2);
+    assert_eq!(out.value["diagnosis"]["code"], "watcher_silent");
+    assert!(
+        out.human
+            .ends_with(&format!("(read of @bravo (request {}))", r.id)),
+        "{}",
+        out.human
+    );
+    let out = env
+        .cli("alpha", &["wake", "bravo", "--wait", "--timeout", &secs])
+        .unwrap();
+    assert_eq!(out.value["diagnosis"]["code"], "watcher_silent");
+}
+
+#[test]
+fn ages_and_dispatch_diagnoses_follow_the_same_rules() {
+    assert_eq!(
+        [0, 119, 120, 7199, 7200].map(age_text),
+        ["0s", "119s", "2m", "119m", "2h"]
+    );
+    let what = "dispatch of #4 to @bravo (request 9)";
+    let d = |p: &PresenceReading| diagnose_dispatch_timeout(p, PROJECT, what);
+    assert_eq!(d(&PresenceReading::Unavailable).code, "no_status");
+    assert_eq!(
+        d(&PresenceReading::Unavailable).cancel_reason(30),
+        "no running Keitora app picked it up within 30s"
+    );
+    assert_eq!(
+        d(&PresenceReading::Stale { age_s: Some(30) }).code,
+        "app_stale"
+    );
+    assert_eq!(d(&PresenceReading::Stale { age_s: None }).code, "app_stale");
+    assert_eq!(
+        d(&PresenceReading::Fresh { project: None }).code,
+        "project_unknown"
+    );
+    let closed = keitora_tasks::AppProject {
+        open: false,
+        ..app_row()
+    };
+    let not_open = d(&PresenceReading::Fresh {
+        project: Some(closed),
+    });
+    assert_eq!(not_open.code, "project_not_open");
+    assert_eq!(
+        not_open.cancel_reason(30),
+        "timed out after 30s: Keitora is running but project proj is not open in its window; open it in Keitora, then retry"
+    );
+    assert_eq!(
+        d(&PresenceReading::Fresh {
+            project: Some(app_row())
+        })
+        .code,
+        "not_examined"
+    );
+}
+
+// ---- health findings on stalls and timeouts ----
+
+/// The app's findings for `proj`: two for bravo (warn, error), one info and one for
+/// alpha (never shown for bravo), and an older warn (cut by the cap of two).
+fn app_reports_findings(env: &Env) {
+    let at = env.clock.wall_ms();
+    let row = |wt: &str, check: &str, severity: &str, last_seen: i64| keitora_tasks::FindingRow {
+        project: PROJECT.into(),
+        worktree: wt.into(),
+        check_id: check.into(),
+        severity: severity.into(),
+        message: format!("{check} says so"),
+        detail: "{}".into(),
+        first_seen: at,
+        last_seen,
+        occurrences: 1,
+        cleared_at: None,
+        remedy: String::new(),
+        remedy_at: None,
+    };
+    keitora_tasks::status_store::write_findings_for_test(
+        &env.status_path(),
+        &[
+            row("bravo", "hooks_vs_herdr", "warn", at),
+            row("bravo", "hooks_missing", "error", at - 5),
+            row("bravo", "worktree_identity", "info", at),
+            row("bravo", "herdr_unknown", "warn", at - 9),
+            row("alpha", "agy_plumbing", "error", at),
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_stalled_wait_carries_the_worktree_health_findings() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    app_publishes(&env, &[view("bravo", "idle", 2, None, true, 0)]);
+    app_reports_findings(&env);
+    let (_, delivery) = app_delivers(&env, "bravo");
+    app_records(&env, "bravo", "driver", Some(delivery), "restarted", "");
+    let out = env.cli("alpha", &["wait", "bravo"]).unwrap();
+    assert_eq!(out.value["event"], "stalled");
+    assert_eq!(
+        out.value["findings"],
+        json!([
+            {"check_id": "hooks_missing", "severity": "error", "message": "hooks_missing says so"},
+            {"check_id": "hooks_vs_herdr", "severity": "warn", "message": "hooks_vs_herdr says so"},
+        ])
+    );
+    assert_eq!(
+        out.human,
+        "  @bravo looks stalled: agent restarted mid-turn; result unknown; try: keitora read \
+         bravo\n  health: hooks_missing says so\n  health: hooks_vs_herdr says so"
+    );
+}
+
+#[test]
+fn a_stall_without_a_fresh_app_carries_no_findings() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    app_reports_findings(&env);
+    app_delivers(&env, "bravo");
+    let out = env
+        .cli("alpha", &["wait", "bravo", "--stall-after", "10"])
+        .unwrap();
+    assert_eq!(out.value["event"], "stalled");
+    assert!(out.value.get("findings").is_none());
+    assert!(!out.human.contains("health:"), "{}", out.human);
+}
+
+#[test]
+fn a_timed_out_request_carries_findings_while_the_app_is_fresh() {
+    let env = Env::new();
+    env.bind("alpha", "bravo");
+    app_publishes(&env, &[]);
+    app_reports_findings(&env);
+    let out = env
+        .cli(
+            "alpha",
+            &["send", "bravo", "hi", "--wait", "--timeout", "2"],
+        )
+        .unwrap();
+    assert_eq!(out.code, 2);
+    assert_eq!(out.value["timed_out"], true);
+    assert_eq!(out.value["findings"].as_array().unwrap().len(), 2);
+    assert_eq!(out.value["findings"][0]["check_id"], "hooks_missing");
+    let lines: Vec<&str> = out.human.lines().collect();
+    assert!(
+        lines[0].starts_with("  timed out after 2s"),
+        "{}",
+        out.human
+    );
+    assert_eq!(
+        &lines[1..],
+        [
+            "  health: hooks_missing says so",
+            "  health: hooks_vs_herdr says so"
+        ]
+    );
+    // An answered request carries none.
+    let out = env.cli("alpha", &["send", "bravo", "hi"]).unwrap();
+    assert!(out.value.get("findings").is_none());
 }

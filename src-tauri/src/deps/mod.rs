@@ -21,6 +21,7 @@ pub mod tier1;
 pub mod tier2;
 mod upgrade;
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -29,6 +30,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+
+use crate::backend::herdr::env::herdr_var_names;
 
 use manifest::NetError;
 pub use preflight::Tier;
@@ -200,14 +203,16 @@ pub fn startup(app: tauri::AppHandle) {
     let ctx = DepsContext {
         keitora_home: crate::paths::keitora_home(),
         home: dirs::home_dir(),
-        env: std::env::vars().collect(),
+        env: utf8_env(std::env::vars_os()),
         release_build: !cfg!(debug_assertions),
         app_version: app.package_info().version.to_string(),
         config: Box::new(UserHerdrConfig),
         prober: Box::new(crate::agent_updates::probe::MachineProber),
     };
+    let engine = app.state::<crate::engine::SharedEngine>().inner().clone();
     let service = DepsService::new(
         backend,
+        engine,
         floor,
         Box::new(manifest::HttpNet::new()),
         Box::new(RealProc),
@@ -324,6 +329,40 @@ impl fmt::Display for VersionError {
     }
 }
 
+/// The entries of an OS environment whose name and value are both valid UTF-8;
+/// the rest are skipped (`std::env::vars` would panic on them).
+pub fn utf8_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<(String, String)> {
+    vars.into_iter()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect()
+}
+
+/// The inherited variables a herdr child must not see: every `HERDR_*` name in
+/// `names` (an outer herdr's session, socket, config), including every case variant
+/// of `HERDR_CONFIG_PATH`. Always includes the canonical `HERDR_CONFIG_PATH`.
+pub fn herdr_env_removals(names: impl IntoIterator<Item = OsString>) -> Vec<String> {
+    let names: Vec<OsString> = names.into_iter().collect();
+    let mut out = herdr_var_names(names.iter().cloned());
+    out.extend(
+        names
+            .iter()
+            .filter_map(|n| n.to_str())
+            .filter(|n| n.eq_ignore_ascii_case("HERDR_CONFIG_PATH"))
+            .map(str::to_string),
+    );
+    out.push("HERDR_CONFIG_PATH".to_string());
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The `--version` probe for `exe`, run without any inherited outer-herdr variables.
+fn version_spec(exe: &Path, names: impl IntoIterator<Item = OsString>) -> ProcSpec {
+    let mut spec = ProcSpec::new(exe, &["--version"]);
+    spec.env_remove = herdr_env_removals(names);
+    spec
+}
+
 /// Run `<exe> --version` and parse it. Returns the version and the trimmed output.
 pub fn binary_version(
     proc_: &dyn Proc,
@@ -331,7 +370,7 @@ pub fn binary_version(
 ) -> Result<(semver::Version, String), VersionError> {
     let out = proc_
         .run(
-            &ProcSpec::new(exe, &["--version"]),
+            &version_spec(exe, std::env::vars_os().map(|(k, _)| k)),
             VERSION_TIMEOUT,
             &mut |_| {},
         )
@@ -733,6 +772,43 @@ mod tests {
             binary_version(&p, exe),
             Err(VersionError::Unparseable(_))
         ));
+    }
+
+    #[test]
+    fn version_probe_drops_inherited_herdr_vars() {
+        let names = ["HERDR_SOCKET_PATH", "herdr_config_path", "PATH"].map(OsString::from);
+        let spec = version_spec(Path::new("/opt/x/herdr"), names);
+        assert_eq!(
+            spec.env_remove,
+            [
+                "HERDR_CONFIG_PATH",
+                "HERDR_SOCKET_PATH",
+                "herdr_config_path"
+            ]
+        );
+        // The canonical name is removed even when the process does not carry it.
+        let spec = version_spec(Path::new("/opt/x/herdr"), Vec::<OsString>::new());
+        assert_eq!(spec.env_remove, ["HERDR_CONFIG_PATH"]);
+    }
+
+    #[test]
+    fn utf8_env_skips_entries_that_are_not_utf8() {
+        #[cfg(unix)]
+        let bad = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![b'K', 0xff])
+        };
+        #[cfg(windows)]
+        let bad = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[b'K' as u16, 0xD800])
+        };
+        let got = utf8_env([
+            (OsString::from("A"), OsString::from("1")),
+            (bad.clone(), OsString::from("v")),
+            (OsString::from("B"), bad),
+        ]);
+        assert_eq!(got, [("A".to_string(), "1".to_string())]);
     }
 
     #[test]

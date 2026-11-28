@@ -165,8 +165,8 @@ pub fn is_name_taken(e: &HerdrError) -> bool {
 ///
 /// A still-launching or `working` agent is BUSY; a `blocked` one is WAITING on the
 /// user; `idle`/`done`/unknown (and any unrecognized status) carry no hint.
-/// `apply_reconcile` only ever moves a live session away from `idle` (to busy or
-/// waiting), so this can withhold a dispatch but never force one.
+/// A hint only ever moves a live session away from `idle` (to busy or waiting), so
+/// it can withhold work but never force it.
 pub fn agent_status_to_state_hint(status: &str, launch_pending: bool) -> Option<String> {
     if launch_pending {
         return Some(HINT_BUSY.to_string());

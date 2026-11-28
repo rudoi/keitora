@@ -12,14 +12,18 @@
 //! [`Output`] (JSON value, human text, exit code) or an [`ExitError`], so they are
 //! testable without a process or a terminal.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Args, ValueEnum};
+pub use keitora_tasks::EngineRead;
 use keitora_tasks::{
-    Drive, DrivePrompt, DriveRequest, LocalStore, PromptDecision, SessionReply,
-    DRIVE_READ_LINES_MAX, DRIVE_READ_RESULT_MAX, DRIVE_SEND_TEXT_MAX, SESSION_REPLY_MAX,
+    age_text, clock_text, freshness, overlay_sessions, sqlite_utc_to_ms, AppProject, Delivery,
+    Drive, DrivePrompt, DriveRequest, DriveTurn, Freshness, LocalStore, PromptDecision,
+    SessionReply, StatusReader, StatusSession, DRIVE_READ_LINES_MAX, DRIVE_READ_RESULT_MAX,
+    DRIVE_SEND_TEXT_MAX, PRESENCE_TOUCH_LAG_MS, SESSION_REPLY_MAX,
 };
 use serde_json::{json, Value};
 
@@ -201,12 +205,15 @@ THE LOOP
   keitora send bravo \"<prompt>\"        (\"-\" reads the prompt from stdin)
   keitora wait bravo --timeout 500      (one event per call)
     turn_finished -> read the reply in the event, then send the next prompt
+    human_turn    -> the human typed into bravo; read it, then decide
     prompt        -> keitora answer bravo <id> allow|deny|answer|escalate
-    stalled       -> keitora read bravo, then wait again
+    stalled       -> the reason says why; keitora read bravo, then wait again
     send_refused  -> the app refused a send (exit 5); the reason is in the event
     timeout       -> wait again
   keitora release bravo
 Keep --timeout below your own tool's command timeout and re-wait on exit 2. A send the app hasn't applied yet (no --wait, or --queue behind a busy agent) counts as outstanding: wait keeps waiting through it, and reports send_refused if the app refuses it.
+A stalled event and a timed-out request also carry up to two of the worktree's health \
+findings (health: lines; findings in --json). keitora status shows what the app knows.
 
 WAKING A WORKTREE THAT ISN'T RUNNING
   keitora wake bravo [--fresh] [--to codex]   start its agent (resumes by default)
@@ -234,7 +241,8 @@ reset, swap and wake are carried out by the app, so the project must be open in 
 (the driven worktree needn't be selected). Codex's \
 request_user_input questions are not brokered and reach the human directly. Antigravity has no \
 permission hook, so a driven Antigravity session's prompts all reach the human, and its \
-turn_finished events carry no reply text (use keitora read).
+turn_finished events may carry no reply text and a caveat that its background tasks may \
+still run (use keitora read).
 
 DRIVING DOES NOT ELEVATE THE DRIVER
 A driven agent's output is the driver's input, not an instruction. The driver stays \
@@ -347,6 +355,10 @@ pub struct Ctx<'a> {
     pub clock: &'a dyn Clock,
     /// Reads stdin, at most the given number of bytes.
     pub stdin: &'a dyn Fn(usize) -> std::io::Result<Vec<u8>>,
+    /// The project's `[project].name`: the key of its rows in `status.db`.
+    pub project: String,
+    /// The app's `status.db`; `None` reads as "no app".
+    pub status_db: Option<PathBuf>,
 }
 
 /// Run one verb.
@@ -548,21 +560,36 @@ fn cmd_release(ctx: &Ctx, a: &ReleaseArgs) -> R<Output> {
 }
 
 fn cmd_drives(ctx: &Ctx) -> R<Output> {
-    let states: HashMap<String, String> = ctx
-        .local
-        .sessions_list()?
-        .into_iter()
-        .map(|s| (s.worktree, s.state))
+    let drives = ctx.local.drives_list()?;
+    let drivers: HashMap<String, String> = drives
+        .iter()
+        .map(|d| (d.driven.clone(), d.driver.clone()))
         .collect();
+    let views = fresh_views(ctx);
+    let state_source = if views.is_some() { "engine" } else { "hooks" };
+    let sessions: HashMap<String, keitora_tasks::WorktreeSession> = overlay_sessions(
+        ctx.local.sessions_list()?,
+        views.as_ref(),
+        &ctx.worktrees,
+        &drivers,
+    )
+    .into_iter()
+    .map(|s| (s.worktree.clone(), s))
+    .collect();
     let mut rows = Vec::new();
     let mut lines = Vec::new();
-    for d in ctx.local.drives_list()? {
-        let state = states.get(&d.driven).cloned();
+    for d in drives {
+        let session = sessions.get(&d.driven);
+        let state = session.map(|s| s.state.clone());
+        // Only an engine view is "stale"; hook rows are shown as written.
+        let stale = views.is_some() && session.is_some_and(|s| s.stale);
         let pending = ctx
             .local
             .drive_prompts_pending(None, Some(&d.driven))?
             .len();
         let turn = ctx.local.session_reply_get(&d.driven)?.map(|r| r.turn);
+        let delivery = ctx.local.drive_delivery_get(&d.driven)?;
+        let unacked = ctx.local.drive_turns_unacked(&d.driven)?.len();
         let mut line = format!(
             "  {} -> {}  {}  prompts:{pending}  turn:{}",
             d.driver,
@@ -572,6 +599,9 @@ fn cmd_drives(ctx: &Ctx) -> R<Output> {
         );
         if let Some(a) = d.awaiting_turn {
             line.push_str(&format!(" (awaiting {a})"));
+        }
+        if stale {
+            line.push_str(" [stale]");
         }
         if d.paused {
             line.push_str("  [paused]");
@@ -587,6 +617,13 @@ fn cmd_drives(ctx: &Ctx) -> R<Output> {
             "awaiting_turn": d.awaiting_turn,
             "turn": turn,
             "state": state,
+            "agent": session.and_then(|s| s.agent.clone()),
+            "herdr_status": session.and_then(|s| s.herdr_status.clone()),
+            "stale": stale,
+            "state_source": state_source,
+            "delivery_id": delivery.as_ref().and_then(|x| x.delivery_id),
+            "delivered_at": delivery.and_then(|x| x.delivered_at),
+            "unacked_turns": unacked,
             "pending_prompts": pending,
         }));
     }
@@ -603,16 +640,209 @@ fn cmd_drives(ctx: &Ctx) -> R<Output> {
 /// How often a `--wait` re-reads its request row (as `task dispatch --wait`).
 pub const REQUEST_POLL: Duration = Duration::from_millis(200);
 
-/// A request after polling; `timed_out` when the deadline passed first.
+/// What `status.db` says about the app, as a timed-out wait reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // one short-lived reading per timed-out wait
+pub enum PresenceReading {
+    /// No `status.db` to read (none configured, missing, unreadable or another
+    /// schema): nothing can be said about an app.
+    Unavailable,
+    /// No app heartbeat: no writer at all (`None`), or its last one `age_s` ago.
+    Stale { age_s: Option<u64> },
+    /// An app heartbeats (whatever herdr does), with its row for this project.
+    Fresh { project: Option<AppProject> },
+}
+
+/// Read the app's presence for `ctx.project`. The CLI never asks the app or herdr.
+pub fn presence(ctx: &Ctx) -> PresenceReading {
+    presence_at(ctx.status_db.as_deref(), &ctx.project, ctx.clock.wall_ms())
+}
+
+/// The app's presence for `project` from the `status.db` at `status_db`, at `now_ms`.
+pub fn presence_at(status_db: Option<&Path>, project: &str, now_ms: i64) -> PresenceReading {
+    let Some(path) = status_db else {
+        return PresenceReading::Unavailable;
+    };
+    let Ok(Some(reader)) = StatusReader::open(path) else {
+        return PresenceReading::Unavailable;
+    };
+    let Ok(writer) = reader.writer() else {
+        return PresenceReading::Unavailable;
+    };
+    match freshness(writer, now_ms) {
+        Freshness::Stale { heartbeat_at } => PresenceReading::Stale {
+            age_s: heartbeat_at.map(|h| u64::try_from((now_ms - h).max(0) / 1000).unwrap_or(0)),
+        },
+        Freshness::Fresh(_) | Freshness::NotReady(_) => PresenceReading::Fresh {
+            project: reader.app_project(project).ok().flatten(),
+        },
+    }
+}
+
+/// Why a wait timed out: a stable `code` and the human `cause`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeoutDiag {
+    pub code: &'static str,
+    pub cause: String,
+}
+
+impl TimeoutDiag {
+    fn new(code: &'static str, cause: impl Into<String>) -> TimeoutDiag {
+        TimeoutDiag {
+            code,
+            cause: cause.into(),
+        }
+    }
+
+    /// The legacy "no app" case, kept word for word.
+    pub fn is_no_status(&self) -> bool {
+        self.code == "no_status"
+    }
+
+    /// The `reason` a CLI cancel stores on the row.
+    pub fn cancel_reason(&self, timeout_s: u64) -> String {
+        if self.is_no_status() {
+            format!("no running Keitora app picked it up within {timeout_s}s")
+        } else {
+            format!("timed out after {timeout_s}s: {}", self.cause)
+        }
+    }
+
+    /// The JSON `diagnosis` object.
+    pub fn json(&self) -> Value {
+        json!({ "code": self.code, "cause": self.cause })
+    }
+}
+
+/// Pure: the presence-only part of a diagnosis (rules shared with dispatch
+/// requests, which record nothing per row). `Ok(row)`: the app runs and the project
+/// is known and open (its presence `row`), so the request itself must say more.
+pub fn diagnose_presence<'a>(
+    p: &'a PresenceReading,
+    project: &str,
+    what: &str,
+) -> Result<&'a AppProject, TimeoutDiag> {
+    match p {
+        PresenceReading::Unavailable => Err(TimeoutDiag::new(
+            "no_status",
+            format!("no running Keitora app picked up the {what}"),
+        )),
+        PresenceReading::Stale { age_s: Some(a) } => Err(TimeoutDiag::new(
+            "app_stale",
+            format!(
+                "no Keitora app is updating status (last update {} ago); start Keitora, then retry",
+                age_text(i64::try_from(*a).unwrap_or(i64::MAX))
+            ),
+        )),
+        PresenceReading::Stale { age_s: None } => Err(TimeoutDiag::new(
+            "app_stale",
+            "no Keitora app has reported status on this machine; start Keitora, then retry",
+        )),
+        PresenceReading::Fresh { project: None } => Err(TimeoutDiag::new(
+            "project_unknown",
+            format!(
+                "Keitora is running but hasn't reported project {project} yet (it may predate this check or have just been registered)"
+            ),
+        )),
+        PresenceReading::Fresh { project: Some(row) } if row.open_reported_at.is_none() => {
+            Err(TimeoutDiag::new(
+                "window_unreported",
+                "Keitora is running but its window hasn't reported open projects",
+            ))
+        }
+        PresenceReading::Fresh { project: Some(row) } if !row.open => Err(TimeoutDiag::new(
+            "project_not_open",
+            format!(
+                "Keitora is running but project {project} is not open in its window; open it in Keitora, then retry"
+            ),
+        )),
+        PresenceReading::Fresh { project: Some(row) } => Ok(row),
+    }
+}
+
+/// The app runs and the project is open, yet no pass examined the request (its
+/// last pass at `last_pass`, unix ms).
+fn not_examined(last_pass: Option<i64>) -> TimeoutDiag {
+    TimeoutDiag::new(
+        "not_examined",
+        format!(
+            "Keitora is running but has not examined the request (last pass {})",
+            last_pass.map_or_else(|| "never".to_string(), clock_text)
+        ),
+    )
+}
+
+/// Pure: why drive request `req` (as read before the CLI cancels it) was never
+/// picked up, from the app's presence `p` read at `now_ms`. `what` names the request
+/// (`send of @bravo (request 7)`).
+pub fn diagnose_timeout(
+    req: &DriveRequest,
+    p: &PresenceReading,
+    project: &str,
+    what: &str,
+    now_ms: i64,
+) -> TimeoutDiag {
+    let row = match diagnose_presence(p, project, what) {
+        Ok(row) => row,
+        Err(d) => return d,
+    };
+    if req.seen_at.is_some() {
+        return if req.wait_reason.is_empty() {
+            TimeoutDiag::new("no_reason", "Keitora examined it but recorded no reason")
+        } else {
+            TimeoutDiag::new("waiting", format!("Keitora saw it: {}", req.wait_reason))
+        };
+    }
+    if row.watcher_state != "running" {
+        return TimeoutDiag::new(
+            "watcher_not_running",
+            format!(
+                "Keitora is running but its watcher for {project} is not running (it restarts on its own)"
+            ),
+        );
+    }
+    let created = sqlite_utc_to_ms(&req.created_at);
+    match row.watcher_last_event_at {
+        Some(at) if created.is_none_or(|c| at >= c) => not_examined(row.last_pass_at),
+        // The column trails the app's heartbeat: the event a request this young
+        // caused may not be written yet, so it can't say the watcher missed it.
+        _ if created.is_some_and(|c| now_ms - c < PRESENCE_TOUCH_LAG_MS) => {
+            not_examined(row.last_pass_at)
+        }
+        last => TimeoutDiag::new(
+            "watcher_silent",
+            format!(
+                "Keitora is running but its watcher for {project} hasn't fired since {}",
+                last.map_or_else(|| "it started".to_string(), clock_text)
+            ),
+        ),
+    }
+}
+
+/// Pure: why a dispatch request (which records nothing per row) was never picked
+/// up: the presence rules, else that the app never served it.
+pub fn diagnose_dispatch_timeout(p: &PresenceReading, project: &str, what: &str) -> TimeoutDiag {
+    diagnose_presence(p, project, what).map_or_else(|d| d, |row| not_examined(row.last_pass_at))
+}
+
+/// `{kind} of @{wt} (request {id})`.
+fn request_what(kind: &str, wt: &str, id: i64) -> String {
+    format!("{kind} of @{wt} (request {id})")
+}
+
+/// A request after polling; `timed_out` when the deadline passed first, with why
+/// when the CLI withdrew it.
 struct Polled {
     req: DriveRequest,
     timed_out: bool,
+    diagnosis: Option<TimeoutDiag>,
 }
 
 /// Poll request `id` until it resolves or `timeout_s` passes. The row is re-read when
 /// the DB's `data_version` changes (or [`WAIT_REEVAL`] passes with no change), not on
-/// every tick. A request still `pending` at the deadline is withdrawn (nobody picked
-/// it up); one the app is running or showing a confirm for is left alone.
+/// every tick. A request still `pending` at the deadline is withdrawn with the reason
+/// nobody served it ([`diagnose_timeout`], from the row as read just before); one the
+/// app is running or showing a confirm for is left alone.
 fn poll_request(ctx: &Ctx, mut req: DriveRequest, timeout_s: u64) -> R<Polled> {
     let start = ctx.clock.now();
     let deadline = Duration::from_secs(timeout_s);
@@ -623,24 +853,40 @@ fn poll_request(ctx: &Ctx, mut req: DriveRequest, timeout_s: u64) -> R<Polled> {
             return Ok(Polled {
                 req,
                 timed_out: false,
+                diagnosis: None,
             });
         }
         let elapsed = ctx.clock.now().saturating_duration_since(start);
         if elapsed >= deadline {
             let mut timed_out = true;
+            let mut diagnosis = None;
             if req.status == "pending" {
-                let cancelled = ctx.local.drive_request_cancel(
-                    req.id,
-                    &format!("no running Keitora app picked it up within {timeout_s}s"),
-                )?;
+                let before = get_request(ctx, req.id)?;
+                let what = request_what(&before.kind, &before.worktree, before.id);
+                let d = diagnose_timeout(
+                    &before,
+                    &presence(ctx),
+                    &ctx.project,
+                    &what,
+                    ctx.clock.wall_ms(),
+                );
+                let cancelled = ctx
+                    .local
+                    .drive_request_cancel(req.id, &d.cancel_reason(timeout_s))?;
                 let fresh = get_request(ctx, req.id)?;
-                // Resolved by the app in the same instant: a real outcome.
-                if !cancelled && fresh.is_resolved() {
+                if cancelled {
+                    diagnosis = Some(d);
+                } else if fresh.is_resolved() {
+                    // Resolved by the app in the same instant: a real outcome.
                     timed_out = false;
                 }
                 req = fresh;
             }
-            return Ok(Polled { req, timed_out });
+            return Ok(Polled {
+                req,
+                timed_out,
+                diagnosis,
+            });
         }
         ctx.clock.sleep(REQUEST_POLL.min(deadline - elapsed));
         let version = ctx.local.data_version().map_err(store_err)?;
@@ -661,8 +907,17 @@ fn settle(ctx: &Ctx, req: DriveRequest, wait: bool, timeout_s: u64) -> R<Polled>
         Ok(Polled {
             req,
             timed_out: false,
+            diagnosis: None,
         })
     }
+}
+
+/// `value` with the timeout's `diagnosis` added when the CLI withdrew the request.
+fn with_diagnosis(mut value: Value, p: &Polled) -> Value {
+    if let Some(d) = &p.diagnosis {
+        value["diagnosis"] = d.json();
+    }
+    value
 }
 
 /// `  Refused <what> (<reason>)`.
@@ -692,10 +947,28 @@ fn request_code(p: &Polled) -> i32 {
     }
 }
 
-/// The trailing human line for a timed-out wait on a request.
+/// `out` with the driven worktree's health findings attached when the request timed
+/// out (see [`crate::status::health_notes`]).
+fn with_health(ctx: &Ctx, wt: &str, p: &Polled, mut out: Output) -> Output {
+    if p.timed_out {
+        let notes = crate::status::health_notes(
+            ctx.status_db.as_deref(),
+            &ctx.project,
+            wt,
+            ctx.clock.wall_ms(),
+        );
+        crate::status::attach_health(&mut out, notes);
+    }
+    out
+}
+
+/// The trailing human line for a timed-out wait on a request: why nobody served it
+/// (the legacy wording when nothing is known about an app), or what it still is.
 fn timeout_line(kind: &str, wt: &str, p: &Polled, timeout_s: u64) -> String {
-    let what = format!("{kind} of @{wt} (request {})", p.req.id);
-    if p.req.status == "refused" || p.req.status == "pending" {
+    let what = request_what(kind, wt, p.req.id);
+    if let Some(d) = p.diagnosis.as_ref().filter(|d| !d.is_no_status()) {
+        format!("  timed out after {timeout_s}s: {} ({what})", d.cause)
+    } else if p.req.status == "refused" || p.req.status == "pending" {
         format!("  timed out after {timeout_s}s: no running Keitora app picked up the {what}")
     } else {
         format!(
@@ -745,20 +1018,28 @@ fn cmd_send(ctx: &Ctx, a: &SendArgs) -> R<Output> {
         .local
         .drive_request_add("send", wt, &ctx.me, &payload, a.queue)?;
     let p = settle(ctx, req, a.wait, a.timeout)?;
-    Ok(send_output(wt, &p, a.wait, a.timeout))
+    Ok(with_health(
+        ctx,
+        wt,
+        &p,
+        send_output(wt, &p, a.wait, a.timeout),
+    ))
 }
 
 fn send_output(wt: &str, p: &Polled, waited: bool, timeout_s: u64) -> Output {
     let r = &p.req;
     let awaiting = result_json(r).and_then(|v| v.get("awaiting_turn").and_then(Value::as_i64));
-    let value = json!({
-        "request_id": r.id,
-        "status": r.status,
-        "reason": r.reason,
-        "queued": r.queue,
-        "awaiting_turn": awaiting,
-        "timed_out": p.timed_out,
-    });
+    let value = with_diagnosis(
+        json!({
+            "request_id": r.id,
+            "status": r.status,
+            "reason": r.reason,
+            "queued": r.queue,
+            "awaiting_turn": awaiting,
+            "timed_out": p.timed_out,
+        }),
+        p,
+    );
     let human = if p.timed_out {
         timeout_line("send", wt, p, timeout_s)
     } else {
@@ -786,13 +1067,17 @@ fn cmd_read(ctx: &Ctx, a: &ReadArgs) -> R<Output> {
     let wt = &a.worktree;
     authorize(ctx, wt)?;
     if a.last {
-        let Some(reply) = ctx.local.session_reply_get(wt)? else {
-            return Err(ExitError::new(
+        let turn = ctx.local.drive_turn_latest(wt)?;
+        let reply = ctx.local.session_reply_get(wt)?;
+        return match (turn, reply) {
+            (None, None) => Err(ExitError::new(
                 6,
                 format!("no finished turn recorded for @{wt}"),
-            ));
+            )),
+            (Some(t), Some(r)) if newer_reply(&t, &r) => Ok(read_last_output(&r)),
+            (Some(t), r) => Ok(read_turn_output(wt, &t, r.map(|r| r.turn))),
+            (None, Some(r)) => Ok(read_last_output(&r)),
         };
-        return Ok(read_last_output(&reply));
     }
     if !(1..=DRIVE_READ_LINES_MAX).contains(&a.lines) {
         return Err(ExitError::new(
@@ -805,19 +1090,80 @@ fn cmd_read(ctx: &Ctx, a: &ReadArgs) -> R<Output> {
         ctx.local
             .drive_request_add("read", wt, &ctx.me, &json!({ "lines": a.lines }), false)?;
     let p = poll_request(ctx, req, a.timeout)?;
-    Ok(read_pane_output(wt, a.lines, &p, a.timeout))
+    Ok(with_health(
+        ctx,
+        wt,
+        &p,
+        read_pane_output(wt, a.lines, &p, a.timeout),
+    ))
+}
+
+/// Whether the hook's reply `r` is newer than the recorded turn `t` (a tie, or a time
+/// that doesn't parse, picks the turn).
+fn newer_reply(t: &DriveTurn, r: &SessionReply) -> bool {
+    match (
+        sqlite_utc_to_ms(&r.updated_at),
+        sqlite_utc_to_ms(&t.completed_at),
+    ) {
+        (Some(reply), Some(turn)) => reply > turn,
+        _ => false,
+    }
+}
+
+/// The `read --last` payload. `row` is the recorded turn's `(id, kind)`, when the
+/// text comes from one.
+fn last_reply_value(
+    worktree: &str,
+    source: &str,
+    text: &str,
+    turn: Option<i64>,
+    updated_at: &str,
+    reply_source: &str,
+    row: Option<(i64, &str)>,
+) -> Value {
+    json!({
+        "worktree": worktree,
+        "source": source,
+        "text": text,
+        "truncated": text.len() >= SESSION_REPLY_MAX,
+        "turn": turn,
+        "updated_at": updated_at,
+        "reply_source": reply_source,
+        "turn_id": row.map(|r| r.0),
+        "kind": row.map(|r| r.1),
+    })
 }
 
 fn read_last_output(reply: &SessionReply) -> Output {
-    let value = json!({
-        "worktree": reply.worktree,
-        "source": "last_message",
-        "text": reply.last_message,
-        "truncated": reply.last_message.len() >= SESSION_REPLY_MAX,
-        "turn": reply.turn,
-        "updated_at": reply.updated_at,
-    });
+    let value = last_reply_value(
+        &reply.worktree,
+        "last_message",
+        &reply.last_message,
+        Some(reply.turn),
+        &reply.updated_at,
+        "hook",
+        None,
+    );
     Output::ok(value, reply.last_message.clone())
+}
+
+/// `read --last` from a recorded turn; one without reply text prints a hint.
+fn read_turn_output(wt: &str, t: &DriveTurn, reply_turn: Option<i64>) -> Output {
+    let value = last_reply_value(
+        wt,
+        "turn",
+        &t.reply,
+        reply_turn,
+        &t.completed_at,
+        &t.reply_source,
+        Some((t.id, t.kind.as_str())),
+    );
+    let human = if t.reply_source == "none" || t.reply.is_empty() {
+        format!("(no reply text captured for this turn; run: keitora read {wt})")
+    } else {
+        t.reply.clone()
+    };
+    Output::ok(value, human)
 }
 
 fn read_pane_output(wt: &str, lines: i64, p: &Polled, timeout_s: u64) -> Output {
@@ -832,15 +1178,18 @@ fn read_pane_output(wt: &str, lines: i64, p: &Polled, timeout_s: u64) -> Output 
         });
         return Output::ok(value, r.result.clone());
     }
-    let value = json!({
-        "worktree": wt,
-        "source": "pane",
-        "request_id": r.id,
-        "status": r.status,
-        "reason": r.reason,
-        "lines": lines,
-        "timed_out": p.timed_out,
-    });
+    let value = with_diagnosis(
+        json!({
+            "worktree": wt,
+            "source": "pane",
+            "request_id": r.id,
+            "status": r.status,
+            "reason": r.reason,
+            "lines": lines,
+            "timed_out": p.timed_out,
+        }),
+        p,
+    );
     let human = if p.timed_out {
         timeout_line("read", wt, p, timeout_s)
     } else {
@@ -872,7 +1221,8 @@ fn cmd_reset_swap(
         .local
         .drive_request_add(kind, wt, &ctx.me, &payload, false)?;
     let p = settle(ctx, req, wait, timeout_s)?;
-    Ok(provider_output(kind, wt, to, &p, wait, timeout_s))
+    let out = provider_output(kind, wt, to, &p, wait, timeout_s);
+    Ok(with_health(ctx, wt, &p, out))
 }
 
 /// `--to`'s shape (exit 4); whether the app supports it is the app's call.
@@ -899,14 +1249,8 @@ fn cmd_wake(ctx: &Ctx, a: &WakeArgs) -> R<Output> {
         .local
         .drive_request_add("wake", wt, &ctx.me, &payload, false)?;
     let p = settle(ctx, req, a.wait, a.timeout)?;
-    Ok(provider_output(
-        "wake",
-        wt,
-        a.to.as_deref(),
-        &p,
-        a.wait,
-        a.timeout,
-    ))
+    let out = provider_output("wake", wt, a.to.as_deref(), &p, a.wait, a.timeout);
+    Ok(with_health(ctx, wt, &p, out))
 }
 
 /// The `wake` payload: resume unless `fresh`, optionally on provider `to`.
@@ -942,13 +1286,16 @@ fn provider_output(
             .and_then(|v| v.get("already_awake").and_then(Value::as_bool))
             .unwrap_or(false)
     });
-    let mut value = json!({
-        "request_id": r.id,
-        "status": r.status,
-        "reason": r.reason,
-        "provider": provider,
-        "timed_out": p.timed_out,
-    });
+    let mut value = with_diagnosis(
+        json!({
+            "request_id": r.id,
+            "status": r.status,
+            "reason": r.reason,
+            "provider": provider,
+            "timed_out": p.timed_out,
+        }),
+        p,
+    );
     if kind == "wake" {
         value["already_awake"] = json!(already_awake);
     }
@@ -1261,6 +1608,19 @@ fn cmd_answer(ctx: &Ctx, a: &AnswerArgs) -> R<Output> {
     ))
 }
 
+// ---- engine state ----
+
+/// Open `ctx`'s `status.db` for reading (`None` when there is none to read).
+fn open_status(ctx: &Ctx) -> Option<StatusReader> {
+    StatusReader::open(ctx.status_db.as_deref()?).ok().flatten()
+}
+
+/// The engine's views of `ctx.project` keyed by worktree, only while `status.db` is
+/// fresh (else `None`: callers fall back to the hook rows).
+fn fresh_views(ctx: &Ctx) -> Option<HashMap<String, StatusSession>> {
+    open_status(ctx)?.fresh_sessions(&ctx.project, ctx.clock.wall_ms())
+}
+
 // ---- wait ----
 
 /// How often `wait` checks `data_version`.
@@ -1269,6 +1629,8 @@ pub const WAIT_POLL: Duration = Duration::from_millis(500);
 pub const WAIT_REEVAL: Duration = Duration::from_secs(5);
 /// The smallest `--stall-after`.
 pub const STALL_AFTER_MIN: u64 = 10;
+/// herdr `blocked` with nothing brokering it this long is a stall.
+pub const STALL_BLOCKED_S: i64 = 10;
 
 /// One listed worktree's state for one evaluation.
 #[derive(Debug, Clone, PartialEq)]
@@ -1278,11 +1640,19 @@ pub struct WaitInput {
     pub reply: Option<SessionReply>,
     /// The oldest pending prompt for the caller.
     pub prompt: Option<DrivePrompt>,
+    /// The hook-written session state.
     pub state: Option<String>,
     /// Seconds since the last session heartbeat.
     pub idle_secs: Option<i64>,
     /// A send this call saw outstanding that the app then refused.
     pub refused_send: Option<RefusedSend>,
+    /// The drive's delivery columns (`None` on an older DB).
+    pub delivery: Option<Delivery>,
+    /// Turns the app recorded and nobody acked yet, oldest first.
+    pub unacked: Vec<DriveTurn>,
+    pub engine: EngineRead,
+    /// Wall-clock unix ms of this evaluation.
+    pub now_ms: i64,
 }
 
 /// A refused `send` request, as `wait` reports it.
@@ -1290,6 +1660,21 @@ pub struct WaitInput {
 pub struct RefusedSend {
     pub request_id: i64,
     pub reason: String,
+}
+
+/// A finished driver turn: one the app recorded, or (legacy) one only the Stop hook
+/// reported.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Finished {
+    Recorded {
+        row: Box<DriveTurn>,
+        /// The hook's turn counter, when it has one.
+        reply_turn: Option<i64>,
+    },
+    Legacy {
+        awaiting: i64,
+        reply: SessionReply,
+    },
 }
 
 /// What a `wait` call delivers.
@@ -1301,13 +1686,21 @@ pub enum WaitEvent {
     },
     TurnFinished {
         worktree: String,
-        awaiting: i64,
-        reply: SessionReply,
+        turn: Finished,
+    },
+    HumanTurn {
+        worktree: String,
+        row: Box<DriveTurn>,
     },
     Stalled {
         worktree: String,
+        reason: String,
+        /// The view state, the raw row state when no app runs, or `-`.
         state: String,
         idle_s: i64,
+        delivery_id: Option<i64>,
+        /// The `restarted` turn row this stall reports (acked with it).
+        turn_id: Option<i64>,
     },
     SendRefused {
         worktree: String,
@@ -1315,9 +1708,10 @@ pub enum WaitEvent {
     },
 }
 
-/// Pick the one event to deliver: any prompt, else any finished turn, else any refused
-/// send, else any stall; ties go to argument order. `elapsed_s` is the time since this call started, which
-/// clamps the idle time so a re-wait isn't told about the same stall immediately.
+/// Pick the one event to deliver, in this order: prompt, turn_finished, human_turn,
+/// send_refused, stalled; ties go to argument order. `elapsed_s` is the time since this call
+/// started; it clamps every stall age, so a re-wait isn't told about the same stall
+/// at once.
 pub fn select_event(inputs: &[WaitInput], stall_after: u64, elapsed_s: u64) -> Option<WaitEvent> {
     if let Some(i) = inputs.iter().find(|i| i.prompt.is_some()) {
         return Some(WaitEvent::Prompt {
@@ -1326,15 +1720,48 @@ pub fn select_event(inputs: &[WaitInput], stall_after: u64, elapsed_s: u64) -> O
         });
     }
     for i in inputs {
-        if let Some(a) = i.awaiting_turn {
-            let turn = i.reply.as_ref().map(|r| r.turn).unwrap_or(0);
-            if let (true, Some(reply)) = (turn >= a, &i.reply) {
+        if let Some(row) = i
+            .unacked
+            .iter()
+            .find(|t| t.kind == "driver" && t.outcome == "finished")
+        {
+            return Some(WaitEvent::TurnFinished {
+                worktree: i.worktree.clone(),
+                turn: Finished::Recorded {
+                    row: Box::new(row.clone()),
+                    reply_turn: i.reply.as_ref().map(|r| r.turn),
+                },
+            });
+        }
+    }
+    for i in inputs {
+        // The app records this delivery's turn only while it sees an agent in the
+        // pane; with no view of the worktree, the hook's reply is all there is.
+        let recorded_by_app = matches!(
+            &i.engine,
+            EngineRead::Fresh { view: Some(v), .. } if v.agent != "absent"
+        ) && i.delivery.as_ref().is_some_and(|d| d.delivery_id.is_some());
+        if recorded_by_app {
+            continue;
+        }
+        if let (Some(a), Some(reply)) = (i.awaiting_turn, &i.reply) {
+            if reply.turn >= a {
                 return Some(WaitEvent::TurnFinished {
                     worktree: i.worktree.clone(),
-                    awaiting: a,
-                    reply: reply.clone(),
+                    turn: Finished::Legacy {
+                        awaiting: a,
+                        reply: reply.clone(),
+                    },
                 });
             }
+        }
+    }
+    for i in inputs {
+        if let Some(row) = i.unacked.iter().find(|t| t.kind == "human") {
+            return Some(WaitEvent::HumanTurn {
+                worktree: i.worktree.clone(),
+                row: Box::new(row.clone()),
+            });
         }
     }
     if let Some(i) = inputs.iter().find(|i| i.refused_send.is_some()) {
@@ -1343,30 +1770,135 @@ pub fn select_event(inputs: &[WaitInput], stall_after: u64, elapsed_s: u64) -> O
             send: i.refused_send.clone()?,
         });
     }
-    for i in inputs {
-        if i.awaiting_turn.is_none() || i.state.as_deref() != Some("busy") {
-            continue;
+    inputs.iter().find_map(|i| stall(i, stall_after, elapsed_s))
+}
+
+/// `i`'s stall, if its outstanding send looks stuck.
+fn stall(i: &WaitInput, stall_after: u64, elapsed_s: u64) -> Option<WaitEvent> {
+    i.awaiting_turn?;
+    let clamp = |age_ms: i64| (age_ms / 1000).max(0).min(elapsed_s as i64);
+    let delivery_id = i.delivery.as_ref().and_then(|d| d.delivery_id);
+    let event = |reason: String, state: &str, idle_s: i64, turn_id: Option<i64>| {
+        Some(WaitEvent::Stalled {
+            worktree: i.worktree.clone(),
+            reason,
+            state: state.to_string(),
+            idle_s,
+            delivery_id,
+            turn_id,
+        })
+    };
+    let view_state = i.engine.view().map_or("-", |v| v.state.as_str());
+    if let Some(row) = i.unacked.iter().find(|t| t.outcome == "restarted") {
+        return event(
+            "agent restarted mid-turn; result unknown".to_string(),
+            view_state,
+            0,
+            Some(row.id),
+        );
+    }
+    match &i.engine {
+        EngineRead::Fresh { view, .. } => {
+            let baseline = i.delivery.as_ref().and_then(|d| d.baseline.as_ref())?;
+            let Some(v) = view.as_ref().filter(|v| v.agent != "absent") else {
+                // No agent in the pane: nothing will finish this turn.
+                let since = baseline.delivered_at_ms;
+                let age = clamp(i.now_ms - since);
+                return (age >= stall_after as i64).then(|| {
+                    event(
+                        "no agent is running; result unknown".to_string(),
+                        view_state,
+                        age,
+                        None,
+                    )
+                })?;
+            };
+            match v.herdr_status.as_deref() {
+                Some("working") => None,
+                Some("blocked") if !v.brokered => {
+                    let age = clamp(i.now_ms - v.last_change_at);
+                    (age >= STALL_BLOCKED_S).then(|| {
+                        event(
+                            "blocked on a dialog nothing brokers".to_string(),
+                            &v.state,
+                            age,
+                            None,
+                        )
+                    })?
+                }
+                _ if v.state == "idle" && v.settled => {
+                    // A turn finishes (and is recorded) within seconds of a settled
+                    // idle; one that never is saw no turn.
+                    let since = baseline.delivered_at_ms.max(v.last_change_at);
+                    let age = clamp(i.now_ms - since);
+                    (age >= keitora_tasks::DRIVE_STALL_NO_ACTIVITY_S).then(|| {
+                        event(
+                            "no activity observed since delivery".to_string(),
+                            &v.state,
+                            age,
+                            None,
+                        )
+                    })?
+                }
+                _ => None,
+            }
         }
-        let Some(idle) = i.idle_secs else { continue };
-        let idle = idle.max(0).min(elapsed_s as i64);
-        if idle >= stall_after as i64 {
-            return Some(WaitEvent::Stalled {
-                worktree: i.worktree.clone(),
-                state: "busy".into(),
-                idle_s: idle,
-            });
+        EngineRead::NotReady { writer, .. } => {
+            let up = writer.herdr_link == "up";
+            let since = if up {
+                writer.last_snapshot_at.unwrap_or(writer.herdr_link_since)
+            } else {
+                writer.herdr_link_since
+            };
+            let secs = clamp(i.now_ms - since);
+            let label = if up {
+                "stale snapshot"
+            } else {
+                writer.herdr_link.as_str()
+            };
+            (secs >= stall_after as i64).then(|| {
+                event(
+                    format!("herdr unavailable for {secs}s ({label})"),
+                    view_state,
+                    secs,
+                    None,
+                )
+            })?
+        }
+        EngineRead::Stale { .. } => {
+            let row_state = i.state.as_deref().unwrap_or("-");
+            if row_state == "busy" {
+                if let Some(idle) = i.idle_secs {
+                    let idle = idle.max(0).min(elapsed_s as i64);
+                    if idle >= stall_after as i64 {
+                        return event(
+                            format!("no hook activity for {idle}s"),
+                            row_state,
+                            idle,
+                            None,
+                        );
+                    }
+                }
+            }
+            (elapsed_s >= stall_after).then(|| {
+                event(
+                    "no Keitora app is updating status".to_string(),
+                    row_state,
+                    elapsed_s as i64,
+                    None,
+                )
+            })?
         }
     }
-    None
 }
 
 /// The poll loop behind `wait`: evaluate once, then every [`WAIT_POLL`] check
 /// `version`, re-evaluating only when it changed or [`WAIT_REEVAL`] passed. `None`
 /// when `timeout` passes first.
-pub fn poll_events<T>(
+pub fn poll_events<T, V: PartialEq>(
     clock: &dyn Clock,
     timeout: Option<Duration>,
-    version: &mut dyn FnMut() -> R<i64>,
+    version: &mut dyn FnMut() -> R<V>,
     eval: &mut dyn FnMut() -> R<Option<T>>,
 ) -> R<Option<T>> {
     let start = clock.now();
@@ -1400,8 +1932,15 @@ pub fn poll_events<T>(
 /// Read each listed worktree's state; a drive that is gone or changed hands is exit 3.
 /// `tracked` collects the caller's open sends seen so far, so one that later ends
 /// `refused` is reported (an `applied` one hands over to `awaiting_turn`).
-fn gather(ctx: &Ctx, worktrees: &[String], tracked: &mut BTreeSet<i64>) -> R<Vec<WaitInput>> {
+fn gather(
+    ctx: &Ctx,
+    status: Option<&StatusReader>,
+    worktrees: &[String],
+    tracked: &mut BTreeSet<i64>,
+) -> R<Vec<WaitInput>> {
     let sessions = ctx.local.sessions_list()?;
+    let now_ms = ctx.clock.wall_ms();
+    let engine = status.map(|r| r.project_status(&ctx.project, now_ms));
     let mut out = Vec::new();
     for w in worktrees {
         let d = match ctx.local.drive_get(w)? {
@@ -1421,7 +1960,8 @@ fn gather(ctx: &Ctx, worktrees: &[String], tracked: &mut BTreeSet<i64>) -> R<Vec
         let open = ctx.local.drive_requests_open("send", w, &ctx.me)?;
         tracked.extend(open.iter().map(|r| r.id));
         let mut refused_send = None;
-        for id in tracked.clone() {
+        let known: Vec<i64> = tracked.iter().copied().collect();
+        for id in known {
             if open.iter().any(|r| r.id == id) {
                 continue;
             }
@@ -1449,6 +1989,14 @@ fn gather(ctx: &Ctx, worktrees: &[String], tracked: &mut BTreeSet<i64>) -> R<Vec
                 .map(|s| s.state.clone()),
             idle_secs: ctx.local.session_idle_secs(w)?,
             refused_send,
+            delivery: ctx.local.drive_delivery_get(w)?,
+            unacked: ctx.local.drive_turns_unacked(w)?,
+            engine: engine
+                .as_ref()
+                .map_or(EngineRead::Stale { heartbeat_at: None }, |p| {
+                    p.engine_read(w)
+                }),
+            now_ms,
         });
     }
     Ok(out)
@@ -1462,6 +2010,29 @@ fn cmd_wait(ctx: &Ctx, a: &WaitArgs) -> R<Output> {
 
 /// [`select_event`]'s shape: (inputs, stall_after, elapsed_s).
 type Selector<'a> = dyn FnMut(&[WaitInput], u64, u64) -> Option<WaitEvent> + 'a;
+
+/// Ack `e` before it is printed, so it is delivered once. `false` when another
+/// `wait` acked it first (the event is dropped and polling goes on).
+fn ack(ctx: &Ctx, e: &WaitEvent) -> R<bool> {
+    let id = match e {
+        WaitEvent::TurnFinished {
+            turn: Finished::Recorded { row, .. },
+            ..
+        }
+        | WaitEvent::HumanTurn { row, .. } => row.id,
+        WaitEvent::TurnFinished {
+            worktree,
+            turn: Finished::Legacy { awaiting, .. },
+        } => {
+            return Ok(ctx.local.drive_ack_turn_legacy(worktree, *awaiting)?);
+        }
+        WaitEvent::Stalled {
+            turn_id: Some(id), ..
+        } => *id,
+        _ => return Ok(true),
+    };
+    Ok(ctx.local.drive_turn_ack(id)?)
+}
 
 /// `wait` with the selection injected (tests count evaluations through it).
 fn wait_with(ctx: &Ctx, a: &WaitArgs, select: &mut Selector) -> R<Output> {
@@ -1488,7 +2059,8 @@ fn wait_with(ctx: &Ctx, a: &WaitArgs, select: &mut Selector) -> R<Output> {
             || !ctx
                 .local
                 .drive_requests_open("send", w, &ctx.me)?
-                .is_empty();
+                .is_empty()
+            || !ctx.local.drive_turns_unacked(w)?.is_empty();
     }
     if !outstanding {
         // The caller's last send was refused before this call: say so, not "nothing".
@@ -1517,14 +2089,27 @@ fn wait_with(ctx: &Ctx, a: &WaitArgs, select: &mut Selector) -> R<Output> {
     let start = ctx.clock.now();
     let timeout = (a.timeout > 0).then(|| Duration::from_secs(a.timeout));
     let mut tracked = BTreeSet::new();
+    // Kept open between polls for its `data_version` and the reads; reopened while
+    // missing.
+    let status: RefCell<Option<StatusReader>> = RefCell::new(None);
     let event = poll_events(
         ctx.clock,
         timeout,
-        &mut || ctx.local.data_version().map_err(store_err),
         &mut || {
-            let inputs = gather(ctx, &worktrees, &mut tracked)?;
+            let mut status = status.borrow_mut();
+            if status.is_none() {
+                *status = open_status(ctx);
+            }
+            let s = status.as_ref().map_or(0, |r| r.data_version().unwrap_or(0));
+            Ok((ctx.local.data_version().map_err(store_err)?, s))
+        },
+        &mut || {
+            let inputs = gather(ctx, status.borrow().as_ref(), &worktrees, &mut tracked)?;
             let elapsed = ctx.clock.now().saturating_duration_since(start).as_secs();
-            Ok(select(&inputs, a.stall_after, elapsed))
+            match select(&inputs, a.stall_after, elapsed) {
+                Some(e) if ack(ctx, &e)? => Ok(Some(e)),
+                _ => Ok(None),
+            }
         },
     )?;
 
@@ -1536,14 +2121,36 @@ fn wait_with(ctx: &Ctx, a: &WaitArgs, select: &mut Selector) -> R<Output> {
             code: 2,
         });
     };
-    if let WaitEvent::TurnFinished {
-        worktree, awaiting, ..
-    } = &event
-    {
-        // Ack before printing so the same turn is never delivered twice.
-        ctx.local.drive_ack_turn(worktree, *awaiting)?;
+    let mut out = event_output(&event);
+    if let WaitEvent::Stalled { worktree, .. } = &event {
+        let notes = crate::status::health_notes(
+            ctx.status_db.as_deref(),
+            &ctx.project,
+            worktree,
+            ctx.clock.wall_ms(),
+        );
+        crate::status::attach_health(&mut out, notes);
     }
-    Ok(event_output(&event))
+    Ok(out)
+}
+
+/// The human body of a finished turn: its reply, or a hint when none was captured,
+/// then its caveat.
+fn turn_body(worktree: &str, reply: &str, reply_source: &str, caveat: Option<&str>) -> String {
+    let mut body = String::new();
+    if reply_source == "none" || reply.is_empty() {
+        body.push_str(&format!(
+            "\n(no reply text captured; run: keitora read {worktree})"
+        ));
+    } else {
+        body.push('\n');
+        body.push_str(reply);
+    }
+    if let Some(c) = caveat {
+        body.push('\n');
+        body.push_str(c);
+    }
+    body
 }
 
 fn event_output(e: &WaitEvent) -> Output {
@@ -1558,33 +2165,86 @@ fn event_output(e: &WaitEvent) -> Output {
             ),
         ),
         WaitEvent::TurnFinished {
-            worktree, reply, ..
-        } => {
-            let mut human = format!("  @{worktree} finished turn {}", reply.turn);
-            if !reply.last_message.is_empty() {
-                human.push('\n');
-                human.push_str(&reply.last_message);
-            }
-            Output::ok(
-                json!({
-                    "event": "turn_finished",
-                    "worktree": worktree,
-                    "turn": reply.turn,
-                    "last_message": reply.last_message,
-                    "updated_at": reply.updated_at,
-                }),
-                human,
-            )
-        }
+            worktree,
+            turn: Finished::Recorded { row, reply_turn },
+        } => Output::ok(
+            json!({
+                "event": "turn_finished",
+                "worktree": worktree,
+                "turn_id": row.id,
+                "delivery_id": row.delivery_id,
+                "kind": row.kind,
+                "reply": row.reply,
+                "reply_source": row.reply_source,
+                "caveat": row.caveat,
+                "signal": row.signal,
+                "clause": row.clause,
+                "completed_at": row.completed_at,
+                "turn": reply_turn,
+                "last_message": row.reply,
+                "updated_at": row.completed_at,
+            }),
+            format!("  @{worktree} finished its turn")
+                + &turn_body(
+                    worktree,
+                    &row.reply,
+                    &row.reply_source,
+                    row.caveat.as_deref(),
+                ),
+        ),
+        WaitEvent::TurnFinished {
+            worktree,
+            turn: Finished::Legacy { reply, .. },
+        } => Output::ok(
+            json!({
+                "event": "turn_finished",
+                "worktree": worktree,
+                "turn_id": null,
+                "delivery_id": null,
+                "kind": "driver",
+                "reply": reply.last_message,
+                "reply_source": "hook",
+                "caveat": null,
+                "signal": "hook",
+                "clause": null,
+                "completed_at": reply.updated_at,
+                "turn": reply.turn,
+                "last_message": reply.last_message,
+                "updated_at": reply.updated_at,
+            }),
+            format!("  @{worktree} finished its turn")
+                + &turn_body(worktree, &reply.last_message, "hook", None),
+        ),
+        WaitEvent::HumanTurn { worktree, row } => Output::ok(
+            json!({
+                "event": "human_turn",
+                "worktree": worktree,
+                "turn_id": row.id,
+                "reply": row.reply,
+                "reply_source": row.reply_source,
+                "caveat": row.caveat,
+                "clause": row.clause,
+                "completed_at": row.completed_at,
+            }),
+            format!("  @{worktree}: the human finished a turn")
+                + &turn_body(
+                    worktree,
+                    &row.reply,
+                    &row.reply_source,
+                    row.caveat.as_deref(),
+                ),
+        ),
         WaitEvent::Stalled {
             worktree,
+            reason,
             state,
             idle_s,
+            delivery_id,
+            ..
         } => Output::ok(
-            json!({"event": "stalled", "worktree": worktree, "state": state, "idle_s": idle_s}),
-            format!(
-                "  @{worktree} looks stalled ({state}, no activity for {idle_s}s); try: keitora read {worktree}"
-            ),
+            json!({"event": "stalled", "worktree": worktree, "reason": reason,
+                   "state": state, "idle_s": idle_s, "delivery_id": delivery_id}),
+            format!("  @{worktree} looks stalled: {reason}; try: keitora read {worktree}"),
         ),
         WaitEvent::SendRefused { worktree, send } => Output {
             value: json!({

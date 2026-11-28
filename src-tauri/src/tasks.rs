@@ -9,6 +9,9 @@ use keitora_tasks::{
     Reservation, Task, TaskBackend, TaskUpdate, TaskWithDeps, WorktreeSession,
 };
 use serde::Serialize;
+use std::collections::HashMap;
+
+use crate::engine::{ProjectViews, SharedEngine};
 
 /// Serializable, structured error returned by the task Tauri commands. Replaces the
 /// blanket `Result<_, String>` so the frontend can branch on `kind` (e.g. show a
@@ -82,60 +85,89 @@ pub(crate) fn open_backend() -> Result<(Box<dyn TaskBackend>, ProjectConfig), St
     Ok((backend, config))
 }
 
-/// Worktree sessions reconciled against the daemon's live-set: a session whose
-/// worktree has no live daemon PTY and isn't already offline is reported
-/// `offline`, with its `current_task_id`/`pid` cleared (covers crashed sessions
-/// the app never received a SessionEnd for). The single source of truth for the
-/// idle rule, so the dispatcher and `sessions_list` agree on what "idle" means.
-///
-/// Task-state reconciliation of `current_task_id` (nulling the pointer when the
-/// referenced task is no longer `active` or no longer owned by this worktree) now
-/// happens inside `keitora_tasks::sessions_list`. This function layers daemon-liveness
-/// on top — offline → null pointer — exactly as before. The actual downgrade is
-/// `crate::backend::apply_reconcile`, keyed by the daemon's `SessionKey`s under the
-/// active project namespace.
-pub(crate) fn reconciled_sessions(
-    live: &std::collections::HashSet<crate::backend::SessionKey>,
-    hints: &crate::backend::HintMap,
-    project: &str,
-    config: &ProjectConfig,
-) -> Result<Vec<WorktreeSession>, String> {
-    // Open the LocalStore from the ALREADY-RESOLVED config's db_path so each command
-    // resolves config + opens the local handle once (no second `resolve_active()` +
-    // Connection — FIX 6).
-    let local =
-        LocalStore::open(&config.tasks.db_path.to_string_lossy()).map_err(|e| e.to_string())?;
-    reconciled_sessions_in(&local, live, hints, project, config)
+/// A project's session rows as the app reports them, plus the names left out.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Reconciled {
+    /// Rows overlaid with the engine views, scoped to the configured worktrees,
+    /// stamped with the project.
+    pub sessions: Vec<WorktreeSession>,
+    /// Worktrees with a hook row that are not configured for the project (sorted).
+    /// They are not shown; they are kept for the health check that reports them.
+    pub unconfigured: Vec<String>,
 }
 
-/// [`reconciled_sessions`] over an already-open store (e.g. a read-only handle).
-pub(crate) fn reconciled_sessions_in(
-    local: &LocalStore,
-    live: &std::collections::HashSet<crate::backend::SessionKey>,
-    hints: &crate::backend::HintMap,
+/// The project's worktree sessions with the engine's views laid over the hook rows
+/// (`keitora_tasks::overlay_sessions`): the single source of truth for "idle", so the
+/// dispatcher, the rail and `sessions_list` agree.
+///
+/// - A fresh view sets the state (an agent herdr lists without a hook row still
+///   shows, e.g. one whose hooks never fired).
+/// - Once the engine is ready, a row without a view reads `offline`.
+/// - Before that (or with no herdr link) the rows are reported as they are,
+///   marked `stale`.
+///
+/// Task-state reconciliation of `current_task_id` happens inside
+/// `keitora_tasks::sessions_list`.
+pub(crate) fn reconciled_sessions(
+    views: &ProjectViews,
     project: &str,
     config: &ProjectConfig,
 ) -> Result<Vec<WorktreeSession>, String> {
-    // `worktree_sessions` rows carry NO project column, and the sessions DB
-    // accumulates a row for every worktree that has ever run a session across ALL
-    // projects. Scope to the ACTIVE project's configured worktrees so the board
-    // shows this project's worktrees only — not a cross-project superset.
-    let configured: std::collections::HashSet<String> = config.worktrees().into_iter().collect();
-    let all = local.sessions_list().map_err(|e| e.to_string())?;
-    // Empty configured set → don't filter: a project with no configured worktrees
-    // (effective_worktrees None + an empty committed list) would otherwise blank the
-    // board even when live sessions exist. Falling back to the unscoped list keeps
-    // those visible; the scoping only kicks in once worktrees are actually configured.
-    let sessions: Vec<WorktreeSession> = if configured.is_empty() {
-        all
+    // Open the LocalStore from the already-resolved config so each command resolves
+    // config and opens the local handle once.
+    let local =
+        LocalStore::open(&config.tasks.db_path.to_string_lossy()).map_err(|e| e.to_string())?;
+    Ok(reconciled_sessions_in(&local, views, project, config)?.sessions)
+}
+
+/// [`reconciled_sessions`] over an already-open store (e.g. a read-only handle),
+/// with the unconfigured names it left out.
+pub(crate) fn reconciled_sessions_in(
+    local: &LocalStore,
+    views: &ProjectViews,
+    project: &str,
+    config: &ProjectConfig,
+) -> Result<Reconciled, String> {
+    let rows = local.sessions_list().map_err(|e| e.to_string())?;
+    // A store without drive tables (or a read error) only costs synthesized rows
+    // their `driven_by`.
+    let drivers: HashMap<String, String> = local
+        .drives_list()
+        .map(|ds| ds.into_iter().map(|d| (d.driven, d.driver)).collect())
+        .unwrap_or_default();
+    // `worktree_sessions` rows carry no project column and the DB keeps a row for
+    // every worktree that ever ran a session; only the configured ones are shown.
+    // An empty configured set doesn't restrict.
+    let configured = config.worktrees();
+    let mut unconfigured: Vec<String> = if configured.is_empty() {
+        Vec::new()
     } else {
-        all.into_iter()
-            .filter(|s| configured.contains(&s.worktree))
+        rows.iter()
+            .filter(|r| !configured.contains(&r.worktree))
+            .map(|r| r.worktree.clone())
             .collect()
     };
-    Ok(crate::backend::apply_reconcile(
-        &sessions, live, hints, project,
-    ))
+    unconfigured.sort();
+    unconfigured.dedup();
+    if !unconfigured.is_empty() {
+        log::debug!(
+            "sessions: {project} has rows for unconfigured worktrees: {}",
+            unconfigured.join(", ")
+        );
+    }
+    let mut sessions = keitora_tasks::overlay_sessions(
+        rows,
+        views.ready.then_some(&views.views),
+        &configured,
+        &drivers,
+    );
+    for s in &mut sessions {
+        s.project = project.to_string();
+    }
+    Ok(Reconciled {
+        sessions,
+        unconfigured,
+    })
 }
 
 /// The worktree this app acts as (assignee for claim/done/unclaim). Lets the UI
@@ -145,27 +177,16 @@ pub fn task_actor() -> String {
     keitora_tasks::current_worktree()
 }
 
-/// Live worktree session states. Reconciles against PTY ownership: a worktree the
-/// app holds no live PTY for is reported `offline`, regardless of its last hook
-/// write (covers crashed sessions the app never received a SessionEnd for).
-/// Polled every few seconds, so the busy hints come from the backend's cached
-/// session list and never spawn a server query.
+/// Live worktree session states of the active project: the engine's views over
+/// the hook rows (see [`reconciled_sessions`]), each stamped with the project so
+/// the frontend keys sessions by `project/worktree`.
 #[tauri::command(async)]
 pub fn sessions_list(
-    client: tauri::State<'_, crate::backend::SharedBackend>,
+    engine: tauri::State<'_, SharedEngine>,
 ) -> Result<Vec<WorktreeSession>, String> {
-    // Resolve config ONCE and reuse it for both the project name and the LocalStore
-    // open inside `reconciled_sessions` (FIX 6 — no duplicate resolve).
     let config = keitora_tasks::resolve_active().map_err(|e| e.to_string())?;
     let project = config.project.name.clone();
-    let hints = crate::backend::cached_agent_hints(client.inner().as_ref());
-    let mut sessions = reconciled_sessions(&client.live_set_snapshot(), &hints, &project, &config)?;
-    // Stamp the active project onto each row so the frontend keys sessions by
-    // `project/worktree` — DB rows carry no project column.
-    for s in &mut sessions {
-        s.project = project.clone();
-    }
-    Ok(sessions)
+    reconciled_sessions(&engine.views(&project), &project, &config)
 }
 
 /// IPC-layer wrapper: the board's tasks plus the active project they were resolved
@@ -376,4 +397,137 @@ pub async fn task_new(
         )
         .await
         .map_err(|e| to_ipc_error(&e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::SessionKey;
+    use crate::engine::model::{obs, AgentObs};
+    use crate::engine::tests::{ingest_settled, FakeEvidence};
+    use crate::engine::SessionEngine;
+    use keitora_tasks::WorktreeEntry;
+
+    /// Project `proj` (worktrees alpha and bravo) with its DB in a temp dir.
+    fn project(dir: &std::path::Path) -> (ProjectConfig, LocalStore) {
+        let root = dir.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = ProjectConfig::scaffold(&root);
+        config.effective_worktrees = Some(
+            ["alpha", "bravo"]
+                .into_iter()
+                .map(WorktreeEntry::name_only)
+                .collect(),
+        );
+        let db = dir.join("tasks.db").to_string_lossy().into_owned();
+        config.tasks.db_path = db.clone().into();
+        (config, LocalStore::open(&db).unwrap())
+    }
+
+    fn key(w: &str) -> SessionKey {
+        SessionKey {
+            project: "proj".into(),
+            worktree: w.into(),
+        }
+    }
+
+    fn engine() -> SharedEngine {
+        SessionEngine::new_for_test(std::sync::Arc::new(FakeEvidence::default()))
+    }
+
+    #[test]
+    fn a_rowless_live_agent_reads_idle_in_sessions_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, local) = project(dir.path());
+        local.drive_bind("bravo", "alpha", None, false).unwrap();
+        let engine = engine();
+        let agy = AgentObs {
+            agent: Some("agy".into()),
+            ..obs("w1:p1", "idle", 2, None)
+        };
+        ingest_settled(&engine, vec![(key("alpha"), Some(agy))]);
+
+        let sessions = reconciled_sessions(&engine.views("proj"), "proj", &config).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!((s.worktree.as_str(), s.state.as_str()), ("alpha", "idle"));
+        assert_eq!(s.project, "proj");
+        assert_eq!(s.agent.as_deref(), Some("present"));
+        assert_eq!(
+            s.driven_by.as_deref(),
+            Some("bravo"),
+            "from the drives table"
+        );
+        assert!(!s.stale);
+    }
+
+    #[test]
+    fn an_offline_row_with_a_live_agent_reads_idle_and_a_shell_reads_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, local) = project(dir.path());
+        local
+            .session_upsert("alpha", "offline", None, None)
+            .unwrap();
+        local
+            .session_upsert("bravo", "idle", Some(4), Some(99))
+            .unwrap();
+        let engine = engine();
+        let shell = AgentObs {
+            agent: None,
+            ..obs("w1:p2", "unknown", 0, None)
+        };
+        ingest_settled(
+            &engine,
+            vec![
+                (key("alpha"), Some(obs("w1:p1", "idle", 2, None))),
+                (key("bravo"), Some(shell)),
+            ],
+        );
+        let r = reconciled_sessions_in(&local, &engine.views("proj"), "proj", &config).unwrap();
+        let states: Vec<(&str, &str)> = r
+            .sessions
+            .iter()
+            .map(|s| (s.worktree.as_str(), s.state.as_str()))
+            .collect();
+        assert_eq!(states, vec![("alpha", "idle"), ("bravo", "offline")]);
+        assert_eq!(
+            r.sessions[1].current_task_id, None,
+            "offline clears the task"
+        );
+        assert_eq!(r.sessions[1].pid, None);
+    }
+
+    #[test]
+    fn before_the_first_snapshot_rows_are_reported_stale_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, local) = project(dir.path());
+        local.session_upsert("alpha", "busy", None, None).unwrap();
+        let r = reconciled_sessions_in(&local, &engine().views("proj"), "proj", &config).unwrap();
+        assert_eq!(r.sessions.len(), 1);
+        assert_eq!(r.sessions[0].state, "busy");
+        assert!(r.sessions[0].stale);
+    }
+
+    #[test]
+    fn rows_outside_the_configured_set_are_reported_as_unconfigured() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, local) = project(dir.path());
+        for wt in ["alpha", "zulu", "other-wt"] {
+            local.session_upsert(wt, "idle", None, None).unwrap();
+        }
+        let r = reconciled_sessions_in(&local, &engine().views("proj"), "proj", &config).unwrap();
+        let shown: Vec<&str> = r.sessions.iter().map(|s| s.worktree.as_str()).collect();
+        assert_eq!(shown, vec!["alpha"]);
+        assert_eq!(
+            r.unconfigured,
+            vec!["other-wt".to_string(), "zulu".to_string()]
+        );
+
+        // With no configured worktrees nothing is filtered, so nothing is reported.
+        let mut open = config.clone();
+        open.effective_worktrees = Some(Vec::new());
+        let r = reconciled_sessions_in(&local, &engine().views("proj"), "proj", &open).unwrap();
+        assert!(r.unconfigured.is_empty());
+        assert_eq!(r.sessions.len(), 3);
+    }
 }

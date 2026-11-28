@@ -78,6 +78,8 @@ pub mod watchdog;
 pub mod writer;
 
 use crate::deps::floor::FloorSlot;
+use crate::engine::model::AgentObs;
+use crate::engine::SharedEngine;
 use boot::BootClass;
 use bridge::{Bridge, BridgeStdin, ExitAuthority};
 use cli::{PaneInfo, ServerStatus};
@@ -317,10 +319,20 @@ pub struct HerdrBackend {
     /// The running server's version/protocol judgement, written by the status
     /// loop; a protocol mismatch refuses pane binding.
     floor: Arc<FloorSlot>,
+    /// The session engine the status loop feeds and agent launches report to.
+    engine: Option<SharedEngine>,
+    /// Prepares a worktree's hooks before a launch (tests inject their own).
+    launch_prep: LaunchPrepFn,
 }
 
 /// Per-key launch trails of strict spawns (see [`PtyBackend::take_launch_trail`]).
 type LaunchTrails = Arc<Mutex<HashMap<SessionKey, VecDeque<LaunchTrailEntry>>>>;
+
+/// What a launch of `cli` for a session in `cwd` adds to its pane
+/// ([`crate::hooks::launch_prep_for_session`]).
+type LaunchPrepFn = Arc<
+    dyn Fn(&SessionKey, &Path, keitora_tasks::CliKind) -> crate::hooks::LaunchPrep + Send + Sync,
+>;
 
 /// When a bridge stream's end last proved the server gone: in which
 /// generation, and when. Shared by every bridge so a server death that ends
@@ -793,6 +805,9 @@ struct Spawner {
     sizes: SizeMemory,
     /// The launch trails strict spawns write.
     trails: LaunchTrails,
+    /// Told when a launch starts and ends, so the pane reads `starting` meanwhile.
+    engine: Option<SharedEngine>,
+    launch_prep: LaunchPrepFn,
 }
 
 impl Spawner {
@@ -968,19 +983,44 @@ impl Spawner {
         launch: &AgentLaunch,
         decision: ResumeDecision,
     ) -> Result<(u64, ResumeResult, bool), PtyBackendError> {
+        if let Some(engine) = &self.engine {
+            engine.note_launch(key);
+        }
+        let r = self.launch_agent_locked(key, cwd, cols, rows, launch, decision);
+        // A launch that went through stays noted until a snapshot lists its agent:
+        // herdr's `agent list` lags the launch call.
+        if let (Some(engine), Err(_)) = (&self.engine, &r) {
+            engine.note_launch_failed(key);
+        }
+        r
+    }
+
+    /// [`Self::spawn_agent_locked`] without the engine's launch notes.
+    fn launch_agent_locked(
+        &self,
+        key: &SessionKey,
+        cwd: String,
+        cols: u16,
+        rows: u16,
+        launch: &AgentLaunch,
+        decision: ResumeDecision,
+    ) -> Result<(u64, ResumeResult, bool), PtyBackendError> {
         let first = decision.clone();
         let mut decision = decision;
         let kind = agent::herdr_kind(launch.cli);
         let name = agent::agent_name(kind, key);
+        // The provider's hooks, written before the agent starts, plus what the pane
+        // carries for them: the Keitora pane marker and `KEITORA_BIN` (the global
+        // Antigravity hook acts only inside Keitora panes).
+        let prep = (self.launch_prep)(key, Path::new(&cwd), launch.cli);
         // A PATH that resolves the configured exe (on unix always built on herdr's
         // own PATH; on Windows a bare `claude`/`codex` adds none and the pane
-        // inherits herdr's), plus the user's own XDG dirs and `KEITORA_BIN` (which
-        // the global Antigravity hooks need to act only inside Keitora panes).
+        // inherits herdr's), plus the user's own XDG dirs and the prep's env.
         let pane_env = env::pane_env_with(
             &launch.path,
             &self.ops.env().original_xdg,
             self.ops.env().path(),
-            &crate::hooks::keitora_bin_extra_env(Path::new(&cwd)),
+            &prep.env,
         );
         // One `agent_name_taken` per launch is recovered from by closing the
         // unmapped holders in this cwd and starting over in a fresh pane.
@@ -992,7 +1032,11 @@ impl Spawner {
             // Give the fresh shell a brief, bounded moment to reach its prompt before
             // `agent.start` (which requires an interactive shell prompt).
             std::thread::sleep(Duration::from_millis(SHELL_READY_DELAY_MS));
-            let args = agent::build_agent_args(launch.cli, launch.autonomy, &decision);
+            // The prep's args go after the provider's own (and its resume flags), on
+            // every fallback decision.
+            let mut args = agent::build_agent_args(launch.cli, launch.autonomy, &decision);
+            args.extend(prep.agent_args.iter().cloned());
+            crate::hooks::note_launch(key, prep.record(launch.cli, &args));
             match self
                 .ops
                 .agent_start(&name, kind, &id.pane_id, &args, AGENT_START_TIMEOUT_MS)
@@ -1060,6 +1104,11 @@ impl Spawner {
                     decision = next;
                 }
                 Err(e) => {
+                    // Kept for the hook diagnostics: `agent_not_ready` here is how a
+                    // new worktree's Claude folder-trust dialog shows up.
+                    if let Some(code) = e.code() {
+                        crate::hooks::note_start_refused(key, code);
+                    }
                     // Only herdr's own startup timeout can mean codex sat on its update
                     // screen; a transport failure leaves nothing worth reading.
                     let update_prompt = agent::start_error_may_show_update_screen(&e)
@@ -1952,7 +2001,7 @@ impl HerdrBackend {
     /// (its directories, its config file, a socket path that is too long). A
     /// herdr executable that is not found is not a failure here: the backend
     /// starts, reports it as not found, and looks again on `restart`.
-    pub fn new(app: tauri::AppHandle) -> Result<Self, PtyBackendError> {
+    pub fn new(app: tauri::AppHandle, engine: SharedEngine) -> Result<Self, PtyBackendError> {
         let cfg = keitora_tasks::UserConfig::load()
             .map_err(|e| PtyBackendError::Other(format!("loading user config: {e}")))?;
         let env = HerdrEnv::resolve(&cfg.pty)?;
@@ -1962,7 +2011,15 @@ impl HerdrBackend {
         Ok(Self::with_parts(env, Arc::new(app), Some(launcher))
             .with_worktree_filter(Arc::new(crate::host::worktree_exists))
             .with_recovery_params(params)
-            .with_notifier(notifier))
+            .with_notifier(notifier)
+            .with_engine(engine))
+    }
+
+    /// Feed `engine` from the status loop and report agent launches to it. Call it
+    /// before `start`.
+    pub fn with_engine(mut self, engine: SharedEngine) -> Self {
+        self.engine = Some(engine);
+        self
     }
 
     /// Construct from an explicit env + emit sink (the headless path), driving the
@@ -2035,7 +2092,17 @@ impl HerdrBackend {
             sizes: SizeMemory::default(),
             trails: Arc::default(),
             floor: Arc::default(),
+            engine: None,
+            launch_prep: Arc::new(crate::hooks::launch_prep_for_session),
         }
+    }
+
+    /// Prepare launches with `prep` instead of
+    /// [`crate::hooks::launch_prep_for_session`].
+    #[cfg(test)]
+    pub fn with_launch_prep(mut self, prep: LaunchPrepFn) -> Self {
+        self.launch_prep = prep;
+        self
     }
 
     /// Sample memory headroom from `headroom` (tests inject a fake). Rebuilds the
@@ -2189,6 +2256,8 @@ impl HerdrBackend {
             exit_authority: self.exit_authority(),
             sizes: self.sizes.clone(),
             trails: Arc::clone(&self.trails),
+            engine: self.engine.clone(),
+            launch_prep: Arc::clone(&self.launch_prep),
         }
     }
 
@@ -2257,6 +2326,8 @@ impl HerdrBackend {
                 Arc::new(move || latch_is_set(&ready))
             },
             floor: Arc::clone(&self.floor),
+            engine: self.engine.clone(),
+            wall_ms: Arc::new(keitora_tasks::now_ms),
         })
     }
 
@@ -2895,6 +2966,20 @@ impl PtyBackend for HerdrBackend {
         Ok(self.ops.process_name(info.shell_pid))
     }
 
+    fn agent_snapshot(&self, key: &SessionKey) -> Result<Option<AgentObs>, PtyBackendError> {
+        self.gate.admit_session(key)?;
+        // A pane of a replaced server has no agent of this key's.
+        let Some(pane) = self.keymap.get_current(key) else {
+            return Ok(None);
+        };
+        Ok(self
+            .ops
+            .agent_list()?
+            .iter()
+            .find(|a| a.pane_id == pane.pane_id)
+            .map(AgentObs::from_info))
+    }
+
     fn run_line(&self, key: &SessionKey, gen: u64, line: &str) -> Result<(), PtyBackendError> {
         self.gate.admit_session(key)?;
         // Only into the pane spawned at `gen`: a replaced or closed one never gets it.
@@ -3422,7 +3507,7 @@ mod tests {
 
         // Cold cache: no sessions, no herdr call.
         assert_eq!(backend.cached_sessions().unwrap(), Vec::new());
-        assert!(crate::backend::cached_agent_hints(&backend).is_empty());
+        assert!(crate::backend::hint_map(backend.cached_sessions()).is_empty());
 
         // A stale list taken at an older keymap version still answers.
         let mut busy = pane("pane_busy");
@@ -3440,7 +3525,7 @@ mod tests {
             Some(crate::backend::HINT_BUSY)
         );
         assert_eq!(
-            crate::backend::cached_agent_hints(&backend),
+            crate::backend::hint_map(backend.cached_sessions()),
             crate::backend::HintMap::from([(skey("wt"), crate::backend::HINT_BUSY.to_string())])
         );
         assert!(
@@ -3457,7 +3542,7 @@ mod tests {
             backend.cached_sessions(),
             Err(PtyBackendError::RecoveryPending)
         ));
-        assert!(crate::backend::cached_agent_hints(&backend).is_empty());
+        assert!(crate::backend::hint_map(backend.cached_sessions()).is_empty());
 
         assert_eq!(count(&fake, ops::Op::PaneList), 0, "{:?}", fake.calls());
         assert!(fake.calls().is_empty(), "{:?}", fake.calls());
@@ -4489,6 +4574,63 @@ mod tests {
             .map(|c| c.args)
             .collect();
         assert_eq!(names, ["4100", "4100"]);
+    }
+
+    #[test]
+    fn agent_snapshot_reads_the_keys_pane_from_one_agent_list() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        // No pane for the key: no herdr call.
+        assert_eq!(backend.agent_snapshot(&skey("a")).unwrap(), None);
+        assert_eq!(count(&fake, ops::Op::AgentList), 0);
+        backend
+            .spawn(skey("a"), "/repos/a".into(), String::new(), None, None)
+            .unwrap();
+        // A bare shell has no agent entry.
+        assert_eq!(backend.agent_snapshot(&skey("a")).unwrap(), None);
+        let pane_id = backend.keymap.get(&skey("a")).unwrap().pane_id;
+        fake.set_agent_present(&pane_id, true);
+        fake.set_agent_status(&pane_id, "working");
+        let o = backend.agent_snapshot(&skey("a")).unwrap().expect("agent");
+        assert_eq!(o.pane_id, pane_id);
+        assert_eq!(o.agent_status, "working");
+        assert!(o.state_change_seq >= 2, "presence and status each bump it");
+        assert_eq!(count(&fake, ops::Op::AgentList), 2);
+    }
+
+    #[test]
+    fn an_agent_launch_reads_starting_in_the_engine_until_it_ends() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let engine = crate::engine::SessionEngine::new_for_test(Arc::new(
+            crate::engine::tests::FakeEvidence::default(),
+        ));
+        let backend = backend.with_engine(Arc::clone(&engine));
+        let modes = Arc::new(Mutex::new(Vec::new()));
+        {
+            let engine = Arc::clone(&engine);
+            let modes = Arc::clone(&modes);
+            fake.on_call(
+                ops::Op::AgentStart,
+                Arc::new(move || modes.lock().unwrap().push(engine.mode())),
+            );
+        }
+        let cwd = worktree_dir(&fake, "wt", None);
+        backend
+            .spawn_agent(
+                skey("wt"),
+                cwd,
+                String::new(),
+                Some((80, 24)),
+                claude_launch(),
+            )
+            .unwrap();
+        assert_eq!(*modes.lock().unwrap(), [crate::engine::Mode::Hot]);
+        assert_eq!(
+            engine.mode(),
+            crate::engine::Mode::Hot,
+            "a launch stays noted until a snapshot lists its agent"
+        );
     }
 
     #[test]
@@ -8163,6 +8305,244 @@ mod tests {
         assert_eq!(raw_agent_start_args(&fake), vec![String::new()]);
     }
 
+    /// A launch prep that marks the pane and appends `--extra x`.
+    fn marked_prep() -> LaunchPrepFn {
+        Arc::new(|_: &SessionKey, _: &Path, _| crate::hooks::LaunchPrep {
+            env: crate::hooks::launch_pane_env(None, false),
+            agent_args: vec!["--extra".into(), "x".into()],
+            prepared: None,
+        })
+    }
+
+    #[test]
+    fn launch_prep_args_follow_the_resume_flags_on_every_attempt() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let backend = backend.with_launch_prep(marked_prep());
+        let cwd = worktree_dir(&fake, "prep-args", Some("sess-1"));
+        record_session(&fake, &skey("prep-args"), "sess-1");
+        fake.script_agent_start(vec![
+            fake::AgentStartScript::EarlyExit,
+            fake::AgentStartScript::EarlyExit,
+            fake::AgentStartScript::Ok,
+        ]);
+        backend
+            .spawn_agent(
+                skey("prep-args"),
+                cwd,
+                String::new(),
+                Some((80, 24)),
+                claude_launch(),
+            )
+            .unwrap();
+        assert_eq!(
+            agent_start_args(&fake),
+            vec![
+                "--resume sess-1 --extra x".to_string(),
+                "--continue --extra x".into(),
+                "--extra x".into()
+            ]
+        );
+        let creates: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter(|c| c.op == ops::Op::WorkspaceCreate)
+            .map(|c| c.args)
+            .collect();
+        assert_eq!(creates.len(), 3);
+        assert!(
+            creates.iter().all(|c| c.contains("KEITORA_PANE")),
+            "{creates:?}"
+        );
+        let rec = crate::hooks::last_launch(&skey("prep-args")).unwrap();
+        assert_eq!(rec.env_names, ["KEITORA_PANE"]);
+    }
+
+    #[test]
+    fn claude_launch_appends_settings_after_resume_flags() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let settings = "/Users/me/.keitora/hooks/claude-launch-settings.json";
+        let backend = backend.with_launch_prep(Arc::new(move |_: &SessionKey, _: &Path, cli| {
+            assert_eq!(cli, keitora_tasks::CliKind::Claude);
+            crate::hooks::launch_prep_for(crate::hooks::Prepared {
+                bin_resolved: Some("/x/keitora".into()),
+                claude_file: crate::hooks::FileWrite::Failed,
+                claude_settings: crate::hooks::ClaudeSettings::Applied(settings.into()),
+                codex_file: crate::hooks::FileWrite::NotApplicable,
+            })
+        }));
+        let key = skey("claude-settings");
+        let cwd = worktree_dir(&fake, "claude-settings", Some("sess-1"));
+        record_session(&fake, &key, "sess-1");
+        // The resume exits early: the fallback step keeps the flag.
+        fake.script_agent_start(vec![
+            fake::AgentStartScript::EarlyExit,
+            fake::AgentStartScript::Ok,
+        ]);
+        let launch = AgentLaunch {
+            autonomy: true,
+            ..claude_launch()
+        };
+        backend
+            .spawn_agent(key.clone(), cwd, String::new(), Some((80, 24)), launch)
+            .unwrap();
+        assert_eq!(
+            agent_start_args(&fake),
+            vec![
+                format!("--dangerously-skip-permissions --resume sess-1 --settings {settings}"),
+                format!("--dangerously-skip-permissions --continue --settings {settings}"),
+            ]
+        );
+        let create = fake
+            .calls()
+            .into_iter()
+            .find(|c| c.op == ops::Op::WorkspaceCreate)
+            .unwrap();
+        assert!(
+            create.args.contains("KEITORA_LAUNCH_HOOKS"),
+            "{}",
+            create.args
+        );
+        let rec = crate::hooks::last_launch(&key).unwrap();
+        assert_eq!(
+            rec.claude_settings,
+            crate::hooks::ClaudeSettings::Applied(settings.into())
+        );
+        assert!(rec.env_names.contains(&"KEITORA_LAUNCH_HOOKS".to_string()));
+    }
+
+    /// Each prep call: the worktree, the provider, and whether an agent had
+    /// already been started.
+    type PrepCalls = Arc<Mutex<Vec<(String, keitora_tasks::CliKind, bool)>>>;
+
+    /// A prep that records each call (key, cli) and whether an agent had already
+    /// been started when it ran.
+    fn recording_prep(fake: &Arc<fake::FakeHerdr>) -> (LaunchPrepFn, PrepCalls) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (fake, log) = (Arc::clone(fake), Arc::clone(&seen));
+        let prep: LaunchPrepFn = Arc::new(move |key: &SessionKey, _: &Path, cli| {
+            let started = fake.calls().iter().any(|c| c.op == ops::Op::AgentStart);
+            log.lock()
+                .unwrap()
+                .push((key.worktree.clone(), cli, started));
+            crate::hooks::LaunchPrep::default()
+        });
+        (prep, seen)
+    }
+
+    /// Every relaunch (a reset, wake, switch, recovery, boot resume, or a new
+    /// worktree's first pane) goes through a spawn: the prep runs there for the
+    /// provider being launched, before its agent starts.
+    #[test]
+    fn launch_prep_runs_for_the_launched_provider_before_the_agent_starts() {
+        for (name, launch) in [
+            ("prep-claude", claude_launch()),
+            ("prep-codex", codex_launch()),
+            ("prep-agy", antigravity_launch()),
+        ] {
+            let fake = fake::FakeHerdr::new();
+            let (backend, _) = fake_backend(&fake);
+            let (prep, seen) = recording_prep(&fake);
+            let backend = backend.with_launch_prep(prep);
+            let cli = launch.cli;
+            let cwd = worktree_dir(&fake, name, None);
+            backend
+                .spawn_agent(skey(name), cwd, String::new(), Some((80, 24)), launch)
+                .unwrap();
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![(name.to_string(), cli, false)],
+                "{name}"
+            );
+        }
+        // The strict (transfer) launch too.
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let (prep, seen) = recording_prep(&fake);
+        let backend = backend.with_launch_prep(prep);
+        let cwd = worktree_dir(&fake, "prep-strict", None);
+        let launch = AgentLaunch {
+            resume_target: None,
+            fresh: true,
+            policy: LaunchPolicy::TransferStrict,
+            ..codex_launch()
+        };
+        let _ = backend.spawner().spawn_agent_transfer_strict_with(
+            &skey("prep-strict"),
+            cwd,
+            80,
+            24,
+            &launch,
+            &crate::backend::herdr::strict::StrictTiming::fast(),
+            None,
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(
+                "prep-strict".to_string(),
+                keitora_tasks::CliKind::Codex,
+                false
+            )]
+        );
+    }
+
+    #[test]
+    fn a_refused_claude_start_is_recorded_on_the_launch() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let backend = backend.with_launch_prep(marked_prep());
+        let key = skey("trust-dialog");
+        let cwd = worktree_dir(&fake, "trust-dialog", None);
+        fake.script_agent_start(vec![fake::AgentStartScript::Err(ops::HerdrError::Api {
+            code: "agent_not_ready".into(),
+            message: "agent did not become ready".into(),
+        })]);
+        assert!(backend
+            .spawn_agent(
+                key.clone(),
+                cwd,
+                String::new(),
+                Some((80, 24)),
+                claude_launch()
+            )
+            .is_err());
+        let rec = crate::hooks::last_launch(&key).unwrap();
+        assert_eq!(rec.start_refused.as_deref(), Some("agent_not_ready"));
+    }
+
+    #[test]
+    fn strict_launch_carries_the_prep_env() {
+        let fake = fake::FakeHerdr::new();
+        let (backend, _) = fake_backend(&fake);
+        let backend = backend.with_launch_prep(marked_prep());
+        let cwd = worktree_dir(&fake, "strict-prep", None);
+        let key = skey("strict-prep");
+        let launch = AgentLaunch {
+            resume_target: None,
+            fresh: true,
+            policy: LaunchPolicy::TransferStrict,
+            ..codex_launch()
+        };
+        let _ = backend.spawner().spawn_agent_transfer_strict_with(
+            &key,
+            cwd,
+            80,
+            24,
+            &launch,
+            &crate::backend::herdr::strict::StrictTiming::fast(),
+            None,
+        );
+        let create = fake
+            .calls()
+            .into_iter()
+            .find(|c| c.op == ops::Op::WorkspaceCreate)
+            .unwrap();
+        assert!(create.args.contains("KEITORA_PANE"), "{}", create.args);
+        let rec = crate::hooks::last_launch(&key).unwrap();
+        assert!(rec.trust_bypass, "a strict launch starts with the bypass");
+    }
+
     #[test]
     fn default_launch_env_comes_from_pane_env_with() {
         let fake = fake::FakeHerdr::new();
@@ -8193,8 +8573,19 @@ mod tests {
         backend: &HerdrBackend,
         launch: AgentLaunch,
     ) -> Result<u64, PtyBackendError> {
-        let cwd = worktree_dir(fake, "wt", None);
-        backend.spawn_agent(skey("wt"), cwd, String::new(), Some((80, 24)), launch)
+        codex_spawn_as(fake, backend, launch, "wt")
+    }
+
+    /// [`codex_spawn`] for worktree `w`: a test that reads the process-wide launch
+    /// record spawns under its own key so parallel tests never overwrite it.
+    fn codex_spawn_as(
+        fake: &Arc<fake::FakeHerdr>,
+        backend: &HerdrBackend,
+        launch: AgentLaunch,
+        w: &str,
+    ) -> Result<u64, PtyBackendError> {
+        let cwd = worktree_dir(fake, w, None);
+        backend.spawn_agent(skey(w), cwd, String::new(), Some((80, 24)), launch)
     }
 
     const HOOK: &str = "--dangerously-bypass-hook-trust";
@@ -9788,7 +10179,7 @@ mod tests {
         }
 
         const EXHAUSTED: &str = "codex did not start: agent never appeared \
-             (tried: resume thr-1 -> fresh -> fresh without optional flags)";
+             (tried: resume thr-1 -> fresh -> fresh without the hook-trust bypass)";
 
         #[test]
         fn strict_evicts_a_stale_claude_name_before_launching_codex() {
@@ -10197,11 +10588,11 @@ mod tests {
         }
 
         #[test]
-        fn strict_early_exit_flag_rejection_drops_the_flag() {
+        fn strict_early_exit_on_every_step_ends_the_chain() {
             let fake = fake::FakeHerdr::new();
-            let (backend, events) = fake_backend(&fake);
-            fake.script_agent_start(vec![Start::EarlyExit, Start::EarlyExit, Start::Ok]);
-            codex_spawn(&fake, &backend, strict()).unwrap();
+            let (backend, _) = fake_backend(&fake);
+            fake.script_agent_start(vec![Start::EarlyExit, Start::EarlyExit, Start::EarlyExit]);
+            assert!(codex_spawn(&fake, &backend, strict()).is_err());
             assert_eq!(
                 agent_start_args(&fake),
                 vec![
@@ -10210,7 +10601,34 @@ mod tests {
                     String::new()
                 ]
             );
-            assert_eq!(resume_events(&events), event("fresh", true));
+            assert!(!backend.is_live(&skey("wt")));
+        }
+
+        #[test]
+        fn strict_flag_rejection_falls_back_to_a_launch_without_the_bypass() {
+            let fake = fake::FakeHerdr::new();
+            let (backend, events) = fake_backend(&fake);
+            // A codex build that rejects the bypass flag exits at once.
+            fake.script_agent_start(vec![Start::EarlyExit, Start::EarlyExit, Start::Ok]);
+            codex_spawn_as(&fake, &backend, strict(), "strict-flag-fallback").unwrap();
+            assert_eq!(
+                agent_start_args(&fake),
+                vec![
+                    format!("resume thr-1 {HOOK}"),
+                    HOOK.to_string(),
+                    String::new()
+                ]
+            );
+            assert_eq!(
+                resume_events(&events),
+                vec![(
+                    "pty://resume/p/strict-flag-fallback".to_string(),
+                    serde_json::json!({ "outcome": "fresh", "fell_back": true }),
+                )]
+            );
+            // The launch record shows the degraded launch.
+            let rec = crate::hooks::last_launch(&skey("strict-flag-fallback")).unwrap();
+            assert!(!rec.trust_bypass);
         }
 
         fn busy() -> Start {
@@ -10439,6 +10857,15 @@ mod tests {
                     HOOK
                 ])
             );
+            assert_eq!(launches[1].detail["label"], "fresh");
+            assert_eq!(
+                launches[1].detail["args"],
+                serde_json::json!(["-c", "check_for_update_on_startup=false", HOOK])
+            );
+            assert_eq!(
+                launches[2].detail["label"],
+                crate::backend::herdr::strict::LAST_RESORT_LABEL
+            );
             assert_eq!(
                 launches[2].detail["args"],
                 serde_json::json!(["-c", "check_for_update_on_startup=false"])
@@ -10489,10 +10916,11 @@ mod tests {
         fn strict_chain_never_exceeds_budget() {
             let fake = fake::FakeHerdr::new();
             let (backend, _) = fake_backend(&fake);
-            fake.script_agent_start(vec![Start::TimedOutLaunched; 3]);
+            fake.script_agent_start(vec![Start::TimedOutLaunched; 2]);
             fake.script_pane_get(endless(Get::NoAgent));
+            // The first step's cap is the whole budget, so no second step starts.
             let timing = StrictTiming {
-                chain_budget: Duration::from_millis(250),
+                chain_budget: Duration::from_millis(150),
                 ..StrictTiming::fast()
             };
             let cwd = worktree_dir(&fake, "wt", None);
@@ -10512,7 +10940,7 @@ mod tests {
             let limit = timing.chain_budget + timing.poll + Duration::from_millis(100);
             assert!(elapsed <= limit, "{elapsed:?} > {limit:?}");
             assert!(
-                count(&fake, ops::Op::AgentStart) < 3,
+                count(&fake, ops::Op::AgentStart) < 2,
                 "the budget cut the chain"
             );
         }

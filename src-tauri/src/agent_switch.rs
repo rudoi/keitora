@@ -100,7 +100,6 @@ pub async fn switch_worktree_cli(
         || discover_target(target_cli);
     check_switch(current, target_cli, available)?;
 
-    let worktree_root = config.worktree_path(&worktree);
     let backend = client.inner().clone();
     let registry = registry.inner().clone();
     // Recovery must not resume this session while the switch rewrites it.
@@ -143,20 +142,14 @@ pub async fn switch_worktree_cli(
     })
     .await?;
 
-    if target_cli == CliKind::Antigravity {
-        // Hook install plus workspace trust for the worktree, then herdr's
-        // integrations, so an `agy` installed after start-up is integrated
-        // without a restart (the backend skips it under test and with the
-        // opt-out env var). Finished before the outcome is returned: the
-        // frontend restarts the pane on `Switched`, and `agy` must find its hook
-        // and trust already in place.
-        let setup = tauri::async_runtime::spawn_blocking(move || {
-            crate::antigravity_hooks::sync_worktree(&worktree_root);
-            backend.refresh_integration();
-        })
-        .await;
-        if let Err(e) = setup {
-            log::warn!("antigravity setup for the switched worktree panicked: {e}");
+    // The frontend restarts the pane on `Switched`; that spawn writes the target's
+    // hooks (and an agy worktree's trust) before the agent starts. herdr's
+    // integration for a provider found late (an `agy` installed after start-up) is
+    // installed here, before the outcome is returned.
+    if target_cli.spec().integration_on_switch {
+        let refresh = tauri::async_runtime::spawn_blocking(move || backend.refresh_integration());
+        if let Err(e) = refresh.await {
+            log::warn!("refreshing herdr's integration after the switch panicked: {e}");
         }
     }
 

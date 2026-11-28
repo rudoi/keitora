@@ -222,7 +222,7 @@ fn drive_bind_force_steals_and_escalates() {
     let db = TempDb::new();
     let ls = db.open();
     let id = bound_with_prompt(&ls);
-    ls.drive_set_awaiting_turn("bravo").unwrap();
+    set_awaiting(&ls, "bravo").unwrap();
     ls.conn
         .execute("UPDATE drives SET paused = 1 WHERE driven = 'bravo'", [])
         .unwrap();
@@ -255,7 +255,7 @@ fn drive_bind_same_driver_is_idempotent_and_keeps_state() {
             [],
         )
         .unwrap();
-    ls.drive_set_awaiting_turn("bravo").unwrap();
+    set_awaiting(&ls, "bravo").unwrap();
     let id = ls
         .drive_prompt_insert(&new_prompt("bravo", "permission"))
         .unwrap()
@@ -415,21 +415,21 @@ fn drive_take_over_marks_escalated_human_and_keeps_binding() {
 }
 
 #[test]
-fn drive_set_awaiting_turn_is_turn_plus_one_and_none_when_released() {
+fn begin_delivery_awaits_turn_plus_one_and_none_when_released() {
     let db = TempDb::new();
     let ls = db.open();
-    assert_eq!(ls.drive_set_awaiting_turn("bravo").unwrap(), None);
+    assert_eq!(set_awaiting(&ls, "bravo").unwrap(), None);
     ls.drive_bind("alpha", "bravo", None, false).unwrap();
-    assert_eq!(ls.drive_set_awaiting_turn("bravo").unwrap(), Some(1));
+    assert_eq!(set_awaiting(&ls, "bravo").unwrap(), Some(1));
     ls.session_reply_record("bravo", "done").unwrap();
     ls.session_reply_record("bravo", "done again").unwrap();
-    assert_eq!(ls.drive_set_awaiting_turn("bravo").unwrap(), Some(3));
+    assert_eq!(set_awaiting(&ls, "bravo").unwrap(), Some(3));
     assert_eq!(
         ls.drive_get("bravo").unwrap().unwrap().awaiting_turn,
         Some(3)
     );
     ls.drive_release("alpha", "bravo").unwrap();
-    assert_eq!(ls.drive_set_awaiting_turn("bravo").unwrap(), None);
+    assert_eq!(set_awaiting(&ls, "bravo").unwrap(), None);
 }
 
 #[test]
@@ -437,9 +437,9 @@ fn drive_ack_turn_only_clears_matching_value() {
     let db = TempDb::new();
     let ls = db.open();
     ls.drive_bind("alpha", "bravo", None, false).unwrap();
-    ls.drive_set_awaiting_turn("bravo").unwrap(); // 1
+    set_awaiting(&ls, "bravo").unwrap(); // 1
     ls.session_reply_record("bravo", "x").unwrap();
-    ls.drive_set_awaiting_turn("bravo").unwrap(); // 2
+    set_awaiting(&ls, "bravo").unwrap(); // 2
     assert!(!ls.drive_ack_turn("bravo", 1).unwrap(), "stale ack");
     assert_eq!(
         ls.drive_get("bravo").unwrap().unwrap().awaiting_turn,
@@ -457,7 +457,7 @@ fn drive_restore_awaiting_turn_sets_exact_value_or_none() {
     assert!(!ls.drive_restore_awaiting_turn("bravo", Some(1)).unwrap());
     ls.drive_bind("alpha", "bravo", None, false).unwrap();
     let prev = ls.drive_get("bravo").unwrap().unwrap().awaiting_turn;
-    ls.drive_set_awaiting_turn("bravo").unwrap();
+    set_awaiting(&ls, "bravo").unwrap();
     assert!(ls.drive_restore_awaiting_turn("bravo", prev).unwrap());
     assert_eq!(ls.drive_get("bravo").unwrap().unwrap().awaiting_turn, None);
     assert!(ls.drive_restore_awaiting_turn("bravo", Some(7)).unwrap());
@@ -1393,6 +1393,90 @@ fn session_reply_record_bumps_turn_and_truncates_on_char_boundary() {
 }
 
 #[test]
+fn session_reply_record_for_turn_dedupes_and_migrates() {
+    let db = TempDb::new();
+    let ls = db.open();
+    let rec =
+        |msg: &str, id: Option<&str>| ls.session_reply_record_for_turn("bravo", msg, id, None);
+    let msg = || ls.session_reply_get("bravo").unwrap().unwrap().last_message;
+    // Same id twice: one turn.
+    assert_eq!(rec("first", Some("t-1")).unwrap(), 1);
+    assert_eq!(rec("first again", Some("t-1")).unwrap(), 1);
+    assert_eq!(msg(), "first", "a repeat never replaces text");
+    // A different id bumps.
+    assert_eq!(rec("", Some("t-2")).unwrap(), 2);
+    // A repeat fills an empty capture.
+    assert_eq!(rec("second", Some("t-2")).unwrap(), 2);
+    assert_eq!(msg(), "second");
+    // No id: always bumps (and clears the stored id, so a later `t-2` bumps too).
+    assert_eq!(rec("x", None).unwrap(), 3);
+    assert_eq!(rec("y", None).unwrap(), 4);
+    assert_eq!(rec("z", Some("t-2")).unwrap(), 5);
+    // The plain recorder still bumps every call.
+    assert_eq!(ls.session_reply_record("bravo", "p").unwrap(), 6);
+    assert_eq!(ls.session_reply_record("bravo", "p").unwrap(), 7);
+    // Ids are per worktree.
+    assert_eq!(
+        ls.session_reply_record_for_turn("charlie", "c", Some("t-2"), None)
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn session_reply_turn_ids_repeat_only_within_one_session() {
+    let db = TempDb::new();
+    let ls = db.open();
+    let rec = |msg: &str, sid: Option<&str>| {
+        ls.session_reply_record_for_turn("bravo", msg, Some("1"), sid)
+    };
+    let msg = || ls.session_reply_get("bravo").unwrap().unwrap().last_message;
+    assert_eq!(rec("first", Some("s-1")).unwrap(), 1);
+    // The same Stop again: one turn.
+    assert_eq!(rec("first", Some("s-1")).unwrap(), 1);
+    // A reset starts a new session that numbers its turns from "1" again: a real
+    // turn, never a repeat.
+    assert_eq!(rec("after reset", Some("s-2")).unwrap(), 2);
+    assert_eq!(msg(), "after reset");
+    assert_eq!(rec("after reset", Some("s-2")).unwrap(), 2);
+    // A payload without a session id dedupes on the turn id alone.
+    assert_eq!(rec("no session", None).unwrap(), 2);
+    assert_eq!(msg(), "after reset");
+}
+
+#[test]
+fn old_database_gains_the_last_turn_id_column() {
+    let db = TempDb::new();
+    {
+        let conn = rusqlite::Connection::open(&db.path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_replies (
+               worktree     TEXT PRIMARY KEY,
+               turn         INTEGER NOT NULL DEFAULT 0,
+               last_message TEXT NOT NULL DEFAULT '',
+               updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO session_replies (worktree, turn, last_message) VALUES ('bravo', 4, 'old');",
+        )
+        .unwrap();
+    }
+    let ls = db.open();
+    let r = ls.session_reply_get("bravo").unwrap().unwrap();
+    assert_eq!((r.turn, r.last_message.as_str()), (4, "old"), "rows kept");
+    assert_eq!(
+        ls.session_reply_record_for_turn("bravo", "new", Some("t-1"), None)
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        ls.session_reply_record_for_turn("bravo", "new", Some("t-1"), None)
+            .unwrap(),
+        5
+    );
+    assert_eq!(ls.session_reply_record("bravo", "plain").unwrap(), 6);
+}
+
+#[test]
 fn session_idle_secs_none_without_row_and_counts_up() {
     let db = TempDb::new();
     let ls = db.open();
@@ -1737,4 +1821,714 @@ fn drive_tables_probe_is_cached_once_seen() {
     let ls = db.open();
     assert!(ls.drive_tables_exist().unwrap());
     assert!(ls.drive_tables_seen.get());
+}
+
+// ---- deliveries and turns ----
+
+fn baseline(cs: Option<u64>, scs: u64) -> crate::drive::Baseline {
+    crate::drive::Baseline {
+        agent: Some("codex".into()),
+        pane_id: "p-1".into(),
+        terminal_id: "t-1".into(),
+        agent_session: Some("s-1".into()),
+        state_change_seq: scs,
+        completion_seq: cs,
+        status: "idle".into(),
+        delivered_at_ms: 1_700_000_000_000,
+    }
+}
+
+/// Begin a delivery to `wt` and return its `awaiting_turn`.
+fn set_awaiting(ls: &LocalStore, wt: &str) -> crate::Result<Option<i64>> {
+    ls.drive_begin_delivery(wt, &baseline(None, 1))
+        .map(|v| v.map(|(awaiting, _)| awaiting))
+}
+
+fn driver_turn(driven: &str, delivery_id: i64) -> crate::drive::NewDriveTurn<'_> {
+    crate::drive::NewDriveTurn {
+        driven,
+        kind: "driver",
+        delivery_id: Some(delivery_id),
+        outcome: "finished",
+        signal: "herdr",
+        clause: "completion_seq",
+        completion_seq: Some(5),
+        state_change_seq: Some(13),
+        reply: "",
+        reply_source: "none",
+        caveat: None,
+    }
+}
+
+fn human_turn(driven: &str) -> crate::drive::NewDriveTurn<'_> {
+    crate::drive::NewDriveTurn {
+        kind: "human",
+        delivery_id: None,
+        ..driver_turn(driven, 0)
+    }
+}
+
+/// An older DB: the drive tables as they were before the delivery columns, no
+/// `drive_turns`. `drives` holds `alpha -> bravo` awaiting turn 2.
+fn old_drives_db(db: &TempDb) {
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute_batch(OLD_SCHEMA).unwrap();
+    conn.execute_batch(crate::drive::DRIVE_DDL).unwrap();
+    conn.execute_batch(&crate::drive::drive_requests_ddl("drive_requests"))
+        .unwrap();
+    conn.execute(
+        "INSERT INTO drives (driven, driver, awaiting_turn) VALUES ('bravo', 'alpha', 2)",
+        [],
+    )
+    .unwrap();
+}
+
+/// Age turn `id` by `days`: its completion and, when `acked`, its ack.
+fn backdate_turn(ls: &LocalStore, id: i64, days: i64, acked: bool) {
+    let at = format!("-{days} days");
+    ls.conn
+        .execute(
+            "UPDATE drive_turns SET completed_at = strftime('%Y-%m-%d %H:%M:%f','now',?2), \
+               acked_at = CASE WHEN ?3 THEN strftime('%Y-%m-%d %H:%M:%f','now',?2) END \
+             WHERE id = ?1",
+            params![id, at, acked],
+        )
+        .unwrap();
+}
+
+#[test]
+fn init_schema_adds_delivery_columns_to_an_old_drives_table() {
+    let db = TempDb::new();
+    old_drives_db(&db);
+    let ls = db.open();
+    let d = ls.drive_get("bravo").unwrap().unwrap();
+    assert_eq!(d.driver, "alpha");
+    assert_eq!(d.awaiting_turn, Some(2));
+    assert!(ls.drive_delivery_columns_exist().unwrap());
+    assert!(ls.drive_turns_exist().unwrap());
+    let del = ls.drive_delivery_get("bravo").unwrap().unwrap();
+    assert_eq!(del.awaiting_turn, Some(2));
+    assert_eq!(del.delivery_id, None);
+    assert_eq!(del.baseline, None);
+    // Opening again is a no-op.
+    drop(ls);
+    let again = db.open();
+    assert_eq!(
+        again.drive_get("bravo").unwrap().unwrap().awaiting_turn,
+        Some(2)
+    );
+}
+
+#[test]
+fn read_only_handle_on_an_old_db_reads_drives_without_delivery_columns() {
+    let db = TempDb::new();
+    old_drives_db(&db);
+    let ro = LocalStore::open_read_only(&db.path).unwrap();
+    assert!(!ro.drive_delivery_columns_exist().unwrap());
+    assert!(!ro.drive_turns_exist().unwrap());
+    assert_eq!(ro.drive_delivery_get("bravo").unwrap(), None);
+    assert!(ro.drive_deliveries().unwrap().is_empty());
+    assert!(ro.drive_session_replies().unwrap().is_empty());
+    assert!(ro.drive_turns_unacked("bravo").unwrap().is_empty());
+    assert_eq!(ro.drive_turn_latest("bravo").unwrap(), None);
+    assert!(ro.drive_turns_recent("bravo", 5).unwrap().is_empty());
+    assert_eq!(ro.drive_turn_for_delivery(1).unwrap(), None);
+    assert_eq!(ro.drive_turns_prune().unwrap(), 0);
+    let drives = ro.drives_list().unwrap();
+    assert_eq!(drives.len(), 1);
+    assert_eq!(drives[0].awaiting_turn, Some(2));
+}
+
+#[test]
+fn begin_delivery_sets_awaiting_turn_and_a_monotonic_delivery_id() {
+    let db = TempDb::new();
+    let ls = db.open();
+    let b = baseline(Some(4), 11);
+    assert_eq!(
+        ls.drive_begin_delivery("bravo", &b).unwrap(),
+        None,
+        "not driven"
+    );
+    ls.drive_bind("alpha", "bravo", None, false).unwrap();
+    assert_eq!(ls.drive_begin_delivery("bravo", &b).unwrap(), Some((1, 1)));
+    let del = ls.drive_delivery_get("bravo").unwrap().unwrap();
+    assert_eq!(del.awaiting_turn, Some(1));
+    assert_eq!(del.delivery_id, Some(1));
+    assert_eq!(del.baseline, Some(b.clone()));
+    assert!(del.delivered_at.is_some());
+    ls.session_reply_record("bravo", "done").unwrap();
+    assert_eq!(ls.drive_begin_delivery("bravo", &b).unwrap(), Some((2, 2)));
+    assert_eq!(ls.drive_deliveries().unwrap().len(), 1);
+
+    // A turn row outlives the drive: after release and rebind the next id is above it.
+    ls.drive_turn_insert(&driver_turn("bravo", 2))
+        .unwrap()
+        .unwrap();
+    ls.conn
+        .execute(
+            "UPDATE drive_turns SET delivery_id = 9 WHERE delivery_id = 2",
+            [],
+        )
+        .unwrap();
+    ls.drive_release("alpha", "bravo").unwrap();
+    ls.drive_bind("alpha", "bravo", None, false).unwrap();
+    assert_eq!(
+        ls.drive_delivery_get("bravo").unwrap().unwrap().delivery_id,
+        None
+    );
+    let (_, id) = ls.drive_begin_delivery("bravo", &b).unwrap().unwrap();
+    assert_eq!(id, 10);
+}
+
+#[test]
+fn deliveries_list_only_those_without_a_turn_row() {
+    let db = TempDb::new();
+    let ls = db.open();
+    ls.drive_bind("alpha", "bravo", None, false).unwrap();
+    ls.drive_bind("alpha", "charlie", None, false).unwrap();
+    let b = baseline(Some(4), 11);
+    let (_, done) = ls.drive_begin_delivery("bravo", &b).unwrap().unwrap();
+    let (_, open) = ls.drive_begin_delivery("charlie", &b).unwrap().unwrap();
+    assert_eq!(ls.drive_deliveries().unwrap().len(), 2);
+    ls.drive_turn_insert(&driver_turn("bravo", done))
+        .unwrap()
+        .unwrap();
+    // Recorded but not yet acked: no longer outstanding for the turn tracker.
+    let ids: Vec<_> = ls
+        .drive_deliveries()
+        .unwrap()
+        .into_iter()
+        .map(|d| d.delivery_id)
+        .collect();
+    assert_eq!(ids, vec![Some(open)]);
+}
+
+#[test]
+fn session_replies_of_driven_worktrees_only() {
+    let db = TempDb::new();
+    let ls = db.open();
+    ls.drive_bind("alpha", "bravo", None, false).unwrap();
+    ls.session_reply_record("bravo", "driven").unwrap();
+    ls.session_reply_record("charlie", "not driven").unwrap();
+    let replies = ls.drive_session_replies().unwrap();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(
+        (
+            replies[0].worktree.as_str(),
+            replies[0].last_message.as_str()
+        ),
+        ("bravo", "driven")
+    );
+    assert_eq!(
+        Some(&replies[0]),
+        ls.session_reply_get("bravo").unwrap().as_ref()
+    );
+}
+
+#[test]
+fn restore_delivery_restores_all_four_columns() {
+    let db = TempDb::new();
+    let ls = db.open();
+    ls.drive_bind("alpha", "bravo", None, false).unwrap();
+    ls.drive_begin_delivery("bravo", &baseline(Some(4), 11))
+        .unwrap();
+    let prev = ls.drive_delivery_get("bravo").unwrap().unwrap();
+    ls.drive_begin_delivery("bravo", &baseline(Some(6), 15))
+        .unwrap();
+    assert_ne!(ls.drive_delivery_get("bravo").unwrap().unwrap(), prev);
+    assert!(ls.drive_restore_delivery(&prev).unwrap());
+    assert_eq!(ls.drive_delivery_get("bravo").unwrap().unwrap(), prev);
+
+    // Back to "never delivered".
+    let empty = crate::drive::Delivery {
+        awaiting_turn: None,
+        delivery_id: None,
+        baseline: None,
+        delivered_at: None,
+        ..prev.clone()
+    };
+    assert!(ls.drive_restore_delivery(&empty).unwrap());
+    assert_eq!(ls.drive_delivery_get("bravo").unwrap().unwrap(), empty);
+    ls.drive_release("alpha", "bravo").unwrap();
+    assert!(!ls.drive_restore_delivery(&prev).unwrap());
+}
+
+#[test]
+fn turn_insert_dedups_by_delivery_id_and_requires_an_outstanding_delivery() {
+    let db = TempDb::new();
+    let ls = db.open();
+    ls.drive_bind("alpha", "bravo", None, false).unwrap();
+    // No delivery yet.
+    assert_eq!(
+        ls.drive_turn_insert(&driver_turn("bravo", 1)).unwrap(),
+        None
+    );
+    let (_, id) = ls
+        .drive_begin_delivery("bravo", &baseline(Some(4), 11))
+        .unwrap()
+        .unwrap();
+    // A different delivery id is not outstanding.
+    assert_eq!(
+        ls.drive_turn_insert(&driver_turn("bravo", id + 1)).unwrap(),
+        None
+    );
+    let first = ls.drive_turn_insert(&driver_turn("bravo", id)).unwrap();
+    assert!(first.is_some());
+    // The second source loses.
+    let hook = crate::drive::NewDriveTurn {
+        signal: "hook",
+        clause: "stop_hook",
+        reply: "from the hook",
+        reply_source: "hook",
+        ..driver_turn("bravo", id)
+    };
+    assert_eq!(ls.drive_turn_insert(&hook).unwrap(), None);
+    let rows = ls.drive_turns_unacked("bravo").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].signal, "herdr");
+    assert_eq!(rows[0].reply_source, "none");
+    assert_eq!(
+        ls.drive_turn_for_delivery(id).unwrap().unwrap().id,
+        rows[0].id
+    );
+
+    // Human turns need no delivery and never collide.
+    assert!(ls
+        .drive_turn_insert(&human_turn("bravo"))
+        .unwrap()
+        .is_some());
+    assert!(ls
+        .drive_turn_insert(&human_turn("bravo"))
+        .unwrap()
+        .is_some());
+    assert_eq!(ls.drive_turns_unacked("bravo").unwrap().len(), 3);
+    assert_eq!(
+        ls.drive_turn_latest("bravo").unwrap().unwrap().kind,
+        "human"
+    );
+    // The newest first, capped.
+    let recent = ls.drive_turns_recent("bravo", 2).unwrap();
+    assert_eq!(recent.len(), 2);
+    assert!(recent[0].id > recent[1].id);
+    assert_eq!(recent[0].kind, "human");
+    assert_eq!(ls.drive_turns_recent("bravo", 5).unwrap().len(), 3);
+    assert!(ls.drive_turns_recent("alpha", 5).unwrap().is_empty());
+
+    // The reply is truncated on a char boundary.
+    let long = "é".repeat(SESSION_REPLY_MAX);
+    let t = crate::drive::NewDriveTurn {
+        reply: &long,
+        ..human_turn("bravo")
+    };
+    ls.drive_turn_insert(&t).unwrap().unwrap();
+    let got = ls.drive_turn_latest("bravo").unwrap().unwrap();
+    assert!(got.reply.len() <= SESSION_REPLY_MAX);
+    assert!(got.reply.len() > SESSION_REPLY_MAX - 2);
+}
+
+#[test]
+fn turn_ack_is_once_and_clears_awaiting_turn_by_delivery_id() {
+    let db = TempDb::new();
+    let ls = db.open();
+    ls.drive_bind("alpha", "bravo", None, false).unwrap();
+    let (_, first) = ls
+        .drive_begin_delivery("bravo", &baseline(Some(4), 11))
+        .unwrap()
+        .unwrap();
+    let old = ls
+        .drive_turn_insert(&driver_turn("bravo", first))
+        .unwrap()
+        .unwrap();
+    // A newer delivery before the old turn is acked.
+    let (_, second) = ls
+        .drive_begin_delivery("bravo", &baseline(Some(5), 13))
+        .unwrap()
+        .unwrap();
+    assert!(ls.drive_turn_ack(old).unwrap());
+    assert!(!ls.drive_turn_ack(old).unwrap(), "second ack");
+    let del = ls.drive_delivery_get("bravo").unwrap().unwrap();
+    assert_eq!(del.delivery_id, Some(second));
+    assert!(del.awaiting_turn.is_some(), "the newer send is kept");
+
+    let new = ls
+        .drive_turn_insert(&driver_turn("bravo", second))
+        .unwrap()
+        .unwrap();
+    assert!(ls.drive_turn_ack(new).unwrap());
+    assert_eq!(ls.drive_get("bravo").unwrap().unwrap().awaiting_turn, None);
+    assert!(ls.drive_turns_unacked("bravo").unwrap().is_empty());
+
+    // A human turn's ack leaves the drive alone.
+    ls.drive_begin_delivery("bravo", &baseline(Some(6), 15))
+        .unwrap();
+    let h = ls.drive_turn_insert(&human_turn("bravo")).unwrap().unwrap();
+    assert!(ls.drive_turn_ack(h).unwrap());
+    assert!(ls
+        .drive_get("bravo")
+        .unwrap()
+        .unwrap()
+        .awaiting_turn
+        .is_some());
+    assert!(!ls.drive_turn_ack(999).unwrap(), "unknown id");
+}
+
+#[test]
+fn legacy_ack_also_acks_the_engine_row() {
+    let db = TempDb::new();
+    let ls = db.open();
+    ls.drive_bind("alpha", "bravo", None, false).unwrap();
+    let (awaiting, id) = ls
+        .drive_begin_delivery("bravo", &baseline(Some(4), 11))
+        .unwrap()
+        .unwrap();
+    ls.drive_turn_insert(&driver_turn("bravo", id))
+        .unwrap()
+        .unwrap();
+    let human = ls.drive_turn_insert(&human_turn("bravo")).unwrap().unwrap();
+    assert!(!ls.drive_ack_turn_legacy("bravo", awaiting + 1).unwrap());
+    assert_eq!(ls.drive_turns_unacked("bravo").unwrap().len(), 2);
+    assert!(ls.drive_ack_turn_legacy("bravo", awaiting).unwrap());
+    assert_eq!(ls.drive_get("bravo").unwrap().unwrap().awaiting_turn, None);
+    let left = ls.drive_turns_unacked("bravo").unwrap();
+    assert_eq!(left.len(), 1, "only the human turn stays unacked");
+    assert_eq!(left[0].id, human);
+}
+
+#[test]
+fn prune_keeps_the_newest_50_and_recent_rows() {
+    let db = TempDb::new();
+    let ls = db.open();
+    let mut ids = Vec::new();
+    for _ in 0..60 {
+        ids.push(ls.drive_turn_insert(&human_turn("bravo")).unwrap().unwrap());
+    }
+    for id in &ids {
+        backdate_turn(&ls, *id, 30, true);
+    }
+    // Another worktree: one 6-day-old acked row (kept by age) and an 8-day-old
+    // unacked row pushed out of its newest 50 (deleted).
+    let old_unacked = ls
+        .drive_turn_insert(&human_turn("charlie"))
+        .unwrap()
+        .unwrap();
+    backdate_turn(&ls, old_unacked, 8, false);
+    let recent = ls
+        .drive_turn_insert(&human_turn("charlie"))
+        .unwrap()
+        .unwrap();
+    backdate_turn(&ls, recent, 6, true);
+    for _ in 0..50 {
+        let id = ls
+            .drive_turn_insert(&human_turn("charlie"))
+            .unwrap()
+            .unwrap();
+        backdate_turn(&ls, id, 30, true);
+    }
+    assert_eq!(ls.drive_turns_prune().unwrap(), 11);
+    let count = |w: &str| -> i64 {
+        ls.conn
+            .query_row(
+                "SELECT COUNT(*) FROM drive_turns WHERE driven = ?1",
+                params![w],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(count("bravo"), 50);
+    assert_eq!(count("charlie"), 51);
+    let exists = |id: i64| -> bool {
+        ls.conn
+            .prepare("SELECT 1 FROM drive_turns WHERE id = ?1")
+            .unwrap()
+            .exists(params![id])
+            .unwrap()
+    };
+    assert!(!exists(ids[0]), "oldest bravo row pruned");
+    assert!(exists(ids[59]));
+    assert!(exists(recent), "a 6-day-old acked row is kept");
+    assert!(!exists(old_unacked), "an 8-day-old unacked row is pruned");
+    assert_eq!(ls.drive_turns_prune().unwrap(), 0);
+}
+
+#[test]
+fn prune_keeps_the_unacked_turn_of_the_outstanding_delivery() {
+    let db = TempDb::new();
+    let ls = db.open();
+    ls.drive_bind("alpha", "bravo", None, false).unwrap();
+    let (_, delivery) = ls
+        .drive_begin_delivery("bravo", &baseline(None, 1))
+        .unwrap()
+        .unwrap();
+    let turn = ls
+        .drive_turn_insert(&driver_turn("bravo", delivery))
+        .unwrap()
+        .unwrap();
+    backdate_turn(&ls, turn, 8, false);
+    // Pushed out of bravo's newest rows by later human turns.
+    for _ in 0..crate::drive::DRIVE_TURNS_KEEP_PER_WORKTREE {
+        let id = ls.drive_turn_insert(&human_turn("bravo")).unwrap().unwrap();
+        backdate_turn(&ls, id, 30, true);
+    }
+    assert!(ls.drive_deliveries().unwrap().is_empty());
+    ls.drive_turns_prune().unwrap();
+    assert!(
+        ls.drive_deliveries().unwrap().is_empty(),
+        "the delivery's turn row is kept, so it isn't outstanding again"
+    );
+    assert_eq!(ls.drive_turns_unacked("bravo").unwrap()[0].id, turn);
+    // Once acked (the awaiting turn cleared), it ages out like any other row.
+    assert!(ls
+        .drive_ack_turn_legacy(
+            "bravo",
+            ls.drive_get("bravo")
+                .unwrap()
+                .unwrap()
+                .awaiting_turn
+                .unwrap()
+        )
+        .unwrap());
+    backdate_turn(&ls, turn, 8, true);
+    assert_eq!(ls.drive_turns_prune().unwrap(), 1);
+}
+
+#[test]
+fn requeue_returns_a_running_request_to_pending() {
+    let db = TempDb::new();
+    let ls = db.open();
+    ls.drive_bind("alpha", "bravo", None, false).unwrap();
+    let r = ls
+        .drive_request_add("send", "bravo", "alpha", &send("hi"), true)
+        .unwrap();
+    assert!(!ls.drive_request_requeue(r.id).unwrap(), "still pending");
+    assert!(ls.drive_request_begin(r.id).unwrap());
+    assert!(ls.drive_request_requeue(r.id).unwrap());
+    assert_eq!(
+        ls.drive_request_get(r.id).unwrap().unwrap().status,
+        "pending"
+    );
+    assert!(ls.drive_request_begin(r.id).unwrap(), "taken again");
+}
+
+#[test]
+fn drive_turns_ddl_checks_match_the_constants() {
+    use crate::drive::{
+        DRIVE_TURNS_DDL, DRIVE_TURN_CLAUSES, DRIVE_TURN_KINDS, DRIVE_TURN_OUTCOMES,
+        DRIVE_TURN_REPLY_SOURCES, DRIVE_TURN_SIGNALS,
+    };
+    for s in DRIVE_TURN_KINDS
+        .iter()
+        .chain(DRIVE_TURN_OUTCOMES.iter())
+        .chain(DRIVE_TURN_SIGNALS.iter())
+        .chain(DRIVE_TURN_CLAUSES.iter())
+        .chain(DRIVE_TURN_REPLY_SOURCES.iter())
+    {
+        assert!(DRIVE_TURNS_DDL.contains(&format!("'{s}'")), "{s}");
+    }
+    // The CHECKs hold.
+    let db = TempDb::new();
+    let ls = db.open();
+    let bad = [
+        crate::drive::NewDriveTurn {
+            reply_source: "pane",
+            ..human_turn("bravo")
+        },
+        crate::drive::NewDriveTurn {
+            clause: "guess",
+            ..human_turn("bravo")
+        },
+        // A human turn with a delivery id.
+        crate::drive::NewDriveTurn {
+            kind: "human",
+            ..driver_turn("bravo", 1)
+        },
+    ];
+    for t in bad {
+        assert!(ls.drive_turn_insert(&t).is_err(), "{t:?}");
+    }
+}
+
+// ---- Wait reasons ----
+
+#[test]
+fn note_wait_writes_once_per_reason_and_only_on_pending_rows() {
+    let db = TempDb::new();
+    let ls = db.open();
+    let watcher = db.open();
+    ls.drive_bind("alpha", "bravo", None, false).unwrap();
+    let req = ls
+        .drive_request_add("send", "bravo", "alpha", &send("hi"), true)
+        .unwrap();
+    assert_eq!(req.seen_at, None);
+    assert_eq!(req.wait_reason, "");
+
+    let v0 = watcher.data_version().unwrap();
+    assert!(ls
+        .drive_request_note_wait(req.id, "waiting for @bravo to settle")
+        .unwrap());
+    let v1 = watcher.data_version().unwrap();
+    assert_ne!(v0, v1, "a first note is a write");
+    let row = ls.drive_request_get(req.id).unwrap().unwrap();
+    let seen = row.seen_at.clone().expect("seen_at stamped");
+    assert_eq!(row.wait_reason, "waiting for @bravo to settle");
+    assert!(row.wait_reason_at.is_some());
+
+    // The same reason again: nothing written.
+    assert!(!ls
+        .drive_request_note_wait(req.id, "waiting for @bravo to settle")
+        .unwrap());
+    assert_eq!(watcher.data_version().unwrap(), v1, "no write on a repeat");
+
+    // A changed reason: written, `seen_at` kept.
+    assert!(ls
+        .drive_request_note_wait(req.id, "waiting for herdr (recovering)")
+        .unwrap());
+    let row = ls.drive_request_get(req.id).unwrap().unwrap();
+    assert_eq!(row.wait_reason, "waiting for herdr (recovering)");
+    assert_eq!(row.seen_at.as_deref(), Some(seen.as_str()));
+
+    // A row that is no longer pending is never touched.
+    ls.drive_request_begin(req.id).unwrap();
+    let v2 = watcher.data_version().unwrap();
+    assert!(!ls
+        .drive_request_note_wait(req.id, "something else")
+        .unwrap());
+    assert_eq!(watcher.data_version().unwrap(), v2);
+    assert_eq!(
+        ls.drive_request_get(req.id).unwrap().unwrap().wait_reason,
+        "waiting for herdr (recovering)"
+    );
+    // Nor is a missing one.
+    assert!(!ls.drive_request_note_wait(9999, "x").unwrap());
+}
+
+#[test]
+fn note_wait_with_an_empty_reason_still_marks_the_row_seen() {
+    let db = TempDb::new();
+    let ls = db.open();
+    ls.drive_bind("alpha", "bravo", None, false).unwrap();
+    let req = ls
+        .drive_request_add("read", "bravo", "alpha", &serde_json::json!({}), false)
+        .unwrap();
+    assert!(ls.drive_request_note_wait(req.id, "").unwrap());
+    assert!(
+        !ls.drive_request_note_wait(req.id, "").unwrap(),
+        "seen once"
+    );
+    let row = ls.drive_request_get(req.id).unwrap().unwrap();
+    assert!(row.seen_at.is_some());
+    assert_eq!(row.wait_reason, "");
+}
+
+#[test]
+fn expiry_names_the_wait_reason_or_that_it_was_never_examined() {
+    let db = TempDb::new();
+    let ls = db.open();
+    ls.drive_bind("alpha", "bravo", None, false).unwrap();
+    let examined = ls
+        .drive_request_add("send", "bravo", "alpha", &send("a"), true)
+        .unwrap();
+    let unseen = ls
+        .drive_request_add("send", "bravo", "alpha", &send("b"), true)
+        .unwrap();
+    ls.drive_request_note_wait(
+        examined.id,
+        "waiting for @bravo to be idle (herdr: working)",
+    )
+    .unwrap();
+    for id in [examined.id, unseen.id] {
+        backdate_request(&ls, id, 601);
+    }
+    assert_eq!(ls.drive_requests_expire(600).unwrap(), 2);
+    let a = ls.drive_request_get(examined.id).unwrap().unwrap();
+    assert_eq!(a.status, "refused");
+    assert_eq!(
+        a.reason,
+        "expired after 600s: waiting for @bravo to be idle (herdr: working)"
+    );
+    let b = ls.drive_request_get(unseen.id).unwrap().unwrap();
+    assert_eq!(b.reason, "expired after 600s: the app never examined it");
+}
+
+#[test]
+fn has_pending_reads_only_status_and_works_on_an_old_table() {
+    let db = TempDb::new();
+    {
+        // A table from before the wait columns (and before the drive tables' later
+        // additions), read through a read-only handle that never migrates it.
+        let conn = rusqlite::Connection::open(&db.path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE drives (driven TEXT PRIMARY KEY, driver TEXT NOT NULL);
+             CREATE TABLE drive_prompts (id INTEGER PRIMARY KEY);
+             CREATE TABLE session_replies (worktree TEXT PRIMARY KEY);
+             CREATE TABLE drive_requests (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+               worktree TEXT NOT NULL, requested_by TEXT NOT NULL,
+               payload TEXT NOT NULL DEFAULT '{}', queue INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL DEFAULT 'pending', reason TEXT NOT NULL DEFAULT '',
+               result TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL DEFAULT (datetime('now')), resolved_at TEXT);
+             CREATE TABLE dispatch_requests (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL,
+               worktree TEXT NOT NULL, requested_by TEXT NOT NULL,
+               status TEXT NOT NULL DEFAULT 'pending', reason TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL DEFAULT (datetime('now')), resolved_at TEXT);",
+        )
+        .unwrap();
+    }
+    let ro = LocalStore::open_read_only(&db.path).unwrap();
+    assert!(!ro.drive_requests_has_pending().unwrap());
+    assert!(!ro.dispatch_requests_has_pending().unwrap());
+    {
+        let conn = rusqlite::Connection::open(&db.path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO drive_requests (kind, worktree, requested_by) VALUES ('send','b','a');
+             INSERT INTO dispatch_requests (task_id, worktree, requested_by, status)
+               VALUES (1, 'b', 'a', 'applied');",
+        )
+        .unwrap();
+    }
+    assert!(ro.drive_requests_has_pending().unwrap());
+    assert!(
+        !ro.dispatch_requests_has_pending().unwrap(),
+        "only applied rows"
+    );
+    assert_eq!(ro.dispatch_requests_pending_count().unwrap(), 0);
+    rusqlite::Connection::open(&db.path)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO dispatch_requests (task_id, worktree, requested_by) VALUES (2, 'b', 'a');
+             INSERT INTO dispatch_requests (task_id, worktree, requested_by) VALUES (3, 'c', 'a');",
+        )
+        .unwrap();
+    assert_eq!(ro.dispatch_requests_pending_count().unwrap(), 2);
+}
+
+#[test]
+fn has_pending_is_false_without_the_tables() {
+    let db = TempDb::new();
+    rusqlite::Connection::open(&db.path)
+        .unwrap()
+        .execute_batch("CREATE TABLE unrelated (x INTEGER);")
+        .unwrap();
+    let ro = LocalStore::open_read_only(&db.path).unwrap();
+    assert!(!ro.drive_requests_has_pending().unwrap());
+    assert!(!ro.dispatch_requests_has_pending().unwrap());
+    assert_eq!(ro.dispatch_requests_pending_count().unwrap(), 0);
+}
+
+#[test]
+fn has_pending_tracks_the_lifecycle() {
+    let db = TempDb::new();
+    let ls = db.open();
+    ls.drive_bind("alpha", "bravo", None, false).unwrap();
+    assert!(!ls.drive_requests_has_pending().unwrap());
+    let req = ls
+        .drive_request_add("send", "bravo", "alpha", &send("hi"), false)
+        .unwrap();
+    assert!(ls.drive_requests_has_pending().unwrap());
+    ls.drive_request_begin(req.id).unwrap();
+    assert!(
+        !ls.drive_requests_has_pending().unwrap(),
+        "running is not pending"
+    );
 }

@@ -4,6 +4,7 @@ import type { CliKind } from "./ipc";
 import {
   actionDisabledReason,
   blockAnimates,
+  blockClassName,
   blockStateCls,
   laneMenuAction,
   menuItemKey,
@@ -96,6 +97,26 @@ describe("blockAnimates", () => {
 
   it("does NOT animate when there is no attention", () => {
     expect(blockAnimates(undefined)).toBe(false);
+  });
+});
+
+describe("blockClassName", () => {
+  const off = { animates: false, pulse: false, stale: false };
+
+  it("is the colour class alone by default", () => {
+    expect(blockClassName("idle", off)).toBe("wt-block idle");
+  });
+
+  it("adds is-stale for a stale lane", () => {
+    expect(blockClassName("busy", { ...off, stale: true })).toBe("wt-block busy is-stale");
+  });
+
+  it("pulses only an animated block", () => {
+    expect(blockClassName("waiting", { ...off, pulse: true })).toBe("wt-block waiting");
+    expect(blockClassName("waiting", { animates: true, pulse: true, stale: true })).toBe(
+      "wt-block waiting attn pulse is-stale",
+    );
+    expect(blockClassName("waiting", { ...off, animates: true })).toBe("wt-block waiting attn");
   });
 });
 

@@ -633,38 +633,13 @@ fn write_keymap_atomic(path: &Path, file: &PersistedFile) -> std::io::Result<()>
 /// case on case-insensitive platforms (Windows). So herdr's
 /// `\\?\D:\repos\proj\wt\` and Keitora's `D:/repos/proj/wt` normalise equal.
 pub fn normalize_cwd(cwd: &str) -> String {
-    normalize_path(cwd, cfg!(windows))
+    keitora_tasks::path_key::normalize_path(cwd, cfg!(windows), cfg!(windows))
 }
 
 /// [`normalize_cwd`] with `\` a separator on every host, for comparing against
 /// paths a tool printed in Windows form (a build log read as text). Pure.
 pub fn normalize_either_separator(path: &str) -> String {
-    normalize_path(path, true)
-}
-
-fn normalize_path(path: &str, backslash_separates: bool) -> String {
-    // Strip the Windows verbatim prefix in either slash form.
-    let s = path
-        .strip_prefix(r"\\?\")
-        .or_else(|| path.strip_prefix("//?/"))
-        .unwrap_or(path);
-    // Unify separators.
-    let mut s = if backslash_separates {
-        s.replace('\\', "/")
-    } else {
-        s.to_string()
-    };
-    // Trim trailing separators, keeping a lone root ("/").
-    while s.len() > 1 && s.ends_with('/') {
-        s.pop();
-    }
-    // Case-insensitive filesystems (Windows): fold case so a drive-letter or path
-    // casing difference does not defeat the match.
-    #[cfg(windows)]
-    {
-        s = s.to_lowercase();
-    }
-    s
+    keitora_tasks::path_key::normalize_path(path, true, cfg!(windows))
 }
 
 /// A cwd Keitora holds (a worktree path as it was given), normalised into the
@@ -1554,9 +1529,16 @@ mod tests {
     fn agent_in(pane_id: &str, kind: &str, name: &str, status: &str) -> AgentInfo {
         AgentInfo {
             pane_id: pane_id.into(),
+            terminal_id: String::new(),
             agent: Some(kind.into()),
             agent_status: status.into(),
             launch_pending: false,
+            interactive_ready: None,
+            screen_detection_skipped: false,
+            completion_seq: None,
+            state_change_seq: 0,
+            agent_session: None,
+            revision: 0,
             name: Some(name.into()),
             cwd: None,
         }

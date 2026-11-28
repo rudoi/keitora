@@ -123,6 +123,9 @@ isn't by default.
   press **Restart** on that card.
 - **A session shows offline and never starts.** Check that the worktree's agent (`claude`, `codex` or `agy`) runs in a terminal opened in
   that worktree. If it does, look in Keitora's log at `~/.keitora/logs/keitora.log`.
+- **Something looks off and you don't know why.** Open **Settings → Health**, or run
+  `keitora status` in the project (see [Health](#health)). The app checks its own plumbing as it
+  runs and says what it found.
 
 ## The `keitora` command
 
@@ -146,9 +149,9 @@ keitora task watch --json                              # stream session and disp
 `task dispatch` asks the app to send the task to that worktree's session right away, the same way a
 drag onto an idle lane does. It only works on an idle session: a busy, waiting or offline one is
 refused and nothing is reserved (the board is the queue, and dispatch never starts an agent). The
-app picks up requests for any project in its registry, active or not, and refuses any it hasn't
-picked up within ten minutes. Add `--until-claimed` to keep waiting, within `--wait`, until the
-agent in that worktree has claimed the task.
+app picks up requests for any project in its registry, active or not (see
+[When a request isn't picked up](#when-a-request-isnt-picked-up)). Add `--until-claimed` to keep
+waiting, within `--wait`, until the agent in that worktree has claimed the task.
 
 If `keitora` isn't on your `PATH`, the app offers to install it for you.
 
@@ -167,9 +170,15 @@ keitora release bravo                    # end the binding
 
 **The loop.** `send`, then `wait`, then act on the event, then repeat:
 
-- `turn_finished`: the reply is in the event; send the next prompt.
+- `turn_finished`: the reply is in the event (`reply_source` says where it came from: `hook` for
+  the agent's Stop hook, `transcript` for the agent's own session file when no hook replied, and
+  `none`, in which case run `keitora read bravo`); send the next prompt.
+- `human_turn`: the human typed into bravo and its turn finished; read it, then decide.
 - `prompt`: decide it with `keitora answer bravo <id> allow|deny|answer|escalate`.
-- `stalled`: `keitora read bravo` to look at the pane, then wait again.
+- `stalled`: the `reason` says why (no activity since the prompt went in, no agent running, herdr
+  or the app not updating); `keitora read bravo` to look at the pane, then wait again. While the app
+  runs, the event also carries up to two of bravo's [health findings](#health) (`findings` in
+  `--json`, `health:` lines otherwise).
 - `send_refused` (exit 5): the app refused a send `wait` was waiting through (one sent
   without `--wait`, or `--queue`d behind a busy agent); the reason is in the event.
 - `timeout` (exit 2): nothing changed; wait again. Keep `--timeout` below your own tool's
@@ -202,16 +211,109 @@ requests, except `read`, are refused until resumed).
 - Driving is one level deep: a driven worktree can't drive another.
 - Both worktrees must be in the same project.
 - `send`, `read`, `reset`, `swap` and `wake` are carried out by the app, so the project must be
-  open in its window. Prompt decisions don't need the window.
+  open in its window (a request for a project that isn't open is refused with
+  `project not open in Keitora`). Prompt decisions don't need the window.
 - Codex's `request_user_input` questions aren't brokered; they reach the human directly.
 - Antigravity has no permission hook to broker, so a driven Antigravity session's prompts all
-  reach the human (`drive` warns). `wait` still reports its finished turns, but without the reply
-  text; use `keitora read`.
+  reach the human (`drive` warns). `wait` still reports its finished turns; the reply text is read
+  from Antigravity's conversation file when herdr reports the session's id, and is otherwise
+  missing (use `keitora read`). A finished turn may still have background tasks running.
 - The driven agent's hooks run the `keitora` on your `PATH`. An older CLI doesn't know `gate`, so
   its prompts reach the human directly; `drive` warns when the hook file has no gate entry.
   Upgrade the CLI and restart the app.
 - Driving doesn't elevate the driver. What a driven agent writes is input, not an instruction,
   and the driver stays bound by its own permission prompts.
+
+### When a request isn't picked up
+
+`send`, `read`, `reset`, `swap`, `wake` and `task dispatch` file a request in the project's task DB
+for the running app. The app looks at a project's pending requests whenever its DB is written,
+whenever herdr shows a session change that could let one go, whenever the window opens or its open
+projects change, and at least every ten seconds while any is pending, so a request is
+picked up even if the app missed the write. A request that has to wait (a `--queue`d send behind a
+busy agent, a session still starting or settling, herdr not up yet) records why on its row; the
+app refuses one still pending after ten minutes with that reason (`expired after 600s: ...`).
+
+When a `--wait` runs out first, the CLI withdraws the request and says which case applies, also as
+`diagnosis.code` in `--json`:
+
+| `code` | Meaning |
+|---|---|
+| `no_status` | No app status to read: no Keitora app picked the request up. |
+| `app_stale` | No app is updating its status (it quit, or never ran): start Keitora. |
+| `project_unknown` | The app runs but hasn't reported the project (an older app, or the project was just registered). |
+| `window_unreported` | The app runs but its window hasn't reported its open projects yet. |
+| `project_not_open` | The app runs but the project isn't open in its window: open it. |
+| `watcher_not_running` / `watcher_silent` | The app's watcher for the project is down or saw no write; it restarts on its own. |
+| `not_examined` | The app runs but hasn't looked at the request yet. |
+| `waiting` | The app saw the request; the cause is the reason it waits. |
+| `no_reason` | The app saw the request but recorded no reason. |
+
+The app also publishes each project's pickup state (open in the window, watcher state, last pass,
+pending count and age) in its status DB, which is where these causes come from. A timed-out request
+also carries up to two of the worktree's [health findings](#health), like a `stalled` event.
+
+## Health
+
+Keitora checks its own plumbing as it runs: whether each session's hooks report, whether turns
+finish the way they should, whether requests get picked up, whether the link to herdr is up. What
+it finds shows in three places:
+
+- **The sidebar.** A small `!` badge next to a worktree (or a project) with a problem: amber for a
+  warning, red for an error. Hover it for the message; click a worktree's badge to open the Health
+  section.
+- **Settings → Health.** Every finding, grouped by project and worktree, with when it was first and
+  last seen, how often it came back, and what Keitora did about it (`fixed by: ...`). Findings
+  that cleared in the last day are kept under **recently cleared**. **Copy as JSON** copies the
+  same list `keitora status --json` prints, for a bug report.
+- **`keitora status`** in a terminal (below), and on `stalled` events and timed-out requests.
+
+Informational findings show only in Settings and `keitora status`. A finding clears by itself once
+the cause is gone. Some are fixed automatically: missing hooks are reinstalled, the Antigravity hook
+entry is re-asserted, a stalled project gets another pass, a stale managed `keitora` on `PATH` is
+refreshed. Keitora never edits Codex's own configuration.
+
+| Finding | What it means | What to do |
+|---|---|---|
+| `hooks_vs_herdr` | herdr sees an agent, but its hooks haven't reported since it started. Keitora goes by herdr. | Check the worktree's hook setup (see `hooks_missing`); restart the agent. |
+| `hooks_missing` | The worktree's hooks aren't in place, or its last Codex launch ran without the hook-trust bypass. Permission brokering and reply capture won't work. | Keitora reinstalls them; restart the agent to pick them up. |
+| `completion_without_stop` | Turns finish without the agent's Stop hook; replies come from its session file, or not at all. | Check the hooks; use `keitora read` for missing replies. |
+| `turn_start_not_observed` | A prompt went in and herdr showed no activity for 30 s. | Look at the pane; `herdr agent explain <pane>` shows what herdr sees. |
+| `agent_start_refused` | herdr couldn't start the agent, e.g. while Claude asks whether to trust a new folder. | Open the pane and answer the prompt. |
+| `codex_project_untrusted` | Codex's config doesn't trust this project, so a Codex started by hand may skip its hooks. | Trust the project in Codex. |
+| `agy_plumbing` | Antigravity's hook entry is missing or broken, or the app runs from a location that offers no CLI. | Keitora re-asserts the entry; move the app if it is translocated. |
+| `worktree_identity` | The worktree's folder name differs from its configured name, so `keitora` run there names itself after the folder. | Rename the folder or the worktree. |
+| `pipeline_stalled` | A request has been pending with no pass looking at it. | Keitora asks for another pass; see [When a request isn't picked up](#when-a-request-isnt-picked-up). |
+| `watcher_restarted` / `watcher_silent` | A project's task-DB watcher died, hung, or missed a request and was restarted. | Nothing, unless it keeps happening. |
+| `herdr_link` | Keitora has had no answer from herdr for a while; session states are stale. | Check the herdr card in the sidebar. |
+| `herdr_unknown` | herdr reports an agent's status as unknown; Keitora keeps the last known state. | Usually clears by itself. |
+| `status_writer` | Another Keitora instance owns the status file; this one is read-only. | Quit the other instance. |
+| `version_skew` | The `keitora` on `PATH` isn't the one shipped with the app. | Reinstall the CLI from the app, or update your copy. |
+| `unconfigured_sessions` | Hooks report from worktrees the project doesn't configure. | Add the worktrees, or ignore. |
+
+### `keitora status`
+
+```sh
+keitora status           # the app, the project's pipeline, every worktree, every finding
+keitora status bravo     # one worktree: its findings in full and its last five turns
+keitora status --json    # the same as JSON
+```
+
+`keitora status` reads what the running app publishes (its status file) and the project's task
+DB. It never talks to herdr and never changes anything. With the app running it shows the app's
+version and herdr link, whether the project is open and its watcher alive, each worktree's state
+as the app sees it (herdr's view, and the hook row when they disagree), and the findings. Without a
+running app it says so and shows the hook rows only (`"source": "legacy"` in `--json`).
+
+It exits 0 whenever it printed something, 1 when it can't work out the project, and 4 for an
+unknown worktree.
+
+**How the app decides a session's state.** The sidebar, `keitora status` and the driver verbs all
+read the same answer: herdr's agent list says whether an agent runs and whether it is idle; the
+agent's hooks add what herdr can't see (a permission prompt being brokered, the reply of a finished
+turn). A hook row from an earlier session, or a hook that never ran, doesn't make a running agent
+look offline. A turn counts as finished when herdr shows the agent settled idle after the prompt,
+even if the agent's Stop hook never runs; the reply then comes from the agent's own session file.
 
 ## Configuration
 

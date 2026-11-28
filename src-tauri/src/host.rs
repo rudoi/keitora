@@ -3,7 +3,7 @@
 //!
 //! `lib.rs` declares this module unconditionally; desktop is the only target.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use crate::backend::{
     PtyBackendError, ScrollDirection, ScrollSource, SessionHint, SessionKey, SharedBackend,
     StatusPayload,
 };
-use crate::{antigravity_hooks, bg_notifier, codex_hooks, dispatch, hooks, tasks};
+use crate::{antigravity_hooks, bg_notifier, dispatch, hooks, tasks};
 
 /// A configured worktree as the rail sees it: the resolved worktree plus whether
 /// the user terminated its session. Tauri-layer only.
@@ -193,31 +193,34 @@ pub struct ProjectOverview {
 }
 
 /// Worktrees and session states for every registered project in display order,
-/// so lanes of non-active projects can show real status. Reads only the backend's
-/// caches (no server query). A project whose config or worktrees fail to resolve
-/// is skipped.
+/// so lanes of non-active projects can show real status. Session states are the
+/// engine's views over each project's hook rows (no server query). A project whose
+/// config or worktrees fail to resolve is skipped.
 #[tauri::command(async)]
-fn projects_overview(client: State<SharedBackend>) -> Result<Vec<ProjectOverview>, String> {
+fn projects_overview(
+    client: State<SharedBackend>,
+    engine: State<crate::engine::SharedEngine>,
+) -> Result<Vec<ProjectOverview>, String> {
     let user_cfg = keitora_tasks::UserConfig::load().map_err(|e| e.to_string())?;
-    let backend = client.inner().as_ref();
-    let live = backend.live_set_snapshot();
-    let hints = crate::backend::cached_agent_hints(backend);
-    Ok(project_overviews(backend, &user_cfg, &live, &hints))
+    Ok(project_overviews(
+        client.inner().as_ref(),
+        &user_cfg,
+        engine.inner(),
+    ))
 }
 
-/// [`projects_overview`] over an already-loaded registry, live set and agent hints.
+/// [`projects_overview`] over an already-loaded registry and the engine.
 fn project_overviews(
     client: &dyn PtyBackend,
     user_cfg: &keitora_tasks::UserConfig,
-    live: &HashSet<SessionKey>,
-    hints: &crate::backend::HintMap,
+    engine: &crate::engine::SessionEngine,
 ) -> Vec<ProjectOverview> {
     user_cfg
         .ordered_project_names()
         .into_iter()
         .filter_map(|key| {
             let pc = keitora_tasks::effective_config(&user_cfg.projects[&key]).ok()?;
-            project_overview(client, user_cfg, &key, pc, live, hints).ok()
+            project_overview(client, user_cfg, &key, pc, engine).ok()
         })
         .collect()
 }
@@ -232,24 +235,24 @@ fn project_overview(
     user_cfg: &keitora_tasks::UserConfig,
     key: &str,
     pc: keitora_tasks::ProjectConfig,
-    live: &HashSet<SessionKey>,
-    hints: &crate::backend::HintMap,
+    engine: &crate::engine::SessionEngine,
 ) -> Result<ProjectOverview, String> {
     let resolved = pc.project.name.clone();
     let local = keitora_tasks::LocalStore::open_read_only(&pc.tasks.db_path.to_string_lossy());
-    let mut sessions = local
+    let sessions = local
         .as_ref()
         .map_err(|e| e.to_string())
-        .and_then(|local| crate::tasks::reconciled_sessions_in(local, live, hints, &resolved, &pc))
+        .and_then(|local| {
+            crate::tasks::reconciled_sessions_in(local, &engine.views(&resolved), &resolved, &pc)
+        })
+        .map(|r| r.sessions)
         .unwrap_or_default();
     let active_tasks = local
         .as_ref()
         .ok()
         .and_then(|local| local.active_tasks().ok())
         .unwrap_or_default();
-    for s in &mut sessions {
-        s.project = resolved.clone();
-    }
+
     // The registry is already loaded; resolve against it rather than re-reading it per
     // project.
     let worktrees = keitora_tasks::Config::from_project(pc)
@@ -303,6 +306,9 @@ fn set_active_project(app: AppHandle, name: String) -> Result<(), String> {
 /// project: hooks, repair pass, watchers, and the frontend's change events. Shared
 /// by an in-app switch and an out-of-app one the registry watcher picks up.
 fn activate_resolved(app: &AppHandle) -> Result<(), String> {
+    // Consumers of the cached registry (the background notifier's active check)
+    // see the switch at once.
+    crate::project_stores::invalidate_registry();
     // The active project changed: drop the cached `(name, db_path)` so the next
     // PTY command re-resolves against the new project, (re)install its worktrees'
     // session hooks off-thread, and kick off the repair pass off-thread. Pass the
@@ -540,8 +546,9 @@ fn cancel_removed_worktrees(
     }
 }
 
-/// Create a new git worktree named `name` under the active project, install
-/// session hooks into it, then notify the UI so the rail/board refresh.
+/// Create a new git worktree named `name` under the active project, write its
+/// provider's hooks (idempotent: its first spawn rewrites nothing), then notify
+/// the UI so the rail/board refresh.
 #[tauri::command(async)]
 fn worktree_create(
     app: AppHandle,
@@ -549,26 +556,9 @@ fn worktree_create(
 ) -> Result<keitora_tasks::ResolvedWorktree, String> {
     let pc = keitora_tasks::resolve_active().map_err(|e| e.to_string())?;
     let wt = keitora_tasks::create_worktree(&pc, &name).map_err(|e| e.to_string())?;
-    // Resolve the `keitora` binary for the new worktree: PATH → [cli].path override →
-    // the app-bundled CLI → its own build (none yet on a fresh worktree, and only a
-    // last resort).
-    let sources = hooks::KeitoraBinSources::gather(Some(&pc), keitora_tasks::keitora_on_path());
-    if let Some(bin) = hooks::resolve_keitora_bin(&wt.path, &sources) {
-        hooks::install_hooks_for(&wt.path, &bin);
-        // Codex worktrees also get a worktree-local `.codex/hooks.json`,
-        // gated on `CliKind::Codex` so a hand-run `codex` in a Claude worktree is
-        // never prompted to trust our hooks.
-        if wt.cli == keitora_tasks::CliKind::Codex {
-            codex_hooks::install_codex_hooks_for(&wt.path, &bin);
-        }
-    }
-    // Antigravity worktrees get the global agy hook and workspace trust; neither
-    // needs a resolved `keitora` binary (the hook runs `$KEITORA_BIN`). Done before
-    // returning (this command runs off the main thread) so the pane the UI starts
-    // next already finds them.
-    if wt.cli == keitora_tasks::CliKind::Antigravity {
-        antigravity_hooks::sync_worktree(&wt.path);
-    }
+    // Before returning (this command runs off the main thread), so the worktree
+    // has its hooks even before its first pane spawns.
+    hooks::prepare_new_worktree(&pc, &wt.path, wt.cli);
     let _ = app.emit("project://changed", ());
     let _ = app.emit("worktrees://changed", ());
     Ok(wt)
@@ -1269,9 +1259,9 @@ fn install_keitora_cli() -> Result<crate::cli_install::CliStatus, String> {
 /// it lags the CLI bundled with this app (a same-version upgrade never rewrote it),
 /// replace it. A `keitora` on PATH that is not the managed copy is never touched, and
 /// unix needs nothing (its managed entry is a symlink to the bundled CLI).
-fn refresh_managed_cli() {
+pub(crate) fn refresh_managed_cli() {
     use crate::cli_install::{self, Refresh};
-    if !cfg!(windows) {
+    if !cli_install::REFRESHES_MANAGED_COPY {
         return;
     }
     let on_path = keitora_tasks::keitora_on_path().map(std::path::PathBuf::from);
@@ -1363,20 +1353,10 @@ fn on_project_activated(app: AppHandle, project_root: std::path::PathBuf) {
     );
 }
 
-/// Stop handle for the single live tasks/sessions watcher thread.
-///
-/// `start_tasks_watcher` is restartable: each call replaces this sender (dropping
-/// the previous one). The previous watcher thread observes its stop receiver
-/// disconnect (or a sent `()`) and exits, so the watcher always follows the
-/// active project after a switch without leaking threads. See
-/// [`replace_stop`] for the swap and [`start_tasks_watcher`] for the
-/// stop-aware loop.
-static TASKS_WATCHER_STOP: Mutex<Option<mpsc::SyncSender<()>>> = Mutex::new(None);
-
-/// Stop handle for the single live config-file watcher thread. Mirrors
-/// [`TASKS_WATCHER_STOP`]: `start_config_watcher` replaces this on each call, so the
-/// watcher follows the active project's `keitora.toml` across project switches without
-/// leaking the previous thread. See [`start_config_watcher`].
+/// Stop handle for the single live config-file watcher thread: `start_config_watcher`
+/// replaces this on each call, so the watcher follows the active project's
+/// `keitora.toml` across project switches without leaking the previous thread. (The
+/// tasks watcher's stop sender lives in its `crate::watchers` registry entry.)
 static CONFIG_WATCHER_STOP: Mutex<Option<mpsc::SyncSender<()>>> = Mutex::new(None);
 
 /// Install `new_tx` as `slot`'s live stop sender, returning the previous one (if
@@ -1384,8 +1364,7 @@ static CONFIG_WATCHER_STOP: Mutex<Option<mpsc::SyncSender<()>>> = Mutex::new(Non
 /// case — callers just let it drop) disconnects the *previous* watcher thread's stop
 /// receiver, signalling it to exit on its next loop iteration.
 ///
-/// Slot-parameterized so the tasks and config watchers share one swap primitive, and
-/// pulled out as a standalone function so the sender-replacement semantics can be
+/// Pulled out as a standalone function so the sender-replacement semantics can be
 /// unit-tested without spawning real `notify` watchers or filesystem threads.
 fn replace_stop(
     slot: &Mutex<Option<mpsc::SyncSender<()>>>,
@@ -2266,14 +2245,47 @@ fn daemon_restart(client: State<SharedBackend>) -> Result<(), String> {
     client.restart().map_err(daemon_err)
 }
 
-/// List live daemon sessions as project/worktree hints (background-session count
-/// + Settings display). Groups/counts happen on the frontend.
+/// List the sessions with a running agent as project/worktree hints (quit prompt,
+/// background-session count, Settings display). Groups/counts happen on the frontend.
 #[tauri::command(async)]
-fn daemon_list_sessions(client: State<SharedBackend>) -> Result<Vec<SessionHint>, String> {
-    client
-        .list_sessions()
-        .map(|v| v.iter().map(session_hint).collect())
-        .map_err(daemon_err)
+fn daemon_list_sessions(
+    client: State<SharedBackend>,
+    engine: State<crate::engine::SharedEngine>,
+) -> Result<Vec<SessionHint>, String> {
+    agent_session_hints(client.inner().as_ref(), engine.inner())
+}
+
+/// The keys with a running agent per the engine (all pane keys while it has no
+/// fresh answer: no snapshot, herdr not up, or stale views), with each pane's
+/// generation where the backend lists one.
+fn agent_session_hints(
+    client: &dyn PtyBackend,
+    engine: &crate::engine::SessionEngine,
+) -> Result<Vec<SessionHint>, String> {
+    let ready = engine.is_fresh();
+    let panes = match client.list_sessions() {
+        Ok(p) => p,
+        // Without a fresh answer the panes are the only answer.
+        Err(e) if !ready => return Err(daemon_err(e)),
+        Err(_) => Vec::new(),
+    };
+    let by_key: HashMap<&SessionKey, &crate::backend::SessionSummary> =
+        panes.iter().map(|s| (&s.key, s)).collect();
+    Ok(crate::engine::running_agent_keys(
+        &engine.all_views(),
+        ready,
+        panes.iter().map(|s| s.key.clone()),
+    )
+    .into_iter()
+    .map(|key| match by_key.get(&key) {
+        Some(s) => session_hint(s),
+        None => SessionHint {
+            project: key.project,
+            worktree: key.worktree,
+            gen: 0,
+        },
+    })
+    .collect())
 }
 
 /// "Quitting now" latch, managed as Tauri state. Set by the quit commands before
@@ -2344,13 +2356,23 @@ fn start_config_watcher(app: AppHandle) {
     let file = "keitora.toml".to_string();
 
     thread::spawn(move || {
-        crate::db_watch::watch_dir(dir, file, Duration::from_millis(200), stop_rx, move || {
-            // Dual-emit: `project://changed` is the new event name; the
-            // `worktrees://changed` alias is kept one release for the existing
-            // frontend subscriber and removed once it migrates.
-            let _ = app.emit("project://changed", ());
-            let _ = app.emit("worktrees://changed", ());
-        });
+        crate::db_watch::watch_dir_logged(
+            "config",
+            dir,
+            file,
+            Duration::from_millis(200),
+            stop_rx,
+            move || {
+                // Cached project configs (worktrees, as the drive pass reads them)
+                // follow the file at once.
+                crate::project_stores::invalidate_registry();
+                // Dual-emit: `project://changed` is the new event name; the
+                // `worktrees://changed` alias is kept one release for the existing
+                // frontend subscriber and removed once it migrates.
+                let _ = app.emit("project://changed", ());
+                let _ = app.emit("worktrees://changed", ());
+            },
+        );
     });
 }
 
@@ -2389,9 +2411,14 @@ fn start_registry_watcher(app: AppHandle) {
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
-        crate::db_watch::watch_dir(dir, file, Duration::from_millis(200), stop_rx, || {
-            on_registry_change(&app)
-        });
+        crate::db_watch::watch_dir_logged(
+            "registry",
+            dir,
+            file,
+            Duration::from_millis(200),
+            stop_rx,
+            || on_registry_change(&app),
+        );
     });
 }
 
@@ -2406,7 +2433,16 @@ fn on_registry_change(app: &AppHandle) {
         let mut last = LAST_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
         take_active_change(&mut last, reg.active.clone())
     };
+    // Everything cached from the registry (projects, worktrees, the active one) is
+    // re-read once, here, for every consumer below.
+    crate::project_stores::invalidate_registry();
     if !changed {
+        // A project registered or removed from the CLI gets (or loses) its background
+        // watcher, which also carries its requests.
+        let registry = crate::project_stores::registry();
+        if bg_notifier::watched_set_changed(&registry) {
+            bg_notifier::start_bg_watchers(app, &registry);
+        }
         let _ = app.emit("projects://reordered", ());
         return;
     }
@@ -2445,57 +2481,63 @@ struct TasksChanged {
 /// `start_config_watcher` but anchors on `db_path` (not the config file) and
 /// filters to the `tasks.db*` family. Debounced ~300ms; carries a revision marker
 /// so the frontend can dedupe redundant events.
-fn start_tasks_watcher(app: AppHandle) {
-    // Stop-then-maybe-start: supersede the previous watcher FIRST (replacing the
-    // global stop sender drops the old one, disconnecting the old thread's `stop_rx`
-    // so it exits on its next loop). A rendezvous channel (cap 0) is enough — we only
-    // care about connect/disconnect, never buffering. Doing this before the resolve
-    // means a call with no active project (e.g. after the active project is removed)
+fn start_tasks_watcher(app: AppHandle) -> Option<String> {
+    use crate::watchers::{WatcherId, WatcherKind};
+    // Supersede the previous watcher: the registry marks it stopped and drops its stop
+    // sender, so its thread exits on its next loop and the supervisor never restarts
+    // it. A call with no active project (e.g. after the active project is removed)
     // stops the stale watcher instead of leaking it.
-    let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(0);
-    drop(replace_stop(&TASKS_WATCHER_STOP, stop_tx));
-
-    let (db_path, project) = match keitora_tasks::resolve_active() {
-        Ok(pc) => (pc.tasks.db_path.clone(), pc.project.name.clone()),
-        Err(_) => return, // no active project → previous watcher stopped above
+    let registry = crate::watchers::global();
+    let Ok(pc) = keitora_tasks::resolve_active() else {
+        registry.retain_kind(WatcherKind::Tasks, |_| false);
+        return None;
     };
-    let dir = match db_path.parent() {
-        Some(p) => p.to_path_buf(),
-        None => return,
-    };
-    // Match tasks.db, tasks.db-wal, tasks.db-shm — any write to the DB family.
-    let db_file = match db_path.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n.to_string(),
-        None => return,
-    };
-    let db_path_str = db_path.to_string_lossy().to_string();
-
-    thread::spawn(move || {
-        // Two long-lived handles: `SqliteBackend` for the task revision (task +
-        // dispatch log cursors), `LocalStore` for the session revision (state-based,
-        // no task backend needed). Both point at the same file (WAL-safe). Neither
-        // needs a tokio runtime — `revision_blocking` / `session_revision` are sync.
-        let backend = keitora_tasks::SqliteBackend::open(&db_path_str).ok();
-        let local = keitora_tasks::LocalStore::open(&db_path_str).ok();
-        let mut last_revision = String::new();
-        let mut last_session_revision = String::new();
-        let app_for_requests = app.clone();
-        // Emit `event` only when `rev` differs from the last value we sent.
-        let emit_if_changed = |event: &str, rev: String, last: &mut String| {
-            if rev != *last {
-                *last = rev.clone();
-                let _ = app.emit(event, TasksChanged { revision: rev });
-            }
-        };
-        // Shared notify-setup + poll/stop/debounce loop; on each debounced burst:
-        // Tasks: log-id+count marker. Sessions: state-based marker (same DB file)
-        // so heartbeat-only writes don't spam the UI.
-        crate::db_watch::watch_dir(
-            dir,
-            db_file,
-            Duration::from_millis(300),
-            stop_rx,
-            move || {
+    let project = pc.project.name.clone();
+    registry.retain_kind(WatcherKind::Tasks, |p| p == project);
+    let db_path_str = pc.tasks.db_path.to_string_lossy().to_string();
+    registry.spawn_db_watcher(
+        WatcherId::new(WatcherKind::Tasks, &project),
+        &pc.tasks.db_path,
+        Duration::from_millis(300),
+        move |health| {
+            // Two long-lived handles: `SqliteBackend` for the task revision (task +
+            // dispatch log cursors), `LocalStore` for the session revision (state-based,
+            // no task backend needed). Both point at the same file (WAL-safe). Neither
+            // needs a tokio runtime — `revision_blocking` / `session_revision` are sync.
+            // A failed open is recorded and retried on the next event, never kept.
+            let (h, path) = (Arc::clone(health), db_path_str.clone());
+            let open_backend = move || {
+                keitora_tasks::SqliteBackend::open(&path)
+                    .map_err(|e| h.record_error(format!("store open failed: {e}")))
+                    .ok()
+            };
+            let (h, path) = (Arc::clone(health), db_path_str);
+            let open_local = move || {
+                keitora_tasks::LocalStore::open(&path)
+                    .map_err(|e| h.record_error(format!("store open failed: {e}")))
+                    .ok()
+            };
+            let mut backend = open_backend();
+            let mut local = open_local();
+            let mut last_revision = String::new();
+            let mut last_session_revision = String::new();
+            // Emit `event` only when `rev` differs from the last value we sent.
+            let emit_if_changed = move |event: &str, rev: String, last: &mut String| {
+                if rev != *last {
+                    *last = rev.clone();
+                    let _ = app.emit(event, TasksChanged { revision: rev });
+                }
+            };
+            // On each debounced burst: Tasks: log-id+count marker. Sessions:
+            // state-based marker (same DB file) so heartbeat-only writes don't spam the
+            // UI. Requests are the background watcher's (it watches this DB too).
+            Ok(move || {
+                if backend.is_none() {
+                    backend = open_backend();
+                }
+                if local.is_none() {
+                    local = open_local();
+                }
                 let trev = backend
                     .as_ref()
                     .and_then(|b| b.revision_blocking().ok())
@@ -2506,23 +2548,68 @@ fn start_tasks_watcher(app: AppHandle) {
                     .and_then(|l| l.session_revision().ok())
                     .unwrap_or_default();
                 emit_if_changed("sessions://changed", srev, &mut last_session_revision);
-                // CLI dispatch requests (`keitora task dispatch`) arrive as rows in
-                // this DB; run them through the app's own dispatch path.
-                if let Some(l) = local.as_ref() {
-                    crate::dispatch::spawn_pending_requests(&app_for_requests, l, &project);
-                }
-            },
-        );
-    });
+            })
+        },
+    );
+    Some(project)
+}
+
+/// How the supervisor respawns each kind of supervised watcher: the tasks watcher
+/// always follows the active project, so a restart respawns the active project's
+/// (and reports success only when that is still the project whose watcher died);
+/// a background watcher is respawned for its own project.
+fn install_watcher_restarts(app: &AppHandle) {
+    use crate::watchers::WatcherKind;
+    let registry = crate::watchers::global();
+    let handle = app.clone();
+    registry.set_restart(
+        WatcherKind::Tasks,
+        Arc::new(move |project: &str| {
+            start_tasks_watcher(handle.clone()).as_deref() == Some(project)
+        }),
+    );
+    let handle = app.clone();
+    registry.set_restart(
+        WatcherKind::Bg,
+        Arc::new(move |project: &str| bg_notifier::restart_bg_watcher(&handle, project)),
+    );
 }
 
 /// Build the PTY backend: [`crate::backend::herdr::HerdrBackend`], or, when it
 /// cannot be constructed (herdr unresolvable, user config unreadable), an
 /// [`UnavailableBackend`] that reports why, so the app still starts.
-fn select_pty_backend(app: AppHandle) -> SharedBackend {
-    let herdr =
-        crate::backend::herdr::HerdrBackend::new(app.clone()).map(|b| Arc::new(b) as SharedBackend);
+/// The engine's link reads `unavailable` in the fallback (nothing ever feeds it).
+fn select_pty_backend(app: AppHandle, engine: &crate::engine::SharedEngine) -> SharedBackend {
+    let herdr = crate::backend::herdr::HerdrBackend::new(app.clone(), Arc::clone(engine))
+        .map(|b| Arc::new(b) as SharedBackend);
+    if herdr.is_err() {
+        engine.mark_link(
+            crate::engine::HerdrLink::Unavailable,
+            keitora_tasks::now_ms(),
+        );
+    }
     choose_backend(herdr, Arc::new(app))
+}
+
+/// The session engine: herdr's agent view combined with hook rows, published to
+/// `status.db` (which the CLI reads) and to the window as `sessions://changed`.
+fn start_session_engine(app: &AppHandle) -> crate::engine::SharedEngine {
+    let publisher = crate::engine::writer::StatusPublisher::start(
+        keitora_tasks::status_db_path(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    app.manage(Arc::clone(&publisher));
+    let engine = crate::engine::SessionEngine::new(
+        Arc::new(crate::engine::evidence::RegistryEvidence::new()),
+        Some(publisher),
+    );
+    engine.set_transcript_source(Arc::new(crate::transcript::AgentTranscripts::from_env()));
+    app.manage(Arc::clone(&engine));
+    let handle = app.clone();
+    engine.subscribe(Box::new(move |_| {
+        let _ = handle.emit("sessions://changed", ());
+    }));
+    engine
 }
 
 /// The backend to run given the outcome of constructing herdr: herdr itself, or
@@ -2581,7 +2668,15 @@ pub fn run() {
             // `agy` must find both in place. Plain file I/O, so the window barely
             // waits.
             antigravity_hooks::sync_registry();
-            let backend: SharedBackend = select_pty_backend(app.handle().clone());
+            let engine = start_session_engine(app.handle());
+            // Requested passes run on the async runtime; requests waiting on the
+            // engine get one when a view or the link changes.
+            crate::pipeline::install(app.handle(), &engine);
+            // The safety sweep, watcher supervision and presence rows run on their
+            // own thread, whatever the backend (herdr or not).
+            crate::pipeline::start_thread(app.handle());
+            let backend: SharedBackend = select_pty_backend(app.handle().clone(), &engine);
+            engine.attach_backend(&backend);
             backend.start();
             app.manage(backend);
             // Shared sysinfo System for the rail daemon card's 2s stats poll.
@@ -2611,6 +2706,8 @@ pub fn run() {
                     log::warn!("[updater] couldn't add the app menu item: {e}");
                 }
             }
+            // How the supervisor respawns a request-carrying watcher that stopped.
+            install_watcher_restarts(app.handle());
             // Point the tasks + config watchers at the launch-time active project.
             restart_project_watchers(app.handle());
             // Follow active-project changes made outside the app (CLI, another instance).
@@ -2639,6 +2736,22 @@ pub fn run() {
         // stop all). The `quitting` latch (set by app_quit_keep/app_quit_stop)
         // lets our own programmatic `app.exit(0)` close through without re-prompting.
         .on_window_event(|window, event| {
+            // No window, no warm cadence, and no open set: requests wait for the
+            // next window's report (a reopened window reports afresh).
+            if let tauri::WindowEvent::Destroyed = event {
+                if let Some(engine) = window
+                    .app_handle()
+                    .try_state::<crate::engine::SharedEngine>()
+                {
+                    engine.set_window_open(false);
+                }
+                if let Some(rt) = window
+                    .app_handle()
+                    .try_state::<crate::drive::DriveRuntime>()
+                {
+                    rt.clear_open();
+                }
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle();
                 // Closing mid-install could leave a half-swapped app bundle; the update
@@ -2654,9 +2767,11 @@ pub fn run() {
                     .try_state::<Quitting>()
                     .map(|q| q.0.load(Ordering::SeqCst))
                     .unwrap_or(false);
+                // The engine's count of running agents (every live pane while it
+                // has no fresh answer), never the backend's raw pane set.
                 let live = app
-                    .try_state::<SharedBackend>()
-                    .map(|c| c.live_set_snapshot().len())
+                    .try_state::<crate::engine::SharedEngine>()
+                    .map(|e| e.running_count())
                     .unwrap_or(0);
                 if should_prevent_close(quitting, live) {
                     api.prevent_close();
@@ -2738,6 +2853,7 @@ pub fn run() {
             crate::deps::commands::deps_status,
             crate::deps::commands::deps_recheck,
             crate::deps::commands::deps_doctor,
+            crate::health::commands::health_list,
             crate::deps::commands::deps_install,
             crate::deps::commands::deps_snooze_upgrade,
             crate::deps::commands::deps_set_herdr_bin,
@@ -2779,8 +2895,16 @@ pub fn run() {
             crate::diff::worktree_diff_watch_start,
             crate::diff::worktree_diff_watch_stop
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // Give the status.db lease up so the CLI sees "no app" at once.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(p) = app.try_state::<Arc<crate::engine::writer::StatusPublisher>>() {
+                    p.release();
+                }
+            }
+        });
 }
 
 #[cfg(test)]
@@ -3375,6 +3499,33 @@ mod tests {
         assert!(!should_prevent_close(false, 0));
     }
 
+    /// The guard asks the engine: once it has a fresh snapshot, a live pane with no
+    /// agent (a bare shell) doesn't hold the window; before that, every live pane does.
+    #[test]
+    fn close_guard_counts_the_engines_running_agents() {
+        let fake = Arc::new(crate::backend::fake::FakeBackend::new());
+        let backend: SharedBackend = fake.clone();
+        let engine = test_engine();
+        engine.attach_backend(&backend);
+        let k = SessionKey {
+            project: "proj".into(),
+            worktree: "alpha".into(),
+        };
+        fake.insert_live(k.clone());
+        assert!(should_prevent_close(false, engine.running_count()));
+        let shell = crate::engine::model::AgentObs {
+            agent: None,
+            ..crate::engine::model::obs("w1:p1", "unknown", 1, None)
+        };
+        crate::engine::tests::ingest_settled(&engine, vec![(k.clone(), Some(shell))]);
+        assert!(!should_prevent_close(false, engine.running_count()));
+        crate::engine::tests::ingest_settled(
+            &engine,
+            vec![(k, Some(crate::engine::model::obs("w1:p1", "idle", 2, None)))],
+        );
+        assert!(should_prevent_close(false, engine.running_count()));
+    }
+
     #[test]
     fn allows_close_when_already_quitting() {
         // The re-entrancy guard: our own programmatic exit must not re-prevent,
@@ -3507,6 +3658,176 @@ mod tests {
         assert!(s[1].active);
     }
 
+    /// An engine with no hook evidence and no snapshot yet.
+    fn test_engine() -> crate::engine::SharedEngine {
+        crate::engine::SessionEngine::new_for_test(std::sync::Arc::new(
+            crate::engine::tests::FakeEvidence::default(),
+        ))
+    }
+
+    /// An agy agent idle in `acme`'s pane with no hook row at all reads `idle` in
+    /// the overview (its hooks never fired), not `offline`.
+    #[test]
+    fn project_overview_shows_a_rowless_live_agent_as_idle() {
+        use crate::backend::fake::FakeBackend;
+        use crate::backend::SessionKey;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pref = overview_project(tmp.path(), "acme");
+        let pc = keitora_tasks::effective_config(&pref).unwrap();
+        keitora_tasks::LocalStore::open(&pc.tasks.db_path.to_string_lossy()).unwrap();
+        let engine = test_engine();
+        let agy = crate::engine::model::AgentObs {
+            agent: Some("agy".into()),
+            ..crate::engine::model::obs("w1:p1", "idle", 2, None)
+        };
+        crate::engine::tests::ingest_settled(
+            &engine,
+            vec![(
+                SessionKey {
+                    project: "acme".into(),
+                    worktree: "acme".into(),
+                },
+                Some(agy),
+            )],
+        );
+        let o = super::project_overview(
+            &FakeBackend::new(),
+            &keitora_tasks::UserConfig::default(),
+            "registry-key",
+            pc,
+            &engine,
+        )
+        .unwrap();
+        assert_eq!(o.sessions.len(), 1);
+        assert_eq!(o.sessions[0].state, "idle");
+        assert_eq!(o.sessions[0].agent.as_deref(), Some("present"));
+        assert_eq!(o.sessions[0].project, "acme");
+    }
+
+    /// The quit prompt counts pane keys while the engine has no snapshot (never
+    /// under-counting), then only keys whose agent runs.
+    #[test]
+    fn quit_prompt_counts_panes_until_ready_then_agents_only() {
+        use crate::backend::fake::FakeBackend;
+        use crate::backend::{SessionKey, SessionSummary};
+
+        let key = |w: &str| SessionKey {
+            project: "proj".into(),
+            worktree: w.into(),
+        };
+        let pane = |w: &str, gen| SessionSummary {
+            key: key(w),
+            gen,
+            state_hint: None,
+        };
+        let fake = FakeBackend::new();
+        let engine = test_engine();
+        fake.push_list_sessions(Ok(vec![pane("alpha", 3), pane("bravo", 4)]));
+        let names = |hints: Vec<crate::backend::SessionHint>| -> Vec<(String, u64)> {
+            hints.into_iter().map(|h| (h.worktree, h.gen)).collect()
+        };
+        assert_eq!(
+            names(super::agent_session_hints(&fake, &engine).unwrap()),
+            vec![("alpha".to_string(), 3), ("bravo".to_string(), 4)],
+            "not ready: every pane"
+        );
+        fake.push_list_sessions(Err(PtyBackendError::NotConnected));
+        assert!(
+            super::agent_session_hints(&fake, &engine).is_err(),
+            "not ready and no panes: no answer"
+        );
+
+        // alpha runs an agent, bravo is a bare shell, charlie is starting.
+        let shell = crate::engine::model::AgentObs {
+            agent: None,
+            ..crate::engine::model::obs("w1:p2", "unknown", 0, None)
+        };
+        let starting = crate::engine::model::AgentObs {
+            launch_pending: true,
+            ..crate::engine::model::obs("w1:p3", "unknown", 1, None)
+        };
+        crate::engine::tests::ingest_settled(
+            &engine,
+            vec![
+                (
+                    key("alpha"),
+                    Some(crate::engine::model::obs("w1:p1", "idle", 1, None)),
+                ),
+                (key("bravo"), Some(shell)),
+                (key("charlie"), Some(starting)),
+            ],
+        );
+        fake.push_list_sessions(Ok(vec![pane("alpha", 3), pane("bravo", 4)]));
+        assert_eq!(
+            names(super::agent_session_hints(&fake, &engine).unwrap()),
+            vec![("alpha".to_string(), 3), ("charlie".to_string(), 0)],
+            "ready: agents only"
+        );
+        fake.push_list_sessions(Err(PtyBackendError::NotConnected));
+        assert_eq!(
+            names(super::agent_session_hints(&fake, &engine).unwrap()),
+            vec![("alpha".to_string(), 0), ("charlie".to_string(), 0)],
+            "ready: the panes are not needed"
+        );
+    }
+
+    /// Stale views are not trusted, even with herdr up: every live pane counts again.
+    #[test]
+    fn session_hints_fall_back_to_panes_when_the_views_are_stale() {
+        use crate::backend::fake::FakeBackend;
+        use crate::backend::{SessionKey, SessionSummary};
+
+        let key = |w: &str| SessionKey {
+            project: "proj".into(),
+            worktree: w.into(),
+        };
+        let fake = FakeBackend::new();
+        let t0 = std::time::Instant::now();
+        let clock = crate::engine::tests::TestClock::new(t0);
+        let engine = crate::engine::SessionEngine::with_clock(
+            std::sync::Arc::new(crate::engine::tests::FakeEvidence::default()),
+            None,
+            clock.clock(),
+        );
+        let idle = crate::engine::model::obs("w1:p1", "idle", 1, None);
+        for s in [0, 1] {
+            engine.ingest(crate::engine::HerdrSnapshot {
+                at: t0 + std::time::Duration::from_secs(s),
+                at_ms: 1_000 * s as i64,
+                generation: crate::backend::herdr::ops::Generation(1),
+                keys: vec![(key("alpha"), Some(idle.clone()))],
+            });
+        }
+        // Long past three cold intervals: ready (herdr up) but stale.
+        clock.set(t0 + std::time::Duration::from_secs(600));
+        assert!(engine.is_ready());
+        assert!(!engine.is_fresh());
+        fake.push_list_sessions(Ok(vec![
+            SessionSummary {
+                key: key("alpha"),
+                gen: 3,
+                state_hint: None,
+            },
+            SessionSummary {
+                key: key("bravo"),
+                gen: 4,
+                state_hint: None,
+            },
+        ]));
+        let names: Vec<_> = super::agent_session_hints(&fake, &engine)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.worktree)
+            .collect();
+        assert_eq!(names, ["alpha", "bravo"], "stale: every pane");
+        fake.push_list_sessions(Err(PtyBackendError::NotConnected));
+        assert!(
+            super::agent_session_hints(&fake, &engine).is_err(),
+            "stale and no panes: no answer"
+        );
+    }
+
     /// A file-less project rooted at `<tmp>/<dir>` whose task DB lives at
     /// `<tmp>/<dir>.db` (kept inside the temp dir, never under the real home).
     fn overview_project(tmp: &std::path::Path, dir: &str) -> keitora_tasks::ProjectRef {
@@ -3524,7 +3845,6 @@ mod tests {
     fn project_overview_without_db_lists_worktrees_and_creates_nothing() {
         use crate::backend::fake::FakeBackend;
         use crate::backend::SessionKey;
-        use std::collections::HashSet;
 
         let tmp = tempfile::TempDir::new().unwrap();
         let pref = overview_project(tmp.path(), "acme");
@@ -3543,15 +3863,7 @@ mod tests {
             default_cli: Some(keitora_tasks::CliKind::Codex),
             ..keitora_tasks::UserConfig::default()
         };
-        let o = super::project_overview(
-            &fake,
-            &user,
-            "registry-key",
-            pc,
-            &HashSet::new(),
-            &crate::backend::HintMap::new(),
-        )
-        .unwrap();
+        let o = super::project_overview(&fake, &user, "registry-key", pc, &test_engine()).unwrap();
 
         assert_eq!(o.key, "registry-key");
         assert_eq!(o.resolved_name, "acme");
@@ -3570,7 +3882,6 @@ mod tests {
     fn project_overview_with_db_scopes_and_stamps_sessions() {
         use crate::backend::fake::FakeBackend;
         use crate::backend::SessionKey;
-        use std::collections::HashSet;
 
         let tmp = tempfile::TempDir::new().unwrap();
         let pref = overview_project(tmp.path(), "acme");
@@ -3587,23 +3898,28 @@ mod tests {
             project: "acme".into(),
             worktree: "acme".into(),
         };
-        let live: HashSet<_> = [key.clone()].into();
-        let hints: crate::backend::HintMap = [(key, crate::backend::HINT_BUSY.to_string())].into();
+        let engine = test_engine();
+        crate::engine::tests::ingest_settled(
+            &engine,
+            vec![(
+                key,
+                Some(crate::engine::model::obs("w1:p1", "working", 1, None)),
+            )],
+        );
 
         let o = super::project_overview(
             &FakeBackend::new(),
             &keitora_tasks::UserConfig::default(),
             "registry-key",
             pc,
-            &live,
-            &hints,
+            &engine,
         )
         .unwrap();
         assert_eq!(o.sessions.len(), 1, "only configured worktrees");
         let s = &o.sessions[0];
         assert_eq!(s.worktree, "acme");
         assert_eq!(s.project, "acme");
-        assert_eq!(s.state, "busy", "idle + background work reconciles to busy");
+        assert_eq!(s.state, "busy", "idle row + herdr working reads busy");
         assert!(!o.worktrees[0].terminated);
         assert!(o.active_tasks.is_empty());
     }
@@ -3614,7 +3930,6 @@ mod tests {
     fn project_overview_carries_active_tasks() {
         use crate::backend::fake::FakeBackend;
         use keitora_tasks::TaskBackend;
-        use std::collections::HashSet;
 
         let tmp = tempfile::TempDir::new().unwrap();
         let pref = overview_project(tmp.path(), "acme");
@@ -3635,8 +3950,7 @@ mod tests {
             &keitora_tasks::UserConfig::default(),
             "registry-key",
             pc,
-            &HashSet::new(),
-            &crate::backend::HintMap::new(),
+            &test_engine(),
         )
         .unwrap();
         assert_eq!(
@@ -3654,7 +3968,6 @@ mod tests {
     #[test]
     fn project_overview_with_unreadable_db_keeps_worktrees_without_sessions() {
         use crate::backend::fake::FakeBackend;
-        use std::collections::HashSet;
 
         let tmp = tempfile::TempDir::new().unwrap();
         let pref = overview_project(tmp.path(), "acme");
@@ -3666,8 +3979,7 @@ mod tests {
             &keitora_tasks::UserConfig::default(),
             "registry-key",
             pc,
-            &HashSet::new(),
-            &crate::backend::HintMap::new(),
+            &test_engine(),
         )
         .unwrap();
         assert_eq!(o.worktrees.len(), 1);
@@ -3680,7 +3992,6 @@ mod tests {
     fn project_overviews_follow_order_and_skip_broken_projects() {
         use crate::backend::fake::FakeBackend;
         use keitora_tasks::UserConfig;
-        use std::collections::HashSet;
 
         let tmp = tempfile::TempDir::new().unwrap();
         let broken = overview_project(tmp.path(), "broken");
@@ -3694,12 +4005,7 @@ mod tests {
         user.projects.insert("bad".into(), broken);
         user.set_project_order(vec!["beta".into(), "bad".into(), "alpha".into()]);
 
-        let all = super::project_overviews(
-            &FakeBackend::new(),
-            &user,
-            &HashSet::new(),
-            &crate::backend::HintMap::new(),
-        );
+        let all = super::project_overviews(&FakeBackend::new(), &user, &test_engine());
         let keys: Vec<(&str, &str)> = all
             .iter()
             .map(|o| (o.key.as_str(), o.resolved_name.as_str()))
@@ -4119,15 +4425,9 @@ mod tests {
         slot.lock().unwrap().take();
     }
 
-    #[test]
-    fn tasks_watcher_stop_sender_replaced_on_restart() {
-        assert_replace_stop_swaps(&super::TASKS_WATCHER_STOP);
-    }
-
-    /// `start_config_watcher` is restartable the same way as the tasks watcher (so a
-    /// project switch re-points it at the new `keitora.toml` without leaking the prior
-    /// thread). The restart handoff goes through the same `replace_stop` swap, here
-    /// against the config slot.
+    /// `start_config_watcher` is restartable (so a project switch re-points it at the
+    /// new `keitora.toml` without leaking the prior thread). The restart handoff goes
+    /// through the `replace_stop` swap.
     #[test]
     fn config_watcher_stop_sender_replaced_on_restart() {
         assert_replace_stop_swaps(&super::CONFIG_WATCHER_STOP);

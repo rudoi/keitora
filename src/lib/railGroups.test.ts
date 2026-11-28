@@ -237,6 +237,20 @@ describe("buildGroups", () => {
     expect(a.lanes[1].blockState).toBe("waiting");
   });
 
+  it("marks a lane stale only when its session is stale", () => {
+    const [a] = buildGroups(
+      input({
+        sessions: new Map([
+          ["a1", { ...session("alpha-res", "a1", "busy"), stale: true }],
+          ["a2", session("alpha-res", "a2", "idle")],
+        ]),
+      }),
+    );
+    expect(a.lanes.map((l) => l.stale)).toEqual([true, false]);
+    // The stale lane keeps its last state's colour; dimming is separate.
+    expect(a.lanes[0].blockState).toBe("busy");
+  });
+
   it("carries a finished attention on the active group without turning it orange", () => {
     const [a] = buildGroups(
       input({ attention: new Map<string, AttentionKind>([["a1", "finished"]]) }),

@@ -56,12 +56,7 @@ pub struct ResolveCtx<'a> {
 fn antigravity_brain_dir(injected: Option<&Path>) -> Option<PathBuf> {
     match injected {
         Some(p) => Some(p.to_path_buf()),
-        None => Some(
-            dirs::home_dir()?
-                .join(".gemini")
-                .join("antigravity-cli")
-                .join("brain"),
-        ),
+        None => Some(keitora_tasks::agy_state_dir(&dirs::home_dir()?).join("brain")),
     }
 }
 
@@ -76,17 +71,8 @@ pub enum ResumeDecision {
     Fresh,
 }
 
-fn cli_of(agent: &str) -> Option<CliKind> {
-    CliKind::ALL
-        .into_iter()
-        .find(|c| c.spec().herdr_agent_names.contains(&agent))
-}
-
 fn system_now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    keitora_tasks::now_ms()
 }
 
 impl ResumeStore {
@@ -215,7 +201,7 @@ impl ResumeStore {
             let present = pane.agent.is_some();
             match &pane.agent_session {
                 Some(s) => {
-                    let Some(cli) = cli_of(&s.agent) else {
+                    let Some(cli) = CliKind::from_herdr_agent(&s.agent) else {
                         continue;
                     };
                     if s.kind != AgentSessionKind::Id || s.source != format!("herdr:{}", s.agent) {
@@ -712,13 +698,17 @@ mod tests {
     const AG_ID: &str = "0b9e6c3e-1f2a-4c5d-8e7f-a1b2c3d4e5f6";
 
     #[test]
-    fn cli_of_accepts_the_three_antigravity_names() {
+    fn from_herdr_agent_accepts_the_three_antigravity_names() {
         for name in ["antigravity_cli", "antigravity-cli", "agy"] {
-            assert_eq!(cli_of(name), Some(CliKind::Antigravity), "{name}");
+            assert_eq!(
+                CliKind::from_herdr_agent(name),
+                Some(CliKind::Antigravity),
+                "{name}"
+            );
         }
-        assert_eq!(cli_of("gemini"), None);
-        assert_eq!(cli_of("claude"), Some(CliKind::Claude));
-        assert_eq!(cli_of("codex"), Some(CliKind::Codex));
+        assert_eq!(CliKind::from_herdr_agent("gemini"), None);
+        assert_eq!(CliKind::from_herdr_agent("claude"), Some(CliKind::Claude));
+        assert_eq!(CliKind::from_herdr_agent("codex"), Some(CliKind::Codex));
     }
 
     #[test]

@@ -34,10 +34,12 @@ import {
   seedProjectForms,
   seedUserForms,
 } from "../lib/settingsForm";
+import { sectionTitle } from "../lib/settingsStyles";
 import { isThemeMode, THEME_MODES, themeLabel, useTheme } from "../lib/theme";
 import { errorText, installLabel, isBusy, statusLine } from "../lib/updates";
 import { useAgentUpdates } from "./AgentUpdatesProvider";
 import { DepsSection } from "./DepsSection";
+import { HealthSection } from "./HealthSection";
 import { type DispatchEditorRender, ProviderSettingsGroup } from "./ProviderSettingsGroup";
 import { RestartDaemonDialog } from "./RestartDaemonDialog";
 import { useToast } from "./Toast";
@@ -48,7 +50,6 @@ const field =
   "w-full bg-bg-3 border border-line rounded-chip px-3 py-2 text-tx-1 text-[13px] outline-none focus:border-accent/60";
 const fieldRo = "w-full bg-bg-2 border border-line/60 rounded-chip px-3 py-2 text-tx-3 text-[13px]";
 const label = "text-[10.5px] uppercase tracking-wide text-tx-3";
-const sectionTitle = "text-[12px] font-semibold uppercase tracking-wide text-tx-2";
 
 /** Build the project-default `DiffBase` from the drawer's kind select + ref/parent text. Always
  *  returns an explicit base (never null): `auto`, or a `ref`/`forkPoint` with empty text, resolve
@@ -1041,6 +1042,9 @@ export function SettingsDrawer({
 
                 {/* ── Dependencies ────────────────────────────────────────── */}
                 <DepsSection />
+
+                {/* ── Health ──────────────────────────────────────────────── */}
+                <HealthSection />
               </div>
             )}
           </div>

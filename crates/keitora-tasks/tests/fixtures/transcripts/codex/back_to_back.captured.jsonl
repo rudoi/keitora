@@ -1,0 +1,17 @@
+{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{"id":"00000000-0000-4000-8000-000000000001","timestamp":"2026-01-01T00:00:00.000Z","cwd":"C:/Users/x/proj/alpha","originator":"codex-tui","cli_version":"0.0.0","source":"cli"}}
+{"timestamp":"2026-01-01T00:00:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"00000000-0000-4000-a000-000000000001"}}
+{"timestamp":"2026-01-01T00:00:00.350Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<instructions placeholder>"}]}}
+{"timestamp":"2026-01-01T00:00:00.352Z","type":"world_state","payload":{}}
+{"timestamp":"2026-01-01T00:00:00.353Z","type":"turn_context","payload":{}}
+{"timestamp":"2026-01-01T00:00:00.353Z","type":"event_msg","payload":{"type":"thread_settings_applied"}}
+{"timestamp":"2026-01-01T00:00:01.107Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"say one"}]}}
+{"timestamp":"2026-01-01T00:00:01.109Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"00000000-0000-4000-a000-000000000001","item":{"type":"UserMessage","content":[{"type":"text","text":"<placeholder>","text_elements":[]}]}}}
+{"timestamp":"2026-01-01T00:00:02.205Z","type":"token_usage_record","payload":{}}
+{"timestamp":"2026-01-01T00:00:02.206Z","type":"event_msg","payload":{"type":"token_count"}}
+{"timestamp":"2026-01-01T00:00:02.210Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"say two"}]}}
+{"timestamp":"2026-01-01T00:00:02.211Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"00000000-0000-4000-a000-000000000001","item":{"type":"UserMessage","content":[{"type":"text","text":"<placeholder>","text_elements":[]}]}}}
+{"timestamp":"2026-01-01T00:00:03.287Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"00000000-0000-4000-a000-000000000001","item":{"type":"AgentMessage","content":[{"type":"Text","text":"<placeholder>"}]}}}
+{"timestamp":"2026-01-01T00:00:03.289Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"two"}],"phase":"final_answer"}}
+{"timestamp":"2026-01-01T00:00:03.300Z","type":"token_usage_record","payload":{}}
+{"timestamp":"2026-01-01T00:00:03.301Z","type":"event_msg","payload":{"type":"token_count"}}
+{"timestamp":"2026-01-01T00:00:03.925Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"00000000-0000-4000-a000-000000000001","last_agent_message":"two"}}

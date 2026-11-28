@@ -1743,3 +1743,35 @@ export function onAgentUpdatePrompt(cb: (e: AgentPromptEvent) => void): Promise<
 export function cliAvailability(): Promise<Record<CliKind, boolean>> {
   return invoke<Record<CliKind, boolean>>("cli_availability");
 }
+
+// ── Health (self-diagnostics) ───────────────────────────────────────────────────
+
+export type HealthSeverity = "info" | "warn" | "error";
+
+/** One finding of the app's health monitor (`health_list`, `health://changed`). Times
+ *  are unix ms. `project` is `""` for app-level findings, `worktree` `""` for project-
+ *  or app-level ones. `clearedAt` is set for a finding that cleared in the last day. */
+export interface HealthFinding {
+  project: string;
+  worktree: string;
+  checkId: string;
+  severity: HealthSeverity;
+  message: string;
+  detail: unknown;
+  firstSeen: number;
+  lastSeen: number;
+  occurrences: number;
+  clearedAt: number | null;
+  remedy: string;
+  remedyAt: number | null;
+}
+
+/** Active and recently cleared findings. */
+export function healthList(): Promise<HealthFinding[]> {
+  return invoke("health_list");
+}
+
+/** The full list, whenever a finding is inserted, changed, cleared or dropped. */
+export function onHealthChanged(cb: (findings: HealthFinding[]) => void): Promise<UnlistenFn> {
+  return listen<HealthFinding[]>("health://changed", cb);
+}

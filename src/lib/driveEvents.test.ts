@@ -9,6 +9,7 @@ import {
   openProjectsFromKey,
   openProjectsKey,
   PROJECT_NOT_OPEN,
+  reportOpenProjects,
   wakeRetryReason,
   wakeStep,
 } from "./driveEvents";
@@ -294,5 +295,26 @@ describe("driveRestartKind", () => {
     expect(driveRestartKind({ mode: "reset", replace: true })).toBe("drive-reset");
     expect(driveRestartKind({ mode: "wake", replace: false })).toBe("drive-wake");
     expect(driveRestartKind({ mode: "wake", replace: true })).toBe("drive-wake-replace");
+  });
+});
+
+describe("reportOpenProjects", () => {
+  it("sends the set", async () => {
+    const send = vi.fn(async (_: string[]) => {});
+    const warn = vi.fn();
+    await reportOpenProjects(["my-game"], send, warn);
+    expect(send).toHaveBeenCalledWith(["my-game"]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("logs a failed report instead of swallowing it", async () => {
+    const err = new Error("ipc down");
+    const send = vi.fn(async (_: string[]) => {
+      throw err;
+    });
+    const warn = vi.fn();
+    await expect(reportOpenProjects(["proj"], send, warn)).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][1]).toBe(err);
   });
 });

@@ -1,8 +1,11 @@
 //! The vendor install script: herdr's own `install.ps1` / `install.sh`, run hidden with a
 //! scrubbed environment, then located and checked on disk.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use super::herdr_env_removals;
 
 use super::floor::HERDR_FLOOR;
 use super::manifest::Platform;
@@ -91,8 +94,9 @@ fn is_inside(value: &str, root: &Path, platform: Platform) -> bool {
 }
 
 /// Apply the script's env policy to `spec`, given the current process env `vars`:
-/// remove [`SCRUBBED_VARS`] and any `XDG_*` that points inside `keitora_home`, and pin
-/// `HERDR_CHANNEL=stable`. Everything else, proxy variables included, is inherited.
+/// remove [`SCRUBBED_VARS`], every other inherited `HERDR_*` (`HERDR_CONFIG_PATH` in
+/// any case included: the installer must not see an outer herdr's config) and any
+/// `XDG_*` (ASCII case-insensitive on Windows) that points inside `keitora_home`, and pin `HERDR_CHANNEL=stable`. Everything else, proxy variables included, is inherited.
 pub fn apply_script_env(
     spec: &mut ProcSpec,
     vars: &[(String, String)],
@@ -100,8 +104,21 @@ pub fn apply_script_env(
     platform: Platform,
 ) {
     spec.env_remove = SCRUBBED_VARS.iter().map(|s| s.to_string()).collect();
+    let inherited = herdr_env_removals(vars.iter().map(|(k, _)| OsString::from(k)));
+    for name in inherited {
+        if !spec.env_remove.contains(&name) {
+            spec.env_remove.push(name);
+        }
+    }
     for (k, v) in vars {
-        if k.starts_with("XDG_") && is_inside(v, keitora_home, platform) {
+        let xdg = k.get(..4).is_some_and(|p| {
+            if platform.is_windows() {
+                p.eq_ignore_ascii_case("XDG_")
+            } else {
+                p == "XDG_"
+            }
+        });
+        if xdg && is_inside(v, keitora_home, platform) {
             spec.env_remove.push(k.clone());
         }
     }
@@ -434,7 +451,8 @@ mod tests {
                 "HERDR_HOME",
                 "HERDR_INSTALL_DIR",
                 "HERDR_MANIFEST_URL",
-                "HERDR_EXPECTED_BUILD_ID"
+                "HERDR_EXPECTED_BUILD_ID",
+                "HERDR_CONFIG_PATH"
             ]
         );
         assert_eq!(
@@ -445,6 +463,52 @@ mod tests {
         for k in ["HTTPS_PROXY", "NO_PROXY", "PATH"] {
             assert!(!spec.env_remove.iter().any(|r| r == k), "{k}");
         }
+    }
+
+    #[test]
+    fn inherited_herdr_vars_are_removed_including_the_config_path() {
+        let mut spec = script_command(Platform::MacosAarch64, Path::new("unused"));
+        let vars = env(&[
+            ("HERDR_SOCKET_PATH", "/tmp/outer.sock"),
+            ("HERDR_HOME", "/tmp/h"),
+            ("HERDR_CONFIG_PATH", "/tmp/config.toml"),
+            ("Herdr_Config_Path", "/tmp/config2.toml"),
+            ("PATH", "/usr/bin"),
+        ]);
+        apply_script_env(
+            &mut spec,
+            &vars,
+            Path::new("/Users/me/.keitora"),
+            Platform::MacosAarch64,
+        );
+        let removed: Vec<&str> = spec.env_remove.iter().map(String::as_str).collect();
+        assert!(removed.contains(&"HERDR_SOCKET_PATH"));
+        assert!(removed.contains(&"HERDR_CONFIG_PATH"));
+        assert!(removed.contains(&"Herdr_Config_Path"));
+        assert!(!removed.contains(&"PATH"));
+        assert_eq!(removed.iter().filter(|n| **n == "HERDR_HOME").count(), 1);
+    }
+
+    #[test]
+    fn xdg_prefix_ignores_case_on_windows_only() {
+        let vars = env(&[("Xdg_Config_Home", "C:/Users/x/.keitora/herdr")]);
+        let mut win = script_command(Platform::WindowsX86_64, Path::new("unused"));
+        apply_script_env(
+            &mut win,
+            &vars,
+            Path::new("C:/Users/x/.keitora"),
+            Platform::WindowsX86_64,
+        );
+        assert!(win.env_remove.iter().any(|n| n == "Xdg_Config_Home"));
+        let mut mac = script_command(Platform::MacosAarch64, Path::new("unused"));
+        let vars = env(&[("Xdg_Config_Home", "/Users/me/.keitora/herdr")]);
+        apply_script_env(
+            &mut mac,
+            &vars,
+            Path::new("/Users/me/.keitora"),
+            Platform::MacosAarch64,
+        );
+        assert!(!mac.env_remove.iter().any(|n| n == "Xdg_Config_Home"));
     }
 
     #[test]

@@ -1,0 +1,11 @@
+{"type":"mode","mode":"normal","sessionId":"00000000-0000-4000-8000-000000000001"}
+{"parentUuid":null,"isSidechain":false,"type":"user","uuid":"00000000-0000-4000-9000-000000000001","timestamp":"2026-01-01T00:00:00.000Z","sessionId":"00000000-0000-4000-8000-000000000001","cwd":"C:/Users/x/proj/alpha","message":{"role":"user","content":"say one"},"promptSource":"typed"}
+{"type":"last-prompt","lastPrompt":"<placeholder>","sessionId":"00000000-0000-4000-8000-000000000001"}
+{"type":"mode","mode":"normal","sessionId":"00000000-0000-4000-8000-000000000001"}
+{"type":"last-prompt","lastPrompt":"<placeholder>","sessionId":"00000000-0000-4000-8000-000000000001"}
+{"type":"mode","mode":"normal","sessionId":"00000000-0000-4000-8000-000000000001"}
+{"parentUuid":"00000000-0000-4000-9000-000000000002","isSidechain":false,"type":"assistant","uuid":"00000000-0000-4000-9000-000000000003","timestamp":"2026-01-01T00:00:00.903Z","sessionId":"00000000-0000-4000-8000-000000000001","cwd":"C:/Users/x/proj/alpha","message":{"role":"assistant","type":"message","content":[{"type":"text","text":"one"}],"stop_reason":"end_turn","model":"claude-x"}}
+{"type":"last-prompt","lastPrompt":"<placeholder>","sessionId":"00000000-0000-4000-8000-000000000001"}
+{"type":"mode","mode":"normal","sessionId":"00000000-0000-4000-8000-000000000001"}
+{"parentUuid":"00000000-0000-4000-9000-000000000004","isSidechain":false,"type":"system","subtype":"stop_hook_summary","timestamp":"2026-01-01T00:00:01.310Z","uuid":"00000000-0000-4000-9000-000000000005","sessionId":"00000000-0000-4000-8000-000000000001"}
+{"parentUuid":"00000000-0000-4000-9000-000000000005","isSidechain":false,"type":"system","subtype":"turn_duration","timestamp":"2026-01-01T00:00:01.313Z","uuid":"00000000-0000-4000-9000-000000000006","sessionId":"00000000-0000-4000-8000-000000000001"}

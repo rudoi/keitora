@@ -13,11 +13,13 @@ import {
 } from "../../lib/activity";
 import { driveKind, driveTag } from "../../lib/drive";
 import type { WorkflowState, WorktreeActivity, WorktreeStatus } from "../../lib/ipc";
-import { blockAnimates } from "../../lib/laneState";
+import { blockAnimates, blockClassName } from "../../lib/laneState";
 import { isWindows } from "../../lib/platform";
 import type { LaneModel } from "../../lib/railGroups";
 import { usePrefersReducedMotion } from "../../lib/usePrefersReducedMotion";
+import { useHealth } from "../HealthProvider";
 import { ProviderGlyph } from "../ProviderGlyph";
+import { HealthGlyph } from "./HealthGlyph";
 
 const STATUS_LABEL: Record<WorktreeStatus, string> = {
   available: "",
@@ -153,6 +155,7 @@ const SHELL_LABEL = isWindows ? "Open PowerShell" : "Open terminal";
 // every lane and an unchanged lane skips re-rendering.
 export const Lane = memo(function Lane({
   lane,
+  project,
   isSelected,
   hintBadge,
   hintVisible,
@@ -162,6 +165,8 @@ export const Lane = memo(function Lane({
   onContextMenu,
 }: {
   lane: LaneModel;
+  /** The project's resolved name (health findings are keyed by it). */
+  project: string;
   isSelected: boolean;
   hintBadge?: number;
   hintVisible: boolean;
@@ -171,6 +176,7 @@ export const Lane = memo(function Lane({
   onContextMenu: (worktree: string, x: number, y: number) => void;
 }) {
   const reduceMotion = usePrefersReducedMotion();
+  const health = useHealth(project, lane.name);
   const { activity: act, task, building, attn, terminated } = lane;
   const ok = lane.status === "available";
   const badge = hintBadge;
@@ -199,14 +205,12 @@ export const Lane = memo(function Lane({
   // attention (waiting), except on the selected lane (you're already looking at it)
   // or when motion is reduced. A finished worktree stays steady green.
   const animates = !terminated && blockAnimates(attn);
-  const blockCls = [
-    "wt-block",
-    lane.blockState,
-    animates ? "attn" : "",
-    animates && !isSelected && !reduceMotion ? "pulse" : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
+  // A stale lane (state not confirmed against herdr) is dimmed.
+  const blockCls = blockClassName(lane.blockState, {
+    animates,
+    pulse: !isSelected && !reduceMotion,
+    stale: lane.stale,
+  });
   // Small live dot in the name row when the worktree is doing something now (a build
   // or a busy tracked agent): green/teal while building, amber for a busy agent.
   const workDotCls = ["lane-work-dot", building ? "working" : "busy", reduceMotion ? "" : "live"]
@@ -240,6 +244,7 @@ export const Lane = memo(function Lane({
           <span className="lane-name" title={nameTitle}>
             {lane.name}
           </span>
+          <HealthGlyph findings={health} scope="lane" />
           {task && <span className="lane-status mono">#{task.id}</span>}
           {!lane.sessionState && !ok && (
             <span className="lane-status">{STATUS_LABEL[lane.status]}</span>

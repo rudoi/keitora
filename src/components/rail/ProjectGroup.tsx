@@ -32,6 +32,8 @@ import {
   lastActivityLabel,
   sentinelAbove,
 } from "../../lib/railGroupView";
+import { useHealth } from "../HealthProvider";
+import { HealthGlyph } from "./HealthGlyph";
 import { Lane, type LaneOpenTarget } from "./Lane";
 
 function groupClass(group: GroupModel, open: boolean): string {
@@ -70,6 +72,7 @@ function HeaderSummary({
 }) {
   const { key, summaryStats: stats } = group;
   const view = headerView(stats, open);
+  const health = useHealth(group.resolvedName);
   const workCls = ["lane-work-dot", view.work ?? "off", view.work && !reduceMotion ? "live" : ""]
     .filter(Boolean)
     .join(" ");
@@ -84,6 +87,7 @@ function HeaderSummary({
           <span className="rail-group-name" title={key}>
             {key}
           </span>
+          <HealthGlyph findings={health} scope="project" />
           {view.waiting && (
             <span
               className={reduceMotion ? "rail-group-wait" : "rail-group-wait pulse"}
@@ -354,6 +358,7 @@ export const ProjectGroup = memo(function ProjectGroup({
                 <Lane
                   key={lane.name}
                   lane={lane}
+                  project={group.resolvedName}
                   isSelected={isActive && lane.name === selected}
                   hintBadge={badges?.get(lane.name)}
                   hintVisible={hintVisible}
