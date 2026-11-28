@@ -42,6 +42,17 @@ export interface WorktreeSession {
   brokered?: boolean;
   /** While waiting on a prompt escalated to the human, why it was escalated. */
   escalated_reason?: string | null;
+  /** Agent presence from the session engine; absent/null when no engine view was overlaid. */
+  agent?: "present" | "starting" | "absent" | null;
+  /** herdr's own agent status for the pane, when an engine view was overlaid. */
+  herdr_status?: string | null;
+  /** The state could not be confirmed against a fresh herdr snapshot (absent means false). */
+  stale?: boolean;
+}
+
+/** The agent is still launching: its `busy` is not a turn, so a later `idle` is no finished turn. */
+export function isStarting(s: Pick<WorktreeSession, "agent">): boolean {
+  return s.agent === "starting";
 }
 
 /** All known worktree session states (PTY-ownership reconciled by the backend). */

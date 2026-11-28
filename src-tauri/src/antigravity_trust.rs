@@ -89,9 +89,7 @@ pub fn merge_trusted_workspace(
 
 /// `<home>/.gemini/antigravity-cli/settings.json`.
 pub fn settings_file(home: &Path) -> PathBuf {
-    home.join(".gemini")
-        .join("antigravity-cli")
-        .join("settings.json")
+    keitora_tasks::agy_state_dir(home).join("settings.json")
 }
 
 /// [`merge_trusted_workspace`] for several worktrees at once: `Updated` when any

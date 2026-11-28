@@ -407,6 +407,11 @@ body {
   border: 1.5px dashed var(--waiting);
   box-shadow: none;
 }
+/* Stale: the state could not be confirmed against a fresh herdr snapshot, so the block is
+   dimmed. A filter, so it composes with the pulse animation's opacity. */
+.wt-block.is-stale {
+  filter: opacity(0.5);
+}
 /* Attention: a static glow ring (the reduced-motion baseline) … */
 .wt-block.attn {
   box-shadow: 0 0 10px 0 var(--block);
@@ -574,6 +579,36 @@ body {
   color: var(--tx-2);
   border: 1px solid var(--line);
   white-space: nowrap;
+}
+/* Health monitor badge: a warn/error finding on a lane or project (see HealthGlyph). */
+.health-glyph {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  font-size: 9.5px;
+  font-weight: 800;
+  line-height: 1;
+  color: var(--bg-0);
+  cursor: default;
+}
+button.health-glyph {
+  cursor: pointer;
+}
+.health-glyph.warn {
+  background: var(--busy);
+}
+.health-glyph.error {
+  background: var(--urgent);
+}
+button.health-glyph:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 /* A small live dot in the name row — the worktree is doing something right now. */
 .lane-work-dot {

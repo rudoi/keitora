@@ -4,7 +4,7 @@
 //! read-only: Keitora never creates, writes, renames, or deletes the file.**
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -452,10 +452,7 @@ fn read_capped(path: &Path) -> Option<String> {
 
 /// `now` as epoch ms.
 pub fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    keitora_tasks::now_ms()
 }
 
 #[cfg(test)]

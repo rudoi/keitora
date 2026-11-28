@@ -64,14 +64,31 @@ pub enum AgentSessionKind {
     Path,
 }
 
-/// One `herdr agent list` entry (the subset Keitora uses).
+/// One `herdr agent list` entry (the subset Keitora uses). Only `pane_id` is
+/// required; every other field has a default when herdr omits it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentInfo {
     pub pane_id: String,
+    /// The pane's terminal id; `""` when absent.
+    pub terminal_id: String,
     pub agent: Option<String>,
     /// `idle | working | blocked | done | unknown`, verbatim; `"unknown"` if absent.
     pub agent_status: String,
+    /// herdr is still launching the agent; `false` when absent.
     pub launch_pending: bool,
+    /// Whether the agent accepts input yet; `None` when herdr does not say.
+    pub interactive_ready: Option<bool>,
+    /// herdr skipped screen-based status detection for this pane; `false` when absent.
+    pub screen_detection_skipped: bool,
+    /// Identifies the idle transition that completed work; `None` when absent
+    /// or JSON `null`. Compare for change, never assume `+1` steps.
+    pub completion_seq: Option<u64>,
+    /// Bumped by herdr on each agent state change; `0` when absent.
+    pub state_change_seq: u64,
+    /// The agent session herdr recorded for the pane.
+    pub agent_session: Option<AgentSession>,
+    /// herdr's revision of this entry; `0` when absent.
+    pub revision: u64,
     /// The name the agent was started with; absent for agents herdr did not
     /// start by name.
     pub name: Option<String>,
@@ -272,8 +289,15 @@ pub fn parse_integration_status(output: &str, target: &str) -> IntegrationStatus
 /// Parse one `agent list` entry; `None` if `pane_id` is missing. Other fields
 /// default (`agent_status` → "unknown", `launch_pending` → false).
 pub fn parse_agent_info(value: &Value) -> Option<AgentInfo> {
+    let flag = |key: &str| value.get(key).and_then(Value::as_bool);
+    let count = |key: &str| value.get(key).and_then(Value::as_u64);
     Some(AgentInfo {
         pane_id: value.get("pane_id")?.as_str()?.to_string(),
+        terminal_id: value
+            .get("terminal_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
         agent: value
             .get("agent")
             .and_then(Value::as_str)
@@ -283,10 +307,13 @@ pub fn parse_agent_info(value: &Value) -> Option<AgentInfo> {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string(),
-        launch_pending: value
-            .get("launch_pending")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        launch_pending: flag("launch_pending").unwrap_or(false),
+        interactive_ready: flag("interactive_ready"),
+        screen_detection_skipped: flag("screen_detection_skipped").unwrap_or(false),
+        completion_seq: count("completion_seq"),
+        state_change_seq: count("state_change_seq").unwrap_or(0),
+        agent_session: value.get("agent_session").and_then(parse_agent_session),
+        revision: count("revision").unwrap_or(0),
         name: value
             .get("name")
             .and_then(Value::as_str)
@@ -526,9 +553,16 @@ mod tests {
             agents[0],
             AgentInfo {
                 pane_id: "w1:p1".into(),
+                terminal_id: "t".into(),
                 agent: Some("claude".into()),
                 agent_status: "working".into(),
                 launch_pending: true,
+                interactive_ready: None,
+                screen_detection_skipped: false,
+                completion_seq: None,
+                state_change_seq: 0,
+                agent_session: None,
+                revision: 0,
                 name: None,
                 cwd: None,
             }
@@ -549,13 +583,87 @@ mod tests {
             info,
             AgentInfo {
                 pane_id: "w3:p1".into(),
+                terminal_id: "term_abc".into(),
                 agent: Some("claude".into()),
                 agent_status: "idle".into(),
                 launch_pending: false,
+                interactive_ready: Some(true),
+                screen_detection_skipped: false,
+                completion_seq: None,
+                state_change_seq: 7,
+                agent_session: Some(AgentSession {
+                    source: "herdr:claude".into(),
+                    agent: "claude".into(),
+                    kind: AgentSessionKind::Id,
+                    value: "sess-1".into(),
+                }),
+                revision: 3,
                 name: Some("claude-1a2b3c4d".into()),
                 cwd: Some("/Users/me/code/proj".into()),
             }
         );
+    }
+
+    #[test]
+    fn parse_agent_info_reads_seqs_readiness_and_identity() {
+        let v: Value = serde_json::from_str(
+            r#"{"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"sess-1"},"agent_status":"idle","completion_seq":4,"cwd":"/Users/me/code/proj","foreground_cwd":"/Users/me/code/proj/sub","interactive_ready":true,"launch_pending":false,"name":"claude-1a2b3c4d","pane_id":"w3:p1","revision":3,"screen_detection_skipped":true,"state_change_seq":7,"tab_id":"w3:t1","terminal_id":"term_abc","terminal_title":"Claude Code","workspace_id":"w3"}"#,
+        )
+        .unwrap();
+        let info = parse_agent_info(&v).unwrap();
+        assert_eq!(info.completion_seq, Some(4));
+        assert_eq!(info.state_change_seq, 7);
+        assert_eq!(info.interactive_ready, Some(true));
+        assert!(info.screen_detection_skipped);
+        assert!(!info.launch_pending);
+        assert_eq!(info.terminal_id, "term_abc");
+        assert_eq!(info.revision, 3);
+        assert_eq!(info.agent_session.unwrap().value, "sess-1");
+    }
+
+    #[test]
+    fn parse_agent_info_defaults_optional_fields() {
+        let v: Value =
+            serde_json::from_str(r#"{"pane_id":"w1:p1","agent_status":"idle"}"#).unwrap();
+        let info = parse_agent_info(&v).unwrap();
+        assert_eq!(info.terminal_id, "");
+        assert_eq!(info.completion_seq, None);
+        assert_eq!(info.state_change_seq, 0);
+        assert_eq!(info.interactive_ready, None);
+        assert!(!info.screen_detection_skipped);
+        assert!(!info.launch_pending);
+        assert_eq!(info.agent_session, None);
+        assert_eq!(info.revision, 0);
+    }
+
+    #[test]
+    fn parse_agent_info_null_completion_seq_is_none() {
+        let null: Value =
+            serde_json::from_str(r#"{"pane_id":"w1:p1","completion_seq":null}"#).unwrap();
+        assert_eq!(parse_agent_info(&null).unwrap().completion_seq, None);
+        let missing: Value = serde_json::from_str(r#"{"pane_id":"w1:p1"}"#).unwrap();
+        assert_eq!(parse_agent_info(&missing).unwrap().completion_seq, None);
+        let zero: Value =
+            serde_json::from_str(r#"{"pane_id":"w1:p1","completion_seq":0}"#).unwrap();
+        assert_eq!(parse_agent_info(&zero).unwrap().completion_seq, Some(0));
+    }
+
+    #[test]
+    fn parse_agent_info_launch_pending_absent_is_false() {
+        let v: Value =
+            serde_json::from_str(r#"{"pane_id":"w1:p1","interactive_ready":false}"#).unwrap();
+        let info = parse_agent_info(&v).unwrap();
+        assert!(!info.launch_pending);
+        assert_eq!(info.interactive_ready, Some(false));
+    }
+
+    #[test]
+    fn parse_agent_info_bad_agent_session_is_none() {
+        let v: Value = serde_json::from_str(
+            r#"{"pane_id":"w1:p1","agent_session":{"agent":"claude","kind":"bogus","source":"herdr:claude","value":"s"}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_agent_info(&v).unwrap().agent_session, None);
     }
 
     #[test]

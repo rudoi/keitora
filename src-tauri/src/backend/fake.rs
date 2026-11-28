@@ -10,13 +10,14 @@
 //! `PtyBackendError` is not `Clone`, so scripted results are built per test and
 //! consumed from `VecDeque`s rather than cloned.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use super::{
     AgentLaunch, AttachResult, OutputSink, PtyBackend, PtyBackendError, SessionKey, SessionSummary,
     StatusPayload,
 };
+use crate::engine::model::AgentObs;
 
 /// One recorded trait call (args captured where a test might assert on them).
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +87,9 @@ pub enum Call {
     Shutdown,
     Restart,
     RefreshIntegration,
+    AgentSnapshot {
+        key: SessionKey,
+    },
 }
 
 #[derive(Default)]
@@ -119,6 +123,8 @@ struct FakeState {
     /// `restart` answers `Ok(())` once this is empty.
     restart_results: VecDeque<Result<(), PtyBackendError>>,
     floor: Option<Arc<crate::deps::floor::FloorSlot>>,
+    /// What `agent_snapshot` answers per key (`Ok(None)` when unset).
+    agents: HashMap<SessionKey, AgentObs>,
 }
 
 /// A scriptable, call-logging [`PtyBackend`] for tests.
@@ -233,6 +239,15 @@ impl FakeBackend {
     /// Expose `slot` as the backend's floor slot.
     pub fn set_floor_slot(&self, slot: Arc<crate::deps::floor::FloorSlot>) {
         self.state.lock().unwrap().floor = Some(slot);
+    }
+
+    /// Set (or, with `None`, clear) the agent entry `agent_snapshot` reports for `key`.
+    pub fn set_agent(&self, key: SessionKey, agent: Option<AgentObs>) {
+        let mut st = self.state.lock().unwrap();
+        match agent {
+            Some(a) => st.agents.insert(key, a),
+            None => st.agents.remove(&key),
+        };
     }
 
     /// Snapshot of the recorded call log.
@@ -376,6 +391,14 @@ impl PtyBackend for FakeBackend {
         }
     }
 
+    /// The entry [`FakeBackend::set_agent`] set, or `None`. Recorded as
+    /// [`Call::AgentSnapshot`].
+    fn agent_snapshot(&self, key: &SessionKey) -> Result<Option<AgentObs>, PtyBackendError> {
+        let mut st = self.state.lock().unwrap();
+        st.calls.push(Call::AgentSnapshot { key: key.clone() });
+        Ok(st.agents.get(key).cloned())
+    }
+
     fn run_line(&self, key: &SessionKey, gen: u64, line: &str) -> Result<(), PtyBackendError> {
         let mut st = self.state.lock().unwrap();
         st.calls.push(Call::RunLine {
@@ -511,6 +534,22 @@ impl PtyBackend for FakeBackend {
 mod tests {
     use super::*;
     use crate::backend::LaunchPolicy;
+
+    #[test]
+    fn agent_snapshot_answers_the_set_agent_and_is_recorded() {
+        let b = FakeBackend::new();
+        let key = SessionKey {
+            project: "proj".into(),
+            worktree: "alpha".into(),
+        };
+        assert_eq!(b.agent_snapshot(&key).unwrap(), None);
+        let o = crate::engine::model::obs("w1:p1", "idle", 3, Some(3));
+        b.set_agent(key.clone(), Some(o.clone()));
+        assert_eq!(b.agent_snapshot(&key).unwrap(), Some(o));
+        b.set_agent(key.clone(), None);
+        assert_eq!(b.agent_snapshot(&key).unwrap(), None);
+        assert_eq!(b.calls(), vec![Call::AgentSnapshot { key: key.clone() }; 3]);
+    }
 
     #[test]
     fn spawn_agent_records_the_launch_and_returns_generation_one() {

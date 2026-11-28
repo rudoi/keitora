@@ -47,6 +47,8 @@ export interface LaneModel {
   building: boolean;
   working: boolean;
   blockState: DotState;
+  /** The session's state could not be confirmed against a fresh herdr snapshot. */
+  stale: boolean;
   /** The lane's drive relationship; null when it neither drives nor is driven. */
   drive: LaneDrive | null;
 }
@@ -136,6 +138,7 @@ export function buildLane(
     building,
     working: activity?.working === true,
     blockState: blockStateCls(attn, session, ok, building, terminated),
+    stale: session?.stale === true,
     drive: buildLaneDrive(session, activity),
   };
 }

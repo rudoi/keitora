@@ -8,6 +8,7 @@ use super::{
     live_sessions, spawn_watcher, AgentUpdates, AgentUpdatesSnapshot, RunPlan, UpdateSession,
 };
 use crate::backend::{SessionKey, SharedBackend};
+use crate::engine::SharedEngine;
 
 /// Run `f` with the app on a blocking thread.
 async fn blocking<T: Send + 'static>(
@@ -21,6 +22,10 @@ async fn blocking<T: Send + 'static>(
 
 fn backend(app: &AppHandle) -> SharedBackend {
     app.state::<SharedBackend>().inner().clone()
+}
+
+fn engine(app: &AppHandle) -> SharedEngine {
+    app.state::<SharedEngine>().inner().clone()
 }
 
 /// The current picture; seeds the UI on mount and after a webview reload.
@@ -102,7 +107,7 @@ pub async fn agent_update_live_sessions(
     cli: CliKind,
 ) -> Result<Vec<UpdateSession>, String> {
     blocking(app, move |app| {
-        Ok(live_sessions(&backend(&app), cli)?
+        Ok(live_sessions(&engine(&app), cli)?
             .iter()
             .map(UpdateSession::from)
             .collect())
@@ -117,7 +122,7 @@ pub async fn agent_update_live_sessions(
 pub async fn agent_update_stop(app: AppHandle, cli: CliKind) -> Result<Vec<UpdateSession>, String> {
     blocking(app, move |app| {
         let backend = backend(&app);
-        let keys = live_sessions(&backend, cli)?;
+        let keys = live_sessions(&engine(&app), cli)?;
         app.state::<AgentUpdates>().stop(cli, &keys);
         for key in &keys {
             if let Err(e) = backend.kill_live(key, None) {
@@ -138,7 +143,7 @@ pub async fn agent_update_restart(
     cli: CliKind,
 ) -> Result<Vec<UpdateSession>, String> {
     blocking(app, move |app| {
-        let live = live_sessions(&backend(&app), cli)?;
+        let live = live_sessions(&engine(&app), cli)?;
         Ok(app.state::<AgentUpdates>().restart(cli, &live))
     })
     .await

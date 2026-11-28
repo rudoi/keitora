@@ -15,12 +15,13 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use keitora_tasks::{
-    current_worktree, resolve, truncate_bytes, Config, LocalStore, NewDrivePrompt, Result,
-    DRIVE_ESCALATE_AFTER_MAX_S, DRIVE_PERMISSION_INPUT_MAX, DRIVE_QUESTION_INPUT_MAX,
+    current_worktree, resolve, status_db_path, truncate_bytes, Config, LocalStore, NewDrivePrompt,
+    Result, StatusReader, DRIVE_ESCALATE_AFTER_MAX_S, DRIVE_PERMISSION_INPUT_MAX,
+    DRIVE_QUESTION_INPUT_MAX,
 };
 use serde_json::{Map, Value};
 
-use crate::drive::parse_question_list;
+use crate::drive::{parse_question_list, EngineRead};
 
 /// Most bytes of hook payload the gate reads from stdin.
 pub const GATE_STDIN_CAP: u64 = 1024 * 1024;
@@ -158,6 +159,8 @@ pub trait GateStore {
 pub trait Clock {
     fn now(&self) -> Instant;
     fn sleep(&self, d: Duration);
+    /// Wall-clock unix ms (compared with `status.db` times).
+    fn wall_ms(&self) -> i64;
 }
 
 pub struct RealClock;
@@ -169,27 +172,64 @@ impl Clock for RealClock {
     fn sleep(&self, d: Duration) {
         std::thread::sleep(d);
     }
+    fn wall_ms(&self) -> i64 {
+        keitora_tasks::now_ms()
+    }
 }
 
-impl GateStore for LocalStore {
+/// The gate's store in production: the project's `tasks.db`, except that a worktree's
+/// session state comes from the app's engine view while `status.db` is fresh.
+pub struct GateDb {
+    pub local: LocalStore,
+    pub project: String,
+    /// The engine's store; `None` reads the hook rows only.
+    pub status: Option<StatusReader>,
+    /// Read on every session-state call, so a long poll sees `status.db` go stale.
+    pub clock: Box<dyn Clock>,
+}
+
+impl GateDb {
+    /// The project store alone: session states are the hook rows.
+    pub fn hook_rows_only(local: LocalStore) -> Self {
+        GateDb {
+            local,
+            project: String::new(),
+            status: None,
+            clock: Box::new(RealClock),
+        }
+    }
+}
+
+impl GateStore for GateDb {
     fn drive_for(&self, worktree: &str) -> Result<Option<DriveInfo>> {
-        Ok(self.drive_get(worktree)?.map(|d| DriveInfo {
+        Ok(self.local.drive_get(worktree)?.map(|d| DriveInfo {
             driver: d.driver,
             paused: d.paused,
             escalate_after_s: d.escalate_after_s.clamp(0, i64::from(u32::MAX)) as u32,
         }))
     }
 
+    /// Fresh: the engine's view (`offline` for an absent agent or no row); else the
+    /// hook-written row.
     fn session_state(&self, worktree: &str) -> Result<Option<String>> {
-        self.session_state_get(worktree)
+        let now_ms = self.clock.wall_ms();
+        match EngineRead::of(self.status.as_ref(), &self.project, worktree, now_ms) {
+            // The engine reads an absent agent as `offline`.
+            EngineRead::Fresh { view: Some(v), .. } => Ok(Some(v.state)),
+            EngineRead::Fresh { view: None, .. } => Ok(Some("offline".to_string())),
+            EngineRead::NotReady { .. } | EngineRead::Stale { .. } => {
+                self.local.session_state_get(worktree)
+            }
+        }
     }
 
     fn insert_prompt(&self, new: &NewDrivePrompt) -> Result<i64> {
-        Ok(self.drive_prompt_insert(new)?.id)
+        Ok(self.local.drive_prompt_insert(new)?.id)
     }
 
     fn prompt(&self, id: i64) -> Result<PromptRow> {
         let p = self
+            .local
             .drive_prompt_get(id)?
             .ok_or_else(|| keitora_tasks::Error::Conflict(format!("no prompt {id}")))?;
         Ok(PromptRow {
@@ -202,23 +242,25 @@ impl GateStore for LocalStore {
     }
 
     fn escalate_if_pending(&self, id: i64, decided_by: &str, reason: &str) -> Result<()> {
-        self.drive_prompt_close(id, "escalated", decided_by, reason)?;
+        self.local
+            .drive_prompt_close(id, "escalated", decided_by, reason)?;
         Ok(())
     }
 
     fn set_session_state(&self, worktree: &str, state: &str) -> Result<()> {
-        let current = self.active_task_id(worktree).ok().flatten();
-        self.session_upsert(worktree, state, current, None)
+        let current = self.local.active_task_id(worktree).ok().flatten();
+        self.local.session_upsert(worktree, state, current, None)
     }
 
     fn resume_after_decision(&self, worktree: &str) -> Result<()> {
-        let current = self.active_task_id(worktree).ok().flatten();
-        self.session_resume_after_decision(worktree, current)?;
+        let current = self.local.active_task_id(worktree).ok().flatten();
+        self.local
+            .session_resume_after_decision(worktree, current)?;
         Ok(())
     }
 
     fn data_version(&self) -> Result<i64> {
-        LocalStore::data_version(self)
+        self.local.data_version()
     }
 }
 
@@ -720,14 +762,39 @@ fn is_driven(db_path: &str, me: &str) -> bool {
         .is_ok_and(|d| d.is_some())
 }
 
-/// Read stdin, parse, open the project's store and run the gate.
+/// The gate's provider from `--provider`, or the log message when it is missing or
+/// unknown.
+fn gate_provider(provider: Option<&str>) -> std::result::Result<Provider, String> {
+    let p = provider.ok_or("gate: no --provider given")?;
+    Provider::parse(p).ok_or_else(|| format!("gate: unknown provider {p:?}"))
+}
+
+/// Read stdin, parse, open the project's store and run the gate. Each path that
+/// ends without a decision for a reason other than "nothing to decide" is logged.
 fn gate_output(provider: Option<&str>) -> Option<String> {
-    let provider = Provider::parse(provider?)?;
+    use crate::hook_log::log;
+    use keitora_tasks::HookLogLevel::{Error, Warn};
+    let provider = gate_provider(provider).map_err(|m| log(Error, &m)).ok()?;
     let stdin = std::io::stdin();
     let terminal = stdin.is_terminal();
     let raw = read_bounded(stdin, GATE_STDIN_CAP, GATE_STDIN_TIMEOUT, terminal);
-    let config = Config::from_project(resolve().ok()?);
-    let open = || LocalStore::open(&config.db_path).ok();
+    let project = resolve()
+        .map_err(|e| log(Error, &format!("gate: no project here: {e}")))
+        .ok()?;
+    let config = Config::from_project(project);
+    let open = || {
+        LocalStore::open(&config.db_path)
+            .map_err(|e| log(Error, &format!("gate: store open failed: {e}")))
+            .ok()
+    };
+    let gate_db = || {
+        Some(GateDb {
+            local: open()?,
+            project: config.project_config().project.name.clone(),
+            status: StatusReader::open(&status_db_path()).ok().flatten(),
+            clock: Box::new(RealClock),
+        })
+    };
     let me = current_worktree();
     match parse_payload(&raw) {
         Ok(payload) => {
@@ -736,11 +803,14 @@ fn gate_output(provider: Option<&str>) -> Option<String> {
             if provider == Provider::Claude && !is_driven(&config.db_path, &me) {
                 return None;
             }
-            run_gate(&open()?, &RealClock, provider, &me, &payload)
+            run_gate(&gate_db()?, &RealClock, provider, &me, &payload)
         }
-        Err(_) => {
+        Err(e) => {
+            log(Warn, &format!("gate: payload rejected: {}", e.0));
             if provider == Provider::Codex {
-                let _ = open()?.set_session_state(&me, "waiting");
+                if let Err(e) = GateDb::hook_rows_only(open()?).set_session_state(&me, "waiting") {
+                    log(Error, &format!("gate: recording waiting failed: {e}"));
+                }
             }
             None
         }
@@ -751,8 +821,10 @@ fn gate_output(provider: Option<&str>) -> Option<String> {
 /// every path, ignoring `--json`.
 pub fn gate_main(provider: Option<&str>) -> ! {
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gate_output(provider)))
-        .ok()
-        .flatten();
+        .unwrap_or_else(|_| {
+            crate::hook_log::log(keitora_tasks::HookLogLevel::Error, "gate: panicked");
+            None
+        });
     if let Some(s) = out {
         let mut stdout = std::io::stdout();
         let _ = write!(stdout, "{s}");

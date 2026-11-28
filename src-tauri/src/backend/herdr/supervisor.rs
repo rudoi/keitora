@@ -273,11 +273,26 @@ impl Supervisor {
         let agy_found = agy_installed(&user, project.as_ref(), || {
             keitora_tasks::discover_cli_cached(CliKind::Antigravity).is_some()
         });
-        for target in integration_targets(agy_found) {
+        let installed = Self::install_integrations(ops, &integration_targets(agy_found));
+        // herdr's agy install may rewrite the shared global hooks file and drop or
+        // alter Keitora's entry: put it back (the sync writes only on a difference).
+        if installed.contains(&CliKind::Antigravity.spec().herdr_integration) {
+            crate::antigravity_hooks::sync_registry();
+        }
+    }
+
+    /// Install each of `targets` herdr reports missing or outdated; returns the
+    /// ones whose install went through. Every failure is logged and non-fatal.
+    fn install_integrations(ops: &dyn HerdrOps, targets: &[&'static str]) -> Vec<&'static str> {
+        let mut installed = Vec::new();
+        for &target in targets {
             match ops.integration_status(target) {
                 Ok(IntegrationStatus::NotInstalled | IntegrationStatus::Outdated) => {
                     match ops.integration_install(target) {
-                        Ok(()) => log::info!("herdr: installed {target} integration"),
+                        Ok(()) => {
+                            log::info!("herdr: installed {target} integration");
+                            installed.push(target);
+                        }
                         Err(e) => log::warn!(
                             "herdr: {target} integration install failed: {}; {target} \
                              session ids will not be recorded, so a resume falls back \
@@ -293,6 +308,7 @@ impl Supervisor {
                 ),
             }
         }
+        installed
     }
 
     /// Run the integration install again even though it already ran this
@@ -1187,6 +1203,34 @@ mod tests {
                 start_time: 0
             },
             "the child's pid, start time unknown"
+        );
+    }
+
+    #[test]
+    fn install_integrations_reports_only_the_installs_that_went_through() {
+        let fake = FakeHerdr::new();
+        let targets = integration_targets(true);
+        // All current: nothing is installed, so the agy entry needs no re-assert.
+        assert!(Supervisor::install_integrations(&*fake, &targets).is_empty());
+        assert!(!fake.calls().iter().any(|c| c.op == Op::IntegrationInstall));
+        // Missing or outdated targets are installed and reported.
+        fake.set_integration_status("antigravity-cli", IntegrationStatus::Outdated);
+        fake.set_integration_status("codex", IntegrationStatus::NotInstalled);
+        assert_eq!(
+            Supervisor::install_integrations(&*fake, &targets),
+            vec!["codex", "antigravity-cli"]
+        );
+        // A failed install is not reported.
+        fake.fail_next(
+            Op::IntegrationInstall,
+            HerdrError::Api {
+                code: "x".into(),
+                message: "install failed".into(),
+            },
+        );
+        assert_eq!(
+            Supervisor::install_integrations(&*fake, &targets),
+            vec!["antigravity-cli"]
         );
     }
 

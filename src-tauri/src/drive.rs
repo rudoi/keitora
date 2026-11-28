@@ -22,12 +22,19 @@
 //! A request is served only for a project the window reports open
 //! ([`drive_set_open_projects`]); until the first report, rows stay pending.
 //!
+//! Passes are asked for through [`DriveRuntime::request_pass`] by everything that can
+//! make a request actionable: a tasks-DB write, an engine view or link change, a
+//! window report, a scheduled recheck and the pipeline's safety sweep. Each pass
+//! records on every row it leaves pending why it waits (`wait_reason`) and logs one
+//! line per request, so a request that never moves explains itself.
+//!
 //! The DB-only drive commands (`drives_list`, `drive_release`, `drive_take_over`,
 //! `drive_pause`) work for any registered project, with or without a window.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -36,19 +43,20 @@ use tauri::State;
 use tokio::sync::mpsc;
 
 use keitora_tasks::{
-    CliKind, Drive, DriveRequest, LocalStore, ProjectConfig, DRIVE_READ_LINES_DEFAULT,
-    DRIVE_READ_LINES_MAX, DRIVE_READ_RESULT_MAX, DRIVE_REQUEST_MAX_AGE_SECS, DRIVE_RETENTION_SECS,
-    DRIVE_SEND_TEXT_MAX,
+    Baseline, CliKind, Drive, DriveRequest, LocalStore, ProjectConfig, StatusSession,
+    DRIVE_READ_LINES_DEFAULT, DRIVE_READ_LINES_MAX, DRIVE_READ_RESULT_MAX,
+    DRIVE_REQUEST_MAX_AGE_SECS, DRIVE_RETENTION_SECS, DRIVE_SEND_TEXT_MAX,
 };
 
 use crate::activity::lock;
-use crate::backend::{
-    agent_hints, map_write_line_result, HintMap, SessionKey, SharedBackend, WriteLineOutcome,
-};
+use crate::backend::{map_write_line_result, SessionKey, SharedBackend, WriteLineOutcome};
 use crate::dispatch::{
     collapse, injection_detail, transfer_refusal, unknown_worktree_refusal, DispatchGate,
     SUBMIT_DELAY,
 };
+use crate::engine::gate::{self, Hold, Refusal, Verdict};
+use crate::engine::model::{AgentObs, HookEvidence, ViewQuery};
+use crate::engine::{HerdrLink, KeyView, ProjectViews, SharedEngine, ViewChange, SETTLE};
 use crate::transfer_registry::TransferRegistry;
 
 /// How long the window has to restart a pane for a `reset`.
@@ -67,6 +75,11 @@ pub(crate) const SEND_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long after a woken send's settle window its follow-up pass runs, so the pass
 /// lands just past the deadline it checks.
 const WAKE_RECHECK_SLACK: Duration = Duration::from_millis(500);
+/// Pass requests for one project closer together than this collapse into one pass.
+pub(crate) const PASS_COALESCE: Duration = Duration::from_millis(150);
+/// How often a project's pass also refuses stuck rows and purges old ones (expiry
+/// runs on every pass).
+const HOUSEKEEPING_EVERY: Duration = Duration::from_secs(60);
 /// Prefix of a `read` result whose head was cut to fit the cap.
 const TRUNCATED_MARKER: &str = "[... earlier output truncated ...]\n";
 
@@ -111,7 +124,7 @@ struct RuntimeInner {
     /// (project, request id) this process has begun and not yet resolved.
     tracked: Mutex<HashSet<WaiterKey>>,
     /// (project, worktree) a `send` was just typed into, until its turn is seen
-    /// starting: the hook's `busy` write lags the keystrokes.
+    /// starting: herdr's `working` lags the keystrokes.
     sent: Mutex<HashMap<(String, String), RecentSend>>,
     /// (project, send request id) whose target was woken for it, or that waited on a
     /// reset/swap/wake holding its target's slot: the send then waits for idle like a
@@ -119,7 +132,75 @@ struct RuntimeInner {
     woken: Mutex<HashMap<WaiterKey, WakeMark>>,
     /// (project, send request id) with a follow-up pass scheduled, and when it fires.
     rechecks: Mutex<HashMap<WaiterKey, Instant>>,
+    /// Project -> the due times of its requested passes that haven't started.
+    queued: Mutex<HashMap<String, BTreeSet<Instant>>>,
+    /// Runs requested passes; none until the app (or a test) installs one.
+    runner: Mutex<Option<Arc<dyn PassRunner>>>,
+    /// Project -> worktree -> pending requests, as of the last pass or sweep. A hint
+    /// for the engine trigger only.
+    pending_by_worktree: Mutex<HashMap<String, HashMap<String, u32>>>,
+    /// When the window last reported its open projects (unix ms).
+    open_reported_at: Mutex<Option<i64>>,
+    /// (project, request id) -> the last outcome logged for it (a waiting request is
+    /// logged again only when its reason changes).
+    last_logged: Mutex<HashMap<WaiterKey, String>>,
+    /// Project -> when its last pass started (unix ms) and what asked for it.
+    last_pass: Mutex<HashMap<String, (i64, Trigger)>>,
+    /// DB path -> the writable store the last pass used, kept for the next one, with
+    /// the DB's `data_version` as that pass began reading (other connections' commits
+    /// move it; the pass's own writes don't).
+    stores: Mutex<HashMap<String, (LocalStore, i64)>>,
+    /// Project -> when its pass last ran the full housekeeping.
+    housekept: Mutex<HashMap<String, Instant>>,
+    /// Every pass-log line, kept for tests to read.
+    #[cfg(test)]
+    pass_lines: Mutex<Vec<String>>,
 }
+
+/// What asked for a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Trigger {
+    /// A tasks-DB watcher saw a write.
+    Watcher,
+    /// The pipeline's safety sweep found pending rows.
+    Sweep,
+    /// A pass (or a hold that lifts by time) asked for a follow-up.
+    Recheck,
+    /// An engine view or link change could unblock a request.
+    Engine,
+    /// The window reported its open projects.
+    OpenSet,
+}
+
+impl Trigger {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Trigger::Watcher => "watcher",
+            Trigger::Sweep => "sweep",
+            Trigger::Recheck => "recheck",
+            Trigger::Engine => "engine",
+            Trigger::OpenSet => "open_set",
+        }
+    }
+}
+
+/// Runs a requested pass once it is due: sleep until `due`, then (only if
+/// [`DriveRuntime::take_due`] still holds `due` for the project) run it.
+pub(crate) trait PassRunner: Send + Sync {
+    fn run_at(&self, project: String, due: Instant, after: Duration, why: Trigger);
+}
+
+/// How a window report compares with the previous one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenChange {
+    /// The first report (or the first after the window closed).
+    First,
+    Changed,
+    Same,
+}
+
+/// Process-wide pass ids, for the pass log.
+static PASS_IDS: AtomicU64 = AtomicU64::new(0);
 
 /// Why a waking send is waiting, and since when.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,8 +215,11 @@ struct WakeMark {
 #[derive(Debug, Clone, Copy)]
 struct RecentSend {
     at: Instant,
-    /// The turn the send is waiting for; a finished turn this far means it ran.
-    turn: i64,
+    /// The delivery the hold belongs to (0 for a dispatch, which records none).
+    delivery_id: i64,
+    /// herdr's `state_change_seq` for the target when the send went in; any change
+    /// means the turn moved.
+    baseline_scs: u64,
 }
 
 /// Managed state shared by the runner and the drive commands. Cheap to clone; every
@@ -143,7 +227,8 @@ struct RecentSend {
 #[derive(Default, Clone)]
 pub struct DriveRuntime(Arc<RuntimeInner>);
 
-/// Releases a worktree's reset/swap slot on drop.
+/// Releases a worktree's reset/swap slot on drop, and asks for a pass over its
+/// project: a request waiting on the slot can go now, and a freed slot is no DB write.
 pub(crate) struct InFlightGuard {
     runtime: DriveRuntime,
     key: (String, String),
@@ -152,6 +237,8 @@ pub(crate) struct InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         lock(&self.runtime.0.in_flight).remove(&self.key);
+        self.runtime
+            .request_pass(&self.key.0, Duration::ZERO, Trigger::Recheck);
     }
 }
 
@@ -180,21 +267,200 @@ impl Drop for WaiterGuard {
 }
 
 impl DriveRuntime {
+    /// The pass-log lines written so far.
+    #[cfg(test)]
+    pub(crate) fn pass_lines(&self) -> Vec<String> {
+        lock(&self.0.pass_lines).clone()
+    }
+
     /// The open set, or `None` before the window's first report.
     pub(crate) fn open_set(&self) -> Option<HashSet<String>> {
         lock(&self.0.open).clone()
     }
 
-    /// Store the window's open projects. `true` when this is the first report or the
-    /// set changed.
-    pub(crate) fn set_open(&self, projects: Vec<String>) -> bool {
+    /// Store the window's open projects and stamp the report's time.
+    pub(crate) fn set_open(&self, projects: Vec<String>) -> OpenChange {
         let next: HashSet<String> = projects.into_iter().collect();
+        *lock(&self.0.open_reported_at) = Some(keitora_tasks::now_ms());
         let mut open = lock(&self.0.open);
-        if open.as_ref() == Some(&next) {
+        let change = match open.as_ref() {
+            None => OpenChange::First,
+            Some(o) if *o == next => OpenChange::Same,
+            Some(_) => OpenChange::Changed,
+        };
+        *open = Some(next);
+        change
+    }
+
+    /// The window went away: forget its open set, so its next report counts as the
+    /// first (and rows wait for it).
+    pub(crate) fn clear_open(&self) {
+        *lock(&self.0.open) = None;
+        *lock(&self.0.open_reported_at) = None;
+    }
+
+    /// When `project`'s last pass started (unix ms) and what asked for it.
+    pub(crate) fn last_pass(&self, project: &str) -> Option<(i64, Trigger)> {
+        lock(&self.0.last_pass).get(project).copied()
+    }
+
+    /// When the window last reported its open projects (unix ms), if it has.
+    pub(crate) fn open_reported_at(&self) -> Option<i64> {
+        *lock(&self.0.open_reported_at)
+    }
+
+    /// Whether `project` is in the window's open set.
+    pub(crate) fn is_open(&self, project: &str) -> bool {
+        lock(&self.0.open)
+            .as_ref()
+            .is_some_and(|o| o.contains(project))
+    }
+
+    /// The writable store the last pass over `db_path` left (`None` when none is
+    /// idle: a first pass, one running now, or one that failed).
+    fn take_store(&self, db_path: &str) -> Option<LocalStore> {
+        lock(&self.0.stores).remove(db_path).map(|(s, _)| s)
+    }
+
+    /// Keep `store` for the next pass over `db_path`; `version` is its `data_version`
+    /// as this pass began reading.
+    fn put_store(&self, db_path: &str, store: LocalStore, version: i64) {
+        lock(&self.0.stores).insert(db_path.to_string(), (store, version));
+    }
+
+    /// Drop the kept stores of DBs `keep` rejects (their project left the registry).
+    pub(crate) fn retain_stores(&self, keep: impl Fn(&str) -> bool) {
+        lock(&self.0.stores).retain(|path, _| keep(path));
+    }
+
+    /// Whether nothing but a pass's own writes changed `db_path` since the last pass
+    /// over it began reading (so a watcher event for it has nothing new to show).
+    /// `false` while unknown: no idle store, or a pass running.
+    pub(crate) fn unchanged_since_pass(&self, db_path: &str) -> bool {
+        lock(&self.0.stores)
+            .get(db_path)
+            .is_some_and(|(s, v)| s.data_version().ok() == Some(*v))
+    }
+
+    /// Claim `project`'s full housekeeping at `now`: `true` at most once per
+    /// [`HOUSEKEEPING_EVERY`].
+    fn housekeeping_due(&self, project: &str, now: Instant) -> bool {
+        let mut at = lock(&self.0.housekept);
+        if at
+            .get(project)
+            .is_some_and(|t| now.saturating_duration_since(*t) < HOUSEKEEPING_EVERY)
+        {
             return false;
         }
-        *open = Some(next);
+        at.insert(project.to_string(), now);
         true
+    }
+
+    /// Install what runs requested passes.
+    pub(crate) fn set_runner(&self, runner: Arc<dyn PassRunner>) {
+        *lock(&self.0.runner) = Some(runner);
+    }
+
+    /// Ask for a pass over `project` no sooner than `after`. `false` when deduped: an
+    /// already requested pass that hasn't started serves this one (or nothing runs
+    /// passes yet).
+    pub(crate) fn request_pass(&self, project: &str, after: Duration, why: Trigger) -> bool {
+        self.request_pass_at(Instant::now(), project, after, why)
+    }
+
+    /// [`Self::request_pass`] at `now`. The due time is at least [`PASS_COALESCE`]
+    /// away. A requested pass due at most [`PASS_COALESCE`] before this one serves it
+    /// (so a burst of requests collapses into one pass); any other due time is kept
+    /// as its own pass, so a sooner pass never swallows a later recheck (whose
+    /// deadline the sooner one would run before).
+    pub(crate) fn request_pass_at(
+        &self,
+        now: Instant,
+        project: &str,
+        after: Duration,
+        why: Trigger,
+    ) -> bool {
+        let Some(runner) = lock(&self.0.runner).clone() else {
+            return false;
+        };
+        let after = after.max(PASS_COALESCE);
+        let due = now + after;
+        {
+            let mut queued = lock(&self.0.queued);
+            let dues = queued.entry(project.to_string()).or_default();
+            if dues.range(due - PASS_COALESCE..=due).next().is_some() {
+                return false;
+            }
+            dues.insert(due);
+        }
+        runner.run_at(project.to_string(), due, after, why);
+        true
+    }
+
+    /// A requested pass for `project` due at `due` is about to run: `true` (and that
+    /// request is cleared) while it is still queued. Other due times stay queued.
+    pub(crate) fn take_due(&self, project: &str, due: Instant) -> bool {
+        let mut queued = lock(&self.0.queued);
+        let Some(dues) = queued.get_mut(project) else {
+            return false;
+        };
+        let taken = dues.remove(&due);
+        if dues.is_empty() {
+            queued.remove(project);
+        }
+        taken
+    }
+
+    /// Record `project`'s pending requests (the engine trigger's hint).
+    pub(crate) fn set_pending_rows(&self, project: &str, rows: &[DriveRequest]) {
+        let mut by_wt: HashMap<String, u32> = HashMap::new();
+        for r in rows {
+            *by_wt.entry(r.worktree.clone()).or_default() += 1;
+        }
+        let mut all = lock(&self.0.pending_by_worktree);
+        if by_wt.is_empty() {
+            all.remove(project);
+        } else {
+            all.insert(project.to_string(), by_wt);
+        }
+    }
+
+    /// Whether `project` had a pending request for `worktree`, as last recorded.
+    pub(crate) fn has_pending_for(&self, project: &str, worktree: &str) -> bool {
+        lock(&self.0.pending_by_worktree)
+            .get(project)
+            .is_some_and(|m| m.contains_key(worktree))
+    }
+
+    /// The projects with pending requests, as last recorded, sorted.
+    pub(crate) fn pending_projects(&self) -> Vec<String> {
+        let mut p: Vec<String> = lock(&self.0.pending_by_worktree).keys().cloned().collect();
+        p.sort();
+        p
+    }
+
+    /// Record `outcome` as the last logged for `(project, id)`; `true` when it differs
+    /// from the one before.
+    fn note_logged(&self, project: &str, id: i64, outcome: &str) -> bool {
+        let mut logged = lock(&self.0.last_logged);
+        let key = (project.to_string(), id);
+        if logged.get(&key).map(String::as_str) == Some(outcome) {
+            return false;
+        }
+        logged.insert(key, outcome.to_string());
+        true
+    }
+
+    /// Keep a pass-log line for tests.
+    #[cfg_attr(not(test), allow(unused_variables))]
+    fn record_line(&self, line: &str) {
+        #[cfg(test)]
+        lock(&self.0.pass_lines).push(line.to_string());
+    }
+
+    /// Whether a reset, swap or wake holds `worktree`'s slot.
+    fn slot_held(&self, project: &str, worktree: &str) -> bool {
+        lock(&self.0.in_flight).contains(&(project.to_string(), worktree.to_string()))
     }
 
     /// Take `worktree`'s reset/swap slot; `None` when one is already in flight.
@@ -219,38 +485,76 @@ impl DriveRuntime {
         }
     }
 
-    /// Hold `worktree` busy: a `send` was just typed into it, awaiting `turn`.
-    fn mark_sent(&self, project: &str, worktree: &str, turn: i64) {
+    /// Hold `worktree`: a `send` was just typed into it while herdr's
+    /// `state_change_seq` read `baseline_scs`.
+    pub(crate) fn mark_sent(
+        &self,
+        project: &str,
+        worktree: &str,
+        delivery_id: i64,
+        baseline_scs: u64,
+    ) {
         lock(&self.0.sent).insert(
             (project.to_string(), worktree.to_string()),
             RecentSend {
                 at: Instant::now(),
-                turn,
+                delivery_id,
+                baseline_scs,
             },
         );
+    }
+
+    /// When the hold of a send just typed into `worktree` lapses by time, if it has one.
+    fn send_settle_deadline(
+        &self,
+        project: &str,
+        worktree: &str,
+        settle: Duration,
+    ) -> Option<Instant> {
+        lock(&self.0.sent)
+            .get(&(project.to_string(), worktree.to_string()))
+            .map(|r| r.at + settle)
     }
 
     fn clear_sent(&self, project: &str, worktree: &str) {
         lock(&self.0.sent).remove(&(project.to_string(), worktree.to_string()));
     }
 
-    /// Whether a recent `send` still holds `worktree` busy. The hold ends (and is
-    /// forgotten) once the session is seen out of `idle`, the awaited turn has
-    /// finished, or `settle` has elapsed.
-    fn send_settling(
+    /// Whether a recent `send` still holds `worktree`. The hold ends (and is
+    /// forgotten) once herdr reports the agent `working` or `blocked`, its
+    /// `state_change_seq` moved off the baseline, or `settle` has elapsed.
+    pub(crate) fn send_settling(
         &self,
         project: &str,
         worktree: &str,
-        state: &str,
-        finished_turn: i64,
+        view: &StatusSession,
         settle: Duration,
+    ) -> bool {
+        self.send_settling_or_turned(project, worktree, view, settle, |_| false)
+    }
+
+    /// [`Self::send_settling`], also released once `turned(delivery_id)` says a turn
+    /// row exists for the held delivery (asked only for a recorded delivery).
+    pub(crate) fn send_settling_or_turned(
+        &self,
+        project: &str,
+        worktree: &str,
+        view: &StatusSession,
+        settle: Duration,
+        turned: impl FnOnce(i64) -> bool,
     ) -> bool {
         let key = (project.to_string(), worktree.to_string());
         let mut sent = lock(&self.0.sent);
         let Some(recent) = sent.get(&key) else {
             return false;
         };
-        if state != "idle" || finished_turn >= recent.turn || recent.at.elapsed() >= settle {
+        let started = matches!(view.herdr_status.as_deref(), Some("working" | "blocked"));
+        let moved = view.state_change_seq != i64::try_from(recent.baseline_scs).ok();
+        if started
+            || moved
+            || recent.at.elapsed() >= settle
+            || (recent.delivery_id > 0 && turned(recent.delivery_id))
+        {
             sent.remove(&key);
             return false;
         }
@@ -295,6 +599,7 @@ impl DriveRuntime {
     fn retain_woken(&self, project: &str, pending: &HashSet<i64>) {
         lock(&self.0.woken).retain(|(p, id), _| p != project || pending.contains(id));
         lock(&self.0.rechecks).retain(|(p, id), _| p != project || pending.contains(id));
+        lock(&self.0.last_logged).retain(|(p, id), _| p != project || pending.contains(id));
     }
 
     /// Claim the follow-up pass for send `id` at `due`: `false` when one already
@@ -433,9 +738,11 @@ pub(crate) trait DriveHost: Send + Sync + 'static {
         worktree: &str,
         cli: CliKind,
     ) -> Result<(), String>;
-    /// Get `worktree` ready to launch `cli` after a provider change: Antigravity needs
-    /// its global hook entry, workspace trust and herdr's integration in place first.
-    fn prepare_launch(&self, config: &ProjectConfig, worktree: &str, cli: CliKind);
+    /// Run herdr's integration install again, before a relaunch onto a provider
+    /// whose integration waits for it to be found
+    /// ([`keitora_tasks::ProviderSpec::integration_on_switch`]). The provider's hooks
+    /// are written by the spawn itself, before its agent starts.
+    fn refresh_integration(&self);
     /// Run another pass over `project`'s pending requests after `after`: a waiting
     /// send's deadline can pass with no DB write to trigger one.
     fn schedule_pass(&self, project: &str, after: Duration);
@@ -483,24 +790,18 @@ impl<R: tauri::Runtime> DriveHost for TauriHost<R> {
         )
     }
 
-    fn prepare_launch(&self, config: &ProjectConfig, worktree: &str, cli: CliKind) {
-        if cli != CliKind::Antigravity {
-            return;
-        }
+    fn refresh_integration(&self) {
         use tauri::Manager as _;
-        crate::antigravity_hooks::sync_worktree(&config.worktree_path(worktree));
         if let Some(backend) = self.0.try_state::<SharedBackend>() {
             backend.inner().refresh_integration();
         }
     }
 
     fn schedule_pass(&self, project: &str, after: Duration) {
-        let app = self.0.clone();
-        let project = project.to_string();
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(after).await;
-            run_drive_requests(app, project).await;
-        });
+        use tauri::Manager as _;
+        if let Some(rt) = self.0.try_state::<DriveRuntime>() {
+            rt.request_pass(project, after, Trigger::Recheck);
+        }
     }
 }
 
@@ -528,6 +829,16 @@ impl Outcome {
     fn refused(reason: impl Into<String>) -> Self {
         Outcome {
             status: "refused",
+            reason: reason.into(),
+            result: String::new(),
+        }
+    }
+
+    /// A queued send put back to `pending` at the last moment; `reason` is why it waits.
+    /// Never recorded on the row as an outcome.
+    fn deferred(reason: impl Into<String>) -> Self {
+        Outcome {
+            status: "deferred",
             reason: reason.into(),
             result: String::new(),
         }
@@ -763,19 +1074,46 @@ fn sanitize_prompt(text: &str) -> Result<Prompt, String> {
     Ok(Prompt::Block(body))
 }
 
-/// Pure: why a `send` can't go to a session in `state`; `None` when idle.
-fn state_refusal(state: &str, worktree: &str) -> Option<String> {
+/// Pure: why a `send` can't go to a session in `state`; `None` when idle. The
+/// offline and busy texts end with `detail` (see [`refusal_detail`]), so the refusal
+/// stored in the request says what each source saw.
+fn state_refusal(state: &str, worktree: &str, detail: &str) -> Option<String> {
     match state {
         "idle" => None,
         "busy" => Some(format!(
-            "@{worktree} is busy; send only goes to an idle session (use --queue to wait for it)"
+            "@{worktree} is busy; send only goes to an idle session (use --queue to wait for \
+             it) {detail}"
         )),
         "waiting" => Some(format!(
             "@{worktree} is waiting on a prompt; answer it first (or use --queue)"
         )),
-        "offline" => Some(format!("@{worktree} is offline; start its session first")),
+        "offline" => Some(format!(
+            "@{worktree} is offline; start its session first {detail}"
+        )),
         other => Some(format!("@{worktree} is {other}")),
     }
+}
+
+/// Pure: `(herdr: {no agent | status}; {last hook write {age} ago | no hook rows})`
+/// from the engine's `view` and the worktree's `hook` row at `now_ms`.
+fn refusal_detail(
+    view: Option<&StatusSession>,
+    hook: Option<&HookEvidence>,
+    now_ms: i64,
+) -> String {
+    let herdr = match view {
+        Some(v) if v.is_running() => v.herdr_status.as_deref().unwrap_or("unknown"),
+        _ => "no agent",
+    };
+    let hook = match hook.map(|h| h.written_ms) {
+        Some(Some(at)) => format!(
+            "last hook write {} ago",
+            keitora_tasks::age_text((now_ms - at) / 1000)
+        ),
+        Some(None) => "hook row with no write time".to_string(),
+        None => "no hook rows".to_string(),
+    };
+    format!("(herdr: {herdr}; {hook})")
 }
 
 /// Pure: keep at most the last `max` bytes of `text`, cut at a char boundary. A cut
@@ -871,11 +1209,21 @@ pub(crate) struct DriveEnv {
     pub runtime: DriveRuntime,
     pub host: Arc<dyn DriveHost>,
     pub timeouts: Timeouts,
+    /// The session engine: the one liveness and state answer for send and wake.
+    pub engine: SharedEngine,
 }
 
 impl DriveEnv {
     fn store(&self) -> Result<LocalStore, String> {
         LocalStore::open(&self.db_path).map_err(|e| e.to_string())
+    }
+
+    /// The writable store for a pass: the one the last pass left, else a fresh one.
+    fn pass_store(&self) -> Result<LocalStore, String> {
+        match self.runtime.take_store(&self.db_path) {
+            Some(s) => Ok(s),
+            None => self.store(),
+        }
     }
 
     fn key(&self, worktree: &str) -> SessionKey {
@@ -895,105 +1243,240 @@ impl DriveEnv {
         }
     }
 
+    /// A send `id` left waiting on a hold that lifts by time (a send just typed into
+    /// its target, or an idle not settled yet) gets a pass once the hold can lift:
+    /// neither ends with a DB write, and a send hold's lapse is no view change either.
+    fn recheck_time_hold(&self, id: i64, worktree: &str, sets: &SessionSets) {
+        let due = match self.runtime.send_settle_deadline(
+            &self.project,
+            worktree,
+            self.timeouts.send_settle,
+        ) {
+            Some(at) => at,
+            None if sets
+                .views
+                .views
+                .get(worktree)
+                .is_some_and(|v| !v.stale && v.is_idle() && !v.is_idle_settled()) =>
+            {
+                Instant::now() + SETTLE
+            }
+            None => return,
+        };
+        let due = due + WAKE_RECHECK_SLACK;
+        if self.runtime.claim_recheck(&self.project, id, due) {
+            self.host
+                .schedule_pass(&self.project, due.saturating_duration_since(Instant::now()));
+        }
+    }
+
+    /// A send put back to pending at the last moment (the fresh read disagreed
+    /// with the engine's view) gets a pass once the view has had a tick to catch up:
+    /// the requeue is this pass's own write, which the watcher skips, and a read that
+    /// only says "not ready for input" changes no view. (Requests a few passes apart
+    /// fold into one on the pass queue.)
+    fn recheck_deferred(&self) {
+        self.host
+            .schedule_pass(&self.project, SETTLE + WAKE_RECHECK_SLACK);
+    }
+
     fn terminated(&self, worktree: &str) -> bool {
         self.backend
             .terminated_keys(&self.project)
             .contains(worktree)
     }
 
-    /// Whether `worktree` has a running agent: a live pane that isn't terminated.
-    fn awake(&self, worktree: &str) -> bool {
-        !self.terminated(worktree)
-            && self
-                .backend
-                .live_set_snapshot()
-                .contains(&self.key(worktree))
+    /// Whether `worktree` has a running agent, from fresh session sets.
+    fn awake(&self, worktree: &str) -> Awake {
+        self.sets(&mut None).awake(worktree)
     }
 
-    /// The backend's session sets from `snapshot`, taken on first use and reused until
-    /// the caller clears it.
+    /// The engine's views and the backend's terminated set, from `snapshot`, taken on
+    /// first use and reused until the caller clears it.
     fn sets<'a>(&self, snapshot: &'a mut Option<SessionSets>) -> &'a SessionSets {
         snapshot.get_or_insert_with(|| SessionSets {
-            live: self.backend.live_set_snapshot(),
-            hints: agent_hints(self.backend.as_ref()),
+            views: self.engine.views(&self.project),
             terminated: self.backend.terminated_keys(&self.project),
+            hooks: self.hook_rows(),
+            at_ms: keitora_tasks::now_ms(),
         })
     }
 
-    /// `worktree`'s reconciled session state (`offline` without a row), from the
-    /// session sets in `snapshot`.
-    fn session_state(
-        &self,
-        local: &LocalStore,
-        snapshot: &mut Option<SessionSets>,
-        worktree: &str,
-    ) -> Result<String, String> {
-        let sets = self.sets(snapshot);
-        let sessions = crate::tasks::reconciled_sessions_in(
-            local,
-            &sets.live,
-            &sets.hints,
-            &self.project,
-            &self.config,
-        )?;
-        Ok(sessions
-            .into_iter()
-            .find(|s| s.worktree == worktree)
-            .map(|s| s.state)
-            .unwrap_or_else(|| "offline".to_string()))
+    /// The project's hook rows, through the engine's cached evidence (for refusal
+    /// detail).
+    fn hook_rows(&self) -> HashMap<String, HookEvidence> {
+        self.engine
+            .project_evidence(&self.project)
+            .map(|ev| ev.rows)
+            .unwrap_or_default()
     }
 
-    /// [`Self::session_state`], but `busy` while a send just typed into `worktree`
-    /// hasn't been seen starting its turn.
+    /// Whether a send to `worktree` may go now, waits, or is refused, from the
+    /// session sets in `snapshot` and the hold of a send just typed into it.
     fn send_state(
         &self,
         local: &LocalStore,
         snapshot: &mut Option<SessionSets>,
         worktree: &str,
-    ) -> Result<String, String> {
-        let state = self.session_state(local, snapshot, worktree)?;
-        let finished = local
-            .session_reply_get(worktree)
-            .ok()
-            .flatten()
-            .map_or(0, |r| r.turn);
-        if self.runtime.send_settling(
-            &self.project,
-            worktree,
-            &state,
-            finished,
-            self.timeouts.send_settle,
-        ) {
-            return Ok("busy".to_string());
-        }
-        Ok(state)
+        queued: bool,
+    ) -> SendGate {
+        self.sets(snapshot).send_gate(worktree, queued, |view| {
+            self.runtime.send_settling_or_turned(
+                &self.project,
+                worktree,
+                view,
+                self.timeouts.send_settle,
+                |id| matches!(local.drive_turn_for_delivery(id), Ok(Some(_))),
+            )
+        })
     }
 }
 
-/// The backend's session sets, snapshotted once per pass.
-struct SessionSets {
-    live: HashSet<SessionKey>,
-    hints: HintMap,
+/// Whether a worktree has a running agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Awake {
+    Yes,
+    No,
+    /// The engine has no fresh answer (no snapshot, herdr not up, or stale views):
+    /// nothing is started on it.
+    Unknown,
+}
+
+/// What a send may do now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SendGate {
+    Ready,
+    /// A transient condition: the request stays pending with this reason.
+    Wait(String),
+    Refuse(String),
+}
+
+/// The engine's views of one project and the backend's terminated worktrees,
+/// snapshotted once per pass.
+pub(crate) struct SessionSets {
+    pub views: ProjectViews,
     /// Worktrees whose session is terminated.
-    terminated: HashSet<String>,
+    pub terminated: HashSet<String>,
+    /// The project's hook rows by worktree, for refusal detail.
+    pub hooks: HashMap<String, HookEvidence>,
+    /// Wall ms the sets were taken (hook ages in refusal detail).
+    pub at_ms: i64,
 }
 
 impl SessionSets {
-    /// Whether `key` has a running agent: a live pane that isn't terminated.
-    fn awake(&self, key: &SessionKey) -> bool {
-        !self.terminated.contains(&key.worktree) && self.live.contains(key)
+    /// Whether `worktree` has a running agent: terminated -> no; no fresh view ->
+    /// unknown; an agent present or starting -> yes.
+    pub(crate) fn awake(&self, worktree: &str) -> Awake {
+        if self.terminated.contains(worktree) {
+            return Awake::No;
+        }
+        if !self.views.ready {
+            return Awake::Unknown;
+        }
+        match self.views.views.get(worktree) {
+            Some(v) if v.stale => Awake::Unknown,
+            Some(v) if v.is_running() => Awake::Yes,
+            _ => Awake::No,
+        }
+    }
+
+    /// Pure: the engine's send gate ([`gate::send_gate`]) for `worktree`, worded for
+    /// drive. A fresh view that is not idle is refused, or waits when the send is
+    /// `queued`; no session at all is refused either way.
+    pub(crate) fn send_gate(
+        &self,
+        worktree: &str,
+        queued: bool,
+        settling: impl FnOnce(&StatusSession) -> bool,
+    ) -> SendGate {
+        match gate::send_gate(&self.views, worktree, settling) {
+            Verdict::Go => SendGate::Ready,
+            Verdict::Wait(hold) => SendGate::Wait(wait_reason_for(&WaitFact::Hold(hold, worktree))),
+            Verdict::Refuse(Refusal::NotIdle(view)) if queued => {
+                let status = if view.is_running() {
+                    view.herdr_status.as_deref().unwrap_or("unknown")
+                } else {
+                    "no agent"
+                };
+                SendGate::Wait(wait_reason_for(&WaitFact::NotIdle { worktree, status }))
+            }
+            Verdict::Refuse(r) => {
+                let detail = refusal_detail(
+                    self.views.views.get(worktree),
+                    self.hooks.get(worktree),
+                    self.at_ms,
+                );
+                SendGate::Refuse(state_refusal(r.state(), worktree, &detail).unwrap_or_default())
+            }
+        }
+    }
+}
+
+/// Why a pending request waits, as facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaitFact<'a> {
+    /// The window hasn't reported its open projects yet.
+    Unreported,
+    /// An engine send-gate hold on `worktree`.
+    Hold(Hold, &'a str),
+    /// A queued send whose target isn't idle; `status` is herdr's (`working`,
+    /// `blocked`, `unknown`, `starting`, or `no agent` for an absent agent).
+    NotIdle { worktree: &'a str, status: &'a str },
+    /// The send woke its target, which doesn't show up yet.
+    Woken(&'a str),
+    /// Another reset, swap or wake holds the worktree's slot.
+    SlotHeld,
+    /// A dispatch holds the send gate.
+    DispatchGate,
+}
+
+/// Pure: the one vocabulary of `wait_reason`s (also the send gate's wait texts).
+pub(crate) fn wait_reason_for(fact: &WaitFact<'_>) -> String {
+    match *fact {
+        WaitFact::Unreported => "window hasn't reported open projects".to_string(),
+        WaitFact::Hold(Hold::Link(link), _) => format!("waiting for herdr ({})", link.as_str()),
+        WaitFact::Hold(Hold::FirstSnapshot, _) => "waiting for first herdr snapshot".to_string(),
+        WaitFact::Hold(Hold::Stale, _) => "waiting for herdr (stale snapshot)".to_string(),
+        WaitFact::Hold(Hold::Starting, worktree) => wait_reason_for(&WaitFact::NotIdle {
+            worktree,
+            status: "starting",
+        }),
+        WaitFact::Hold(Hold::Unsettled, worktree) => format!("waiting for @{worktree} to settle"),
+        WaitFact::Hold(Hold::SendSettling, worktree) => {
+            format!("waiting for @{worktree} to start its turn (send settling)")
+        }
+        WaitFact::NotIdle { worktree, status } => {
+            format!("waiting for @{worktree} to be idle (herdr: {status})")
+        }
+        WaitFact::Woken(worktree) => format!("waiting for @{worktree}'s agent to come up (woken)"),
+        WaitFact::SlotHeld => "waiting on the wake slot".to_string(),
+        WaitFact::DispatchGate => "waiting for the dispatch gate".to_string(),
+    }
+}
+
+/// Pure: why the engine has no fresh answer for `views`: herdr's link, no snapshot
+/// yet, or stale views.
+fn freshness_hold(views: &ProjectViews) -> Hold {
+    match views.link {
+        HerdrLink::Recovering | HerdrLink::Down | HerdrLink::Unavailable => Hold::Link(views.link),
+        _ if !views.ready => Hold::FirstSnapshot,
+        _ => Hold::Stale,
     }
 }
 
 /// A reset/swap body, spawned by the caller.
 pub(crate) type Job = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-/// Housekeeping once per pass; errors are logged and ignored.
+/// Expiry on every pass; the rest at most once per [`HOUSEKEEPING_EVERY`]. Errors
+/// are logged and ignored.
 fn housekeeping(local: &LocalStore, env: &DriveEnv, now: chrono::DateTime<chrono::Utc>) {
     match local.drive_requests_expire(env.timeouts.max_age_secs) {
         Ok(0) => {}
         Ok(n) => log::info!("drive requests: {n} expired in {}", env.project),
         Err(e) => log::warn!("drive requests: expiry failed: {e}"),
+    }
+    if !env.runtime.housekeeping_due(&env.project, Instant::now()) {
+        return;
     }
     match local.drive_requests_in_flight() {
         Ok(rows) => {
@@ -1015,6 +1498,11 @@ fn housekeeping(local: &LocalStore, env: &DriveEnv, now: chrono::DateTime<chrono
     if let Err(e) = local.drive_purge(DRIVE_RETENTION_SECS) {
         log::warn!("drive requests: purge failed: {e}");
     }
+    match local.drive_turns_prune() {
+        Ok(0) => {}
+        Ok(n) => log::debug!("drive turns: {n} pruned in {}", env.project),
+        Err(e) => log::warn!("drive turns: prune failed: {e}"),
+    }
 }
 
 fn resolve(local: &LocalStore, req: &DriveRequest, project: &str, outcome: &Outcome) {
@@ -1034,21 +1522,124 @@ fn resolve(local: &LocalStore, req: &DriveRequest, project: &str, outcome: &Outc
     }
 }
 
-/// One pass over `env`'s pending requests, oldest first. `send`/`read` run inline and
-/// are resolved here; begun `reset`/`swap` bodies are returned for the caller to spawn.
-pub(crate) async fn run_pass(env: &Arc<DriveEnv>, gate: &DispatchGate) -> Vec<Job> {
+/// Pure: the line that opens a pass. `open` prints sorted, `none` when empty and
+/// `unreported` before the window's first report.
+pub(crate) fn pass_start_line(
+    pass_id: u64,
+    project: &str,
+    trigger: Trigger,
+    open: Option<&HashSet<String>>,
+    db: &str,
+    pending: &[i64],
+) -> String {
+    let open = match open {
+        None => "unreported".to_string(),
+        Some(o) if o.is_empty() => "none".to_string(),
+        Some(o) => {
+            let mut v: Vec<&str> = o.iter().map(String::as_str).collect();
+            v.sort_unstable();
+            v.join(",")
+        }
+    };
+    let pending: Vec<String> = pending.iter().map(i64::to_string).collect();
+    format!(
+        "drive pass {pass_id} start project={project} trigger={} open={open} db={db} pending=[{}]",
+        trigger.as_str(),
+        pending.join(",")
+    )
+}
+
+/// Pure: one request's line in a pass.
+pub(crate) fn pass_request_line(pass_id: u64, req: &DriveRequest, outcome: &str) -> String {
+    format!(
+        "drive pass {pass_id} request {} ({} @{} by @{}): {outcome}",
+        req.id, req.kind, req.worktree, req.requested_by
+    )
+}
+
+/// One pass's log: every line goes to the app log (and to tests), a waiting request
+/// only when its reason changed since it was last logged.
+struct PassLog<'a> {
+    env: &'a DriveEnv,
+    pass_id: u64,
+    /// The pass started with pending requests (otherwise it logs at debug only).
+    busy: bool,
+    begun: usize,
+}
+
+impl PassLog<'_> {
+    fn line(&self, line: &str) {
+        if self.busy {
+            log::info!("{line}");
+        } else {
+            log::debug!("{line}");
+        }
+        self.env.runtime.record_line(line);
+    }
+
+    /// Log `req`'s outcome in this pass.
+    fn outcome(&self, req: &DriveRequest, outcome: &str) {
+        self.env
+            .runtime
+            .note_logged(&self.env.project, req.id, outcome);
+        self.line(&pass_request_line(self.pass_id, req, outcome));
+    }
+
+    /// Record on the row that `req` waits for `reason`, and log it if the reason is
+    /// new for it.
+    fn waiting(&self, local: &LocalStore, req: &DriveRequest, reason: &str) {
+        note_wait(local, req.id, reason);
+        let outcome = format!("waiting: {reason}");
+        if self
+            .env
+            .runtime
+            .note_logged(&self.env.project, req.id, &outcome)
+        {
+            self.line(&pass_request_line(self.pass_id, req, &outcome));
+        }
+    }
+
+    /// Resolve `req` with `outcome` and log it.
+    fn resolve(&self, local: &LocalStore, req: &DriveRequest, outcome: &Outcome) {
+        resolve(local, req, &self.env.project, outcome);
+        let text = match outcome.status {
+            "refused" => format!("refused: {}", outcome.reason),
+            s => s.to_string(),
+        };
+        self.outcome(req, &text);
+    }
+}
+
+/// Record why pending request `id` waits (a write only when the reason changed).
+fn note_wait(local: &LocalStore, id: i64, reason: &str) {
+    if let Err(e) = local.drive_request_note_wait(id, reason) {
+        log::warn!("drive request {id}: cannot record why it waits: {e}");
+    }
+}
+
+/// One pass over `env`'s pending requests, in id order (a read goes ahead only of a
+/// send held on a busy dispatch gate). `send`/`read` run inline and are resolved
+/// here; begun `reset`/`swap` bodies are returned for the caller to spawn. Every
+/// request left pending records why.
+pub(crate) async fn run_pass(
+    env: &Arc<DriveEnv>,
+    gate: &DispatchGate,
+    trigger: Trigger,
+) -> Vec<Job> {
+    let started = Instant::now();
+    let pass_id = PASS_IDS.fetch_add(1, Ordering::Relaxed) + 1;
     let mut jobs: Vec<Job> = Vec::new();
-    let local = match env.store() {
+    let local = match env.pass_store() {
         Ok(l) => l,
         Err(e) => {
             log::warn!("drive requests: cannot open {}: {e}", env.db_path);
             return jobs;
         }
     };
+    // Read before anything else: a commit from another connection after this (a
+    // request filed mid-pass) moves it, so its watcher event isn't mistaken for ours.
+    let version = local.data_version().ok();
     housekeeping(&local, env, chrono::Utc::now());
-    let Some(open) = env.runtime.open_set() else {
-        return jobs; // the window hasn't reported yet: leave rows pending
-    };
     let pending = match local.drive_requests_pending() {
         Ok(p) => p,
         Err(e) => {
@@ -1056,29 +1647,123 @@ pub(crate) async fn run_pass(env: &Arc<DriveEnv>, gate: &DispatchGate) -> Vec<Jo
             return jobs;
         }
     };
-    let pending_ids: HashSet<i64> = pending.iter().map(|r| r.id).collect();
-    env.runtime.retain_woken(&env.project, &pending_ids);
+    lock(&env.runtime.0.last_pass).insert(env.project.clone(), (keitora_tasks::now_ms(), trigger));
+    let open = env.runtime.open_set();
+    let ids: Vec<i64> = pending.iter().map(|r| r.id).collect();
+    let mut log = PassLog {
+        env,
+        pass_id,
+        busy: !pending.is_empty(),
+        begun: 0,
+    };
+    log.line(&pass_start_line(
+        pass_id,
+        &env.project,
+        trigger,
+        open.as_ref(),
+        &env.db_path,
+        &ids,
+    ));
+    env.runtime
+        .retain_woken(&env.project, &ids.iter().copied().collect());
+    // The engine trigger's hint, before this pass reads any view: a change after that
+    // read (one this pass may have decided on too early) asks for another pass.
+    env.runtime.set_pending_rows(&env.project, &pending);
+    // Poll hot while requests wait on the engine; re-read once the pass is done.
+    let dispatch_pending = local.dispatch_requests_has_pending().unwrap_or(false);
+    env.engine
+        .set_pending(&env.project, !ids.is_empty() || dispatch_pending);
+    let local = match open {
+        // The window hasn't reported yet: every row waits for it.
+        None => {
+            let reason = wait_reason_for(&WaitFact::Unreported);
+            for req in &pending {
+                log.waiting(&local, req, &reason);
+            }
+            local
+        }
+        Some(open) => serve(env, gate, local, &open, pending, &mut log, &mut jobs).await,
+    };
+    // What's left (rows filed meanwhile, deferred sends, sends waiting on a wake) as
+    // the DB has it. A request waiting on a condition that lifts without a DB write
+    // is passed again by its own trigger: the engine, a time-hold recheck, a freed
+    // slot, or the window's report; the sweep backs them all.
+    let left = local.drive_requests_pending();
+    let left_n = left.as_ref().map_or(0, Vec::len);
+    let has_left = left.as_ref().map_or(true, |l| !l.is_empty());
+    env.runtime
+        .set_pending_rows(&env.project, left.as_deref().unwrap_or_default());
+    env.engine.set_pending(
+        &env.project,
+        has_left || local.dispatch_requests_has_pending().unwrap_or(false),
+    );
+    // A store that read fine is kept for the next pass; one that failed is dropped.
+    if let (Ok(_), Some(version)) = (&left, version) {
+        env.runtime.put_store(&env.db_path, local, version);
+    }
+    log.line(&format!(
+        "drive pass {pass_id} done project={} took={}ms begun={} left={}",
+        env.project,
+        started.elapsed().as_millis(),
+        log.begun,
+        left_n
+    ));
+    jobs
+}
+
+/// Serve `requests` (the open set is known) in order. A send that finds the dispatch
+/// gate busy is held, with every later request but a read, until the rest are served;
+/// then the held ones run in order, waiting for the gate. So a read filed after a
+/// send sees its prompt typed, yet never waits behind a dispatch. Takes the store and
+/// hands it back: a borrowed one would keep the future from being `Send`.
+async fn serve(
+    env: &Arc<DriveEnv>,
+    gate: &DispatchGate,
+    store: LocalStore,
+    open: &HashSet<String>,
+    requests: Vec<DriveRequest>,
+    log: &mut PassLog<'_>,
+    jobs: &mut Vec<Job>,
+) -> LocalStore {
     let configured = env.config.worktrees();
-    // Backend session sets, shared by every send in this pass; dropped after a
-    // delivery so the next check sees the session the send just woke.
+    // The engine's views, shared by every request in this pass; dropped after a
+    // delivery so the next check sees the session the send just moved.
     let mut snapshot: Option<SessionSets> = None;
     // Drive rows by driven worktree, loaded for the first waking send.
     let mut drives: Option<HashMap<String, Drive>> = None;
-    for req in pending {
+    let project_open = open.contains(&env.project);
+    let mut queue: VecDeque<DriveRequest> = requests.into();
+    let mut held: VecDeque<DriveRequest> = VecDeque::new();
+    // Serving the held requests: these wait for the gate.
+    let mut on_gate = false;
+    loop {
+        let req = match queue.pop_front() {
+            // Only a read goes ahead of a held request.
+            Some(r) if !held.is_empty() && r.kind != "read" => {
+                held.push_back(r);
+                continue;
+            }
+            Some(r) => r,
+            None => match held.pop_front() {
+                Some(r) => {
+                    on_gate = true;
+                    r
+                }
+                None => break,
+            },
+        };
         let parsed = parse_request(&req.kind, &req.payload);
         // A send to a worktree with no running agent wakes it first (unless the send
         // opted out); it then waits, un-begun, for idle like a queued send.
-        let wake = if matches!(parsed, Ok(Parsed::Send { wake: true, .. }))
-            && open.contains(&env.project)
-        {
+        let wake = if matches!(parsed, Ok(Parsed::Send { wake: true, .. })) && project_open {
             let drives = drives.get_or_insert_with(|| {
-                local
+                store
                     .drives_list()
                     .map(|ds| ds.into_iter().map(|d| (d.driven.clone(), d)).collect())
                     .unwrap_or_default()
             });
             let facts = GateFacts {
-                open: &open,
+                open,
                 configured: &configured,
                 drive: drives.get(&req.worktree),
                 transfer: transfer_refusal(&env.registry, &env.project, &req.worktree),
@@ -1091,8 +1776,17 @@ pub(crate) async fn run_pass(env: &Arc<DriveEnv>, gate: &DispatchGate) -> Vec<Jo
         let mut woke_but_down = None;
         let queued = match wake {
             WakeGate::Proceed { woken } => req.queue || woken,
-            WakeGate::Wait => continue,
+            WakeGate::Wait(reason) => {
+                log.waiting(&store, &req, &reason);
+                continue;
+            }
             WakeGate::Start(claim) => {
+                note_wait(
+                    &store,
+                    req.id,
+                    &wait_reason_for(&WaitFact::Woken(&req.worktree)),
+                );
+                log.outcome(&req, "job: spawned");
                 jobs.push(Box::pin(run_auto_wake(env.clone(), req, claim)));
                 continue;
             }
@@ -1101,20 +1795,55 @@ pub(crate) async fn run_pass(env: &Arc<DriveEnv>, gate: &DispatchGate) -> Vec<Jo
                 false
             }
         };
-        // A queued send waits, un-begun, until its target is idle (the hook's idle
-        // write is itself a DB change, so it fires promptly).
-        if queued && matches!(parsed, Ok(Parsed::Send { .. })) && open.contains(&env.project) {
-            let state = {
+        // A send that can't go yet waits, un-begun (see [`send_wait`]).
+        if woke_but_down.is_none() && matches!(parsed, Ok(Parsed::Send { .. })) && project_open {
+            // Checked under the gate when it is free. A busy gate holds only a send it
+            // alone keeps from going: one that waits anyway says why, gate or not.
+            let free = gate.0.try_lock().ok();
+            let mut wait = send_wait(env, &store, &mut snapshot, open, &configured, &req, queued);
+            let busy = free.is_none();
+            drop(free);
+            if busy && wait.is_none() {
+                log.waiting(&store, &req, &wait_reason_for(&WaitFact::DispatchGate));
+                if !on_gate {
+                    held.push_back(req);
+                    continue;
+                }
                 let _g = gate.0.lock().await;
-                env.send_state(&local, &mut snapshot, &req.worktree)
-            };
-            if state.as_deref() != Ok("idle") {
+                // A dispatch ran meanwhile: look again.
+                snapshot = None;
+                wait = send_wait(env, &store, &mut snapshot, open, &configured, &req, queued);
+            }
+            if let Some(reason) = wait {
+                env.recheck_time_hold(req.id, &req.worktree, env.sets(&mut snapshot));
+                log.waiting(&store, &req, &reason);
                 continue;
             }
         }
-        match local.drive_request_begin(req.id) {
-            Ok(true) => {}
-            Ok(false) => continue, // another pass took it
+        // A wake never starts on stale information: it waits for a fresh view.
+        if matches!(
+            parsed,
+            Ok(Parsed::Restart {
+                mode: RestartMode::Wake,
+                ..
+            })
+        ) && project_open
+            && env.sets(&mut snapshot).awake(&req.worktree) == Awake::Unknown
+        {
+            let hold = freshness_hold(&env.sets(&mut snapshot).views);
+            log.waiting(
+                &store,
+                &req,
+                &wait_reason_for(&WaitFact::Hold(hold, &req.worktree)),
+            );
+            continue;
+        }
+        match store.drive_request_begin(req.id) {
+            Ok(true) => log.begun += 1,
+            Ok(false) => {
+                log.outcome(&req, "skipped: taken by another pass");
+                continue;
+            }
             Err(e) => {
                 log::warn!("drive request {}: cannot begin: {e}", req.id);
                 continue;
@@ -1123,13 +1852,13 @@ pub(crate) async fn run_pass(env: &Arc<DriveEnv>, gate: &DispatchGate) -> Vec<Jo
         let track = env.runtime.track(&env.project, req.id);
         env.runtime.forget_woken(&env.project, req.id);
         if let Some(r) = woke_but_down {
-            resolve(&local, &req, &env.project, &Outcome::refused(r));
+            log.resolve(&store, &req, &Outcome::refused(r));
             continue;
         }
         let parsed = match parsed {
             Ok(p) => p,
             Err(r) => {
-                resolve(&local, &req, &env.project, &Outcome::refused(r));
+                log.resolve(&store, &req, &Outcome::refused(r));
                 continue;
             }
         };
@@ -1141,14 +1870,14 @@ pub(crate) async fn run_pass(env: &Arc<DriveEnv>, gate: &DispatchGate) -> Vec<Jo
                 ..
             }
         );
-        let drive = local.drive_get(&req.worktree).ok().flatten();
+        let drive = store.drive_get(&req.worktree).ok().flatten();
         let refusal = common_refusal(
             &req.kind,
             &env.project,
             &req.worktree,
             &req.requested_by,
             &GateFacts {
-                open: &open,
+                open,
                 configured: &configured,
                 drive: drive.as_ref(),
                 transfer: transfer_refusal(&env.registry, &env.project, &req.worktree),
@@ -1156,7 +1885,7 @@ pub(crate) async fn run_pass(env: &Arc<DriveEnv>, gate: &DispatchGate) -> Vec<Jo
             },
         );
         if let Some(r) = refusal {
-            resolve(&local, &req, &env.project, &Outcome::refused(r));
+            log.resolve(&store, &req, &Outcome::refused(r));
             continue;
         }
         let outcome = match parsed {
@@ -1164,15 +1893,13 @@ pub(crate) async fn run_pass(env: &Arc<DriveEnv>, gate: &DispatchGate) -> Vec<Jo
                 Err(r) => Outcome::refused(r),
                 Ok(prompt) => {
                     let _g = gate.0.lock().await;
-                    match env.send_state(&local, &mut snapshot, &req.worktree) {
-                        Err(e) => Outcome::refused(e),
-                        Ok(state) => match state_refusal(&state, &req.worktree) {
-                            Some(r) => Outcome::refused(r),
-                            None => {
-                                snapshot = None;
-                                deliver_send(env, &local, &req.worktree, &prompt)
-                            }
-                        },
+                    match env.send_state(&store, &mut snapshot, &req.worktree, queued) {
+                        // Only a race since the check above gets here: refuse.
+                        SendGate::Wait(r) | SendGate::Refuse(r) => Outcome::refused(r),
+                        SendGate::Ready => {
+                            snapshot = None;
+                            deliver_send(env, &store, &req, &prompt, queued)
+                        }
                     }
                 }
             },
@@ -1184,16 +1911,73 @@ pub(crate) async fn run_pass(env: &Arc<DriveEnv>, gate: &DispatchGate) -> Vec<Jo
                         req.worktree
                     )),
                     Some(claim) => {
+                        log.outcome(&req, "job: spawned");
                         jobs.push(Box::pin(run_job(env.clone(), req, p, claim, track)));
                         continue;
                     }
                 }
             }
         };
-        resolve(&local, &req, &env.project, &outcome);
+        if outcome.status == "deferred" {
+            // Back to pending at the last moment: the row says why.
+            note_wait(&store, req.id, &outcome.reason);
+            log.outcome(&req, &format!("deferred: {}", outcome.reason));
+            env.recheck_deferred();
+            // A send woken for (not `--queue`) keeps waiting like a queued one; a
+            // direct send deferred on a transient hold stays direct.
+            if queued && !req.queue {
+                env.runtime.mark_slot_wait(&env.project, req.id);
+            }
+            drop(track);
+            continue;
+        }
+        log.resolve(&store, &req, &outcome);
         drop(track);
     }
-    jobs
+    store
+}
+
+/// Why a send to `req.worktree` stays pending in this pass, `None` when it goes on
+/// (to be delivered, or refused at begin): a queued send waits until its target is
+/// ready for it; any send waits on a transient condition (herdr not up, a stale view,
+/// an agent still starting or settling) unless a common gate refuses it anyway.
+fn send_wait(
+    env: &DriveEnv,
+    store: &LocalStore,
+    snapshot: &mut Option<SessionSets>,
+    open: &HashSet<String>,
+    configured: &[String],
+    req: &DriveRequest,
+    queued: bool,
+) -> Option<String> {
+    match env.send_state(store, snapshot, &req.worktree, queued) {
+        SendGate::Ready => None,
+        SendGate::Wait(r) if queued => Some(r),
+        // No session at all: a queued send waits for one.
+        SendGate::Refuse(_) if queued => Some(wait_reason_for(&WaitFact::NotIdle {
+            worktree: &req.worktree,
+            status: "no agent",
+        })),
+        SendGate::Wait(r) => {
+            let drive = store.drive_get(&req.worktree).ok().flatten();
+            common_refusal(
+                &req.kind,
+                &env.project,
+                &req.worktree,
+                &req.requested_by,
+                &GateFacts {
+                    open,
+                    configured,
+                    drive: drive.as_ref(),
+                    transfer: transfer_refusal(&env.registry, &env.project, &req.worktree),
+                    terminated: env.sets(snapshot).terminated.contains(&req.worktree),
+                },
+            )
+            .is_none()
+            .then_some(r)
+        }
+        SendGate::Refuse(_) => None,
+    }
 }
 
 /// What a send does about waking its target in this pass.
@@ -1201,8 +1985,8 @@ enum WakeGate {
     /// Go on to the send path; `woken` when the target was woken for this send, so it
     /// waits for idle like a queued send.
     Proceed { woken: bool },
-    /// Leave the send pending (a wake is in flight, or just finished).
-    Wait,
+    /// Leave the send pending (a wake is in flight, or just finished), for this reason.
+    Wait(String),
     /// The target was woken for this send and is down again: refuse it.
     Refuse(String),
     /// Wake the target now, holding its reset/swap slot.
@@ -1221,33 +2005,48 @@ fn wake_gate(
     let (rt, project, wt) = (&env.runtime, env.project.as_str(), req.worktree.as_str());
     let mark = rt.wake_mark(project, req.id);
     let gated = common_refusal(&req.kind, project, wt, &req.requested_by, facts);
-    if gated.is_some() || sets.awake(&env.key(wt)) {
+    let awake = sets.awake(wt);
+    if gated.is_some() || awake == Awake::Yes {
         return WakeGate::Proceed {
             woken: mark.is_some(),
         };
     }
+    // No fresh view: never wake on stale information.
+    if awake == Awake::Unknown {
+        return WakeGate::Wait(wait_reason_for(&WaitFact::Hold(
+            freshness_hold(&sets.views),
+            wt,
+        )));
+    }
     // A reset, swap or wake holds the slot (this send's own wake, still running, or
     // another request's): wait for it. Waiting isn't waking, so it doesn't start this
-    // send's grace period; the holder's end is a DB write or a scheduled pass.
-    let Some(claim) = rt.claim_worktree(project, wt) else {
+    // send's grace period; the holder's end is a DB write or a scheduled pass. The
+    // slot is only claimed to start a wake: a claim given up again asks for a pass.
+    let slot_wait = || {
         rt.mark_slot_wait(project, req.id);
-        return WakeGate::Wait;
+        WakeGate::Wait(wait_reason_for(&WaitFact::SlotHeld))
     };
+    if rt.slot_held(project, wt) {
+        return slot_wait();
+    }
     match mark {
         // Woken a moment ago: give the live set a moment to show the new session, and
         // make sure a pass comes back once that moment is over.
         Some(WakeMark { own: true, at }) if at.elapsed() < env.timeouts.send_settle => {
             env.recheck_after_settle(req.id, at);
-            WakeGate::Wait
+            WakeGate::Wait(wait_reason_for(&WaitFact::Woken(wt)))
         }
         Some(WakeMark { own: true, .. }) => WakeGate::Refuse(format!(
             "@{wt} was woken but its agent did not come up; check its pane"
         )),
         // Not woken for this send yet (at most it waited on another request): wake it.
-        _ => {
-            rt.mark_woken(project, req.id);
-            WakeGate::Start(claim)
-        }
+        _ => match rt.claim_worktree(project, wt) {
+            Some(claim) => {
+                rt.mark_woken(project, req.id);
+                WakeGate::Start(claim)
+            }
+            None => slot_wait(),
+        },
     }
 }
 
@@ -1275,31 +2074,152 @@ async fn run_auto_wake(env: Arc<DriveEnv>, req: DriveRequest, _claim: InFlightGu
     }
 }
 
+/// Why a fresh `agent list` read forbids typing a prompt now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FreshHold {
+    /// The pending reason a deferred queued send carries.
+    pub wait: String,
+    /// herdr's status as the refusal names it (`starting` for an agent not ready yet).
+    pub status: String,
+    /// A passing condition (an agent still starting, or a view not yet settled at
+    /// this read's seq): any send waits it out, as the pre-delivery gate's waits do.
+    /// Otherwise the agent is busy and only a queued send waits.
+    pub transient: bool,
+}
+
+/// Pure: whether the target may take a prompt now, from a fresh read `obs` and the
+/// engine's `view`. It must be `idle`/`done`, launched and input-ready, and the view
+/// must be a fresh settled idle at the very same `state_change_seq` (nothing moved
+/// between the settled view and this read).
+pub(crate) fn fresh_read_hold(obs: &AgentObs, view: &KeyView, worktree: &str) -> Option<FreshHold> {
+    let status = if obs.launch_pending || obs.interactive_ready == Some(false) {
+        "starting"
+    } else {
+        obs.agent_status.as_str()
+    };
+    if !matches!(status, "idle" | "done") {
+        return Some(FreshHold {
+            wait: wait_reason_for(&WaitFact::NotIdle { worktree, status }),
+            status: status.to_string(),
+            transient: status == "starting",
+        });
+    }
+    let settled_here = match view {
+        KeyView::View(v) => {
+            !v.stale
+                && v.is_idle_settled()
+                && v.state_change_seq == i64::try_from(obs.state_change_seq).ok()
+        }
+        KeyView::NotReady | KeyView::Missing => false,
+    };
+    (!settled_here).then(|| FreshHold {
+        wait: wait_reason_for(&WaitFact::Hold(Hold::Unsettled, worktree)),
+        status: status.to_string(),
+        transient: true,
+    })
+}
+
+/// Pure: the baseline a delivery is judged against, from the fresh read `obs`.
+pub(crate) fn baseline_of(obs: &AgentObs, delivered_at_ms: i64) -> Baseline {
+    Baseline {
+        agent: obs.agent.clone(),
+        pane_id: obs.pane_id.clone(),
+        terminal_id: obs.terminal_id.clone(),
+        agent_session: obs.agent_session.clone(),
+        state_change_seq: obs.state_change_seq,
+        completion_seq: obs.completion_seq,
+        status: obs.agent_status.clone(),
+        delivered_at_ms,
+    }
+}
+
 /// Write a sanitised prompt into an idle session (the caller holds the dispatch gate).
-/// `awaiting_turn` is set before the write so a fast Stop can't be missed, and
-/// restored if the prompt wasn't submitted. A delivered send holds the worktree busy
-/// until its turn is seen starting.
-fn deliver_send(env: &DriveEnv, local: &LocalStore, worktree: &str, prompt: &Prompt) -> Outcome {
+///
+/// A fresh `agent list` read right before typing must still show the target settled
+/// idle and input-ready; otherwise the send goes back to `pending`
+/// ([`Outcome::deferred`]) when it is `queued` or the hold is transient, and is
+/// refused when the agent is busy. The read becomes the
+/// delivery's [`Baseline`], stored with a new `delivery_id` and `awaiting_turn` in one
+/// write before the prompt is typed (so a fast Stop can't be missed) and put back if
+/// the prompt wasn't submitted. A delivered send holds the worktree busy until its
+/// turn is seen starting.
+fn deliver_send(
+    env: &DriveEnv,
+    local: &LocalStore,
+    req: &DriveRequest,
+    prompt: &Prompt,
+    queued: bool,
+) -> Outcome {
+    let worktree = req.worktree.as_str();
     let key = env.key(worktree);
-    let previous = local
-        .drive_get(worktree)
-        .ok()
-        .flatten()
-        .and_then(|d| d.awaiting_turn);
-    let turn = match local.drive_set_awaiting_turn(worktree) {
-        Ok(Some(n)) => n,
+    let obs = match env.backend.agent_snapshot(&key) {
+        Ok(Some(o)) if o.agent.is_some() => o,
+        Ok(_) => {
+            let hooks = env.hook_rows();
+            let detail = refusal_detail(None, hooks.get(worktree), keitora_tasks::now_ms());
+            return Outcome::refused(
+                state_refusal("offline", worktree, &detail).unwrap_or_default(),
+            );
+        }
+        Err(e) => {
+            let detail = injection_detail(&Err(e), env.terminated(worktree));
+            return Outcome::refused(format!("could not send to @{worktree} ({detail})"));
+        }
+    };
+    if let Some(hold) = fresh_read_hold(&obs, &env.engine.view(&key), worktree) {
+        if !queued && !hold.transient {
+            return Outcome::refused(format!(
+                "@{worktree} changed state just before delivery (herdr: {}); use --queue to wait",
+                hold.status
+            ));
+        }
+        return match local.drive_request_requeue(req.id) {
+            Ok(true) => Outcome::deferred(hold.wait),
+            Ok(false) => Outcome::refused(format!("request {} is no longer running", req.id)),
+            Err(e) => Outcome::refused(format!("could not requeue the send: {e}")),
+        };
+    }
+    // Put back if the prompt isn't submitted; unreadable means it couldn't be.
+    let previous = match local.drive_delivery_get(worktree) {
+        Ok(p) => p,
+        Err(e) => return Outcome::refused(format!("could not read the delivery: {e}")),
+    };
+    let baseline = baseline_of(&obs, keitora_tasks::now_ms());
+    let (turn, delivery_id) = match local.drive_begin_delivery(worktree, &baseline) {
+        Ok(Some(v)) => v,
         Ok(None) => return Outcome::refused(format!("@{worktree} is not driven")),
         Err(e) => return Outcome::refused(format!("could not record the turn: {e}")),
     };
+    let restore = || {
+        if let Some(prev) = &previous {
+            let _ = local.drive_restore_delivery(prev);
+        }
+    };
     let delay = SUBMIT_DELAY.as_millis() as u32;
     let restore_and_refuse = |result: &Result<(), crate::backend::PtyBackendError>| {
-        let _ = local.drive_restore_awaiting_turn(worktree, previous);
+        restore();
         let detail = injection_detail(result, env.terminated(worktree));
         Outcome::refused(format!("could not send to @{worktree} ({detail})"))
     };
     let applied = || {
-        env.runtime.mark_sent(&env.project, worktree, turn);
-        Outcome::applied(serde_json::json!({ "awaiting_turn": turn }).to_string())
+        env.runtime.mark_sent(
+            &env.project,
+            worktree,
+            delivery_id,
+            baseline.state_change_seq,
+        );
+        env.engine.note_delivery(&key);
+        log::info!(
+            "drive: delivered to @{worktree} delivery {delivery_id} (herdr {} scs {} cs {})",
+            baseline.status,
+            baseline.state_change_seq,
+            baseline
+                .completion_seq
+                .map_or_else(|| "-".to_string(), |c| c.to_string()),
+        );
+        Outcome::applied(
+            serde_json::json!({ "awaiting_turn": turn, "delivery_id": delivery_id }).to_string(),
+        )
     };
     match prompt {
         Prompt::Line(line) => {
@@ -1319,7 +2239,7 @@ fn deliver_send(env: &DriveEnv, local: &LocalStore, worktree: &str, prompt: &Pro
             match map_write_line_result(&enter) {
                 WriteLineOutcome::Dispatched => applied(),
                 _ => {
-                    let _ = local.drive_restore_awaiting_turn(worktree, previous);
+                    restore();
                     let detail = injection_detail(&enter, env.terminated(worktree));
                     Outcome::refused(format!(
                         "pasted but could not submit to @{worktree} ({detail}); \
@@ -1399,7 +2319,7 @@ async fn run_restart(
         Ok(t) => t,
         Err(r) => return Outcome::refused(r),
     };
-    if mode == RestartMode::Wake && env.awake(wt) {
+    if mode == RestartMode::Wake && env.awake(wt) == Awake::Yes {
         let current = env.host.current_cli(&env.project, &env.config, wt);
         return match to {
             Some(c) if c != current => Outcome::refused(format!(
@@ -1442,17 +2362,14 @@ async fn relaunch(
         _ => false,
     };
     let now_on = to.unwrap_or(previous);
-    if changed {
-        // Before the restart: the new provider must find its hooks and trust in place.
+    // The restart spawns the persisted provider, and the spawn writes its hooks
+    // before the agent starts. herdr's integration for a provider found late is
+    // installed here, before the restart, only on a switch onto it (as a window
+    // switch does): a plain reset or wake of a worktree already on it skips this.
+    if changed && now_on.spec().integration_on_switch {
         let host = env.host.clone();
-        let config = env.config.clone();
-        let worktree = wt.to_string();
-        let prepared = tokio::task::spawn_blocking(move || {
-            host.prepare_launch(&config, &worktree, now_on);
-        })
-        .await;
-        if let Err(e) = prepared {
-            log::warn!("drive reset: preparing @{wt} for {now_on:?} panicked: {e}");
+        if let Err(e) = tokio::task::spawn_blocking(move || host.refresh_integration()).await {
+            log::warn!("drive reset: refreshing herdr's integration for @{wt} panicked: {e}");
         }
     }
 
@@ -1582,27 +2499,26 @@ async fn run_swap(env: &DriveEnv, req: &DriveRequest, to: &str) -> Outcome {
 }
 
 /// Execute `project`'s pending drive requests. `project` is a resolved
-/// `[project].name` from the registry; the tasks-DB watchers call this (through
-/// `dispatch::spawn_pending_requests`) when they see a pending row. Safe to run
-/// concurrently with itself: each row is taken with a compare-and-set.
+/// `[project].name` from the registry; a requested pass (see
+/// [`DriveRuntime::request_pass`]) runs this when it is due. Safe to run concurrently
+/// with itself: each row is taken with a compare-and-set.
 pub(crate) async fn run_drive_requests<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     project: String,
+    trigger: Trigger,
 ) {
     use tauri::Manager;
 
-    let (Some(client), Some(gate), Some(registry), Some(runtime)) = (
+    let (Some(client), Some(gate), Some(registry), Some(runtime), Some(engine)) = (
         app.try_state::<SharedBackend>(),
         app.try_state::<DispatchGate>(),
         app.try_state::<TransferRegistry>(),
         app.try_state::<DriveRuntime>(),
+        app.try_state::<SharedEngine>(),
     ) else {
         return; // still starting up; the next DB event retries
     };
-    let Some(config) = keitora_tasks::UserConfig::load()
-        .ok()
-        .and_then(|u| u.project_config_by_name(&project))
-    else {
+    let Some(config) = crate::project_stores::registry().by_name(&project).cloned() else {
         log::warn!("drive requests: project {project} is not registered");
         return;
     };
@@ -1615,8 +2531,9 @@ pub(crate) async fn run_drive_requests<R: tauri::Runtime>(
         runtime: runtime.inner().clone(),
         host: Arc::new(TauriHost(app.clone())),
         timeouts: Timeouts::default(),
+        engine: engine.inner().clone(),
     });
-    for job in run_pass(&env, &gate).await {
+    for job in run_pass(&env, &gate, trigger).await {
         tauri::async_runtime::spawn(job);
     }
 }
@@ -1764,32 +2681,115 @@ pub fn drive_request_resolve(
     runtime.report(&project, request_id, &outcome, reason)
 }
 
-/// The window's open (warm) projects, by resolved name. When the set changes, every
-/// registered project's pending requests get another pass.
+/// The window's open (warm) projects, by resolved name. The engine polls warm while
+/// any is open. A first report (also the first after the window closed) or a changed
+/// one gives every registered project with pending requests a pass.
 #[tauri::command(async)]
 pub fn drive_set_open_projects(
-    app: tauri::AppHandle,
     projects: Vec<String>,
     runtime: State<'_, DriveRuntime>,
+    engine: State<'_, SharedEngine>,
 ) -> Result<(), String> {
-    if runtime.set_open(projects) {
-        retrigger_pending(&app);
-    }
+    let registry = crate::project_stores::registry();
+    report_open_projects(
+        &runtime,
+        &engine,
+        projects,
+        registry.projects.iter().map(|(_, pc)| pc),
+        &crate::project_stores::shared(),
+    );
     Ok(())
 }
 
-/// Give every registered project's pending requests a pass.
-fn retrigger_pending<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    let Ok(user) = keitora_tasks::UserConfig::load() else {
-        return;
+/// Take the window's report: store the set, then, unless it is unchanged, ask for a
+/// pass over every one of `registered` with pending requests.
+pub(crate) fn report_open_projects<'a>(
+    runtime: &DriveRuntime,
+    engine: &SharedEngine,
+    projects: Vec<String>,
+    registered: impl Iterator<Item = &'a ProjectConfig>,
+    stores: &crate::project_stores::ReadStores,
+) -> OpenChange {
+    let change = set_open_projects(runtime, engine, projects);
+    log::debug!("drive: window reported its open projects ({change:?})");
+    if change != OpenChange::Same {
+        request_pending_passes_in(runtime, registered, stores, |_| true, Trigger::OpenSet);
+    }
+    change
+}
+
+/// Store the window's open projects and set the engine's warm cadence from them.
+fn set_open_projects(
+    runtime: &DriveRuntime,
+    engine: &SharedEngine,
+    projects: Vec<String>,
+) -> OpenChange {
+    engine.set_window_open(!projects.is_empty());
+    runtime.set_open(projects)
+}
+
+/// Pure: whether a view change can let a waiting request go: the view appeared or
+/// went away, settled, its agent came up, it left `busy`/`waiting`, or it turned
+/// fresh.
+pub(crate) fn could_unblock(c: &ViewChange) -> bool {
+    let (Some(prev), Some(next)) = (&c.prev, &c.next) else {
+        return true;
     };
-    for pref in user.projects.values().filter(|p| p.path.is_dir()) {
-        let Ok(pc) = keitora_tasks::effective_config(pref) else {
-            continue;
+    (next.settled && !prev.settled)
+        || (prev.agent != "present" && next.agent == "present")
+        || (matches!(prev.state.as_str(), "busy" | "waiting")
+            && !matches!(next.state.as_str(), "busy" | "waiting"))
+        || (prev.stale && !next.stale)
+}
+
+/// Ask for a pass over each project whose pending requests an engine change could
+/// unblock: a view change of a worktree with a pending request (see
+/// [`could_unblock`]), or, for a link or readiness change (an empty batch, which
+/// covers a project with no session at all), every project with pending requests.
+/// Cheap: no store access on the status loop's thread.
+pub(crate) fn watch_engine(engine: &SharedEngine, runtime: &DriveRuntime) {
+    let rt = runtime.clone();
+    engine.subscribe(Box::new(move |changes| {
+        let mut projects: Vec<String> = if changes.is_empty() {
+            rt.pending_projects()
+        } else {
+            changes
+                .iter()
+                .filter(|c| rt.has_pending_for(&c.key.project, &c.key.worktree) && could_unblock(c))
+                .map(|c| c.key.project.clone())
+                .collect()
         };
-        // Read-only: a project whose DB doesn't exist yet has nothing pending.
-        if let Ok(local) = LocalStore::open_read_only(&pc.tasks.db_path.to_string_lossy()) {
-            crate::dispatch::spawn_pending_requests(app, &local, &pc.project.name);
+        projects.sort();
+        projects.dedup();
+        for p in projects {
+            rt.request_pass(&p, Duration::ZERO, Trigger::Engine);
+        }
+    }));
+}
+
+/// Ask for a pass over every one of `projects` that `which` accepts and has pending
+/// drive or dispatch requests (read through `stores`' shared read-only handles,
+/// status only, so a DB of any age works and a missing one has nothing pending).
+pub(crate) fn request_pending_passes_in<'a>(
+    runtime: &DriveRuntime,
+    projects: impl Iterator<Item = &'a ProjectConfig>,
+    stores: &crate::project_stores::ReadStores,
+    which: impl Fn(&str) -> bool,
+    why: Trigger,
+) {
+    for pc in projects {
+        let project = &pc.project.name;
+        if !which(project) {
+            continue;
+        }
+        let pending = stores
+            .with(&pc.tasks.db_path, |rs| {
+                Ok(rs.store.drive_requests_has_pending()?
+                    || rs.store.dispatch_requests_has_pending()?)
+            })
+            .unwrap_or(false);
+        if pending {
+            runtime.request_pass(project, Duration::ZERO, why);
         }
     }
 }

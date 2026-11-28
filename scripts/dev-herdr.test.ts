@@ -12,6 +12,7 @@ import {
   discoverHerdrBin,
   herdrDevEnv,
   herdrDevPaths,
+  inheritedHerdrVars,
   isolationVerdict,
   isWithin,
   mayStopOnTeardown,
@@ -297,6 +298,72 @@ describe("herdrDevEnv", () => {
     const base = { KEITORA_CONFIG_HOME: "/real/config" };
     herdrDevEnv(base, opts);
     expect(base.KEITORA_CONFIG_HOME).toBe("/real/config");
+  });
+
+  it("strips every inherited HERDR_* variable, case-insensitively", () => {
+    const env = herdrDevEnv(
+      {
+        HERDR_SOCKET_PATH: "/outer/herdr.sock",
+        herdr_session: "outer",
+        HERDR_PANE_ID: "p1",
+        HERDR_CLIENT_SOCKET_PATH: "/outer/client.sock",
+      },
+      opts,
+    );
+    const herdrKeys = Object.keys(env).filter((k) => /^HERDR_/i.test(k));
+    expect(herdrKeys).toEqual(["HERDR_CONFIG_PATH"]);
+  });
+
+  it("replaces an inherited HERDR_CONFIG_PATH with the isolated one", () => {
+    const env = herdrDevEnv(
+      { HERDR_CONFIG_PATH: "/real/config.toml", herdr_config_path: "/real/lower.toml" },
+      opts,
+    );
+    const norm = (p: string) => p.replace(/\\/g, "/");
+    expect(norm(env.HERDR_CONFIG_PATH)).toBe("/dev/home-herdr/herdr/config/herdr/config.toml");
+    expect(env.herdr_config_path).toBeUndefined();
+  });
+
+  it("leaves KEITORA_HERDR_BIN and unrelated variables alone", () => {
+    const env = herdrDevEnv(
+      { PATH: "/usr/bin", FOO: "bar", NOT_HERDR_X: "keep", KEITORA_HERDR_BIN: "/real/herdr" },
+      opts,
+    );
+    expect(env.PATH).toBe("/usr/bin");
+    expect(env.FOO).toBe("bar");
+    expect(env.NOT_HERDR_X).toBe("keep");
+    // Overridden by the isolated bin, never stripped as a HERDR_* name.
+    expect(env.KEITORA_HERDR_BIN).toBe("/opt/herdr/herdr");
+  });
+
+  it("does not mutate the base environment when stripping", () => {
+    const base = { HERDR_SOCKET_PATH: "/outer/herdr.sock", HERDR_CONFIG_PATH: "/real/config.toml" };
+    herdrDevEnv(base, opts);
+    expect(base).toEqual({ HERDR_SOCKET_PATH: "/outer/herdr.sock", HERDR_CONFIG_PATH: "/real/config.toml" });
+  });
+});
+
+describe("inheritedHerdrVars", () => {
+  it("lists sorted names only", () => {
+    const names = inheritedHerdrVars({
+      HERDR_SOCKET_PATH: "/outer/herdr.sock",
+      herdr_session: "secret-value",
+      HERDR_PANE_ID: "p1",
+    });
+    expect(names).toEqual(["HERDR_PANE_ID", "HERDR_SOCKET_PATH", "herdr_session"]);
+    expect(names.join(",")).not.toContain("secret-value");
+  });
+
+  it("ignores HERDR_CONFIG_PATH and non-prefixed names", () => {
+    expect(
+      inheritedHerdrVars({
+        HERDR_CONFIG_PATH: "/x",
+        Herdr_Config_Path: "/y",
+        KEITORA_HERDR_BIN: "/z",
+        NOT_HERDR_X: "1",
+        PATH: "/usr/bin",
+      }),
+    ).toEqual([]);
   });
 });
 

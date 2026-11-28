@@ -1,0 +1,5 @@
+{"type":"mode","mode":"normal","sessionId":"00000000-0000-4000-8000-000000000001"}
+{"type":"file-history-snapshot","messageId":"m-0","snapshot":{}}
+{"type":"user","timestamp":"2026-01-01T00:00:10.000Z","sessionId":"00000000-0000-4000-8000-000000000001","cwd":"/Users/me/proj","isSidechain":false,"message":{"role":"user","content":"think, then say ok"}}
+{"type":"assistant","timestamp":"2026-01-01T00:00:11.000Z","sessionId":"00000000-0000-4000-8000-000000000001","cwd":"/Users/me/proj","isSidechain":false,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"hidden","signature":"sig"}]}}
+{"type":"assistant","timestamp":"2026-01-01T00:00:12.000Z","sessionId":"00000000-0000-4000-8000-000000000001","cwd":"/Users/me/proj","isSidechain":false,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"more","signature":"sig"},{"type":"text","text":"ok"}]}}

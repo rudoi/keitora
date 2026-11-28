@@ -320,6 +320,21 @@ export function seedDemoRegistryToml(projects) {
   return lines.join("\n");
 }
 
+const HERDR_PREFIX = /^HERDR_/i;
+const PINNED_CONFIG_PATH = /^HERDR_CONFIG_PATH$/i;
+
+/**
+ * The inherited `HERDR_*` variable names in `base` (ASCII case-insensitive, since Windows
+ * env names are), sorted, minus `HERDR_CONFIG_PATH`, which the isolated env sets itself.
+ * A process started from inside a herdr pane carries these, and they let herdr reach the
+ * OUTER server whatever `XDG_*` says. Names only, never values. Pure.
+ */
+export function inheritedHerdrVars(base) {
+  return Object.keys(base)
+    .filter((name) => HERDR_PREFIX.test(name) && !PINNED_CONFIG_PATH.test(name))
+    .sort();
+}
+
 /**
  * The environment the isolated herdr dev app runs under. Pure and exported so the
  * isolation contract is asserted in tests, not just observed by running the app.
@@ -333,8 +348,16 @@ export function herdrDevEnv(base, { keitoraHome, configHome, herdrBin }) {
   // CLI call from this script (notably the `server stop` on teardown) targets the
   // isolated server and never the user's real one.
   const herdrHome = join(keitoraHome, "herdr");
+  // Drop every inherited HERDR_* (any case) so nothing points herdr at the outer server;
+  // HERDR_CONFIG_PATH is dropped too so an odd-cased copy cannot shadow the pinned one.
+  // This JS strip covers the launcher's own spawnSync herdr calls; the app strips again in HerdrEnv.
+  const cleaned = { ...base };
+  for (const name of inheritedHerdrVars(base)) delete cleaned[name];
+  for (const name of Object.keys(cleaned)) {
+    if (PINNED_CONFIG_PATH.test(name)) delete cleaned[name];
+  }
   return {
-    ...base,
+    ...cleaned,
     KEITORA_HOME: keitoraHome,
     KEITORA_CONFIG_HOME: configHome,
     KEITORA_HERDR_BIN: herdrBin,
@@ -535,6 +558,10 @@ function main() {
     configHome: p.configHome,
     herdrBin,
   });
+  const stripped = inheritedHerdrVars(process.env);
+  if (stripped.length > 0) {
+    console.log(`[dev:herdr] stripped inherited herdr env: ${stripped.join(", ")}`);
+  }
   const herdrHome = join(p.keitoraHome, "herdr");
   const verdict = isolationVerdict(herdrStatus(herdrBin, isolatedEnv), herdrHome);
   if (!verdict.ok) {
@@ -638,6 +665,22 @@ function main() {
     );
   }
   console.log("[dev:herdr] ISOLATED: no real project registered, herdr state purged.");
+
+  // Re-check isolation right before the app starts: the build and Vite wait above take
+  // minutes, and a server could have appeared meanwhile. `shutdown` is deliberately not
+  // used here: nothing of ours runs yet, and its `server stop` must never hit a server we
+  // cannot prove is ours.
+  const recheck = isolationVerdict(herdrStatus(herdrBin, isolatedEnv), herdrHome);
+  if (!recheck.ok) {
+    console.error(`[dev:herdr] refusing to launch (re-check): ${recheck.reason}.`);
+    // Only the Vite child this run spawned is stopped (never whatever else holds :1420),
+    // and no herdr server is touched.
+    console.error(
+      "[dev:herdr] the app was not started; stopped only the Vite server this run started, no herdr server.",
+    );
+    vite.kill();
+    process.exit(1);
+  }
 
   // The agents inherit the app's environment (through the herdr server it starts).
   const app = spawn(appBin, [], {

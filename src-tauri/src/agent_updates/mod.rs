@@ -24,6 +24,7 @@ use tauri::{AppHandle, Manager};
 use crate::activity::lock;
 use crate::backend::herdr::recovery::Phase;
 use crate::backend::{EmitSink, PtyBackend, SessionKey, SharedBackend};
+use crate::engine::SessionEngine;
 use model::{AgentUpdateState, InstallKind, RunOutcome, ShellFamily, UpdateCommand};
 use probe::{MachineProber, Prober};
 
@@ -623,19 +624,16 @@ fn pane_shell_family(
     Ok(fallback)
 }
 
-/// The live sessions whose agent is `cli` (never the reserved pane). The user config is
-/// loaded once for every key.
-pub fn live_sessions(backend: &SharedBackend, cli: CliKind) -> Result<Vec<SessionKey>, String> {
-    let sessions = backend.list_sessions().map_err(|e| e.to_string())?;
+/// The sessions whose agent is `cli` and runs now, as the engine answers it (present
+/// or starting; every live pane while it has no fresh answer, so nothing is missed),
+/// never the reserved pane. The user config is loaded once for every key.
+pub fn live_sessions(engine: &SessionEngine, cli: CliKind) -> Result<Vec<SessionKey>, String> {
+    let keys = engine.running_keys_or_all_live()?;
     let user = UserConfig::load().ok();
-    Ok(model::sessions_of(
-        sessions.into_iter().map(|s| s.key),
-        cli,
-        |k| {
-            let user = user.as_ref()?;
-            crate::host::launch_for(user, k).map(|(_, launch)| launch.cli)
-        },
-    ))
+    Ok(model::sessions_of(keys, cli, |k| {
+        let user = user.as_ref()?;
+        crate::host::launch_for(user, k).map(|(_, launch)| launch.cli)
+    }))
 }
 
 /// Watch `ticket`'s run in the reserved pane on its own thread.

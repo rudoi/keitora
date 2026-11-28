@@ -6,6 +6,7 @@ import {
   escalationBody,
   isWorktreeFocused,
   latchIdleFromTurn,
+  latchState,
   needsInput,
   nextAcknowledged,
   projectChanged,
@@ -37,6 +38,55 @@ describe("latchIdleFromTurn", () => {
 
   it("clears the latch when the session goes offline", () => {
     expect(latchIdleFromTurn("idle", "offline", true)).toBe(false);
+  });
+});
+
+describe("latch guard (latchState into latchIdleFromTurn)", () => {
+  const ws = (state: SessionState, starting?: boolean) => ({
+    state,
+    agent: starting ? ("starting" as const) : undefined,
+  });
+  /** Step the latch across states, the way useAttention does after its seed. */
+  const run = (steps: { state: SessionState; agent?: "starting" }[]): boolean => {
+    let prev: SessionState | undefined;
+    let latch = false;
+    for (const s of steps) {
+      latch = latchIdleFromTurn(prev, latchState(s), latch);
+      prev = latchState(s);
+    }
+    return latch;
+  };
+
+  it("maps a starting agent to offline and leaves the rest alone", () => {
+    expect(latchState(ws("busy", true))).toBe("offline");
+    expect(latchState(ws("busy", false))).toBe("busy");
+    expect(latchState(ws("busy"))).toBe("busy");
+    expect(latchState(ws("idle"))).toBe("idle");
+  });
+
+  it("a first-seen idle only seeds", () => {
+    expect(latchIdleFromTurn(undefined, "idle", false)).toBe(false);
+    expect(run([ws("idle")])).toBe(false);
+  });
+
+  it("an offline -> idle lift does not latch", () => {
+    expect(latchIdleFromTurn("offline", "idle", false)).toBe(false);
+    expect(run([ws("offline"), ws("idle")])).toBe(false);
+  });
+
+  it("starting -> idle does not latch", () => {
+    expect(run([ws("busy", true), ws("busy", true), ws("idle")])).toBe(false);
+  });
+
+  it("a stale view keeps its last state, so it causes no transition", () => {
+    // The engine holds the last state while stale; the first fresh view compares to it.
+    expect(run([ws("idle"), ws("idle"), ws("idle")])).toBe(false);
+    expect(run([ws("busy"), ws("busy"), ws("busy")])).toBe(false);
+  });
+
+  it("a real busy -> idle of a started agent still latches", () => {
+    expect(run([ws("busy", true), ws("busy"), ws("idle")])).toBe(true);
+    expect(run([ws("busy"), ws("idle")])).toBe(true);
   });
 });
 

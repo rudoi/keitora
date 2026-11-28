@@ -138,6 +138,20 @@ export function openProjectsFromKey(key: string): string[] {
   return key === "" ? [] : key.split("\n");
 }
 
+/** Report `projects` as this window's open set through `send`. A failed report is
+ *  logged (never swallowed): until one lands, the runner leaves requests waiting. */
+export async function reportOpenProjects(
+  projects: string[],
+  send: (projects: string[]) => Promise<void>,
+  warn: (msg: string, err: unknown) => void = console.warn,
+): Promise<void> {
+  try {
+    await send(projects);
+  } catch (err) {
+    warn("couldn't report the open projects to the request runner", err);
+  }
+}
+
 export interface DriveEventDeps {
   /** The live warm registry (read at event time, never a stale closure). */
   warm: () => WarmState;

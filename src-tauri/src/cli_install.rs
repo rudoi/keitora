@@ -90,6 +90,10 @@ pub fn locate_installable(main_worktree: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Whether the app refreshes the managed CLI in place: the Windows copy goes stale
+/// when the app updates; the unix symlink always points at the bundled CLI.
+pub const REFRESHES_MANAGED_COPY: bool = cfg!(windows);
+
 /// The managed location of the CLI on PATH: the `~/.local/bin/keitora` symlink on
 /// unix, and on Windows the copy the app mirrors to
 /// `%LOCALAPPDATA%/keitora/bin/keitora.exe` (see `keitora_tasks::windows_keitora_bin_dir`).

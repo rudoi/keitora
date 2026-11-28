@@ -15,13 +15,12 @@ import {
 } from "../lib/ipc";
 import { cliTitle, parseCliKind } from "../lib/providers";
 import { useDaemonStatus } from "../lib/sessions";
+import { sectionTitle } from "../lib/settingsStyles";
 import { errorText } from "../lib/updates";
 import { useDeps, useDepsInstall } from "./DepsProvider";
 import { browseForHerdr, copyDepsDetails, ManualCommands } from "./DepsStep";
 import { RestartDaemonDialog } from "./RestartDaemonDialog";
 import { useToast } from "./Toast";
-
-const sectionTitle = "text-[12px] font-semibold uppercase tracking-wide text-tx-2";
 
 const TONE: Record<SettingsRow["tone"], string> = {
   ok: "text-tx-3",

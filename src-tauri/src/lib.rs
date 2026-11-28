@@ -21,21 +21,28 @@ mod deps;
 mod diff;
 mod dispatch;
 mod drive;
+mod engine;
 mod global_writes;
 mod headroom;
+mod health;
 mod hooks;
 mod host;
 mod latency_probe;
 mod lifecycle;
+mod locks;
 mod logging;
 mod paths;
 mod perf;
+mod pipeline;
+mod project_stores;
 mod session_toast;
 mod tasks;
 mod terminal_links;
+mod transcript;
 mod transfer;
 mod transfer_registry;
 mod updater;
+mod watchers;
 mod worktree_open;
 
 /// Desktop entry: the full host app (PTY backend, board, dispatch, watchers).

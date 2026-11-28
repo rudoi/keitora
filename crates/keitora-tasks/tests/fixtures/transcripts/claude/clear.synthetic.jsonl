@@ -1,0 +1,7 @@
+{"type":"mode","mode":"normal","sessionId":"00000000-0000-4000-8000-000000000001"}
+{"type":"file-history-snapshot","messageId":"m-0","snapshot":{}}
+{"type":"user","timestamp":"2026-01-01T00:00:01.000Z","sessionId":"00000000-0000-4000-8000-000000000001","cwd":"/Users/me/proj","isSidechain":false,"message":{"role":"user","content":"first question"}}
+{"type":"assistant","timestamp":"2026-01-01T00:00:02.000Z","sessionId":"00000000-0000-4000-8000-000000000001","cwd":"/Users/me/proj","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"old answer"}]}}
+{"type":"system","subtype":"local_command","timestamp":"2026-01-01T00:00:05.000Z","commandRun":{"command":"clear","args":""}}
+{"type":"user","timestamp":"2026-01-01T00:00:10.000Z","sessionId":"00000000-0000-4000-8000-000000000001","cwd":"/Users/me/proj","isSidechain":false,"message":{"role":"user","content":"say hello"}}
+{"type":"assistant","timestamp":"2026-01-01T00:00:11.000Z","sessionId":"00000000-0000-4000-8000-000000000001","cwd":"/Users/me/proj","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}

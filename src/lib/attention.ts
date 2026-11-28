@@ -3,7 +3,7 @@ import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notif
 import { useEffect, useRef, useState } from "react";
 import type { View } from "../components/TopBar";
 import { notifySession } from "./ipc";
-import type { SessionState, WorktreeSession } from "./sessions";
+import { isStarting, type SessionState, type WorktreeSession } from "./sessions";
 import type { TaskWithDeps } from "./tasks";
 
 // macOS silently routes a *foreground* app's OS notifications to Notification Center
@@ -40,6 +40,16 @@ export function latchIdleFromTurn(
   if (next === "busy" || next === "offline") return false;
   if (next === "idle" && (prev === "busy" || prev === "waiting")) return true;
   return was;
+}
+
+/**
+ * The state a session feeds to the turn latch. A launching agent reads `busy`, but no turn
+ * is running, so it feeds `offline`: the idle that follows its launch never latches
+ * "finished". Every other session feeds its own state.
+ * Mirrors `latch_input_state` in `src-tauri/src/bg_notifier.rs`.
+ */
+export function latchState(s: Pick<WorktreeSession, "state" | "agent">): SessionState {
+  return isStarting(s) ? "offline" : s.state;
 }
 
 /** The facts of a session's drive that decide whether it needs the human. */
@@ -201,7 +211,8 @@ export function useAttention(
   showInAppBanner: (worktree: string, body: string) => void,
   activeProject: string | null = null,
 ): Map<string, AttentionKind> {
-  // Previous state per worktree; null until the first non-empty snapshot is seeded.
+  // Previous latch input (`latchState`) per worktree; null until the first non-empty
+  // snapshot is seeded.
   const prevRef = useRef<Map<string, SessionState> | null>(null);
   // idleFromTurn latch per worktree (see latchIdleFromTurn).
   const latchRef = useRef<Map<string, boolean>>(new Map());
@@ -272,7 +283,7 @@ export function useAttention(
       const seed = new Map<string, SessionState>();
       const kinds = new Map<string, AttentionKind>();
       for (const [name, s] of sessions) {
-        seed.set(name, s.state);
+        seed.set(name, latchState(s));
         latch.set(name, false);
         const facts = driveFacts(s);
         prevDrive.set(name, facts);
@@ -336,8 +347,9 @@ export function useAttention(
       // A worktree appearing after the seed (config add, incremental load) has no
       // prior state: record its first observed state as a baseline and don't fire —
       // a baseline is not a transition. It still counts toward the badge below.
+      const latchIn = latchState(s);
       if (prevState === undefined) {
-        prev.set(name, s.state);
+        prev.set(name, latchIn);
         latch.set(name, false);
         const facts = driveFacts(s);
         prevDrive.set(name, facts);
@@ -348,13 +360,21 @@ export function useAttention(
       }
 
       const wasLatch = latch.get(name) ?? false;
+      // A stale row is a fallback (the engine isn't ready): it proves no transition, so
+      // keep the last latched state and let the next fresh view compare against it.
+      if (s.stale) {
+        const kept = classifyAttention(prevState, wasLatch, prevDrive.get(name));
+        if (kept) kinds.set(name, kept);
+        continue;
+      }
       const facts = driveFacts(s);
       const before = needsInput(prevState, wasLatch, prevDrive.get(name));
-      const nextLatch = latchIdleFromTurn(prevState, s.state, wasLatch);
+      // The latch sees each state through `latchState`; `needsInput` sees the real one.
+      const nextLatch = latchIdleFromTurn(prevState, latchIn, wasLatch);
       const now = needsInput(s.state, nextLatch, facts);
 
       latch.set(name, nextLatch);
-      prev.set(name, s.state);
+      prev.set(name, latchIn);
       prevDrive.set(name, facts);
 
       const kind = classifyAttention(s.state, nextLatch, facts);

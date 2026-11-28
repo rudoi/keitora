@@ -101,6 +101,10 @@ pub struct ProviderSpec {
     pub herdr_integration: &'static str,
     /// Agent names herdr may report in `agent_session.agent`.
     pub herdr_agent_names: &'static [&'static str],
+    /// herdr's integration for it is installed only once the provider is found on
+    /// this machine, so switching a worktree to it runs the install again (a
+    /// provider installed after start-up is integrated without a restart).
+    pub integration_on_switch: bool,
 }
 
 /// Indexed by `CliKind` discriminant (declaration order).
@@ -113,6 +117,7 @@ static SPECS: [ProviderSpec; CLI_COUNT] = [
         herdr_kind: "claude",
         herdr_integration: "claude",
         herdr_agent_names: &["claude"],
+        integration_on_switch: false,
     },
     ProviderSpec {
         cli: CliKind::Codex,
@@ -122,6 +127,7 @@ static SPECS: [ProviderSpec; CLI_COUNT] = [
         herdr_kind: "codex",
         herdr_integration: "codex",
         herdr_agent_names: &["codex"],
+        integration_on_switch: false,
     },
     ProviderSpec {
         cli: CliKind::Antigravity,
@@ -131,6 +137,7 @@ static SPECS: [ProviderSpec; CLI_COUNT] = [
         herdr_kind: "agy",
         herdr_integration: "antigravity-cli",
         herdr_agent_names: &["antigravity_cli", "antigravity-cli", "agy"],
+        integration_on_switch: true,
     },
 ];
 
@@ -149,6 +156,14 @@ impl CliKind {
             let spec = c.spec();
             spec.config_key == name || spec.binary == name
         })
+    }
+
+    /// The provider whose agent herdr reports as `agent` (any of its
+    /// [`ProviderSpec::herdr_agent_names`]).
+    pub fn from_herdr_agent(agent: &str) -> Option<CliKind> {
+        CliKind::ALL
+            .into_iter()
+            .find(|c| c.spec().herdr_agent_names.contains(&agent))
     }
 }
 
@@ -2612,6 +2627,12 @@ fn herdr_release_order(release_dirs: &[PathBuf], exe_name: &str) -> Vec<PathBuf>
         }
     }
     out
+}
+
+/// Antigravity's (`agy`) state dir under `home`: `<home>/.gemini/antigravity-cli`
+/// (its `settings.json`, `conversations/` and `brain/` live there).
+pub fn agy_state_dir(home: &Path) -> PathBuf {
+    home.join(".gemini").join("antigravity-cli")
 }
 
 /// Where the standalone herdr installer unpacks releases under `home`:
@@ -7851,6 +7872,11 @@ owner = "acme-corp"
             s.herdr_agent_names,
             ["antigravity_cli", "antigravity-cli", "agy"]
         );
+        let on_switch: Vec<CliKind> = CliKind::ALL
+            .into_iter()
+            .filter(|c| c.spec().integration_on_switch)
+            .collect();
+        assert_eq!(on_switch, [CliKind::Antigravity]);
     }
 
     #[test]

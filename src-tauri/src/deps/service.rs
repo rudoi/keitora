@@ -13,6 +13,7 @@ use crate::agent_updates::probe::Prober;
 use crate::backend::herdr::exe_missing::NOT_FOUND_CODE;
 use crate::backend::herdr::recovery::RecoveryPhase;
 use crate::backend::SharedBackend;
+use crate::engine::SharedEngine;
 
 use super::floor::{FloorSlot, FloorState, HERDR_FLOOR};
 use super::manifest::{Net, Platform};
@@ -228,6 +229,8 @@ pub(super) struct State {
 
 pub(super) struct Inner {
     pub backend: SharedBackend,
+    /// Answers how many sessions an upgrade would interrupt.
+    engine: SharedEngine,
     pub floor: Arc<FloorSlot>,
     pub net: Box<dyn Net>,
     pub proc_: Box<dyn Proc>,
@@ -375,7 +378,7 @@ impl Inner {
     fn read_view(&self) -> BackendView {
         BackendView {
             herdr_installed: self.backend.recovery_snapshot().reason_code != Some(NOT_FOUND_CODE),
-            live_sessions: self.backend.live_set_snapshot().len(),
+            live_sessions: self.engine.running_count(),
         }
     }
 
@@ -865,6 +868,7 @@ impl DepsService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         backend: SharedBackend,
+        engine: SharedEngine,
         floor: Arc<FloorSlot>,
         net: Box<dyn Net>,
         proc_: Box<dyn Proc>,
@@ -877,6 +881,7 @@ impl DepsService {
         let prompt = next_prompt(&None, &mut prompted, &floor.get());
         let inner = Arc::new(Inner {
             backend,
+            engine,
             floor: Arc::clone(&floor),
             net,
             proc_,

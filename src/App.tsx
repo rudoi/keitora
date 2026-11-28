@@ -19,6 +19,7 @@ import { DepsUpgradeDialog } from "./components/DepsUpgradeDialog";
 import { DiffView } from "./components/DiffView";
 import { DispatchStepsEditor } from "./components/DispatchStepsEditor";
 import { FontSizeHud, type FontSizeHudHandle } from "./components/FontSizeHud";
+import { HealthProvider } from "./components/HealthProvider";
 import { Inspector } from "./components/Inspector";
 import { KeybindingHelp } from "./components/KeybindingHelp";
 import { Onboarding } from "./components/Onboarding";
@@ -43,6 +44,7 @@ import {
   driveSwapConfirmPrefix,
   openProjectsFromKey,
   openProjectsKey,
+  reportOpenProjects,
   SWAP_CANCELLED,
   SWAP_EXPIRED_TOAST,
   TRANSFER_ALREADY_RUNNING,
@@ -54,6 +56,7 @@ import {
   setTerminalFontSize,
   TERM_FONT_DEFAULT,
 } from "./lib/fontSize";
+import { OPEN_HEALTH_EVENT } from "./lib/health";
 import {
   type CliKind,
   cancelTransfer,
@@ -412,6 +415,12 @@ function AppInner() {
   useEffect(() => {
     refreshAvailability();
   }, [refreshAvailability]);
+  // A health glyph asks for Settings at its Health section.
+  useEffect(() => {
+    const open = () => setSettingsOpen(true);
+    window.addEventListener(OPEN_HEALTH_EVENT, open);
+    return () => window.removeEventListener(OPEN_HEALTH_EVENT, open);
+  }, []);
   const onSettingsOpenChange = useCallback(
     (open: boolean) => {
       setSettingsOpen(open);
@@ -851,10 +860,11 @@ function AppInner() {
     };
   }, [transferCtl, bumpRestartNonce]);
 
-  // The runner serves only projects this window has open; tell it whenever the set changes.
+  // The runner serves only projects this window has open; tell it whenever the set
+  // changes (a reopened window mounts afresh and reports again).
   const openKey = openProjectsKey(warm);
   useEffect(() => {
-    void driveSetOpenProjects(openProjectsFromKey(openKey)).catch(() => {});
+    void reportOpenProjects(openProjectsFromKey(openKey), driveSetOpenProjects);
   }, [openKey]);
 
   // Drive banners for the driven panes, by `project/worktree`.
@@ -1631,18 +1641,20 @@ function App() {
   return (
     <ToastProvider>
       <DepsProvider>
-        <UpdatesProvider>
-          <AgentUpdatesProvider>
-            <ConfirmDialogProvider>
-              <AttentionBannersProvider>
-                <Tooltip.Provider>
-                  <AppInner />
-                  <QuitConfirmModal />
-                </Tooltip.Provider>
-              </AttentionBannersProvider>
-            </ConfirmDialogProvider>
-          </AgentUpdatesProvider>
-        </UpdatesProvider>
+        <HealthProvider>
+          <UpdatesProvider>
+            <AgentUpdatesProvider>
+              <ConfirmDialogProvider>
+                <AttentionBannersProvider>
+                  <Tooltip.Provider>
+                    <AppInner />
+                    <QuitConfirmModal />
+                  </Tooltip.Provider>
+                </AttentionBannersProvider>
+              </ConfirmDialogProvider>
+            </AgentUpdatesProvider>
+          </UpdatesProvider>
+        </HealthProvider>
       </DepsProvider>
     </ToastProvider>
   );

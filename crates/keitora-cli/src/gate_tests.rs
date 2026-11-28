@@ -106,6 +106,9 @@ impl Clock for FakeClock {
     fn sleep(&self, d: Duration) {
         self.t.set(self.t.get() + d);
     }
+    fn wall_ms(&self) -> i64 {
+        1_800_000_000_000 + self.t.get().as_millis() as i64
+    }
 }
 
 #[derive(Default)]
@@ -396,6 +399,19 @@ fn routes_every_table_row() {
     assert_eq!(Provider::parse("claude"), Some(Claude));
     assert_eq!(Provider::parse("codex"), Some(Codex));
     assert_eq!(Provider::parse("gemini"), None);
+}
+
+#[test]
+fn gate_provider_names_why_it_has_none() {
+    assert_eq!(gate_provider(Some("codex")), Ok(Provider::Codex));
+    assert_eq!(
+        gate_provider(None).unwrap_err(),
+        "gate: no --provider given"
+    );
+    assert_eq!(
+        gate_provider(Some("gemini")).unwrap_err(),
+        "gate: unknown provider \"gemini\""
+    );
 }
 
 // ---- read_bounded ----
@@ -1016,6 +1032,9 @@ impl<F: Fn()> Clock for DecidingClock<F> {
         }
         self.t.set(self.t.get() + d);
     }
+    fn wall_ms(&self) -> i64 {
+        1_800_000_000_000 + self.t.get().as_millis() as i64
+    }
 }
 
 #[test]
@@ -1028,7 +1047,7 @@ fn local_store_gate_sees_a_decision_from_another_connection() {
     std::fs::create_dir_all(&dir).unwrap();
     let db = dir.join("tasks.db").to_string_lossy().into_owned();
 
-    let hook = LocalStore::open(&db).unwrap();
+    let hook = GateDb::hook_rows_only(LocalStore::open(&db).unwrap());
     let driver = LocalStore::open(&db).unwrap();
     // Not driven yet: nothing brokered, nothing written for Claude.
     assert_eq!(GateStore::drive_for(&hook, "bravo").unwrap(), None);
@@ -1096,7 +1115,7 @@ fn local_store_gate_sees_a_decision_from_another_connection() {
 fn a_decided_gate_leaves_a_parallel_gates_prompt_pending() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("tasks.db").to_string_lossy().into_owned();
-    let hook = LocalStore::open(&db).unwrap();
+    let hook = GateDb::hook_rows_only(LocalStore::open(&db).unwrap());
     let driver = LocalStore::open(&db).unwrap();
     driver
         .drive_bind("alpha", "bravo", Some(60), false)
@@ -1241,7 +1260,7 @@ fn question_inputs_are_stored_whole_up_to_the_store_cap() {
 fn a_long_question_round_trips_through_the_store_and_the_driver() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("tasks.db").to_string_lossy().into_owned();
-    let hook = LocalStore::open(&db).unwrap();
+    let hook = GateDb::hook_rows_only(LocalStore::open(&db).unwrap());
     let driver = LocalStore::open(&db).unwrap();
     driver
         .drive_bind("alpha", "bravo", Some(60), false)
@@ -1279,4 +1298,186 @@ fn a_long_question_round_trips_through_the_store_and_the_driver() {
     let answers = &v["hookSpecificOutput"]["updatedInput"]["answers"];
     assert_eq!(answers[&texts[0]], "pg");
     assert_eq!(answers["Ship it?"], "yes");
+}
+
+// ---- GateDb: the engine view while status.db is fresh ----
+
+const PROJ: &str = "proj";
+const NOW: i64 = 1_800_000_000_000;
+
+fn live_writer(heartbeat_at: i64) -> keitora_tasks::WriterRow {
+    keitora_tasks::WriterRow {
+        instance_id: "app-1".into(),
+        pid: 4242,
+        version: "test".into(),
+        started_at: heartbeat_at - 60_000,
+        heartbeat_at,
+        last_snapshot_at: Some(heartbeat_at),
+        herdr_link: "up".into(),
+        herdr_link_since: heartbeat_at - 60_000,
+    }
+}
+
+/// The engine's view of `wt`: an agent `agent` (`present`/`absent`) in `state`.
+fn engine_view(wt: &str, agent: &str, state: &str) -> keitora_tasks::StatusSession {
+    keitora_tasks::StatusSession {
+        project: PROJ.into(),
+        worktree: wt.into(),
+        state: state.into(),
+        agent: agent.into(),
+        agent_kind: Some("claude".into()),
+        herdr_status: Some("idle".into()),
+        settled: true,
+        stale: false,
+        interactive_ready: Some(true),
+        pane_id: Some("w1:p1".into()),
+        terminal_id: Some("t-1".into()),
+        agent_session: Some("s-1".into()),
+        state_change_seq: Some(3),
+        completion_seq: None,
+        brokered: false,
+        escalated_reason: None,
+        last_change_at: NOW,
+    }
+}
+
+/// A temp project DB where alpha drives bravo with alpha's hook row in `row_state`,
+/// and a `status.db` beat at `heartbeat_at` holding `views`.
+fn gate_db(
+    dir: &tempfile::TempDir,
+    row_state: &str,
+    heartbeat_at: i64,
+    views: &[keitora_tasks::StatusSession],
+) -> GateDb {
+    gate_db_at(dir, row_state, heartbeat_at, views, Rc::default())
+}
+
+/// [`gate_db`] whose wall clock reads `NOW + wall`.
+fn gate_db_at(
+    dir: &tempfile::TempDir,
+    row_state: &str,
+    heartbeat_at: i64,
+    views: &[keitora_tasks::StatusSession],
+    wall: Rc<Cell<Duration>>,
+) -> GateDb {
+    let db = dir.path().join("tasks.db");
+    let local = LocalStore::open(db.to_str().unwrap()).unwrap();
+    local.drive_bind("alpha", "bravo", None, false).unwrap();
+    local
+        .session_upsert("alpha", row_state, None, None)
+        .unwrap();
+    let status = dir.path().join("status.db");
+    keitora_tasks::status_store::write_status_for_test(&status, live_writer(heartbeat_at), views)
+        .unwrap();
+    GateDb {
+        local,
+        project: PROJ.into(),
+        status: StatusReader::open(&status).unwrap(),
+        clock: Box::new(FakeClock {
+            base: Instant::now(),
+            t: wall,
+        }),
+    }
+}
+
+#[test]
+fn gate_db_driver_absent_by_engine_is_offline_when_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = gate_db(
+        &dir,
+        "idle",
+        NOW,
+        &[engine_view("alpha", "absent", "offline")],
+    );
+    assert_eq!(
+        db.session_state("alpha").unwrap().as_deref(),
+        Some("offline")
+    );
+    // No view at all for a worktree is offline too.
+    assert_eq!(
+        db.session_state("charlie").unwrap().as_deref(),
+        Some("offline")
+    );
+}
+
+#[test]
+fn gate_db_driver_present_by_engine_although_row_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = gate_db(
+        &dir,
+        "offline",
+        NOW,
+        &[engine_view("alpha", "present", "idle")],
+    );
+    assert_eq!(db.session_state("alpha").unwrap().as_deref(), Some("idle"));
+    // Everything else goes to the project store.
+    assert_eq!(db.drive_for("bravo").unwrap().unwrap().driver, "alpha");
+}
+
+#[test]
+fn gate_db_falls_back_to_the_row_when_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    // No heartbeat for over 15 s.
+    let db = gate_db(
+        &dir,
+        "busy",
+        NOW - 16_000,
+        &[engine_view("alpha", "absent", "offline")],
+    );
+    assert_eq!(db.session_state("alpha").unwrap().as_deref(), Some("busy"));
+    // A stale view row reads the hook row as well.
+    let dir = tempfile::tempdir().unwrap();
+    let stale = keitora_tasks::StatusSession {
+        stale: true,
+        ..engine_view("alpha", "absent", "offline")
+    };
+    let db = gate_db(&dir, "busy", NOW, &[stale]);
+    assert_eq!(db.session_state("alpha").unwrap().as_deref(), Some("busy"));
+    // And with no status.db at all.
+    let db = GateDb { status: None, ..db };
+    assert_eq!(db.session_state("alpha").unwrap().as_deref(), Some("busy"));
+}
+
+#[test]
+fn stop_reason_uses_the_engine_view_when_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = gate_db(
+        &dir,
+        "idle",
+        NOW,
+        &[engine_view("alpha", "absent", "offline")],
+    );
+    assert_eq!(
+        stop_reason(&db, "bravo", "alpha").unwrap(),
+        Some("driver offline")
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let db = gate_db(
+        &dir,
+        "offline",
+        NOW,
+        &[engine_view("alpha", "present", "busy")],
+    );
+    assert_eq!(stop_reason(&db, "bravo", "alpha").unwrap(), None);
+}
+
+#[test]
+fn gate_db_reads_the_wall_clock_on_every_call() {
+    // The app stops beating mid-poll: once status.db ages past freshness the gate
+    // must fall back to the hook row instead of trusting the frozen engine view.
+    let dir = tempfile::tempdir().unwrap();
+    let wall = Rc::new(Cell::new(Duration::ZERO));
+    let db = gate_db_at(
+        &dir,
+        "offline",
+        NOW,
+        &[engine_view("alpha", "present", "busy")],
+        Rc::clone(&wall),
+    );
+    assert_eq!(stop_reason(&db, "bravo", "alpha").unwrap(), None);
+    wall.set(Duration::from_secs(16));
+    assert_eq!(
+        stop_reason(&db, "bravo", "alpha").unwrap(),
+        Some("driver offline")
+    );
 }

@@ -20,6 +20,7 @@
 //! (`onboarding = false`, `[update] version_check = false, manifest_check = false`)
 //! so the pinned server never phones home or rewrites its own binary.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -177,6 +178,10 @@ pub struct HerdrEnvOptions {
     /// Where the `PATH` every herdr process (and so every pane) runs with comes
     /// from.
     pub path: PathSource,
+    /// Inherited `HERDR_*` names (see [`herdr_var_names`]). A Keitora started from
+    /// inside a herdr pane carries these, and they let herdr reach the outer server
+    /// whatever `XDG_*` says, so they are removed from every herdr command.
+    pub inherited_herdr: Vec<String>,
 }
 
 impl HerdrEnvOptions {
@@ -188,6 +193,7 @@ impl HerdrEnvOptions {
             contaminated: OriginalXdg::contaminated(&lookup, keitora_root),
             scrollback_limit_bytes: DEFAULT_HERDR_SCROLLBACK_LIMIT_BYTES,
             path: PathSource::None,
+            inherited_herdr: Vec::new(),
         }
     }
 
@@ -196,13 +202,47 @@ impl HerdrEnvOptions {
     /// first time it is used (see [`PathSource::spawn_path`]).
     pub fn from_process() -> Self {
         let root = crate::paths::keitora_home();
+        let inherited_herdr = herdr_var_names(std::env::vars_os().map(|(k, _)| k));
+        log_stripped_herdr_vars(&inherited_herdr);
         HerdrEnvOptions {
             original_xdg: OriginalXdg::capture(&root),
             contaminated: OriginalXdg::contaminated(|k| std::env::var_os(k), &root),
             scrollback_limit_bytes: DEFAULT_HERDR_SCROLLBACK_LIMIT_BYTES,
             path: PathSource::spawn_path(),
+            inherited_herdr,
         }
     }
+}
+
+/// Log, once per process, the inherited `HERDR_*` names herdr commands run without
+/// (names only, never values), so a dropped user setting is discoverable.
+fn log_stripped_herdr_vars(names: &[String]) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    if names.is_empty() {
+        return;
+    }
+    LOGGED.call_once(|| {
+        log::info!(
+            "[herdr] ignoring inherited herdr variables: {}",
+            names.join(", ")
+        );
+    });
+}
+
+/// The env names that start with `HERDR_` (ASCII case-insensitive, as Windows env
+/// names are), minus `HERDR_CONFIG_PATH`, which Keitora pins itself. Sorted and
+/// deduplicated; non-UTF-8 names are skipped. A prefix rule, not a fixed list, so a
+/// variable a future herdr exports cannot leak. Pure.
+pub fn herdr_var_names(names: impl IntoIterator<Item = OsString>) -> Vec<String> {
+    let set: BTreeSet<String> = names
+        .into_iter()
+        .filter_map(|n| n.into_string().ok())
+        .filter(|n| {
+            n.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("HERDR_"))
+                && !n.eq_ignore_ascii_case("HERDR_CONFIG_PATH")
+        })
+        .collect();
+    set.into_iter().collect()
 }
 
 /// Where the `PATH` herdr and its panes run with comes from.
@@ -326,8 +366,8 @@ pub struct HerdrEnv {
     pub home: PathBuf,
     /// The user's original `XDG_*` values, captured once; panes get these.
     pub original_xdg: OriginalXdg,
-    /// Env names removed from every spawned herdr process (contaminated
-    /// pass-through `XDG_*` values).
+    /// Env names removed from every spawned herdr process: contaminated
+    /// pass-through `XDG_*` values and every inherited `HERDR_*` name.
     pub env_remove: Vec<String>,
     /// How [`Self::exe`] was found (or that it was not).
     pub discovery: ExeDiscovery,
@@ -645,6 +685,7 @@ impl HerdrEnv {
                 matches!(default, PaneDefault::Passthrough) && opts.contaminated.contains(name)
             })
             .map(|(name, _)| name.to_string())
+            .chain(opts.inherited_herdr)
             .collect();
         Ok(HerdrEnv {
             discovery: ExeDiscovery::explicit(exe.clone()),
@@ -1796,6 +1837,93 @@ mod tests {
             "{got:?}"
         );
         assert_eq!(got.len(), 4);
+    }
+
+    #[test]
+    fn herdr_var_names_selects_prefixed_names_only() {
+        let names: Vec<OsString> = [
+            "HERDR_SOCKET_PATH",
+            "herdr_session",
+            "HERDR_PANE_ID",
+            "HERDR_PANE_ID",
+            "HERDR_CONFIG_PATH",
+            "Herdr_Config_Path",
+            "KEITORA_HERDR_BIN",
+            "NOT_HERDR_X",
+            "HERDR",
+            "PATH",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(
+            herdr_var_names(names),
+            ["HERDR_PANE_ID", "HERDR_SOCKET_PATH", "herdr_session"]
+        );
+    }
+
+    /// `HERDR_` followed by a byte sequence that is not valid UTF-8.
+    #[cfg(unix)]
+    fn non_utf8_herdr_name() -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(vec![b'H', b'E', b'R', b'D', b'R', b'_', 0xff])
+    }
+
+    /// `HERDR_` followed by a lone surrogate: valid UTF-16-ish, not UTF-8.
+    #[cfg(windows)]
+    fn non_utf8_herdr_name() -> OsString {
+        use std::os::windows::ffi::OsStringExt;
+        let mut wide: Vec<u16> = "HERDR_".encode_utf16().collect();
+        wide.push(0xD800);
+        OsString::from_wide(&wide)
+    }
+
+    #[test]
+    fn herdr_var_names_skips_a_non_utf8_name() {
+        let bad = non_utf8_herdr_name();
+        assert!(herdr_var_names([bad, OsString::from("PATH")]).is_empty());
+    }
+
+    fn applied_envs(env: &HerdrEnv) -> Vec<(String, Option<String>)> {
+        let mut cmd = std::process::Command::new("herdr");
+        env.apply(&mut cmd);
+        cmd.get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn with_options_removes_inherited_herdr_vars_from_every_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut o = opts(vec![]);
+        o.inherited_herdr = vec!["HERDR_SESSION".into(), "HERDR_SOCKET_PATH".into()];
+        let env =
+            HerdrEnv::with_options(PathBuf::from("herdr"), tmp.path().to_path_buf(), o).unwrap();
+        let got = applied_envs(&env);
+        for name in ["HERDR_SESSION", "HERDR_SOCKET_PATH"] {
+            assert!(got.contains(&(name.to_string(), None)), "{name}: {got:?}");
+        }
+    }
+
+    #[test]
+    fn apply_never_removes_the_pinned_config_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut o = opts(vec![]);
+        // Never produced by `herdr_var_names`; guards `apply` setting after removing.
+        o.inherited_herdr = vec!["HERDR_CONFIG_PATH".into()];
+        let env =
+            HerdrEnv::with_options(PathBuf::from("herdr"), tmp.path().to_path_buf(), o).unwrap();
+        let got = applied_envs(&env);
+        let pinned = got
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("HERDR_CONFIG_PATH"))
+            .and_then(|(_, v)| v.clone());
+        assert!(pinned.is_some(), "{got:?}");
     }
 
     fn assert_herdr_log_path(home: &Path) {

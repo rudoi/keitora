@@ -33,6 +33,24 @@ pub struct WorktreeSession {
     /// human, why it was escalated.
     #[serde(default)]
     pub escalated_reason: Option<String>,
+    /// Agent presence from the session engine (`present` | `starting` | `absent`);
+    /// `None` when no engine view was overlaid (a bare hook row).
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// herdr's own agent status for the pane, when an engine view was overlaid.
+    #[serde(default)]
+    pub herdr_status: Option<String>,
+    /// The state could not be confirmed against a fresh herdr snapshot.
+    #[serde(default)]
+    pub stale: bool,
+}
+
+impl WorktreeSession {
+    /// The agent is still launching (engine presence `starting`); its `busy` is not a
+    /// turn, so a later `idle` must not read as a finished turn.
+    pub fn is_starting(&self) -> bool {
+        self.agent.as_deref() == Some("starting")
+    }
 }
 
 /// A worktree's active (claimed) task, as the rail shows it on the worktree's lane.

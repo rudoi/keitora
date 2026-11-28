@@ -6,6 +6,7 @@
 //! newly-unblocked tasks.
 
 mod backend;
+pub mod codex_trust;
 mod config;
 pub mod config_edit;
 mod discovery;
@@ -15,10 +16,15 @@ mod drive_store;
 mod factory;
 pub mod git;
 mod github;
+mod home;
+pub mod hook_log;
 mod local_store;
 mod migration;
 mod model;
+pub mod path_key;
 mod sqlite_backend;
+pub mod status_store;
+pub mod transcript;
 
 #[cfg(test)]
 pub(crate) mod backend_tests;
@@ -35,22 +41,23 @@ pub use backend::{
     BackendError, BackendResult, BoardSnapshot, ClaimOutcome, Consistency, DoneOutcome,
     Reservation, ReserveOutcome, TaskBackend,
 };
+pub use codex_trust::{codex_project_trust, read_codex_project_trust, ProjectTrust};
 pub use config::{
-    bundled_cli, cached_login_path, classify_worktree, compare_versions_desc, config_path,
-    current_worktree, current_worktree_in, discover_claude, discover_cli, discover_cli_cached,
-    effective_config, git_toplevel, herdr_bin_candidates, herdr_on_path, herdr_release_exes_in,
-    herdr_release_paths, herdr_release_paths_in, herdr_release_paths_with_home,
-    herdr_releases_dir_with_home, herdr_well_known_paths, invalidate_discovery_misses,
-    is_executable_file, is_safe_session_id, keitora_on_path, keitora_on_path_fresh, login_path,
-    managed_keitora_bin_dir, mirror_file, mirror_is_stale, project_provider, project_provider_mut,
-    resolve, resolve_active, resolve_autonomy, resolve_claude_path, resolve_cli,
-    resolve_keitora_path, resolve_provider_path, resolve_skip_permissions, same_file_name,
-    short_path, sort_versions_desc, stamp_from_registry, strip_extended_prefix_str,
-    unreserved_project_name, user_config_path, user_provider, user_provider_mut, write_atomic,
-    CliConfig, CliKind, Config, DiffBase, DispatchConfig, FieldIntent, HerdrPtyConfig,
-    ProjectConfig, ProjectMeta, ProjectRef, ProjectSettingsPatch, ProviderConfig, ProviderIds,
-    ProviderSpec, PtyConfig, RecoveryConfig, ResolveError, TaskConfig, UpdatesConfig, UserConfig,
-    WorktreeEntry, CLI_COUNT, DISCOVER_NONE_TTL, RESERVED_PROJECT_NAME,
+    agy_state_dir, bundled_cli, cached_login_path, classify_worktree, compare_versions_desc,
+    config_path, current_worktree, current_worktree_in, discover_claude, discover_cli,
+    discover_cli_cached, effective_config, git_toplevel, herdr_bin_candidates, herdr_on_path,
+    herdr_release_exes_in, herdr_release_paths, herdr_release_paths_in,
+    herdr_release_paths_with_home, herdr_releases_dir_with_home, herdr_well_known_paths,
+    invalidate_discovery_misses, is_executable_file, is_safe_session_id, keitora_on_path,
+    keitora_on_path_fresh, login_path, managed_keitora_bin_dir, mirror_file, mirror_is_stale,
+    project_provider, project_provider_mut, resolve, resolve_active, resolve_autonomy,
+    resolve_claude_path, resolve_cli, resolve_keitora_path, resolve_provider_path,
+    resolve_skip_permissions, same_file_name, short_path, sort_versions_desc, stamp_from_registry,
+    strip_extended_prefix_str, unreserved_project_name, user_config_path, user_provider,
+    user_provider_mut, write_atomic, CliConfig, CliKind, Config, DiffBase, DispatchConfig,
+    FieldIntent, HerdrPtyConfig, ProjectConfig, ProjectMeta, ProjectRef, ProjectSettingsPatch,
+    ProviderConfig, ProviderIds, ProviderSpec, PtyConfig, RecoveryConfig, ResolveError, TaskConfig,
+    UpdatesConfig, UserConfig, WorktreeEntry, CLI_COUNT, DISCOVER_NONE_TTL, RESERVED_PROJECT_NAME,
 };
 // Windows-only: expose the bundled `keitora` CLI on spawned terminals' PATH.
 #[cfg(unix)]
@@ -70,16 +77,21 @@ pub use discovery::{
     create_worktree, discover_worktrees, repair_project_worktree_paths, set_project_worktrees,
 };
 pub use drive::{
-    truncate_bytes, truncate_chars, Drive, DriveBind, DrivePrompt, DriveRequest, NewDrivePrompt,
-    PromptDecision, SessionReply, DRIVE_CONFIRM_MAX_AGE_SECS, DRIVE_DDL,
-    DRIVE_DEFAULT_ESCALATE_AFTER_S, DRIVE_ESCALATE_AFTER_MAX_S, DRIVE_ESCALATE_AFTER_MIN_S,
-    DRIVE_HOOK_TIMEOUT_S, DRIVE_PERMISSION_INPUT_MAX, DRIVE_PROMPT_KINDS,
-    DRIVE_PROMPT_STALE_SLACK_S, DRIVE_PROMPT_STATUSES, DRIVE_QUESTION_INPUT_MAX,
-    DRIVE_READ_LINES_DEFAULT, DRIVE_READ_LINES_MAX, DRIVE_READ_RESULT_MAX, DRIVE_REQUEST_KINDS,
-    DRIVE_REQUEST_MAX_AGE_SECS, DRIVE_REQUEST_OUTCOMES, DRIVE_REQUEST_STATUSES,
-    DRIVE_RETENTION_SECS, DRIVE_SEND_TEXT_MAX, DRIVE_SUMMARY_MAX, SESSION_REPLY_MAX,
+    truncate_bytes, truncate_chars, Baseline, Delivery, Drive, DriveBind, DrivePrompt,
+    DriveRequest, DriveTurn, NewDrivePrompt, NewDriveTurn, PromptDecision, SessionReply,
+    DRIVE_CONFIRM_MAX_AGE_SECS, DRIVE_DDL, DRIVE_DEFAULT_ESCALATE_AFTER_S,
+    DRIVE_ESCALATE_AFTER_MAX_S, DRIVE_ESCALATE_AFTER_MIN_S, DRIVE_HOOK_TIMEOUT_S,
+    DRIVE_PERMISSION_INPUT_MAX, DRIVE_PROMPT_KINDS, DRIVE_PROMPT_STALE_SLACK_S,
+    DRIVE_PROMPT_STATUSES, DRIVE_QUESTION_INPUT_MAX, DRIVE_READ_LINES_DEFAULT,
+    DRIVE_READ_LINES_MAX, DRIVE_READ_RESULT_MAX, DRIVE_REQUEST_KINDS, DRIVE_REQUEST_MAX_AGE_SECS,
+    DRIVE_REQUEST_OUTCOMES, DRIVE_REQUEST_STATUSES, DRIVE_RETENTION_SECS, DRIVE_SEND_TEXT_MAX,
+    DRIVE_STALL_NO_ACTIVITY_S, DRIVE_SUMMARY_MAX, DRIVE_TURNS_DDL, DRIVE_TURNS_KEEP_PER_WORKTREE,
+    DRIVE_TURNS_RETENTION_DAYS, DRIVE_TURN_CLAUSES, DRIVE_TURN_KINDS, DRIVE_TURN_OUTCOMES,
+    DRIVE_TURN_REPLY_SOURCES, DRIVE_TURN_SIGNALS, SESSION_REPLY_MAX,
 };
 pub use factory::open_backend;
+pub use home::{keitora_home, KEITORA_HOME_ENV};
+pub use hook_log::{HookLogLevel, HookLogLine};
 pub use local_store::{LocalStore, ResumeRow};
 pub use migration::{find_legacy_config, migrate_legacy};
 pub use model::{
@@ -88,6 +100,13 @@ pub use model::{
     DISPATCH_REQUEST_OUTCOMES, DISPATCH_REQUEST_STATUSES, PRIORITIES, SESSION_STATES, STATUSES,
 };
 pub use sqlite_backend::SqliteBackend;
+pub use status_store::{
+    age_text, clock_text, freshness, now_ms, overlay_sessions, sqlite_utc_to_ms, status_db_path,
+    AppProject, AppProjectTouch, Beat, EngineRead, FindingKey, FindingRow, FindingWrite, Freshness,
+    LeaseOutcome, ProjectStatus, StatusReader, StatusSession, StatusWriter, WriterIdentity,
+    WriterOpen, WriterRow, HERDR_LINKS, LEASE_STALE_MS, PRESENCE_TOUCH_LAG_MS, STATUS_DDL,
+    STATUS_FRESH_MS, STATUS_SCHEMA_VERSION,
+};
 
 use rusqlite::Row;
 

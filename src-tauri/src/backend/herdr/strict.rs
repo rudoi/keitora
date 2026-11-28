@@ -7,7 +7,10 @@
 //! and a pane whose agent never came up must not be reported as running.
 //!
 //! The strict launch walks a short chain instead — resume the imported thread,
-//! then fresh, then fresh without the optional hook-trust flag — and confirms
+//! then fresh, both with `--dangerously-bypass-hook-trust` (without it codex never
+//! runs herdr's session hook, so herdr never learns the session), then, as a
+//! degraded last resort for a codex build that rejects that flag, fresh without
+//! it — and confirms
 //! each step by watching the pane (`pane get`) until herdr reports the agent
 //! (and, for a resume, the expected session id). It never issues `continue`.
 //! Every step and every change in what the pane reports goes to a per-key trail
@@ -122,11 +125,16 @@ impl StepError {
     }
 }
 
+/// The label of the last-resort step that drops the hook-trust bypass.
+pub(super) const LAST_RESORT_LABEL: &str = "fresh without the hook-trust bypass";
+
 /// One step of the strict chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StrictStep {
     pub decision: ResumeDecision,
-    /// Whether the optional `--dangerously-bypass-hook-trust` flag is passed.
+    /// Whether `--dangerously-bypass-hook-trust` is passed. Only the last-resort
+    /// step drops it, for a codex build that rejects the flag; its pane runs no
+    /// session hook, so herdr never learns that session.
     pub hook_trust: bool,
     /// How the step reads in the trail and the final error.
     pub label: String,
@@ -134,7 +142,8 @@ pub(super) struct StrictStep {
 
 /// The steps a strict launch tries, in order: `resume <thread>` (only when the
 /// launch is not fresh and carries a safe thread id), `fresh`, then `fresh`
-/// without the optional flag. Never contains [`ResumeDecision::Continue`]: an
+/// without the hook-trust bypass (a degraded last resort; every other step
+/// carries it). Never contains [`ResumeDecision::Continue`]: an
 /// unsafe id would make the args degrade to `resume --last`, so it is dropped.
 pub(super) fn strict_chain(launch: &AgentLaunch) -> Vec<StrictStep> {
     let resume_id = if launch.fresh {
@@ -164,7 +173,7 @@ pub(super) fn strict_chain(launch: &AgentLaunch) -> Vec<StrictStep> {
     steps.push(StrictStep {
         decision: ResumeDecision::Fresh,
         hook_trust: false,
-        label: "fresh without optional flags".into(),
+        label: LAST_RESORT_LABEL.into(),
     });
     steps
 }
@@ -467,9 +476,9 @@ impl Spawner {
         let kind = agent::herdr_kind(STRICT_CLI);
         let name = agent::agent_name(kind, key);
         let mut extra = crate::codex_env::strict_pane_extra_env(codex_home);
-        extra.extend(crate::hooks::keitora_bin_extra_env(std::path::Path::new(
-            &cwd,
-        )));
+        // Codex's hooks and the pane marker; codex takes no extra launch args.
+        let prep = (self.launch_prep)(key, std::path::Path::new(&cwd), STRICT_CLI);
+        extra.extend(prep.env.iter().cloned());
         let pane_env = env::pane_env_with(
             &launch.path,
             &self.ops.env().original_xdg,
@@ -515,6 +524,14 @@ impl Spawner {
                 &step.decision,
                 step.hook_trust,
             );
+            if !step.hook_trust {
+                log::warn!(
+                    "herdr: strict launch of {key}: retrying without the hook-trust bypass; \
+                     herdr will not learn this session"
+                );
+            }
+            // The record's `trust_bypass` shows whether this launch dropped the flag.
+            crate::hooks::note_launch(key, prep.record(STRICT_CLI, &args));
             tried.push(step.label.clone());
             self.push_trail(
                 key,
@@ -834,7 +851,7 @@ mod tests {
         let chain = strict_chain(&launch(Some("thr-1"), false));
         assert_eq!(
             labels(&chain),
-            vec!["resume thr-1", "fresh", "fresh without optional flags"]
+            vec!["resume thr-1", "fresh", LAST_RESORT_LABEL]
         );
         assert_eq!(
             chain.iter().map(|s| s.hook_trust).collect::<Vec<_>>(),
@@ -854,21 +871,14 @@ mod tests {
     #[test]
     fn strict_chain_fresh_starts_at_fresh() {
         let chain = strict_chain(&launch(Some("thr-1"), true));
-        assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].decision, ResumeDecision::Fresh);
-        assert_eq!(
-            labels(&chain),
-            vec!["fresh", "fresh without optional flags"]
-        );
+        assert_eq!(labels(&chain), vec!["fresh", LAST_RESORT_LABEL]);
     }
 
     #[test]
     fn strict_chain_without_target_starts_at_fresh() {
         let chain = strict_chain(&launch(None, false));
-        assert_eq!(
-            labels(&chain),
-            vec!["fresh", "fresh without optional flags"]
-        );
+        assert_eq!(labels(&chain), vec!["fresh", LAST_RESORT_LABEL]);
         assert_eq!(chain[0].decision, ResumeDecision::Fresh);
     }
 
@@ -878,7 +888,42 @@ mod tests {
         assert!(chain
             .iter()
             .all(|s| !matches!(s.decision, ResumeDecision::Resume { .. })));
-        assert_eq!(chain.len(), 2);
+        assert_eq!(labels(&chain), vec!["fresh", LAST_RESORT_LABEL]);
+    }
+
+    #[test]
+    fn only_the_last_resort_step_drops_the_hook_trust_bypass() {
+        for fresh in [false, true] {
+            for target in [None, Some("thr-1"), Some("a b; --last")] {
+                for autonomy in [false, true] {
+                    let l = AgentLaunch {
+                        autonomy,
+                        ..launch(target, fresh)
+                    };
+                    let chain = strict_chain(&l);
+                    let (last, rest) = chain.split_last().unwrap();
+                    let bypass = |step: &StrictStep| {
+                        agent::build_agent_args_opts(
+                            CliKind::Codex,
+                            autonomy,
+                            &step.decision,
+                            step.hook_trust,
+                        )
+                        .iter()
+                        .any(|a| a == crate::hooks::TRUST_BYPASS_FLAG)
+                    };
+                    for step in rest {
+                        assert!(
+                            bypass(step),
+                            "fresh={fresh} target={target:?} autonomy={autonomy} {}",
+                            step.label
+                        );
+                    }
+                    assert!(!bypass(last), "{}", last.label);
+                    assert_eq!(last.decision, ResumeDecision::Fresh);
+                }
+            }
+        }
     }
 
     #[test]
